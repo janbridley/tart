@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
 
     let messages = [Message {
         role: Role::User,
-        content: "Say hi in one word.".to_string(),
+        content: "Say hi and then a random number.".to_string(),
     }];
 
     let (message, finish_reason) = client.create(&messages)?;
