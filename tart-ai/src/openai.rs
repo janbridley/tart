@@ -2,10 +2,8 @@
 
 use std::{borrow::Cow, path::PathBuf};
 
-use anyhow::Context as ErrorContext;
 
 mod completions;
-pub use completions::{ChatCompletions, ChatCompletionsClient};
 
 /// Valid `role` entries for a [`Message`]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +39,7 @@ impl<'a> Context<'a> {
         let is_markdown = filename
             .extension()
             .and_then(|ext| ext.to_str())
-            .map_or(false, |ext| ext.eq_ignore_ascii_case("md"));
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
 
         if !is_markdown {
             anyhow::bail!("Expected a Markdown file (.md), but received: {filename:?}");
