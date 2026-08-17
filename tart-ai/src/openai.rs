@@ -76,7 +76,7 @@ impl ChatCompletionsClient {
     /// - Connection failures and provider error bodies come through as `Err`
     /// - Content deltas arrive as a stream, which can be iterated to completion
     ///   (or consumed entirely by [`CompletionStream::complete`])
-    /// - Dropping the stream early cancels the request
+    /// - Dropping the stream early closes the connection
     pub fn create(&self, history: &ContextHistory) -> anyhow::Result<CompletionStream> {
         let request = CompletionRequest {
             model: &self.model,
@@ -175,8 +175,6 @@ impl Iterator for CompletionStream {
     type Item = anyhow::Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // The stream yields exactly one terminal outcome: a `[DONE]` sentinel,
-        // the end of the body, or an error.
         if self.done || self.errored {
             return None;
         }
