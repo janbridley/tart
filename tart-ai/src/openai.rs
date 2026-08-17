@@ -142,6 +142,8 @@ pub struct CompletionStream {
     content: String,
     /// The reason generation stopped, set once the terminal chunk arrives.
     finish_reason: Option<FinishReason>,
+    /// Content deferred from a chunk that also carried reasoning.
+    pending: Option<String>,
     /// The stream reached `[DONE]` or the end of the body.
     done: bool,
     /// An error was yielded; no further items will be produced.
@@ -155,6 +157,7 @@ impl CompletionStream {
             thinking: String::new(),
             content: String::new(),
             finish_reason: None,
+            pending: None,
             done: false,
             errored: false,
         }
@@ -213,6 +216,11 @@ impl Iterator for CompletionStream {
             return None;
         }
 
+        // Accumulate content from chunks that carry both reasoning and answers.
+        if let Some(pending) = self.pending.take() {
+            return Some(Ok(Delta::Answer(pending)));
+        }
+
         loop {
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
@@ -254,20 +262,29 @@ impl Iterator for CompletionStream {
             if let Some(reason) = choice.finish_reason {
                 self.finish_reason = Some(reason);
             }
-            if let Some(reasoning) = choice
+            // A chunk may carry reasoning and content together. If so, defer content
+            // until we empty all reasoning data.
+            let content = choice.delta.content.as_deref().filter(|c| !c.is_empty());
+            let reasoning = choice
                 .delta
                 .reasoning_content
                 .as_deref()
-                .filter(|r| !r.is_empty())
-            {
-                self.thinking.push_str(reasoning);
-                return Some(Ok(Delta::Thinking(reasoning.to_string())));
+                .filter(|r| !r.is_empty());
+
+            if let Some(c) = content {
+                self.content.push_str(c);
             }
-            let Some(delta) = choice.delta.content.as_deref().filter(|d| !d.is_empty()) else {
+
+            if let Some(r) = reasoning {
+                self.thinking.push_str(r);
+                self.pending = content.map(String::from);
+                return Some(Ok(Delta::Thinking(r.to_string())));
+            }
+
+            let Some(c) = content else {
                 continue;
             };
-            self.content.push_str(delta);
-            return Some(Ok(Delta::Answer(delta.to_string())));
+            return Some(Ok(Delta::Answer(c.to_string())));
         }
     }
 }
