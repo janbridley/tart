@@ -1,5 +1,12 @@
 //! OpenAI Chat Completions interface.
 
+use std::{borrow::Cow, path::PathBuf};
+
+use anyhow::Context as ErrorContext;
+
+mod completions;
+pub use completions::{ChatCompletions, ChatCompletionsClient};
+
 /// Valid `role` entries for a [`Message`]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -12,11 +19,9 @@ enum Role {
 /// One unit of data passed from the user to the model or vice versa.
 struct Message<'a> {
     /// The ,
-    role: Role,
+    pub(crate) role: Role,
     /// The text associated with this message.
-    content: &'a str, // NOTE: should be different container?
-    /// An identifier for the message.
-    id: String, // Owned identifier for the message
+    pub(crate) content: Cow<'a, str>,
 }
 
 /// Container of history for an LLM session.
@@ -29,5 +34,34 @@ impl<'a> Context<'a> {
     #[inline]
     fn append_message(&mut self, msg: Message<'a>) {
         self.responses.push(msg);
+    }
+
+    #[inline]
+    fn from_system_prompt_file(&mut self, filename: PathBuf) -> anyhow::Result<()> {
+        let is_markdown = filename
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("md"));
+
+        if !is_markdown {
+            anyhow::bail!("Expected a Markdown file (.md), but received: {filename:?}");
+        }
+
+        self.append_message(Message {
+            role: Role::System,
+            content: Cow::from(std::fs::read_to_string(&filename)?),
+        });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::openai::{ChatCompletions, ChatCompletionsClient, Context};
+
+    #[test]
+    fn completions_can_send_message() {
+        let client = ChatCompletionsClient::default();
+        // let messages = Context::client.create("glm-5.3");
     }
 }
