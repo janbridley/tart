@@ -46,6 +46,9 @@ pub enum FinishReason {
     ToolCalls,
     ContentFilter,
     FunctionCall,
+    /// A value this client does not recognize.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One streaming delta of a completion.
@@ -292,14 +295,16 @@ struct CompletionChunk {
 /// One entry of `choices` in a [`CompletionChunk`].
 #[derive(Deserialize)]
 struct ChunkChoice {
-    /// The partial message; fields arrive as they fill in.
+    /// The partial message; fields arrive as they fill in. Some servers omit
+    /// `delta` on the terminal chunk.
+    #[serde(default)]
     delta: ChunkDelta,
     /// Reason why the completion exited, on the terminal chunk.
     finish_reason: Option<FinishReason>,
 }
 
 /// The `delta` field of a [`ChunkChoice`].
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ChunkDelta {
     /// Chain-of-thought reasoning, on thinking-capable models.
     #[serde(default)]
