@@ -2,8 +2,11 @@
 
 use std::io::Write;
 
-use tart_ai::ContextHistory;
 use tart_ai::openai::{ChatCompletionsClient, Delta, Message, Role};
+use tart_ai::{ContextHistory, ReasoningEffort};
+
+/// How hard the model reasons before answering.
+const REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
 fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")?;
@@ -11,7 +14,8 @@ fn main() -> anyhow::Result<()> {
         "https://api.deepseek.com/chat/completions",
         api_key,
         "deepseek-v4-flash",
-    );
+    )
+    .reasoning_effort(REASONING_EFFORT);
 
     let history = ContextHistory::from(Message {
         role: Role::User,
