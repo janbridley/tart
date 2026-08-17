@@ -31,6 +31,7 @@ pub trait ChatCompletions {
 
 impl Choices {
     /// Return a reference to the sole choice in a message.
+    #[inline]
     pub fn get_single_choice(&self) -> (&Message, FinishReason) {
         // This fails to compile if COMPLETION_MAX_CHOICES_PER_REQUEST, preventing users
         // from accidentally discarding information, or mixing requests due to missing
