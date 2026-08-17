@@ -17,9 +17,10 @@ fn main() -> anyhow::Result<()> {
     )
     .reasoning_effort(REASONING_EFFORT);
 
-    let history = ContextHistory::from(Message {
+    let mut history = ContextHistory::from(Message::system());
+    history.append_message(Message {
         role: Role::User,
-        content: "Give a 100 word story.".to_string(),
+        content: "Who are you?".to_string(),
     });
 
     let stream = client.create(&history)?;
