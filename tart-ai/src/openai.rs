@@ -2,14 +2,17 @@
 
 use std::{borrow::Cow, path::PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 pub const SYSTEM: &str = include_str!("data/SYSTEM.md");
 
 mod completions;
 pub use completions::{ChatCompletions, ChatCompletionsClient};
 
 /// Valid `role` entries for a [`Message`]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
     Assistant,
     System,
     Developer,
@@ -17,7 +20,7 @@ enum Role {
 }
 
 /// One unit of data passed from the user to the model or vice versa.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// The `Role` of the actor sending the message.
     pub role: Role,

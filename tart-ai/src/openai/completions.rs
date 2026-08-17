@@ -1,5 +1,7 @@
 use std::ops::Index;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ModelConfiguration;
 use crate::openai::{ContextHistory, Message};
 
@@ -7,16 +9,17 @@ use crate::openai::{ContextHistory, Message};
 /// used, so we fix it to be 1.
 const COMPLETION_MAX_CHOICES_PER_REQUEST: usize = 1;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FinishReason {
-    Stope,
+    Stop,
     Length,
     ToolCalls,
     ContentFilter,
     FunctionCall,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Choices {
     choices: [Message; COMPLETION_MAX_CHOICES_PER_REQUEST],
     finish_reason: FinishReason,
