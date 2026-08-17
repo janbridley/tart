@@ -86,6 +86,6 @@ mod test {
     fn completions_can_send_message() {
         let client = ChatCompletionsClient::default();
         let system = Message::system();
-        client.create("glm-5.3", &system.into());
+        let _ = client.create("glm-5.3", &system.into());
     }
 }
