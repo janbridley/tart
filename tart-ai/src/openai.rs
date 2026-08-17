@@ -2,7 +2,6 @@
 
 use std::{borrow::Cow, path::PathBuf};
 
-
 mod completions;
 
 /// Valid `role` entries for a [`Message`]
@@ -23,11 +22,11 @@ struct Message<'a> {
 }
 
 /// Container of history for an LLM session.
-pub struct Context<'a> {
+pub struct ContextHistory<'a> {
     responses: Vec<Message<'a>>,
 }
 
-impl<'a> Context<'a> {
+impl<'a> ContextHistory<'a> {
     /// Push a message into context, taking ownership of it.
     #[inline]
     fn append_message(&mut self, msg: Message<'a>) {
@@ -55,7 +54,7 @@ impl<'a> Context<'a> {
 
 #[cfg(test)]
 mod test {
-    use crate::openai::{ChatCompletions, ChatCompletionsClient, Context};
+    use crate::openai::{ChatCompletions, ChatCompletionsClient, ContextHistory};
 
     #[test]
     fn completions_can_send_message() {
