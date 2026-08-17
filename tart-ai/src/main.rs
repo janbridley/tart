@@ -1,5 +1,7 @@
 //! Manual bin for testing request output.
 
+use std::io::Write;
+
 use tart_ai::ContextHistory;
 use tart_ai::openai::{ChatCompletionsClient, Message, Role};
 
@@ -13,12 +15,18 @@ fn main() -> anyhow::Result<()> {
 
     let history = ContextHistory::from(Message {
         role: Role::User,
-        content: "Say hi and then a random number.".to_string(),
+        content: "Give a 100 word story.".to_string(),
     });
 
-    let (message, finish_reason) = client.create(&history)?;
+    let stream = client.create(&history)?;
+    let (message, finish_reason) = stream.complete(|delta| {
+        print!("{delta}");
+        // Tokens carry no newlines so we flush each delta manually
+        let _ = std::io::stdout().flush();
+    })?;
+    println!();
     println!("finish_reason: {finish_reason:?}");
-    println!("content: {}", message.content);
+    println!("assembled: {}", message.content);
 
     Ok(())
 }
