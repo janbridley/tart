@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use tart_ai::ContextHistory;
-use tart_ai::openai::{ChatCompletionsClient, Message, Role};
+use tart_ai::openai::{ChatCompletionsClient, Delta, Message, Role};
 
 fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")?;
@@ -20,7 +20,11 @@ fn main() -> anyhow::Result<()> {
 
     let stream = client.create(&history)?;
     let (message, finish_reason) = stream.complete(|delta| {
-        print!("{delta}");
+        match delta {
+            // Dim the chain-of-thought; it precedes the answer.
+            Delta::Thinking(text) => print!("\x1b[2m{text}\x1b[0m"),
+            Delta::Answer(text) => print!("{text}"),
+        }
         // Tokens carry no newlines so we flush each delta manually
         let _ = std::io::stdout().flush();
     })?;

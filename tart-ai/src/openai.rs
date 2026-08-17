@@ -48,6 +48,17 @@ pub enum FinishReason {
     FunctionCall,
 }
 
+/// One streaming delta of a completion.
+///
+/// Thinking-capable models emit reasoning deltas first, then answer deltas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delta {
+    /// A fragment of the model's chain-of-thought reasoning.
+    Thinking(String),
+    /// A fragment of the final answer.
+    Answer(String),
+}
+
 /// A client for an OpenAI-compatible Chat Completions endpoint.
 pub struct ChatCompletionsClient {
     /// A Chat-Completions URL.
@@ -111,7 +122,9 @@ impl ChatCompletionsClient {
 pub struct CompletionStream {
     /// The SSE body, read line by line.
     reader: BufReader<Box<dyn Read + Send + Sync>>,
-    /// Content deltas seen so far.
+    /// Reasoning deltas seen so far.
+    thinking: String,
+    /// Answer deltas seen so far.
     content: String,
     /// The reason generation stopped, set once the terminal chunk arrives.
     finish_reason: Option<FinishReason>,
@@ -125,11 +138,17 @@ impl CompletionStream {
     fn from_reader(reader: impl Read + Send + Sync + 'static) -> Self {
         Self {
             reader: BufReader::new(Box::new(reader)),
+            thinking: String::new(),
             content: String::new(),
             finish_reason: None,
             done: false,
             errored: false,
         }
+    }
+
+    /// The chain-of-thought reasoning seen so far.
+    pub fn thinking(&self) -> &str {
+        &self.thinking
     }
 
     /// The reason generation stopped; `Some` once the terminal chunk has been
@@ -148,13 +167,14 @@ impl CompletionStream {
     }
 
     /// Consume the stream, forwarding each delta to `on_delta` as it arrives,
-    /// then return the assembled message and its finish reason.
+    /// then return the assembled message and its finish reason. The assembled
+    /// message contains only the answer; reasoning never enters it.
     pub fn complete(
         mut self,
-        mut on_delta: impl FnMut(&str),
+        mut on_delta: impl FnMut(Delta),
     ) -> anyhow::Result<(Message, FinishReason)> {
         for delta in self.by_ref() {
-            on_delta(&delta?);
+            on_delta(delta?);
         }
 
         let Some(finish_reason) = self.finish_reason else {
@@ -172,7 +192,7 @@ impl CompletionStream {
 }
 
 impl Iterator for CompletionStream {
-    type Item = anyhow::Result<String>;
+    type Item = anyhow::Result<Delta>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done || self.errored {
@@ -220,11 +240,20 @@ impl Iterator for CompletionStream {
             if let Some(reason) = choice.finish_reason {
                 self.finish_reason = Some(reason);
             }
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .as_deref()
+                .filter(|r| !r.is_empty())
+            {
+                self.thinking.push_str(reasoning);
+                return Some(Ok(Delta::Thinking(reasoning.to_string())));
+            }
             let Some(delta) = choice.delta.content.as_deref().filter(|d| !d.is_empty()) else {
                 continue;
             };
             self.content.push_str(delta);
-            return Some(Ok(delta.to_string()));
+            return Some(Ok(Delta::Answer(delta.to_string())));
         }
     }
 }
@@ -250,14 +279,18 @@ struct CompletionChunk {
 #[derive(Deserialize)]
 struct ChunkChoice {
     /// The partial message; fields arrive as they fill in.
-    delta: Delta,
+    delta: ChunkDelta,
     /// Reason why the completion exited, on the terminal chunk.
     finish_reason: Option<FinishReason>,
 }
 
 /// The `delta` field of a [`ChunkChoice`].
 #[derive(Deserialize)]
-struct Delta {
+struct ChunkDelta {
+    /// Chain-of-thought reasoning, on thinking-capable models.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// The answer text.
     #[serde(default)]
     content: Option<String>,
 }
@@ -286,6 +319,8 @@ mod tests {
         let sse = concat!(
             r#"data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
             "\n\n",
+            r#"data: {"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#,
+            "\n\n",
             r#"data: {"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#,
             "\n\n",
             r#"data: {"choices":[{"delta":{"content":"lo"},"finish_reason":null}]}"#,
@@ -296,16 +331,25 @@ mod tests {
         );
         let mut stream = CompletionStream::from_reader(sse.as_bytes());
 
-        assert_eq!(stream.next().unwrap().unwrap(), "Hel");
-        assert_eq!(stream.next().unwrap().unwrap(), "lo");
+        assert_eq!(
+            stream.next().unwrap().unwrap(),
+            Delta::Thinking("hmm".into())
+        );
+        assert_eq!(stream.next().unwrap().unwrap(), Delta::Answer("Hel".into()));
+        assert_eq!(stream.next().unwrap().unwrap(), Delta::Answer("lo".into()));
         assert!(stream.next().is_none());
         assert_eq!(stream.finish_reason(), Some(FinishReason::Stop));
+        assert_eq!(stream.thinking(), "hmm");
         assert_eq!(stream.message().unwrap().content, "Hello");
     }
 
     #[test]
     fn complete_assembles_the_message() {
         let sse = concat!(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Let me "},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}"#,
+            "\n\n",
             r#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
             "\n\n",
             r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
@@ -315,9 +359,35 @@ mod tests {
         let stream = CompletionStream::from_reader(sse.as_bytes());
 
         let (message, finish_reason) = stream.complete(|_| {}).unwrap();
+        // Reasoning never leaks into the assembled message.
         assert_eq!(message.content, "Hi");
         assert_eq!(message.role, Role::Assistant);
         assert_eq!(finish_reason, FinishReason::Length);
+    }
+
+    #[test]
+    fn complete_forwards_thinking_and_answer() {
+        let sse = concat!(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Let me think"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n",
+        );
+        let stream = CompletionStream::from_reader(sse.as_bytes());
+
+        let mut thinking = String::new();
+        let mut answer = String::new();
+        stream
+            .complete(|delta| match delta {
+                Delta::Thinking(text) => thinking.push_str(&text),
+                Delta::Answer(text) => answer.push_str(&text),
+            })
+            .unwrap();
+        assert_eq!(thinking, "Let me think");
+        assert_eq!(answer, "Hi");
     }
 
     #[test]
@@ -325,7 +395,7 @@ mod tests {
         let sse = r#"data: {"choices":[{"delta":{"content":"par"}}]}"#;
         let mut stream = CompletionStream::from_reader(sse.as_bytes());
 
-        assert_eq!(stream.next().unwrap().unwrap(), "par");
+        assert_eq!(stream.next().unwrap().unwrap(), Delta::Answer("par".into()));
         assert!(stream.next().is_none());
         assert_eq!(stream.finish_reason(), None);
         assert!(stream.message().is_none());
