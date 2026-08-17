@@ -59,6 +59,6 @@ mod test {
     #[test]
     fn completions_can_send_message() {
         let client = ChatCompletionsClient::default();
-        // let messages = Context::client.create("glm-5.3");
+        // let messages = ContextHistory::client.create("glm-5.3");
     }
 }
