@@ -49,6 +49,7 @@ impl From<Message> for ContextHistory {
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
+    Medium,
     High,
     Max,
 }
