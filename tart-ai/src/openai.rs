@@ -1,5 +1,6 @@
 //! OpenAI Chat Completions interface.
 
+use crate::ContextHistory;
 use serde::{Deserialize, Serialize};
 
 pub const SYSTEM: &str = include_str!("data/SYSTEM.md");
@@ -68,15 +69,16 @@ impl ChatCompletionsClient {
         }
     }
 
-    /// Request a completion for a conversation, returning the sole assistant
-    /// message and why the model stopped generating.
+    /// Request a completion for the transcript held in `history`, returning the
+    /// sole assistant message and why the model stopped generating.
     ///
     /// We always want a single choice: the wire default for `n` is 1, and this
-    /// errors if the endpoint answers with anything else.
-    pub fn create(&self, messages: &[Message]) -> anyhow::Result<(Message, FinishReason)> {
+    /// errors if the endpoint answers with anything else. The reply is *not*
+    /// recorded into `history`; the harness owns the transcript and decides.
+    pub fn create(&self, history: &ContextHistory) -> anyhow::Result<(Message, FinishReason)> {
         let request = CompletionRequest {
             model: &self.model,
-            messages,
+            messages: history.as_slice(),
         };
 
         let response = match ureq::post(&self.completions_url)

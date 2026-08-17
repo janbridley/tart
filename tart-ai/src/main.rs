@@ -1,5 +1,6 @@
 //! Manual bin for testing request output.
 
+use tart_ai::ContextHistory;
 use tart_ai::openai::{ChatCompletionsClient, Message, Role};
 
 fn main() -> anyhow::Result<()> {
@@ -10,12 +11,12 @@ fn main() -> anyhow::Result<()> {
         "deepseek-v4-flash",
     );
 
-    let messages = [Message {
+    let history = ContextHistory::from(Message {
         role: Role::User,
         content: "Say hi and then a random number.".to_string(),
-    }];
+    });
 
-    let (message, finish_reason) = client.create(&messages)?;
+    let (message, finish_reason) = client.create(&history)?;
     println!("finish_reason: {finish_reason:?}");
     println!("content: {}", message.content);
 
