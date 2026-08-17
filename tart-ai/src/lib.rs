@@ -1,5 +1,7 @@
 pub mod openai;
 
+use serde::Serialize;
+
 use openai::Message;
 
 /// Linear, append-only conversation transcript
@@ -37,4 +39,16 @@ impl From<Message> for ContextHistory {
             messages: vec![message],
         }
     }
+}
+
+/// How hard a model reasons before answering.
+///
+/// `low`, `high`, and `max` are the most common levels providers accept. Omitting
+/// effort entirely uses the provider default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    High,
+    Max,
 }

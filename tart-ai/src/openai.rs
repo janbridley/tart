@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 
-use crate::ContextHistory;
+use crate::{ContextHistory, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 
 pub const SYSTEM: &str = include_str!("data/SYSTEM.md");
@@ -65,6 +65,8 @@ pub struct ChatCompletionsClient {
     completions_url: String,
     api_key: String,
     model: String,
+    /// How hard the model reasons. `None` uses the provider default.
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ChatCompletionsClient {
@@ -79,7 +81,15 @@ impl ChatCompletionsClient {
             completions_url: completions_url.into(),
             api_key: api_key.into(),
             model: model.into(),
+            reasoning_effort: None,
         }
+    }
+
+    /// Set how hard the model reasons before answering.
+    #[inline]
+    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
     }
 
     /// Begin a streaming completion for the transcript held in `history`.
@@ -92,6 +102,7 @@ impl ChatCompletionsClient {
         let request = CompletionRequest {
             model: &self.model,
             messages: history.as_slice(),
+            reasoning_effort: self.reasoning_effort,
             stream: true,
         };
 
@@ -265,6 +276,9 @@ struct CompletionRequest<'a> {
     model: &'a str,
     /// The conversation so far.
     messages: &'a [Message],
+    /// How hard the model reasons; omitted to use the provider default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
     /// Ask for an SSE stream of deltas rather than a single JSON body.
     stream: bool,
 }
