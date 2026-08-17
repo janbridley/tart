@@ -43,11 +43,11 @@ impl From<Message> for ContextHistory {
 
 /// How hard a model reasons before answering.
 ///
-/// `low`, `high`, and `max` are the most common levels providers accept. Omitting
-/// effort entirely uses the provider default.
+/// Variants ascend in effort, with `None` disabling thinking entirely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    None,
     Low,
     Medium,
     High,
