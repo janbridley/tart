@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         content: "Who are you?".to_string(),
     });
 
-    let stream = client.create(&history)?;
+    let mut stream = client.create(&history)?;
     let (message, finish_reason) = stream.complete(|delta| {
         match delta {
             // Dim the chain-of-thought; it precedes the answer.
@@ -36,6 +36,18 @@ fn main() -> anyhow::Result<()> {
     println!();
     println!("finish_reason: {finish_reason:?}");
     println!("assembled: {}", message.content);
+
+    // Read usage from the stream into our history
+    if let Some(u) = stream.usage() {
+        history.record_usage(u)
+    }
+    // Append the message to our context
+    history.append_message(message);
+    let usage = history.usage();
+    println!(
+        "input tokens:  {}\noutput tokens: {} completion + {} reasoning ({} cached)",
+        usage.prompt_tokens, usage.completion_tokens, usage.reasoning_tokens, usage.cached_tokens
+    );
 
     Ok(())
 }

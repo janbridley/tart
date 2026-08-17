@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 
-use crate::{ContextHistory, ReasoningEffort};
+use crate::{ContextHistory, ReasoningEffort, Usage};
 use serde::{Deserialize, Serialize};
 
 pub const SYSTEM: &str = include_str!("data/SYSTEM.md");
@@ -142,6 +142,8 @@ pub struct CompletionStream {
     content: String,
     /// The reason generation stopped, set once the terminal chunk arrives.
     finish_reason: Option<FinishReason>,
+    /// Token usage, set once a chunk carries it.
+    usage: Option<Usage>,
     /// Content deferred from a chunk that also carried reasoning.
     pending: Option<String>,
     /// The stream reached `[DONE]` or the end of the body.
@@ -157,6 +159,7 @@ impl CompletionStream {
             thinking: String::new(),
             content: String::new(),
             finish_reason: None,
+            usage: None,
             pending: None,
             done: false,
             errored: false,
@@ -168,10 +171,14 @@ impl CompletionStream {
         &self.thinking
     }
 
-    /// The reason generation stopped; `Some` once the terminal chunk has been
-    /// seen.
+    /// The reason generation stopped; `Some` once the terminal chunk has been seen.
     pub fn finish_reason(&self) -> Option<FinishReason> {
         self.finish_reason
+    }
+
+    /// Token usage for the request; `Some` once it has been received.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
     }
 
     /// The assembled assistant message; `Some` only after the stream ran to
@@ -183,11 +190,40 @@ impl CompletionStream {
         })
     }
 
-    /// Consume the stream, forwarding each delta to `on_delta` as it arrives,
-    /// then return the assembled message and its finish reason. The assembled
-    /// message contains only the answer; reasoning never enters it.
+    /// Exhaust the stream, forwarding each delta and returning the assembled message.
+    ///
+    /// ```rust
+    /// # fn main() -> anyhow::Result<()> {
+    /// use tart_ai::openai::{ChatCompletionsClient, Delta, Message, Role};
+    /// use tart_ai::ContextHistory;
+    ///
+    /// let client = ChatCompletionsClient::new(
+    ///     "https://api.deepseek.com/chat/completions",
+    ///     std::env::var("DEEPSEEK_API_KEY")?,
+    ///     "deepseek-v4-flash",
+    /// );
+    /// let mut history = ContextHistory::from(Message::system());
+    /// history.append_message(Message {
+    ///     role: Role::User,
+    ///     content: "Who are you?".to_string(),
+    /// });
+    ///
+    /// let mut stream = client.create(&history)?;
+    /// let (message, finish_reason) = stream.complete(|delta| match delta {
+    ///     Delta::Thinking(text) => print!("\x1b[2m{text}\x1b[0m"),
+    ///     Delta::Answer(text) => print!("{text}"),
+    /// })?;
+    ///
+    /// // The stream is spent but still readable, so we can get our usage data out.
+    /// if let Some(usage) = stream.usage() {
+    ///     history.record_usage(usage);
+    /// }
+    /// history.append_message(message);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn complete(
-        mut self,
+        &mut self,
         mut on_delta: impl FnMut(Delta),
     ) -> anyhow::Result<(Message, FinishReason)> {
         for delta in self.by_ref() {
@@ -201,7 +237,7 @@ impl CompletionStream {
         Ok((
             Message {
                 role: Role::Assistant,
-                content: self.content,
+                content: self.content.clone(),
             },
             finish_reason,
         ))
@@ -258,6 +294,10 @@ impl Iterator for CompletionStream {
                     )));
                 }
             };
+            // Usage arrives on the final chunk, empty `choices` or not.
+            if let Some(usage) = chunk.usage {
+                self.usage = Some(usage.into());
+            }
             let Some(choice) = chunk.choices.first() else {
                 // Chunks may legitimately carry an empty `choices` array.
                 continue;
@@ -310,6 +350,9 @@ struct CompletionRequest<'a> {
 #[derive(Deserialize)]
 struct CompletionChunk {
     choices: Vec<ChunkChoice>,
+    /// Token usage, carried by the final chunk (`null` elsewhere).
+    #[serde(default)]
+    usage: Option<WireUsage>,
 }
 
 /// One entry of `choices` in a [`CompletionChunk`].
@@ -332,6 +375,53 @@ struct ChunkDelta {
     /// The answer text.
     #[serde(default)]
     content: Option<String>,
+}
+
+/// The `usage` object, tolerating every provider's spelling.
+#[derive(Clone, Copy, Default, Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: PromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: CompletionTokensDetails,
+    /// DeepSeek's flat spelling of the cache hit count.
+    #[serde(default)]
+    prompt_cache_hit_tokens: u64,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    /// Tokens newly written to the cache.
+    #[serde(default)]
+    cache_write_tokens: u64,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
+}
+
+impl From<WireUsage> for Usage {
+    fn from(wire: WireUsage) -> Self {
+        Self {
+            prompt_tokens: wire.prompt_tokens,
+            completion_tokens: wire.completion_tokens,
+            reasoning_tokens: wire.completion_tokens_details.reasoning_tokens,
+            cached_tokens: if wire.prompt_tokens_details.cached_tokens > 0 {
+                wire.prompt_tokens_details.cached_tokens
+            } else {
+                wire.prompt_cache_hit_tokens
+            },
+            cache_write_tokens: wire.prompt_tokens_details.cache_write_tokens,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -395,7 +485,7 @@ mod tests {
             "\n\n",
             "data: [DONE]\n",
         );
-        let stream = CompletionStream::from_reader(sse.as_bytes());
+        let mut stream = CompletionStream::from_reader(sse.as_bytes());
 
         let (message, finish_reason) = stream.complete(|_| {}).unwrap();
         // Reasoning never leaks into the assembled message.
@@ -415,7 +505,7 @@ mod tests {
             "\n\n",
             "data: [DONE]\n",
         );
-        let stream = CompletionStream::from_reader(sse.as_bytes());
+        let mut stream = CompletionStream::from_reader(sse.as_bytes());
 
         let mut thinking = String::new();
         let mut answer = String::new();
