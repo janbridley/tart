@@ -1,3 +1,5 @@
+//! OpenAI Chat Completions interface.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Assistant,
@@ -19,9 +21,10 @@ pub struct Context<'a> {
     responses: Vec<Message<'a>>,
 }
 
-impl Context<'a> {
+impl<'a> Context<'a> {
+    /// Push a message into context, taking ownership of it.
     #[inline]
-    fn append_message(&mut self, msg: &Message) {
+    fn append_message(&mut self, msg: Message<'a>) {
         self.responses.push(msg);
     }
 }
