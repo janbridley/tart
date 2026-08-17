@@ -5,7 +5,11 @@ pub trait ChatCompletions {
 }
 
 #[derive(Default)]
-pub struct ChatCompletionsClient {}
+pub struct ChatCompletionsClient {
+    completions_url: String,
+    api_key: String,
+    model: String,
+}
 
 impl ChatCompletions for ChatCompletionsClient {
     fn create(&self, _model: &str, _messages: &ContextHistory) {
