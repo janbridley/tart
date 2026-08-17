@@ -1,4 +1,4 @@
-mod openai;
+pub mod openai;
 
 pub trait ModelConfiguration {
     /// A valid URL through which we can reach the LLM.
