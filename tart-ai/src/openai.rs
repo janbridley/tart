@@ -10,7 +10,8 @@ struct Message<'a> {
     /// The ,
     role: Role,
     /// The text associated with this message.
-    content: &'a str,
+    content: &'a str, // NOTE: should be different container?
+    /// An identifier for the message.
     id: String, // Owned identifier for the message
 }
 
