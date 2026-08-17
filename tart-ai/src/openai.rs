@@ -51,16 +51,24 @@ impl<'a> Message<'a> {
     }
 }
 
+impl Into<ContextHistory> for Message {
+    fn into(self) -> ContextHistory {
+        ContextHistory {
+            messages: vec![self],
+        }
+    }
+}
+
 /// Container of history for an LLM session.
 pub struct ContextHistory<'a> {
-    responses: Vec<Message<'a>>,
+    messages: Vec<Message<'a>>,
 }
 
 impl<'a> ContextHistory<'a> {
     /// Push a message into context, taking ownership of it.
     #[inline]
     fn append_message(&mut self, msg: Message<'a>) {
-        self.responses.push(msg);
+        self.messages.push(msg);
     }
 }
 
@@ -68,12 +76,12 @@ impl<'a> ContextHistory<'a> {
 mod test {
     use std::path::PathBuf;
 
-    use crate::openai::{ChatCompletionsClient, ContextHistory, Message};
+    use crate::openai::{ChatCompletions, ChatCompletionsClient, ContextHistory, Message};
 
     #[test]
     fn completions_can_send_message() {
         let client = ChatCompletionsClient::default();
         let system = Message::system();
-        // let messages = ContextHistory::client.create("glm-5.3");
+        client.create("glm-5.3", system)
     }
 }
