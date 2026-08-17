@@ -17,13 +17,13 @@ enum Role {
 }
 
 /// One unit of data passed from the user to the model or vice versa.
-struct Message<'a> {
+struct Message {
     /// The ,
     pub(crate) role: Role,
     /// The text associated with this message.
-    pub(crate) content: Cow<'a, str>,
+    pub(crate) content: String,
 }
-impl<'a> Message<'a> {
+impl Message {
     /// Initialize a `Role::System` message from a markdown file.
     #[inline]
     fn from_system_prompt_markdown_file(filename: PathBuf) -> anyhow::Result<Self> {
@@ -38,7 +38,7 @@ impl<'a> Message<'a> {
 
         Ok(Self {
             role: Role::System,
-            content: Cow::from(std::fs::read_to_string(&filename)?),
+            content: std::fs::read_to_string(&filename)?.to_string(),
         })
     }
 
@@ -46,7 +46,7 @@ impl<'a> Message<'a> {
     fn system() -> Self {
         Self {
             role: Role::System,
-            content: Cow::from(SYSTEM),
+            content: SYSTEM.to_string(),
         }
     }
 }
@@ -60,14 +60,14 @@ impl Into<ContextHistory> for Message {
 }
 
 /// Container of history for an LLM session.
-pub struct ContextHistory<'a> {
-    messages: Vec<Message<'a>>,
+pub struct ContextHistory {
+    messages: Vec<Message>,
 }
 
-impl<'a> ContextHistory<'a> {
+impl ContextHistory {
     /// Push a message into context, taking ownership of it.
     #[inline]
-    fn append_message(&mut self, msg: Message<'a>) {
+    fn append_message(&mut self, msg: Message) {
         self.messages.push(msg);
     }
 }
@@ -82,6 +82,6 @@ mod test {
     fn completions_can_send_message() {
         let client = ChatCompletionsClient::default();
         let system = Message::system();
-        client.create("glm-5.3", system)
+        client.create("glm-5.3", &system.into())
     }
 }
