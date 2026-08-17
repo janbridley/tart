@@ -252,7 +252,10 @@ impl Iterator for CompletionStream {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     self.errored = true;
-                    return Some(Err(error.into()));
+                    // Surface the provider error to the caller verbatim.
+                    return Some(Err(anyhow::anyhow!(
+                        "chat completions stream sent an unparseable chunk: {payload} ({error})"
+                    )));
                 }
             };
             let Some(choice) = chunk.choices.first() else {
