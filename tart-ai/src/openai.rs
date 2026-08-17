@@ -17,11 +17,12 @@ enum Role {
 }
 
 /// One unit of data passed from the user to the model or vice versa.
-struct Message {
-    /// The ,
-    pub(crate) role: Role,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    /// The `Role` of the actor sending the message.
+    pub role: Role,
     /// The text associated with this message.
-    pub(crate) content: String,
+    pub content: String,
 }
 impl Message {
     /// Initialize a `Role::System` message from a markdown file.
