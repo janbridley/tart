@@ -140,11 +140,6 @@ impl Pane {
         self.transcript.append(span);
     }
 
-    /// End the current append-run; later appends start a fresh line.
-    pub fn break_line(&mut self) {
-        self.transcript.break_line();
-    }
-
     pub fn clear(&mut self) {
         self.transcript.clear();
     }
@@ -500,11 +495,6 @@ impl Transcript {
             self.messages.push(Line::from(span));
             self.open = true;
         }
-    }
-
-    /// End the current append-run.
-    fn break_line(&mut self) {
-        self.open = false;
     }
 
     /// Drop every message and reset our caches.
