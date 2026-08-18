@@ -476,6 +476,7 @@ impl CompletionStream {
     /// let (message, finish_reason) = stream.complete(|delta| match delta {
     ///     Delta::Thinking(text) => print!("\x1b[2m{text}\x1b[0m"),
     ///     Delta::Answer(text) => print!("{text}"),
+    ///     _ => {}
     /// })?;
     ///
     /// // The stream is spent but still readable, so we can get our usage data out.
