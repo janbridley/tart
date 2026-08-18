@@ -117,8 +117,8 @@ impl FilePopup {
         self.total = hits.len();
         self.matches = hits
             .into_iter()
-            .map(|(path, _)| path.clone())
             .take(MAX_SHOWN)
+            .map(|(path, _)| path.clone())
             .collect();
         self.state.select((!self.matches.is_empty()).then_some(0));
     }
