@@ -141,12 +141,12 @@ impl ChatCompletionsClient {
             &self.http_agent,
             &self.completions_url,
             &self.api_key,
-            &self.request_body(history)?,
+            &self.try_serialize_history(history)?,
         )
     }
 
     /// The serialized Chat-Completions request body for `history`.
-    fn request_body(&self, history: &ContextHistory) -> anyhow::Result<String> {
+    fn try_serialize_history(&self, history: &ContextHistory) -> anyhow::Result<String> {
         Ok(serde_json::to_string(&CompletionRequest {
             model: &self.model,
             messages: history.as_slice(),
@@ -224,7 +224,7 @@ impl ChatCompletionsClient {
         history: &ContextHistory,
         on_event: impl Fn(GenerationEvent) + Send + 'static,
     ) -> anyhow::Result<()> {
-        let body = self.request_body(history)?;
+        let body = self.try_serialize_history(history)?;
 
         let mut generations = self.generations.lock().expect("generation lock poisoned");
         anyhow::ensure!(
