@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use tart_ai::openai::{ChatCompletionsClient, Delta, Message, Role};
+use tart_ai::openai::{ChatCompletionsClient, Delta, Message};
 use tart_ai::{ContextHistory, ReasoningEffort};
 
 /// How hard the model reasons before answering.
@@ -18,10 +18,7 @@ fn main() -> anyhow::Result<()> {
     .reasoning_effort(REASONING_EFFORT);
 
     let mut history = ContextHistory::from(Message::system());
-    history.append_message(Message {
-        role: Role::User,
-        content: "Who are you?".to_string(),
-    });
+    history.append_message(Message::user("Who are you?".to_string()));
 
     let mut stream = client.create(&history)?;
     let (message, finish_reason) = stream.complete(|delta| {
