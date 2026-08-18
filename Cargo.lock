@@ -1161,6 +1161,7 @@ dependencies = [
 name = "tart-tui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ignore",
  "nucleo-matcher",
  "ratatui",
