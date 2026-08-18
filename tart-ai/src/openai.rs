@@ -413,13 +413,10 @@ impl CompletionStream {
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage.into());
         }
-        let Some(choice) = chunk.choices.first() else {
-            // Chunks may legitimately carry an empty `choices` array.
-            return None;
-        };
-        if let Some(reason) = choice.finish_reason {
-            self.finish_reason = Some(reason);
-        }
+        // Chunks may legitimately carry an empty `choices` array.
+        let choice = chunk.choices.first()?;
+        self.finish_reason = choice.finish_reason.or(self.finish_reason);
+
         // A chunk may carry reasoning and content together. If so, defer content
         // until we empty all reasoning data.
         let content = choice.delta.content.as_deref().filter(|c| !c.is_empty());
@@ -429,9 +426,7 @@ impl CompletionStream {
             .as_deref()
             .filter(|r| !r.is_empty());
 
-        if let Some(c) = content {
-            self.content.push_str(c);
-        }
+        content.inspect(|c| self.content.push_str(c));
 
         if let Some(r) = reasoning {
             self.thinking.push_str(r);
@@ -439,10 +434,7 @@ impl CompletionStream {
             return Some(Ok(Delta::Thinking(r.to_string())));
         }
 
-        let Some(c) = content else {
-            return None;
-        };
-        Some(Ok(Delta::Answer(c.to_string())))
+        Some(Ok(Delta::Answer(content?.to_string())))
     }
 
     /// Exhaust the stream, forwarding each delta and returning the assembled
@@ -526,10 +518,10 @@ impl Iterator for CompletionStream {
             }
 
             // Event separators, keep-alive comments, `event:` lines, and so on.
-            let Some(payload) = line.strip_prefix("data:") else {
-                continue;
+            let payload = match line.strip_prefix("data:") {
+                Some(p) => p.strip_prefix(' ').unwrap_or(p).trim_end(),
+                None => continue,
             };
-            let payload = payload.strip_prefix(' ').unwrap_or(payload).trim_end();
 
             // The chat-completions terminator; not part of SSE itself.
             if payload == "[DONE]" {
