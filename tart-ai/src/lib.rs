@@ -15,15 +15,6 @@ pub struct ContextHistory {
 }
 
 impl ContextHistory {
-    /// Initialize an empty history.
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-            usage: Usage::default(),
-        }
-    }
-
     /// Push a message into the history, taking ownership of it.
     #[inline]
     pub fn append_message(&mut self, msg: Message) {
