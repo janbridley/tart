@@ -167,7 +167,7 @@ impl ChatCompletionsClient {
         mut on_delta: impl FnMut(Delta),
     ) -> Option<anyhow::Result<(Message, FinishReason, Option<Usage>)>> {
         let mut generation = self.generation.lock().expect("generation lock poisoned");
-        let active = generation.as_mut();
+        let active = generation.as_mut()?;
 
         loop {
             match active.receiver.try_recv() {
@@ -343,6 +343,7 @@ impl CompletionStream {
 }
 
 /// A background generation in flight.
+#[derive(Debug)]
 struct Generation {
     receiver: Receiver<Delta>,
     handle: JoinHandle<anyhow::Result<(Message, FinishReason, Option<Usage>)>>,
