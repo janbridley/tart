@@ -137,19 +137,22 @@ impl ChatCompletionsClient {
     ///   (or consumed entirely by [`CompletionStream::complete`])
     /// - Dropping the stream early closes the connection
     pub fn create(&self, history: &ContextHistory) -> anyhow::Result<CompletionStream> {
-        let request = CompletionRequest {
-            model: &self.model,
-            messages: history.as_slice(),
-            reasoning_effort: self.reasoning_effort,
-            stream: true,
-        };
-
         post(
             &self.http_agent,
             &self.completions_url,
             &self.api_key,
-            &serde_json::to_string(&request)?,
+            &self.request_body(history)?,
         )
+    }
+
+    /// The serialized Chat-Completions request body for `history`.
+    fn request_body(&self, history: &ContextHistory) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(&CompletionRequest {
+            model: &self.model,
+            messages: history.as_slice(),
+            reasoning_effort: self.reasoning_effort,
+            stream: true,
+        })?)
     }
 
     /// Run a generation on its own thread, reporting progress to `on_event`.
@@ -221,13 +224,7 @@ impl ChatCompletionsClient {
         history: &ContextHistory,
         on_event: impl Fn(GenerationEvent) + Send + 'static,
     ) -> anyhow::Result<()> {
-        let request = CompletionRequest {
-            model: &self.model,
-            messages: history.as_slice(),
-            reasoning_effort: self.reasoning_effort,
-            stream: true,
-        };
-        let body = serde_json::to_string(&request)?;
+        let body = self.request_body(history)?;
 
         let mut generations = self.generations.lock().expect("generation lock poisoned");
         anyhow::ensure!(
