@@ -140,12 +140,6 @@ impl Pane {
         self.transcript.append(span);
     }
 
-    /// End the current append-run; later appends start a fresh line.
-    #[cfg(test)]
-    pub fn break_line(&mut self) {
-        self.transcript.break_line();
-    }
-
     pub fn clear(&mut self) {
         self.transcript.clear();
     }
