@@ -95,13 +95,12 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                             history.append_message(Message::user(line));
                             let mut stream = client.create(&history)?;
                             let (message, finish_reason) = stream.complete(|delta| {
-                                match delta {
-                                    // Dim the chain-of-thought; it precedes the answer.
+                                pane.append(match delta {
                                     Delta::Thinking(text) => {
-                                        pane.append(Span::styled(text, DIM_STYLE))
+                                        Span::styled(text, DIM_STYLE))
                                     }
-                                    Delta::Answer(text) => pane.append(Span::raw(text)),
-                                };
+                                    Delta::Answer(text) => Span::raw(text)),
+                                });
                             })?;
                         }
                     },
