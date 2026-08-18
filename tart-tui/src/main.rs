@@ -34,7 +34,7 @@ use tart_ai::{
     openai::{ChatCompletionsClient, Delta, GenerationEvent, Message},
 };
 
-pub const DRAW_INTERVAL_MS: u64 = 33;
+pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
