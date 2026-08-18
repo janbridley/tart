@@ -391,7 +391,7 @@ impl CompletionStream {
 
     /// Move the assembled `content` out of the stream into a [`Message`].
     pub fn message(self) -> Option<Message> {
-        (self.done && !self.errored && self.finish_reason.is_some()).then(|| Message {
+        (self.done && !self.errored && self.finish_reason.is_some()).then_some(Message {
             role: Role::Assistant,
             content: self.content,
         })
