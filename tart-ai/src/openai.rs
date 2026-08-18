@@ -31,7 +31,6 @@ pub struct Message {
 
 impl Message {
     /// Initialize a `Role::System` message with the tart system prompt.
-    #[inline]
     pub fn system() -> Self {
         Self {
             role: Role::System,
@@ -39,7 +38,6 @@ impl Message {
         }
     }
     /// Initialize a `Role::User` message from its content.
-    #[inline]
     pub fn user(content: String) -> Self {
         Self {
             role: Role::User,
@@ -104,7 +102,6 @@ pub struct ChatCompletionsClient {
 
 impl ChatCompletionsClient {
     /// Configure a client for an OpenAI-compatible endpoint.
-    #[inline]
     pub fn new(
         completions_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -128,7 +125,6 @@ impl ChatCompletionsClient {
     }
 
     /// Set how hard the model reasons before answering.
-    #[inline]
     pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self
