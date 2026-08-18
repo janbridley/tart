@@ -140,12 +140,6 @@ impl Pane {
         self.transcript.append(span);
     }
 
-    /// End the current append-run; later appends start a fresh line.
-    #[cfg(test)]
-    pub fn break_line(&mut self) {
-        self.transcript.break_line();
-    }
-
     pub fn clear(&mut self) {
         self.transcript.clear();
     }
@@ -477,8 +471,20 @@ impl Transcript {
         self.open = false;
     }
 
-    /// Append a streaming fragment, gluing onto the previous fragment while the style matches.
+    /// Append a streaming fragment, gluing onto the previous fragment while style matches.
+    ///
+    /// Newlines in the text end the current line.
     fn append(&mut self, span: Span<'static>) {
+        for (i, part) in span.content.split('\n').enumerate() {
+            (i > 0).then(|| self.break_line());
+            if !part.is_empty() {
+                self.append_fragment(Span::styled(part.to_string(), span.style));
+            }
+        }
+    }
+
+    /// Glue one unbroken fragment onto the transcript.
+    fn append_fragment(&mut self, span: Span<'static>) {
         let glue = self.open
             && self.messages.last().is_some_and(|line| {
                 line.spans
@@ -503,8 +509,7 @@ impl Transcript {
         }
     }
 
-    /// End the current append-run.
-    #[cfg(test)]
+    /// End the current append-run; later appends start a fresh line.
     fn break_line(&mut self) {
         self.open = false;
     }

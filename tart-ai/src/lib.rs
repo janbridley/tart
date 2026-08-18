@@ -15,42 +15,28 @@ pub struct ContextHistory {
 }
 
 impl ContextHistory {
-    /// Initialize an empty history.
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-            usage: Usage::default(),
-        }
-    }
-
     /// Push a message into the history, taking ownership of it.
-    #[inline]
     pub fn append_message(&mut self, msg: Message) {
         self.messages.push(msg);
     }
 
     /// The transcript so far.
-    #[inline]
     pub fn as_slice(&self) -> &[Message] {
         &self.messages
     }
 
     /// Token usage accumulated across recorded turns.
-    #[inline]
     pub fn usage(&self) -> Usage {
         self.usage
     }
 
     /// Record a turn's token usage into the session total.
-    #[inline]
     pub fn record_usage(&mut self, usage: Usage) {
         self.usage += usage;
     }
 }
 
 impl From<Message> for ContextHistory {
-    #[inline]
     fn from(message: Message) -> Self {
         Self {
             messages: vec![message],
