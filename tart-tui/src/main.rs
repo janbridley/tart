@@ -29,9 +29,11 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Pane, PaneEvent};
 use tmux_override::{override_shift_up, restore_tmux};
 
+use tart_ai::{ReasoningEffort, openai::ChatCompletionsClient};
+
 pub const DRAW_INTERVAL_MS: u64 = 33;
 
-fn main() -> io::Result<()> {
+fn main() -> anyhow::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
@@ -55,13 +57,22 @@ fn install_panic_hook() {
     }));
 }
 
-fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
+fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
         "tart demo — Enter sends · Alt+Enter newline · paste works · Shift+↑ scrollback \
          (q exits) · Ctrl+C quits",
         DIM_STYLE,
     ));
+
+    let api_key = std::env::var("DEEPSEEK_API_KEY")?;
+    let client = ChatCompletionsClient::new(
+        "https://api.deepseek.com/chat/completions",
+        api_key,
+        "deepseek-v4-flash",
+    )
+    .reasoning_effort(ReasoningEffort::Max);
+
     // The parrot's reply, streamed word by word between frames.
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut next_chunk = Instant::now();
