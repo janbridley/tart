@@ -198,9 +198,10 @@ impl CompletionStream {
         })
     }
 
-    /// Exhaust the stream, forwarding each delta and returning the assembled message.
+    /// Exhaust the stream, forwarding each delta and returning the assembled
+    /// message.
     ///
-    /// ```rust
+    /// ```no_run
     /// # fn main() -> anyhow::Result<()> {
     /// use tart_ai::openai::{ChatCompletionsClient, Delta, Message, Role};
     /// use tart_ai::ContextHistory;
