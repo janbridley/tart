@@ -613,22 +613,22 @@ fn window_top(rows_len: usize, visible: usize, anchor: Option<(usize, usize)>) -
     })
 }
 
-/// One wrapped row under construction: (grapheme, style, cell width).
-type Row = Vec<(String, Style, usize)>;
+/// One wrapped row under construction: (&'a grapheme, style, cell width).
+type Row<'a> = Vec<(&'a str, Style, usize)>;
 
 /// Greedy word wrap (break before a word when it fits on the next row,
 /// hard-break when it does not), preserving span styles.
-struct Wrapper {
+struct Wrapper<'a> {
     /// Row cell budget; at least 1.
     width: usize,
     rows: Vec<Line<'static>>,
-    row: Row,
+    row: Row<'a>,
     row_width: usize,
     /// Index into `row` where the current word began.
     word_start: Option<usize>,
 }
 
-impl Wrapper {
+impl<'a> Wrapper<'a> {
     fn new(width: usize) -> Self {
         Self {
             width: width.max(1),
@@ -650,7 +650,7 @@ impl Wrapper {
     }
 
     /// Add one rendered cell; `sym` is a single space for expanded tabs.
-    fn push(&mut self, sym: &str, style: Style) {
+    fn push(&mut self, sym: &'a str, style: Style) {
         let gw = Span::raw(sym).width();
         let space = sym == " ";
         if self.row_width + gw > self.width && !self.row.is_empty() && gw > 0 {
@@ -682,7 +682,7 @@ impl Wrapper {
         } else if self.word_start.is_none() {
             self.word_start = Some(self.row.len());
         }
-        self.row.push((sym.to_string(), style, gw));
+        self.row.push((sym, style, gw));
         self.row_width += gw;
     }
 
@@ -698,8 +698,9 @@ impl Wrapper {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (sym, style, _) in std::mem::take(&mut self.row) {
             match spans.last_mut() {
-                Some(last) if last.style == style => last.content.to_mut().push_str(&sym),
-                _ => spans.push(Span::styled(sym, style)),
+                Some(last) if last.style == style => last.content.to_mut().push_str(sym),
+                // Allocate an owned string once per run
+                _ => spans.push(Span::styled(sym.to_owned(), style)),
             }
         }
         self.rows.push(Line::from(spans));
@@ -709,7 +710,7 @@ impl Wrapper {
 
 /// Feed one grapheme: a tab becomes `TAB_WIDTH` spaces, other control characters are
 /// invisible, anything else renders as itself.
-fn feed(wrapper: &mut Wrapper, grapheme: &str, style: Style) {
+fn feed<'a>(wrapper: &mut Wrapper<'a>, grapheme: &'a str, style: Style) {
     match grapheme {
         "\t" => (0..TAB_WIDTH).for_each(|_| wrapper.push(" ", style)),
         _ if !grapheme.chars().any(char::is_control) => wrapper.push(grapheme, style),
