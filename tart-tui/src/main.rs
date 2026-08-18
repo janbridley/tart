@@ -97,35 +97,56 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         }
     });
 
-    // The parrot's reply, streamed word by word between frames.
     let mut quit = false;
     while !quit {
         terminal.draw(|frame| pane.render(frame, frame.area()))?;
-        if event::poll(Duration::from_millis(DRAW_INTERVAL_MS))? {
-            // ~30FPS idle
-            match event::read()? {
-                Event::Key(key) => match on_key(&mut pane, key) {
-                    Some(PaneEvent::Quit) => quit = true,
-                    Some(PaneEvent::Submit(line)) => match line.trim() {
-                        "/clear" => pane.clear(),
-                        "/quit" | "/exit" => quit = true,
-                        _ => {
-                            history.append_message(Message::user(line));
-                            let mut stream = client.create(&history)?;
-                            let _ = stream.complete(|delta| {
-                                pane.append(match delta {
-                                    Delta::Thinking(text) => Span::styled(text, DIM_STYLE),
-                                    Delta::Answer(text) => Span::raw(text),
-                                });
-                            })?;
-                        }
-                    },
-                    None => {}
+        match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
+            Ok(Wake::Input(Event::Key(key))) => match on_key(&mut pane, key) {
+                Some(PaneEvent::Quit) => quit = true,
+                Some(PaneEvent::Submit(line)) => match line.trim() {
+                    "/clear" => pane.clear(),
+                    "/quit" | "/exit" => quit = true,
+                    // Don't submit text while the agent is generating code
+                    _ if client.is_generating() => {}
+                    _ => {
+                        history.append_message(Message::user(line));
+                        let sender = wake.clone();
+                        client.spawn(0, &history, move |event| {
+                            // Run the generation on its own thread
+                            let _ = sender.send(Wake::Generation(event));
+                        })?;
+                    }
                 },
-                Event::Paste(text) => pane.on_paste(&text),
-                // Resizes are handled at render time (see Pane::render).
-                _ => {}
+                None => {}
+            },
+            Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),
+            // Resizes are handled at render time (see Pane::render).
+            Ok(Wake::Input(_)) => {}
+            // Update the pane when we recieve new text
+            Ok(Wake::Generation(GenerationEvent::Delta(delta))) => {
+                pane.append(match delta {
+                    // Dim the chain-of-thought preceding the answer
+                    Delta::Thinking(text) => Span::styled(text, DIM_STYLE),
+                    Delta::Answer(text) => Span::raw(text),
+                });
             }
+
+            // When the model is done generating, record data
+            Ok(Wake::Generation(GenerationEvent::Done { message, usage })) => {
+                if let Some(usage) = usage {
+                    history.record_usage(usage);
+                }
+                if let Some(message) = message {
+                    history.append_message(message);
+                }
+            }
+            // If the model *fails* for some reason, show the error.
+            Ok(Wake::Generation(GenerationEvent::Failed(error))) => {
+                pane.append(Span::styled(error.to_string(), DIM_STYLE));
+            }
+            // The redraw timer: loop around and draw again.
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
         }
     }
     Ok(())
