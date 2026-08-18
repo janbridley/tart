@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 
     // Read usage from the stream into our history
     if let Some(u) = stream.usage() {
-        history.record_usage(u)
+        history.record_usage(u);
     }
     // Append the message to our context
     history.append_message(message);

@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions interface.
+//! `OpenAI` Chat Completions interface.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -112,7 +112,7 @@ impl ChatCompletionsClient {
             .timeout_connect(std::time::Duration::from_secs(15))
             // Detect if the stream has stopped delivering deltas for at least 2 minutes
             // TODO: In theory a model that doesn't stream reasoning could trigger this?
-            .timeout_read(std::time::Duration::from_secs(120))
+            .timeout_read(std::time::Duration::from_mins(2))
             .build();
         Self {
             http_agent: agent,
@@ -595,7 +595,7 @@ struct WireUsage {
     prompt_tokens_details: PromptTokensDetails,
     #[serde(default)]
     completion_tokens_details: CompletionTokensDetails,
-    /// DeepSeek's flat spelling of the cache hit count.
+    /// `DeepSeek`'s flat spelling of the cache hit count.
     #[serde(default)]
     prompt_cache_hit_tokens: u64,
 }

@@ -107,7 +107,7 @@ impl FilePopup {
             .find(char::is_whitespace)
             .map_or(line.len(), |i| at + 1 + i);
         line.replace_range(at + 1..end, &text);
-        editor.g = graphemes(&line[..at + 1]) + graphemes(&text);
+        editor.g = graphemes(&line[..=at]) + graphemes(&text);
     }
 
     /// Re-match the query against the file snapshot, reseeding the selection.
