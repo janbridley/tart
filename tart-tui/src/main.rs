@@ -94,12 +94,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         _ => {
                             history.append_message(Message::user(line));
                             let mut stream = client.create(&history)?;
-                            let (message, finish_reason) = stream.complete(|delta| {
+                            let _ = stream.complete(|delta| {
                                 pane.append(match delta {
-                                    Delta::Thinking(text) => {
-                                        Span::styled(text, DIM_STYLE))
-                                    }
-                                    Delta::Answer(text) => Span::raw(text)),
+                                    Delta::Thinking(text) => Span::styled(text, DIM_STYLE),
+                                    Delta::Answer(text) => Span::raw(text),
                                 });
                             })?;
                         }
@@ -110,15 +108,6 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 // Resizes are handled at render time (see Pane::render).
                 _ => {}
             }
-        }
-        if Instant::now() >= next_chunk
-            && let Some(chunk) = pending.pop_front()
-        {
-            pane.append(Span::raw(chunk));
-            if pending.is_empty() {
-                pane.break_line();
-            }
-            next_chunk = Instant::now() + Duration::from_millis(80);
         }
     }
     Ok(())
