@@ -226,7 +226,7 @@ impl ChatCompletionsClient {
     ) -> anyhow::Result<()> {
         let body = self.try_serialize_history(history)?;
 
-        let mut generations = self.generations.lock().expect("generation lock poisoned");
+        let mut generations = self.lock_generations();
         anyhow::ensure!(
             !generations.contains_key(&id),
             "generation {id} is already running"
@@ -248,23 +248,19 @@ impl ChatCompletionsClient {
 
     /// Cancel the background generation `id`, closing the connection on the next delta.
     pub fn cancel(&self, id: u64) {
-        if let Some(cancelled) = self
-            .generations
-            .lock()
-            .expect("generation lock poisoned")
-            .remove(&id)
-        {
+        if let Some(cancelled) = self.lock_generations().remove(&id) {
             cancelled.store(true, Ordering::Relaxed);
         }
     }
 
     /// Whether any background generation is running.
     pub fn is_generating(&self) -> bool {
-        !self
-            .generations
-            .lock()
-            .expect("generation lock poisoned")
-            .is_empty()
+        !self.lock_generations().is_empty()
+    }
+
+    /// Lock our generations so they can be safely read or written.
+    fn lock_generations(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<AtomicBool>>> {
+        self.generations.lock().expect("generation lock poisoned")
     }
 }
 
