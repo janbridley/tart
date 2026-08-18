@@ -141,6 +141,7 @@ impl Pane {
     }
 
     /// End the current append-run; later appends start a fresh line.
+    #[cfg(test)]
     pub fn break_line(&mut self) {
         self.transcript.break_line();
     }
@@ -503,6 +504,7 @@ impl Transcript {
     }
 
     /// End the current append-run.
+    #[cfg(test)]
     fn break_line(&mut self) {
         self.open = false;
     }

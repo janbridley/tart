@@ -15,9 +15,8 @@ mod tmux_override;
 #[cfg(test)]
 mod testutil;
 
-use std::collections::VecDeque;
 use std::io::stdout;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -78,8 +77,6 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut history = ContextHistory::from(tart_ai::openai::Message::system());
 
     // The parrot's reply, streamed word by word between frames.
-    let mut pending: VecDeque<String> = VecDeque::new();
-    let mut next_chunk = Instant::now();
     let mut quit = false;
     while !quit {
         terminal.draw(|frame| pane.render(frame, frame.area()))?;
