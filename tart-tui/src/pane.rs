@@ -351,7 +351,7 @@ impl Editor {
     /// Insert pasted text: CRLF normalized, controls dropped except tab,
     /// newlines split the draft.
     pub(crate) fn insert_str(&mut self, text: &str) {
-        for (i, part) in text.replace("\r\n", "\n").split('\n').enumerate() {
+        for (i, part) in text.lines().enumerate() {
             if i > 0 {
                 self.new_line();
             }
