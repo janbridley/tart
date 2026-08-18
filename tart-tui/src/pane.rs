@@ -131,12 +131,12 @@ impl Pane {
         self.popup.take().is_some() || self.copy.take().is_some()
     }
 
-    pub fn push(&mut self, line: impl Into<Line<'static>>) {
+    pub fn push<L: Into<Line<'static>>>(&mut self, line: L) {
         self.transcript.push(line);
     }
 
     /// Append a streaming fragment; see [`Transcript::append`].
-    pub fn append(&mut self, span: Span<'static>) {
+    pub fn append(&mut self, span: &Span<'static>) {
         self.transcript.append(span);
     }
 
@@ -156,8 +156,7 @@ impl Pane {
             Span::raw(rows.next().unwrap_or_default().to_string()),
         ]));
         for continuation in rows {
-            self.transcript
-                .push(Line::from(format!("  {continuation}")));
+            self.transcript.push(Line::from(format!("  {continuation}")));
         }
         self.prompt.clear();
         Some(text)
@@ -189,58 +188,16 @@ impl Pane {
         ])
         .areas(area);
 
-        // Wrap only what is new at an unchanged width, or rewrap if width changed.
-        let rows = self.transcript.sync(transcript.width as usize);
-        if let Some(cursor) = &mut self.copy
-            && !rows.is_empty()
-        {
-            cursor.row = cursor.row.min(rows.len() - 1);
-            cursor.col = cursor.col.min(rows[cursor.row].width().saturating_sub(1));
-        }
-        let visible = transcript.height as usize;
-        let top = window_top(rows.len(), visible, self.copy.map(|c| (c.row, c.top)));
-        if let Some(cursor) = &mut self.copy {
-            cursor.top = top;
-            cursor.visible = visible;
-        }
-        let buf = frame.buffer_mut();
-        let shown = visible.min(rows.len().saturating_sub(top));
-        rows[top..top + shown]
-            .iter()
-            .zip(transcript.y..)
-            .for_each(|(row, y)| {
-                buf.set_line(transcript.x, y, row, transcript.width);
-            });
-        if let Some(cursor) = self.copy {
-            let pos = (
-                transcript.x + cursor.col as u16,
-                transcript.y + (cursor.row - top) as u16,
-            );
-            if let Some(cell) = buf.cell_mut(pos) {
-                cell.set_style(CURSOR_STYLE);
-            }
-        }
-        rule(buf, bar_top);
-        rule(buf, bar_bottom);
-
+        self.render_transcript(transcript, bar_top, bar_bottom, frame);
         if self.copy.is_some() {
-            if prompt_area.height > 0 {
-                buf.set_line(
-                    prompt_area.x,
-                    prompt_area.y,
-                    &Line::from(Span::styled(
-                        "▲ scrollback · ←↑↓→ move · PgUp/PgDn/Home/End · q to exit",
-                        Style::new().fg(Color::Yellow),
-                    )),
-                    prompt_area.width,
-                );
-            }
+            Self::render_scrollback_hint(frame, prompt_area);
             return;
         }
 
         if prompt_area.height == 0 || prompt_area.width < GUTTER {
             return;
         }
+        let buf = frame.buffer_mut();
         // Live prompt: the "❯ " gutter, then the wrapped draft. The inverted caret
         // cell marks the cursor, so the terminal cursor stays hidden and the prompt
         // viewport can never misplace it.
@@ -280,6 +237,57 @@ impl Pane {
             file_mentions::render(frame, popup, bar_top);
         }
     }
+    /// Sync, window, and paint the transcript, then draw its two rules.
+    fn render_transcript(
+        &mut self,
+        area: Rect,
+        bar_top: Rect,
+        bar_bottom: Rect,
+        frame: &mut Frame,
+    ) {
+        // Wrap only what is new at an unchanged width, or rewrap if width changed.
+        let rows = self.transcript.sync(area.width as usize);
+        if let Some(cursor) = &mut self.copy
+            && !rows.is_empty()
+        {
+            cursor.row = cursor.row.min(rows.len() - 1);
+            cursor.col = cursor.col.min(rows[cursor.row].width().saturating_sub(1));
+        }
+        let visible = area.height as usize;
+        let top = window_top(rows.len(), visible, self.copy.map(|c| (c.row, c.top)));
+        if let Some(cursor) = &mut self.copy {
+            cursor.top = top;
+            cursor.visible = visible;
+        }
+        let buf = frame.buffer_mut();
+        let shown = visible.min(rows.len().saturating_sub(top));
+        rows[top..top + shown].iter().zip(area.y..).for_each(|(row, y)| {
+            buf.set_line(area.x, y, row, area.width);
+        });
+        if let Some(cursor) = self.copy {
+            let pos = (area.x + cursor.col as u16, area.y + (cursor.row - top) as u16);
+            if let Some(cell) = buf.cell_mut(pos) {
+                cell.set_style(CURSOR_STYLE);
+            }
+        }
+        rule(buf, bar_top);
+        rule(buf, bar_bottom);
+    }
+
+    /// In copy mode the prompt area shows the scrollback keybindings.
+    fn render_scrollback_hint(frame: &mut Frame, prompt_area: Rect) {
+        if prompt_area.height > 0 {
+            frame.buffer_mut().set_line(
+                prompt_area.x,
+                prompt_area.y,
+                &Line::from(Span::styled(
+                    "▲ scrollback · ←↑↓→ move · PgUp/PgDn/Home/End · q to exit",
+                    Style::new().fg(Color::Yellow),
+                )),
+                prompt_area.width,
+            );
+        }
+    }
 }
 
 impl Default for Pane {
@@ -292,8 +300,7 @@ impl Default for Pane {
 fn rule(buf: &mut Buffer, area: Rect) {
     for col in area.columns() {
         if let Some(cell) = buf.cell_mut((col.x, area.y)) {
-            cell.set_symbol(symbols::line::HORIZONTAL)
-                .set_style(DIM_STYLE);
+            cell.set_symbol(symbols::line::HORIZONTAL).set_style(DIM_STYLE);
         }
     }
 }
@@ -355,10 +362,7 @@ impl Editor {
             if i > 0 {
                 self.new_line();
             }
-            let cleaned: String = part
-                .chars()
-                .filter(|c| !c.is_control() || *c == '\t')
-                .collect();
+            let cleaned: String = part.chars().filter(|c| !c.is_control() || *c == '\t').collect();
             let line = &mut self.lines[self.line];
             line.insert_str(g_to_byte(line, self.g), &cleaned);
             self.g += graphemes(&cleaned);
@@ -470,7 +474,7 @@ impl Transcript {
     /// Append a streaming fragment, gluing onto the previous fragment while style matches.
     ///
     /// Newlines in the text end the current line.
-    fn append(&mut self, span: Span<'static>) {
+    fn append(&mut self, span: &Span<'static>) {
         for (i, part) in span.content.split('\n').enumerate() {
             (i > 0).then(|| self.break_line());
             if !part.is_empty() {
@@ -482,11 +486,10 @@ impl Transcript {
     /// Glue one unbroken fragment onto the transcript.
     fn append_fragment(&mut self, span: Span<'static>) {
         let glue = self.open
-            && self.messages.last().is_some_and(|line| {
-                line.spans
-                    .last()
-                    .is_some_and(|last| last.style == span.style)
-            });
+            && self
+                .messages
+                .last()
+                .is_some_and(|line| line.spans.last().is_some_and(|last| last.style == span.style));
         if glue {
             // The cache already counted the line being extended: drop its
             // stale rows and hand the message back for the next sync.
@@ -563,11 +566,7 @@ impl CopyCursor {
 /// The cursor after one key step, clamped to the transcript edges.
 fn moved(rows: &[Line<'static>], cursor: CopyCursor, key: KeyCode) -> CopyCursor {
     if rows.is_empty() {
-        return CopyCursor {
-            row: 0,
-            col: 0,
-            ..cursor
-        };
+        return CopyCursor { row: 0, col: 0, ..cursor };
     }
     let last = rows.len() - 1;
     let mut c = cursor;
@@ -785,12 +784,7 @@ mod tests {
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect()
-            })
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect()
     }
 
@@ -825,11 +819,11 @@ mod tests {
         let dim = Style::new().fg(Color::DarkGray);
         let mut transcript = Transcript::default();
         transcript.push(Line::from("prompt"));
-        transcript.append(Span::raw("Hel"));
-        transcript.append(Span::raw("lo "));
-        transcript.append(Span::raw("world"));
-        transcript.append(Span::styled(" (thinking)", dim));
-        transcript.append(Span::styled(" more", dim));
+        transcript.append(&Span::raw("Hel"));
+        transcript.append(&Span::raw("lo "));
+        transcript.append(&Span::raw("world"));
+        transcript.append(&Span::styled(" (thinking)", dim));
+        transcript.append(&Span::styled(" more", dim));
         assert_eq!(
             texts(&transcript.messages),
             ["prompt", "Hello world", " (thinking) more"]
@@ -837,9 +831,9 @@ mod tests {
 
         // `push` and `break_line` both end the run.
         transcript.push(Line::from("committed"));
-        transcript.append(Span::raw("after"));
+        transcript.append(&Span::raw("after"));
         transcript.break_line();
-        transcript.append(Span::raw("again"));
+        transcript.append(&Span::raw("again"));
         assert_eq!(
             texts(&transcript.messages),
             [
@@ -879,10 +873,10 @@ mod tests {
         assert_eq!(transcript.cache, (80, 6));
         assert_fresh(&transcript);
 
-        transcript.append(Span::raw("streaming aaaa bbbb")); // glued run
+        transcript.append(&Span::raw("streaming aaaa bbbb")); // glued run
         transcript.sync(80);
         assert_fresh(&transcript);
-        transcript.append(Span::raw(" cccc dddd"));
+        transcript.append(&Span::raw(" cccc dddd"));
         transcript.sync(80);
         assert_fresh(&transcript);
 
@@ -892,11 +886,7 @@ mod tests {
         }
         transcript.sync(80);
         assert_fresh(&transcript);
-        assert!(
-            !texts(&transcript.rows)
-                .iter()
-                .any(|row| row.contains("aaaa"))
-        );
+        assert!(!texts(&transcript.rows).iter().any(|row| row.contains("aaaa")));
     }
 
     #[test]
@@ -908,12 +898,7 @@ mod tests {
         assert_eq!(window_top(10, 5, Some((4, 2))), 2); // inside: stays
 
         let rows = wrap_lines(&[Line::from("abc"), Line::from("de")], 10);
-        let cur = |row, col| CopyCursor {
-            row,
-            col,
-            top: 0,
-            visible: 2,
-        };
+        let cur = |row, col| CopyCursor { row, col, top: 0, visible: 2 };
         assert_eq!(moved(&rows, cur(0, 0), KeyCode::Right), cur(0, 1));
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::Left), cur(0, 2)); // wraps
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::PageUp), cur(0, 0));
@@ -958,7 +943,7 @@ mod tests {
         for _ in 0..5 {
             pane.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         }
-        assert!(pane.copy.unwrap().row > 10);
+        assert!(pane.copy.expect("copy cursor").row > 10);
         pane.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)); // eaten
         pane.on_key(key(KeyCode::PageUp, KeyModifiers::NONE));
 

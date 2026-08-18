@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions interface.
+//! `OpenAI` Chat Completions interface.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -13,6 +13,7 @@ pub const SYSTEM: &str = include_str!("data/SYSTEM.md");
 /// Valid `role` entries for a [`Message`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Role {
     Assistant,
     System,
@@ -31,6 +32,7 @@ pub struct Message {
 
 impl Message {
     /// Initialize a `Role::System` message with the tart system prompt.
+    #[inline]
     pub fn system() -> Self {
         Self {
             role: Role::System,
@@ -38,17 +40,16 @@ impl Message {
         }
     }
     /// Initialize a `Role::User` message from its content.
+    #[inline]
     pub fn user(content: String) -> Self {
-        Self {
-            role: Role::User,
-            content,
-        }
+        Self { role: Role::User, content }
     }
 }
 
 /// Why the model stopped generating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FinishReason {
     Stop,
     Length,
@@ -64,6 +65,7 @@ pub enum FinishReason {
 ///
 /// Thinking-capable models emit reasoning deltas first, then answer deltas.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Delta {
     /// A fragment of the model's chain-of-thought reasoning.
     Thinking(String),
@@ -72,6 +74,7 @@ pub enum Delta {
 }
 
 /// Progress from one background generation, delivered by [`ChatCompletionsClient::spawn`].
+#[non_exhaustive]
 pub enum GenerationEvent {
     /// The stream sent a chunk of text or data.
     Delta(Delta),
@@ -102,17 +105,18 @@ pub struct ChatCompletionsClient {
 
 impl ChatCompletionsClient {
     /// Configure a client for an OpenAI-compatible endpoint.
-    pub fn new(
-        completions_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
+    #[inline]
+    pub fn new<U: Into<String>, K: Into<String>, M: Into<String>>(
+        completions_url: U,
+        api_key: K,
+        model: M,
     ) -> Self {
         let agent = ureq::AgentBuilder::new()
             // If we can't *connect* within 15 seconds, fail.
             .timeout_connect(std::time::Duration::from_secs(15))
             // Detect if the stream has stopped delivering deltas for at least 2 minutes
             // TODO: In theory a model that doesn't stream reasoning could trigger this?
-            .timeout_read(std::time::Duration::from_secs(120))
+            .timeout_read(std::time::Duration::from_mins(2))
             .build();
         Self {
             http_agent: agent,
@@ -125,6 +129,8 @@ impl ChatCompletionsClient {
     }
 
     /// Set how hard the model reasons before answering.
+    #[must_use]
+    #[inline]
     pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self
@@ -136,6 +142,7 @@ impl ChatCompletionsClient {
     /// - Content deltas arrive as a stream, which can be iterated to completion
     ///   (or consumed entirely by [`CompletionStream::complete`])
     /// - Dropping the stream early closes the connection
+    #[inline]
     pub fn create(&self, history: &ContextHistory) -> anyhow::Result<CompletionStream> {
         post(
             &self.http_agent,
@@ -218,11 +225,12 @@ impl ChatCompletionsClient {
     /// assert_eq!(answer, "Hi");
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn spawn(
+    #[inline]
+    pub fn spawn<F: Fn(GenerationEvent) + Send + 'static>(
         &self,
         id: u64,
         history: &ContextHistory,
-        on_event: impl Fn(GenerationEvent) + Send + 'static,
+        on_event: F,
     ) -> anyhow::Result<()> {
         let body = self.try_serialize_history(history)?;
 
@@ -241,12 +249,13 @@ impl ChatCompletionsClient {
         std::thread::spawn(move || {
             // Deregister however we leave, cancelled or not.
             let _guard = GenerationGuard { generations, id };
-            generate(agent, url, api_key, body, cancelled, on_event);
+            generate(&agent, &url, &api_key, &body, &cancelled, on_event);
         });
         Ok(())
     }
 
     /// Cancel the background generation `id`, closing the connection on the next delta.
+    #[inline]
     pub fn cancel(&self, id: u64) {
         if let Some(cancelled) = self.lock_generations().remove(&id) {
             cancelled.store(true, Ordering::Relaxed);
@@ -254,6 +263,7 @@ impl ChatCompletionsClient {
     }
 
     /// Whether any background generation is running.
+    #[inline]
     pub fn is_generating(&self) -> bool {
         !self.lock_generations().is_empty()
     }
@@ -296,9 +306,7 @@ fn post(
         // Surface the provider's error body, which explains what went wrong.
         Err(ureq::Error::Status(code, response)) => anyhow::bail!(
             "chat completions endpoint returned {code}: {}",
-            response
-                .into_string()
-                .unwrap_or_else(|_| "<no body>".to_string())
+            response.into_string().unwrap_or_else(|_| "<no body>".to_string())
         ),
         Err(error) => return Err(error.into()),
     };
@@ -307,15 +315,15 @@ fn post(
 }
 
 /// Drive one generation on the current thread, reporting progress.
-fn generate(
-    agent: ureq::Agent,
-    completions_url: String,
-    api_key: String,
-    body: String,
-    cancelled: Arc<AtomicBool>,
-    on_event: impl Fn(GenerationEvent) + Send + 'static,
+fn generate<F: Fn(GenerationEvent) + Send + 'static>(
+    agent: &ureq::Agent,
+    completions_url: &str,
+    api_key: &str,
+    body: &str,
+    cancelled: &AtomicBool,
+    on_event: F,
 ) {
-    let mut stream = match post(&agent, &completions_url, &api_key, &body) {
+    let mut stream = match post(agent, completions_url, api_key, body) {
         Ok(stream) => stream,
         Err(error) => return on_event(GenerationEvent::Failed(error)),
     };
@@ -330,10 +338,7 @@ fn generate(
         }
     }
     let usage = stream.usage();
-    on_event(GenerationEvent::Done {
-        message: stream.message(),
-        usage,
-    });
+    on_event(GenerationEvent::Done { message: stream.message(), usage });
 }
 
 /// An in-flight streaming completion.
@@ -375,23 +380,27 @@ impl CompletionStream {
     }
 
     /// The chain-of-thought reasoning seen so far.
+    #[inline]
     pub fn thinking(&self) -> &str {
         &self.thinking
     }
 
     /// The reason generation stopped; `Some` once the terminal chunk has been seen.
+    #[inline]
     pub fn finish_reason(&self) -> Option<FinishReason> {
         self.finish_reason
     }
 
     /// Token usage for the request; `Some` once it has been received.
+    #[inline]
     pub fn usage(&self) -> Option<Usage> {
         self.usage
     }
 
     /// Move the assembled `content` out of the stream into a [`Message`].
+    #[inline]
     pub fn message(self) -> Option<Message> {
-        (self.done && !self.errored && self.finish_reason.is_some()).then(|| Message {
+        (self.done && !self.errored && self.finish_reason.is_some()).then_some(Message {
             role: Role::Assistant,
             content: self.content,
         })
@@ -420,11 +429,7 @@ impl CompletionStream {
         // A chunk may carry reasoning and content together. If so, defer content
         // until we empty all reasoning data.
         let mut content = choice.delta.content.take().filter(|c| !c.is_empty());
-        let reasoning = choice
-            .delta
-            .reasoning_content
-            .take()
-            .filter(|r| !r.is_empty());
+        let reasoning = choice.delta.reasoning_content.take().filter(|r| !r.is_empty());
 
         if let Some(c) = &content {
             self.content.push_str(c);
@@ -459,6 +464,7 @@ impl CompletionStream {
     /// let (message, finish_reason) = stream.complete(|delta| match delta {
     ///     Delta::Thinking(text) => print!("\x1b[2m{text}\x1b[0m"),
     ///     Delta::Answer(text) => print!("{text}"),
+    ///     _ => {}
     /// })?;
     ///
     /// // The stream is spent but still readable, so we can get our usage data out.
@@ -469,9 +475,10 @@ impl CompletionStream {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn complete(
+    #[inline]
+    pub fn complete<F: FnMut(Delta)>(
         &mut self,
-        mut on_delta: impl FnMut(Delta),
+        mut on_delta: F,
     ) -> anyhow::Result<(Message, FinishReason)> {
         for delta in self.by_ref() {
             on_delta(delta?);
@@ -494,6 +501,7 @@ impl CompletionStream {
 impl Iterator for CompletionStream {
     type Item = anyhow::Result<Delta>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.done || self.errored {
             return None;
@@ -531,9 +539,8 @@ impl Iterator for CompletionStream {
                 return None;
             }
 
-            match self.decode(payload) {
-                Some(delta) => return Some(delta),
-                None => continue,
+            if let Some(delta) = self.decode(payload) {
+                return Some(delta);
             }
         }
     }
@@ -595,7 +602,7 @@ struct WireUsage {
     prompt_tokens_details: PromptTokensDetails,
     #[serde(default)]
     completion_tokens_details: CompletionTokensDetails,
-    /// DeepSeek's flat spelling of the cache hit count.
+    /// `DeepSeek`'s flat spelling of the cache hit count.
     #[serde(default)]
     prompt_cache_hit_tokens: u64,
 }
@@ -616,6 +623,7 @@ struct CompletionTokensDetails {
 }
 
 impl From<WireUsage> for Usage {
+    #[inline]
     fn from(wire: WireUsage) -> Self {
         Self {
             prompt_tokens: wire.prompt_tokens,
@@ -633,14 +641,17 @@ impl From<WireUsage> for Usage {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
     use super::*;
 
     /// An SSE body delivering `payloads`, terminated by `[DONE]`.
     fn sse(payloads: &[&str]) -> std::io::Cursor<Vec<u8>> {
-        let mut body = payloads
-            .iter()
-            .map(|payload| format!("data: {payload}\n\n"))
-            .collect::<String>();
+        let mut body = String::new();
+        for payload in payloads {
+            body.push_str("data: ");
+            body.push_str(payload);
+            body.push_str("\n\n");
+        }
         body.push_str("data: [DONE]\n");
         std::io::Cursor::new(body.into_bytes())
     }
@@ -648,10 +659,7 @@ mod tests {
     #[test]
     fn messages_serialize_as_expected() {
         let wire = serde_json::to_value(Message::system()).unwrap();
-        assert_eq!(
-            wire,
-            serde_json::json!({ "role": "system", "content": SYSTEM })
-        );
+        assert_eq!(wire, serde_json::json!({ "role": "system", "content": SYSTEM }));
     }
 
     #[test]
@@ -671,10 +679,7 @@ mod tests {
         ]);
         let mut stream = CompletionStream::from_reader(sse);
 
-        assert_eq!(
-            stream.next().unwrap().unwrap(),
-            Delta::Thinking("hmm".into())
-        );
+        assert_eq!(stream.next().unwrap().unwrap(), Delta::Thinking("hmm".into()));
         assert_eq!(stream.next().unwrap().unwrap(), Delta::Answer("Hel".into()));
         assert_eq!(stream.next().unwrap().unwrap(), Delta::Answer("lo".into()));
         assert!(stream.next().is_none());

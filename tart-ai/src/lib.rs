@@ -1,3 +1,5 @@
+#![warn(clippy::missing_inline_in_public_items)]
+
 pub mod openai;
 
 use std::ops::AddAssign;
@@ -16,27 +18,32 @@ pub struct ContextHistory {
 
 impl ContextHistory {
     /// Push a message into the history, taking ownership of it.
+    #[inline]
     pub fn append_message(&mut self, msg: Message) {
         self.messages.push(msg);
     }
 
     /// The transcript so far.
+    #[inline]
     pub fn as_slice(&self) -> &[Message] {
         &self.messages
     }
 
     /// Token usage accumulated across recorded turns.
+    #[inline]
     pub fn usage(&self) -> Usage {
         self.usage
     }
 
     /// Record a turn's token usage into the session total.
+    #[inline]
     pub fn record_usage(&mut self, usage: Usage) {
         self.usage += usage;
     }
 }
 
 impl From<Message> for ContextHistory {
+    #[inline]
     fn from(message: Message) -> Self {
         Self {
             messages: vec![message],
@@ -50,6 +57,7 @@ impl From<Message> for ContextHistory {
 /// Variants ascend in effort, with `None` disabling thinking entirely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ReasoningEffort {
     None,
     Low,
@@ -74,6 +82,7 @@ pub struct Usage {
 }
 
 impl AddAssign for Usage {
+    #[inline]
     fn add_assign(&mut self, rhs: Self) {
         self.prompt_tokens += rhs.prompt_tokens;
         self.completion_tokens += rhs.completion_tokens;

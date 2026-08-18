@@ -13,10 +13,7 @@ static REBOUND: AtomicBool = AtomicBool::new(false);
 fn tmux() -> Option<Command> {
     let tmux = env::var_os("TMUX")?;
     // $TMUX is "<socket>,<pid>,<start time>"; -S targets that exact server.
-    let socket = tmux
-        .to_str()
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("");
+    let socket = tmux.to_str().and_then(|s| s.split(',').next()).unwrap_or("");
     let mut cmd = Command::new("tmux");
     if !socket.is_empty() {
         cmd.arg("-S").arg(socket);

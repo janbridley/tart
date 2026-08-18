@@ -1,4 +1,5 @@
 //! Manual bin for testing request output.
+#![allow(clippy::print_stdout, reason = "manual test bin")]
 
 use std::io::Write;
 
@@ -26,6 +27,7 @@ fn main() -> anyhow::Result<()> {
             // Dim the chain-of-thought; it precedes the answer.
             Delta::Thinking(text) => print!("\x1b[2m{text}\x1b[0m"),
             Delta::Answer(text) => print!("{text}"),
+            _ => {}
         }
         // Tokens carry no newlines so we flush each delta manually
         let _ = std::io::stdout().flush();
@@ -36,7 +38,7 @@ fn main() -> anyhow::Result<()> {
 
     // Read usage from the stream into our history
     if let Some(u) = stream.usage() {
-        history.record_usage(u)
+        history.record_usage(u);
     }
     // Append the message to our context
     history.append_message(message);
