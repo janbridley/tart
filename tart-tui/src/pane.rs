@@ -496,8 +496,9 @@ impl Transcript {
                 self.rows.truncate(self.rows.len() - stale);
                 self.cache.1 -= 1;
             }
-            if let Some(line) = self.messages.last_mut() {
-                line.spans.push(span);
+            if let Some(last) = self.messages.last_mut().and_then(|l| l.spans.last_mut()) {
+                // Extend the last matching span if available to save memory.
+                last.content.to_mut().push_str(&span.content);
             }
         } else {
             self.messages.push(Line::from(span));
