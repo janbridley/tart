@@ -35,10 +35,11 @@ impl Message {
             content: SYSTEM.to_string(),
         }
     }
+    /// Initialize a `Role::User` message from its content.
     #[inline]
     pub fn user(content: String) -> Self {
         Self {
-            role: Role::System,
+            role: Role::User,
             content,
         }
     }
