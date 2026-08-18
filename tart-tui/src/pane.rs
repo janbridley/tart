@@ -288,18 +288,14 @@ impl Default for Pane {
     }
 }
 
-/// A full-width dim rule row.
+/// A full-width dim rule row, drawn cell by cell.
 fn rule(buf: &mut Buffer, area: Rect) {
-    if area.is_empty() {
-        return;
+    for col in area.columns() {
+        if let Some(cell) = buf.cell_mut((col.x, area.y)) {
+            cell.set_symbol(symbols::line::HORIZONTAL)
+                .set_style(DIM_STYLE);
+        }
     }
-    buf.set_stringn(
-        area.x,
-        area.y,
-        symbols::line::HORIZONTAL.repeat(area.width as usize),
-        area.width as usize,
-        DIM_STYLE,
-    );
 }
 
 /// The prompt editor: a multi-line draft with a grapheme caret.
