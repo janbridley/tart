@@ -450,7 +450,7 @@ impl CompletionStream {
     ///
     /// ```no_run
     /// # fn main() -> anyhow::Result<()> {
-    /// use tart_ai::openai::{ChatCompletionsClient, Delta, Message, Role};
+    /// use tart_ai::openai::{ChatCompletionsClient, Delta, Message};
     /// use tart_ai::ContextHistory;
     ///
     /// let client = ChatCompletionsClient::new(
@@ -459,10 +459,7 @@ impl CompletionStream {
     ///     "deepseek-v4-flash",
     /// );
     /// let mut history = ContextHistory::from(Message::system());
-    /// history.append_message(Message {
-    ///     role: Role::User,
-    ///     content: "Who are you?".to_string(),
-    /// });
+    /// history.append_message(Message::user("Who are you?".to_string()));
     ///
     /// let mut stream = client.create(&history)?;
     /// let (message, finish_reason) = stream.complete(|delta| match delta {
@@ -644,6 +641,16 @@ impl From<WireUsage> for Usage {
 mod tests {
     use super::*;
 
+    /// An SSE body delivering `payloads`, terminated by `[DONE]`.
+    fn sse(payloads: &[&str]) -> std::io::Cursor<Vec<u8>> {
+        let mut body = payloads
+            .iter()
+            .map(|payload| format!("data: {payload}\n\n"))
+            .collect::<String>();
+        body.push_str("data: [DONE]\n");
+        std::io::Cursor::new(body.into_bytes())
+    }
+
     #[test]
     fn messages_serialize_as_expected() {
         let wire = serde_json::to_value(Message::system()).unwrap();
@@ -661,20 +668,14 @@ mod tests {
 
     #[test]
     fn stream_yields_deltas_then_completes() {
-        let sse = concat!(
-            r#"data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"content":"lo"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
-            "\n\n",
-            "data: [DONE]\n\n",
-        );
-        let mut stream = CompletionStream::from_reader(sse.as_bytes());
+        let sse = sse(&[
+            r#"{"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut stream = CompletionStream::from_reader(sse);
 
         assert_eq!(
             stream.next().unwrap().unwrap(),
@@ -690,18 +691,13 @@ mod tests {
 
     #[test]
     fn complete_assembles_the_message() {
-        let sse = concat!(
-            r#"data: {"choices":[{"delta":{"reasoning_content":"Let me "},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
-            "\n\n",
-            "data: [DONE]\n",
-        );
-        let mut stream = CompletionStream::from_reader(sse.as_bytes());
+        let sse = sse(&[
+            r#"{"choices":[{"delta":{"reasoning_content":"Let me "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        ]);
+        let mut stream = CompletionStream::from_reader(sse);
 
         let (message, finish_reason) = stream.complete(|_| {}).unwrap();
         // Reasoning never leaks into the assembled message.
@@ -712,16 +708,12 @@ mod tests {
 
     #[test]
     fn complete_forwards_thinking_and_answer() {
-        let sse = concat!(
-            r#"data: {"choices":[{"delta":{"reasoning_content":"Let me think"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
-            "\n\n",
-            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
-            "\n\n",
-            "data: [DONE]\n",
-        );
-        let mut stream = CompletionStream::from_reader(sse.as_bytes());
+        let sse = sse(&[
+            r#"{"choices":[{"delta":{"reasoning_content":"Let me think"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut stream = CompletionStream::from_reader(sse);
 
         let mut thinking = String::new();
         let mut answer = String::new();
