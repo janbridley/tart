@@ -100,6 +100,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut quit = false;
     while !quit {
         terminal.draw(|frame| pane.render(frame, frame.area()))?;
+        #[allow(
+            clippy::match_same_arms,
+            reason = "different wake sources that happen to need no handling"
+        )]
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match on_key(&mut pane, key) {
                 Some(PaneEvent::Quit) => quit = true,
@@ -120,15 +124,18 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 None => {}
             },
             Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),
-            // Resizes are handled at render time (see Pane::render).
-            Ok(Wake::Input(_)) => {}
+            // Resizes are handled at render time (see Pane::render); the redraw
+            // timer just loops around and draws again.
+            Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             // Update the pane when we recieve new text
             Ok(Wake::Generation(GenerationEvent::Delta(delta))) => {
-                pane.append(match delta {
+                let span = match delta {
                     // Dim the chain-of-thought preceding the answer
                     Delta::Thinking(text) => Span::styled(text, DIM_STYLE),
                     Delta::Answer(text) => Span::raw(text),
-                });
+                    _ => Span::raw(String::new()),
+                };
+                pane.append(&span);
             }
 
             // When the model is done generating, record data
@@ -142,10 +149,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             }
             // If the model *fails* for some reason, show the error.
             Ok(Wake::Generation(GenerationEvent::Failed(error))) => {
-                pane.append(Span::styled(error.to_string(), DIM_STYLE));
+                pane.append(&Span::styled(error.to_string(), DIM_STYLE));
             }
-            // The redraw timer: loop around and draw again.
-            Err(RecvTimeoutError::Timeout) => {}
+            // `GenerationEvent` is non-exhaustive, nothing else exists yet.
+            Ok(Wake::Generation(_)) => {}
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
         }
     }
