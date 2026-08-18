@@ -329,9 +329,10 @@ fn generate(
             Err(error) => return on_event(GenerationEvent::Failed(error)),
         }
     }
+    let usage = stream.usage();
     on_event(GenerationEvent::Done {
         message: stream.message(),
-        usage: stream.usage(),
+        usage,
     });
 }
 
@@ -388,12 +389,11 @@ impl CompletionStream {
         self.usage
     }
 
-    /// The assembled assistant message; `Some` only after the stream ran to
-    /// completion.
-    pub fn message(&self) -> Option<Message> {
+    /// Move the assembled `content` out of the stream into a [`Message`].
+    pub fn message(self) -> Option<Message> {
         (self.done && !self.errored && self.finish_reason.is_some()).then(|| Message {
             role: Role::Assistant,
-            content: self.content.clone(),
+            content: self.content,
         })
     }
 
@@ -484,7 +484,7 @@ impl CompletionStream {
         Ok((
             Message {
                 role: Role::Assistant,
-                content: self.content.clone(),
+                content: std::mem::take(&mut self.content),
             },
             finish_reason,
         ))
