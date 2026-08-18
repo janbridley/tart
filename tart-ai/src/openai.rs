@@ -13,6 +13,7 @@ pub const SYSTEM: &str = include_str!("data/SYSTEM.md");
 /// Valid `role` entries for a [`Message`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Role {
     Assistant,
     System,
@@ -31,6 +32,7 @@ pub struct Message {
 
 impl Message {
     /// Initialize a `Role::System` message with the tart system prompt.
+    #[inline]
     pub fn system() -> Self {
         Self {
             role: Role::System,
@@ -38,6 +40,7 @@ impl Message {
         }
     }
     /// Initialize a `Role::User` message from its content.
+    #[inline]
     pub fn user(content: String) -> Self {
         Self {
             role: Role::User,
@@ -49,6 +52,7 @@ impl Message {
 /// Why the model stopped generating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FinishReason {
     Stop,
     Length,
@@ -64,6 +68,7 @@ pub enum FinishReason {
 ///
 /// Thinking-capable models emit reasoning deltas first, then answer deltas.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Delta {
     /// A fragment of the model's chain-of-thought reasoning.
     Thinking(String),
@@ -72,6 +77,7 @@ pub enum Delta {
 }
 
 /// Progress from one background generation, delivered by [`ChatCompletionsClient::spawn`].
+#[non_exhaustive]
 pub enum GenerationEvent {
     /// The stream sent a chunk of text or data.
     Delta(Delta),
