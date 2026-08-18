@@ -17,6 +17,8 @@ const GUTTER: u16 = 2;
 const TAB_WIDTH: usize = 4;
 
 pub const DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
+/// Stands in for a hidden thinking run.
+const THINKING_HIDDEN: &str = "[Thinking… ctrl+t to toggle]";
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 /// The copy cursor and the editor caret are the cell under them, inverted.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
@@ -75,6 +77,8 @@ impl Pane {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
                 KeyCode::Char('u') => self.prompt.clear(),
+                // Toggle the thinking run's visibility (only in normal mode)
+                KeyCode::Char('t') => self.transcript.toggle_thinking(),
                 _ => {}
             }
             return None;
@@ -138,6 +142,16 @@ impl Pane {
     /// Append a streaming fragment; see [`Transcript::append`].
     pub fn append(&mut self, span: &Span<'static>) {
         self.transcript.append(span);
+    }
+
+    /// Append a streaming chain-of-thought fragment to the current thinking block.
+    pub fn append_thinking(&mut self, span: &Span<'static>) {
+        self.transcript.append_thinking(span);
+    }
+
+    /// Retire the previous response's thinking; see [`Transcript::begin_response`].
+    pub fn begin_response(&mut self) {
+        self.transcript.begin_response();
     }
 
     pub fn clear(&mut self) {
@@ -451,17 +465,38 @@ pub(crate) fn g_to_byte(s: &str, g: usize) -> usize {
     s.grapheme_indices(true).nth(g).map_or(s.len(), |(i, _)| i)
 }
 
+/// The row rendered in place of a hidden thinking run.
+fn thinking_placeholder() -> Line<'static> {
+    Line::from(Span::styled(THINKING_HIDDEN, DIM_STYLE))
+}
+
+/// One response's chain-of-thought, as a message-index range into `Transcript::messages`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ThinkingRun {
+    /// First message index of the run.
+    start: usize,
+    /// One past the last thinking message; equals `messages.len()` while the run is
+    /// still the transcript tail.
+    end: usize,
+}
+
 /// One view's message log, kept pre-wrapped to the display width:
 ///
-/// Call `sync` to re-wrap the new content.
+/// Call `sync` to re-wrap the new content. The current response's thinking lives in
+/// [`Transcript::run`]. While hidden its messages render as a placeholder block, and
+/// are drained when the next response begins.
 #[derive(Default)]
 struct Transcript {
     messages: Vec<Line<'static>>,
     /// Whether the last message is still open for `append` runs.
     open: bool,
     rows: Vec<Line<'static>>,
-    /// (width, how many messages `rows` already contains).
+    /// (width, how many *visible* messages `rows` already contains).
     cache: (usize, usize),
+    /// The current response's chain-of-thought, if one has begun.
+    run: Option<ThinkingRun>,
+    /// Whether the thinking run renders; sticky across turns. Starts hidden.
+    show_thinking: bool,
 }
 
 impl Transcript {
@@ -475,6 +510,9 @@ impl Transcript {
     ///
     /// Newlines in the text end the current line.
     fn append(&mut self, span: &Span<'static>) {
+        if self.run.is_some_and(|run| run.end == self.messages.len()) {
+            self.break_line();
+        }
         for (i, part) in span.content.split('\n').enumerate() {
             (i > 0).then(|| self.break_line());
             if !part.is_empty() {
@@ -491,9 +529,13 @@ impl Transcript {
                 .last()
                 .is_some_and(|line| line.spans.last().is_some_and(|last| last.style == span.style));
         if glue {
-            // The cache already counted the line being extended: drop its
-            // stale rows and hand the message back for the next sync.
-            if self.cache.1 == self.messages.len() && self.cache.0 > 0 {
+            // The cache already counted the line being extended: drop its stale rows
+            // and hand the message back for the next sync (unless it is hidden
+            // thinking, whose rows were never in `rows`)
+            if self.cache.1 == self.messages.len()
+                && self.cache.0 > 0
+                && !self.thinking_hidden(self.messages.len() - 1)
+            {
                 let stale =
                     wrap_lines(&self.messages[self.messages.len() - 1..], self.cache.0).len();
                 self.rows.truncate(self.rows.len() - stale);
@@ -514,22 +556,110 @@ impl Transcript {
         self.open = false;
     }
 
-    /// Drop every message and reset our caches.
+    /// Append a chain-of-thought fragment into the current thinking run.
+    fn append_thinking(&mut self, span: &Span<'static>) {
+        if self.run.is_none() {
+            let at = self.messages.len();
+            self.run = Some(ThinkingRun { start: at, end: at });
+        }
+        // The answer (or an echoed draft) already started: collect fresh
+        // messages and move them back above it.
+        let late = self.run.is_some_and(|run| run.end < self.messages.len());
+        let before = self.messages.len();
+        // Never glue thinking into the messages that follow its run.
+        if late {
+            self.break_line();
+        }
+        for (i, part) in span.content.split('\n').enumerate() {
+            (i > 0).then(|| self.break_line());
+            if !part.is_empty() {
+                self.append_fragment(Span::styled(part.to_string(), span.style));
+            }
+        }
+        let Some(run) = &mut self.run else {
+            return;
+        };
+        if late {
+            // Splice the fresh messages back to the run's end, shifting the
+            // tail that followed it.
+            let mut fresh = self.messages.split_off(before);
+            let mut tail = self.messages.split_off(run.end);
+            let count = fresh.len();
+            self.messages.append(&mut fresh);
+            self.messages.append(&mut tail);
+            run.end += count;
+            self.rows.clear();
+            self.cache.1 = 0;
+        } else {
+            run.end = self.messages.len();
+        }
+    }
+
+    /// Show or hide the current response's chain-of-thought.
+    fn toggle_thinking(&mut self) {
+        self.show_thinking = !self.show_thinking;
+        if self.run.is_some_and(|run| run.start < run.end) {
+            // The run's rows sit mid-`rows`; rebuild from scratch.
+            self.rows.clear();
+            self.cache.1 = 0;
+        }
+    }
+
+    /// Retire the previous response's thinking and open a fresh, empty run.
+    fn begin_response(&mut self) {
+        if let Some(run) = self.run.take()
+            && run.start < run.end
+        {
+            self.messages.drain(run.start..run.end);
+        }
+        // Rows that included the drained messages are stale; rewrapping once
+        // per turn is fine.
+        self.rows.clear();
+        self.cache.1 = 0;
+        // Never glue onto the retired turn's tail.
+        self.open = false;
+        let at = self.messages.len();
+        self.run = Some(ThinkingRun { start: at, end: at });
+    }
+
+    /// Whether message `i` belongs to the hidden thinking run.
+    fn thinking_hidden(&self, i: usize) -> bool {
+        !self.show_thinking && self.run.is_some_and(|run| i >= run.start && i < run.end)
+    }
+
+    /// Drop every message and reset our caches, persisting the thinking preference
     fn clear(&mut self) {
         self.messages.clear();
         self.rows.clear();
         self.cache.1 = 0;
         self.open = false;
+        self.run = None;
     }
 
-    /// Wrap the messages not yet folded into `rows`; a width change rewraps everything.
+    /// Wrap the visible messages not yet folded into `rows`; a width change rewraps
+    /// everything. A hidden thinking run renders as its placeholder.
     fn sync(&mut self, width: usize) -> &[Line<'static>] {
         if self.cache.0 != width {
             self.rows.clear();
             self.cache = (width, 0);
         }
         let done = self.cache.1;
-        self.rows.extend(wrap_lines(&self.messages[done..], width));
+        if let Some(run) = &self.run
+            && !self.show_thinking
+            && run.start < run.end
+        {
+            let (start, end) = (run.start, run.end);
+            self.rows
+                .extend(wrap_lines(&self.messages[done.min(start)..start], width));
+            // If the fold point is before the run we need to render, otherwise skip.
+            if start >= done {
+                self.rows.extend(wrap_lines(&[thinking_placeholder()], width));
+            }
+            self.rows
+                .extend(wrap_lines(&self.messages[end.max(done)..], width));
+        } else {
+            self.rows.extend(wrap_lines(&self.messages[done..], width));
+        }
         self.cache.1 = self.messages.len();
         &self.rows
     }
@@ -788,6 +918,19 @@ mod tests {
             .collect()
     }
 
+    /// The messages the transcript renders: the log with a hidden run
+    /// replaced by its placeholder row.
+    fn visible(t: &Transcript) -> Vec<Line<'static>> {
+        let mut messages = t.messages.clone();
+        if let Some(run) = t.run
+            && !t.show_thinking
+            && run.start < run.end
+        {
+            messages.splice(run.start..run.end, std::iter::once(thinking_placeholder()));
+        }
+        messages
+    }
+
     #[test]
     fn wraps_words_hard_breaks_and_keeps_non_ascii_spaces() {
         let wrap =
@@ -962,5 +1105,229 @@ mod tests {
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));
+    }
+
+    #[test]
+    fn wrap_cache_matches_a_full_rewrap_while_hidden() {
+        let mut t = Transcript::default();
+        assert!(!t.show_thinking, "thinking starts hidden");
+        let assert_fresh = |t: &Transcript| {
+            assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(t), t.cache.0)));
+        };
+
+        t.push(Line::from("❯ echo"));
+        t.begin_response();
+        t.sync(20);
+        assert_fresh(&t);
+        t.append_thinking(&Span::styled("hmm aaaa bbbb", DIM_STYLE));
+        t.sync(20);
+        assert_fresh(&t);
+        t.append_thinking(&Span::styled(" cccc dddd", DIM_STYLE)); // glued
+        t.sync(20);
+        assert_fresh(&t);
+        t.append_thinking(&Span::styled("line two\nline three", DIM_STYLE));
+        t.sync(20);
+        assert_fresh(&t);
+        t.append(&Span::raw("the answer aaaa bbbb"));
+        t.sync(20);
+        assert_fresh(&t);
+
+        t.sync(80); // width change rebuilds
+        assert_fresh(&t);
+        t.append_thinking(&Span::styled(" late", DIM_STYLE)); // splices above the answer
+        t.sync(80);
+        assert_fresh(&t);
+
+        t.toggle_thinking(); // reveal
+        t.sync(80);
+        assert_fresh(&t);
+        t.append_thinking(&Span::styled(" more", DIM_STYLE));
+        t.sync(80);
+        assert_fresh(&t);
+        t.toggle_thinking(); // and hide again
+        t.sync(80);
+        assert_fresh(&t);
+
+        t.begin_response(); // retirement drains the run
+        t.sync(80);
+        assert_fresh(&t);
+
+        t.clear();
+        t.sync(80);
+        assert_fresh(&t);
+    }
+
+    #[test]
+    fn toggle_hides_then_shows_the_latest_thinking() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ echo"));
+        t.begin_response();
+        // Long enough to wrap: hiding must shrink the row count.
+        let reasoning = "secret reasoning ".repeat(6);
+        t.append_thinking(&Span::styled(reasoning, DIM_STYLE));
+        t.append(&Span::raw("the answer"));
+
+        t.toggle_thinking(); // reveal
+        t.sync(40);
+        let shown = texts(&t.rows);
+        assert!(shown.iter().any(|row| row.contains("secret reasoning")));
+        assert!(shown.iter().any(|row| row.contains("the answer")));
+
+        t.toggle_thinking(); // hide: a placeholder replaces the reasoning
+        t.sync(40);
+        let hidden = texts(&t.rows);
+        assert!(hidden.len() < shown.len());
+        assert!(hidden.iter().any(|row| row.contains("Thinking")));
+        assert!(hidden.iter().all(|row| !row.contains("secret reasoning")));
+        assert!(hidden.iter().any(|row| row.contains("the answer")));
+
+        t.toggle_thinking(); // and back: the rewrap is byte-identical
+        t.sync(40);
+        assert_eq!(texts(&t.rows), shown);
+    }
+
+    #[test]
+    fn retirement_drains_old_thinking_only() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ one"));
+        t.begin_response();
+        t.append_thinking(&Span::styled("old reasoning", DIM_STYLE));
+        t.append(&Span::raw("old answer"));
+        t.push(Line::from("❯ two"));
+        t.begin_response();
+        let messages = texts(&t.messages);
+        assert!(messages.iter().all(|m| !m.contains("old reasoning")));
+        assert!(messages.iter().any(|m| m.contains("old answer")));
+        assert!(messages.iter().any(|m| m.contains("❯ two")));
+
+        t.append_thinking(&Span::styled("new reasoning", DIM_STYLE));
+        t.append(&Span::raw("new answer"));
+        t.push(Line::from("❯ three"));
+        t.begin_response();
+        t.sync(40);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().all(|r| !r.contains("reasoning")));
+        assert!(!rows.iter().any(|r| r.contains("Thinking")), "empty run");
+        assert!(rows.iter().any(|r| r.contains("old answer")));
+        assert!(rows.iter().any(|r| r.contains("new answer")));
+    }
+
+    /// The dim error line the `Failed` path appends must never end up inside the drain
+    #[test]
+    fn error_line_survives_retirement() {
+        let mut t = Transcript::default();
+        t.begin_response();
+        t.append_thinking(&Span::styled("doomed reasoning", DIM_STYLE));
+        // Same dim style as the thinking: without the append boundary it
+        // would glue into the run and drain away with it.
+        t.append(&Span::styled("boom: network down", DIM_STYLE));
+        assert_eq!(texts(&t.messages), ["doomed reasoning", "boom: network down"]);
+        t.begin_response();
+        let messages = texts(&t.messages);
+        assert!(messages.iter().any(|m| m.contains("boom")));
+        assert!(messages.iter().all(|m| !m.contains("doomed")));
+        t.sync(40);
+        assert!(texts(&t.rows).iter().any(|row| row.contains("boom")));
+    }
+
+    #[test]
+    fn late_thinking_stays_contiguous() {
+        let mut t = Transcript::default();
+        t.begin_response();
+        t.append_thinking(&Span::styled("t1", DIM_STYLE));
+        t.append(&Span::raw("a1"));
+        t.append_thinking(&Span::styled("t2", DIM_STYLE));
+        assert_eq!(texts(&t.messages), ["t1", "t2", "a1"]);
+        let run = t.run.expect("run");
+        assert_eq!((run.start, run.end), (0, 2));
+
+        t.sync(40); // hidden (default): both thinking messages collapse
+        let hidden = texts(&t.rows);
+        assert_eq!(hidden.len(), 2); // placeholder + answer
+        assert!(hidden.iter().any(|r| r.contains("Thinking")));
+        assert!(hidden.iter().all(|r| !r.contains("t1") && !r.contains("t2")));
+
+        t.toggle_thinking();
+        t.sync(40);
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+
+        t.begin_response();
+        assert_eq!(texts(&t.messages), ["a1"]);
+    }
+
+    /// Gluing a hidden thinking fragment must not truncate the cached rows of
+    /// the visible messages around it.
+    #[test]
+    fn hidden_glue_does_not_eat_visible_rows() {
+        let mut t = Transcript::default();
+        t.push(Line::from("prompt"));
+        t.begin_response();
+        t.append_thinking(&Span::styled("abc", DIM_STYLE));
+        t.sync(20);
+        t.append_thinking(&Span::styled("def", DIM_STYLE)); // glue, cache primed
+        t.sync(20);
+        t.append(&Span::raw("answer"));
+        t.sync(20);
+        assert_eq!(
+            texts(&t.rows),
+            texts(&wrap_lines(
+                &[Line::from("prompt"), thinking_placeholder(), Line::from("answer")],
+                20
+            ))
+        );
+    }
+
+    #[test]
+    fn ctrl_t_toggles_in_live_mode_and_is_inert_in_copy_mode() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("❯ hi"));
+        pane.begin_response();
+        pane.append_thinking(&Span::styled("visible reasoning", DIM_STYLE));
+        pane.append(&Span::raw("answer"));
+
+        // Hidden by default: the placeholder shows, the reasoning does not.
+        let hidden = render(&mut pane, (40, 12));
+        assert!(hidden.contains("Thinking"));
+        assert!(!hidden.contains("visible reasoning"));
+
+        pane.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let shown = render(&mut pane, (40, 12));
+        assert!(shown.contains("visible reasoning"));
+
+        // Copy mode swallows Ctrl+T before the control branch (inert by design).
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        pane.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(pane.escape(), "still in copy mode");
+        assert!(render(&mut pane, (40, 12)).contains("visible reasoning"));
+
+        pane.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(render(&mut pane, (40, 12)).contains("Thinking"));
+    }
+
+    #[test]
+    fn empty_runs_and_clear_reset_state() {
+        let mut t = Transcript::default();
+        t.push(Line::from("prompt"));
+        t.begin_response();
+        t.sync(20);
+        // An empty run renders no placeholder; toggling it changes nothing.
+        let rows = texts(&t.rows);
+        assert_eq!(rows, ["prompt"]);
+        t.toggle_thinking();
+        t.sync(20);
+        assert_eq!(texts(&t.rows), rows);
+
+        t.append_thinking(&Span::styled("reasoning", DIM_STYLE));
+        t.clear();
+        assert!(t.messages.is_empty() && t.rows.is_empty());
+        assert!(t.run.is_none());
+        // Toggled on above: `clear` keeps the preference rather than the default.
+        assert!(t.show_thinking, "clear keeps the sticky preference");
+
+        // Thinking after a clear lazily re-opens a drainable run.
+        t.append_thinking(&Span::styled("again", DIM_STYLE));
+        assert!(t.run.is_some_and(|run| run.start == 0 && run.end == 1));
+        t.begin_response();
+        assert!(t.messages.is_empty(), "the re-opened run drains");
     }
 }

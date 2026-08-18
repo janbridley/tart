@@ -1,4 +1,4 @@
-//! Parrot the user's input back to them with a small delay.
+//! A terminal chat front end for the `tart-ai` client.
 //!
 //! ```text
 //! │ transcript (wraps, auto-tails)          │
@@ -113,6 +113,8 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     // Don't submit text while the agent is generating code
                     _ if client.is_generating() => {}
                     _ => {
+                        // New response clears the thinking box for the previous one
+                        pane.begin_response();
                         history.append_message(Message::user(line));
                         let sender = wake.clone();
                         client.spawn(0, &history, move |event| {
@@ -128,15 +130,13 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             // timer just loops around and draws again.
             Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             // Update the pane when we recieve new text
-            Ok(Wake::Generation(GenerationEvent::Delta(delta))) => {
-                let span = match delta {
-                    // Dim the chain-of-thought preceding the answer
-                    Delta::Thinking(text) => Span::styled(text, DIM_STYLE),
-                    Delta::Answer(text) => Span::raw(text),
-                    _ => Span::raw(String::new()),
-                };
-                pane.append(&span);
-            }
+            Ok(Wake::Generation(GenerationEvent::Delta(delta))) => match delta {
+                // Dim the chain-of-thought preceding the answer
+                Delta::Thinking(text) => pane.append_thinking(&Span::styled(text, DIM_STYLE)),
+                Delta::Answer(text) => pane.append(&Span::raw(text)),
+                // `Delta` is non-exhaustive, nothing else exists yet.
+                _ => {}
+            },
 
             // When the model is done generating, record data
             Ok(Wake::Generation(GenerationEvent::Done { message, usage })) => {
