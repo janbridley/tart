@@ -131,13 +131,13 @@ impl Pane {
         self.popup.take().is_some() || self.copy.take().is_some()
     }
 
-    pub fn push(&mut self, line: impl Into<Line<'static>>) {
+    pub fn push<L: Into<Line<'static>>>(&mut self, line: L) {
         self.transcript.push(line);
     }
 
     /// Append a streaming fragment; see [`Transcript::append`].
     pub fn append(&mut self, span: Span<'static>) {
-        self.transcript.append(span);
+        self.transcript.append(&span);
     }
 
     pub fn clear(&mut self) {
@@ -470,7 +470,7 @@ impl Transcript {
     /// Append a streaming fragment, gluing onto the previous fragment while style matches.
     ///
     /// Newlines in the text end the current line.
-    fn append(&mut self, span: Span<'static>) {
+    fn append(&mut self, span: &Span<'static>) {
         for (i, part) in span.content.split('\n').enumerate() {
             (i > 0).then(|| self.break_line());
             if !part.is_empty() {
@@ -825,11 +825,11 @@ mod tests {
         let dim = Style::new().fg(Color::DarkGray);
         let mut transcript = Transcript::default();
         transcript.push(Line::from("prompt"));
-        transcript.append(Span::raw("Hel"));
-        transcript.append(Span::raw("lo "));
-        transcript.append(Span::raw("world"));
-        transcript.append(Span::styled(" (thinking)", dim));
-        transcript.append(Span::styled(" more", dim));
+        transcript.append(&Span::raw("Hel"));
+        transcript.append(&Span::raw("lo "));
+        transcript.append(&Span::raw("world"));
+        transcript.append(&Span::styled(" (thinking)", dim));
+        transcript.append(&Span::styled(" more", dim));
         assert_eq!(
             texts(&transcript.messages),
             ["prompt", "Hello world", " (thinking) more"]
@@ -837,9 +837,9 @@ mod tests {
 
         // `push` and `break_line` both end the run.
         transcript.push(Line::from("committed"));
-        transcript.append(Span::raw("after"));
+        transcript.append(&Span::raw("after"));
         transcript.break_line();
-        transcript.append(Span::raw("again"));
+        transcript.append(&Span::raw("again"));
         assert_eq!(
             texts(&transcript.messages),
             [
@@ -879,10 +879,10 @@ mod tests {
         assert_eq!(transcript.cache, (80, 6));
         assert_fresh(&transcript);
 
-        transcript.append(Span::raw("streaming aaaa bbbb")); // glued run
+        transcript.append(&Span::raw("streaming aaaa bbbb")); // glued run
         transcript.sync(80);
         assert_fresh(&transcript);
-        transcript.append(Span::raw(" cccc dddd"));
+        transcript.append(&Span::raw(" cccc dddd"));
         transcript.sync(80);
         assert_fresh(&transcript);
 
