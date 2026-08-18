@@ -1,0 +1,6 @@
+fn_call_width = 66
+struct_lit_width = 36
+array_width = 66
+chain_width = 66
+single_line_if_else_max_width = 66
+

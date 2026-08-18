@@ -42,10 +42,7 @@ impl Message {
     /// Initialize a `Role::User` message from its content.
     #[inline]
     pub fn user(content: String) -> Self {
-        Self {
-            role: Role::User,
-            content,
-        }
+        Self { role: Role::User, content }
     }
 }
 
@@ -309,9 +306,7 @@ fn post(
         // Surface the provider's error body, which explains what went wrong.
         Err(ureq::Error::Status(code, response)) => anyhow::bail!(
             "chat completions endpoint returned {code}: {}",
-            response
-                .into_string()
-                .unwrap_or_else(|_| "<no body>".to_string())
+            response.into_string().unwrap_or_else(|_| "<no body>".to_string())
         ),
         Err(error) => return Err(error.into()),
     };
@@ -343,10 +338,7 @@ fn generate<F: Fn(GenerationEvent) + Send + 'static>(
         }
     }
     let usage = stream.usage();
-    on_event(GenerationEvent::Done {
-        message: stream.message(),
-        usage,
-    });
+    on_event(GenerationEvent::Done { message: stream.message(), usage });
 }
 
 /// An in-flight streaming completion.
@@ -437,11 +429,7 @@ impl CompletionStream {
         // A chunk may carry reasoning and content together. If so, defer content
         // until we empty all reasoning data.
         let mut content = choice.delta.content.take().filter(|c| !c.is_empty());
-        let reasoning = choice
-            .delta
-            .reasoning_content
-            .take()
-            .filter(|r| !r.is_empty());
+        let reasoning = choice.delta.reasoning_content.take().filter(|r| !r.is_empty());
 
         if let Some(c) = &content {
             self.content.push_str(c);
@@ -671,10 +659,7 @@ mod tests {
     #[test]
     fn messages_serialize_as_expected() {
         let wire = serde_json::to_value(Message::system()).unwrap();
-        assert_eq!(
-            wire,
-            serde_json::json!({ "role": "system", "content": SYSTEM })
-        );
+        assert_eq!(wire, serde_json::json!({ "role": "system", "content": SYSTEM }));
     }
 
     #[test]
@@ -694,10 +679,7 @@ mod tests {
         ]);
         let mut stream = CompletionStream::from_reader(sse);
 
-        assert_eq!(
-            stream.next().unwrap().unwrap(),
-            Delta::Thinking("hmm".into())
-        );
+        assert_eq!(stream.next().unwrap().unwrap(), Delta::Thinking("hmm".into()));
         assert_eq!(stream.next().unwrap().unwrap(), Delta::Answer("Hel".into()));
         assert_eq!(stream.next().unwrap().unwrap(), Delta::Answer("lo".into()));
         assert!(stream.next().is_none());

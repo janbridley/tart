@@ -156,8 +156,7 @@ impl Pane {
             Span::raw(rows.next().unwrap_or_default().to_string()),
         ]));
         for continuation in rows {
-            self.transcript
-                .push(Line::from(format!("  {continuation}")));
+            self.transcript.push(Line::from(format!("  {continuation}")));
         }
         self.prompt.clear();
         Some(text)
@@ -239,7 +238,13 @@ impl Pane {
         }
     }
     /// Sync, window, and paint the transcript, then draw its two rules.
-    fn render_transcript(&mut self, area: Rect, bar_top: Rect, bar_bottom: Rect, frame: &mut Frame) {
+    fn render_transcript(
+        &mut self,
+        area: Rect,
+        bar_top: Rect,
+        bar_bottom: Rect,
+        frame: &mut Frame,
+    ) {
         // Wrap only what is new at an unchanged width, or rewrap if width changed.
         let rows = self.transcript.sync(area.width as usize);
         if let Some(cursor) = &mut self.copy
@@ -256,17 +261,11 @@ impl Pane {
         }
         let buf = frame.buffer_mut();
         let shown = visible.min(rows.len().saturating_sub(top));
-        rows[top..top + shown]
-            .iter()
-            .zip(area.y..)
-            .for_each(|(row, y)| {
-                buf.set_line(area.x, y, row, area.width);
-            });
+        rows[top..top + shown].iter().zip(area.y..).for_each(|(row, y)| {
+            buf.set_line(area.x, y, row, area.width);
+        });
         if let Some(cursor) = self.copy {
-            let pos = (
-                area.x + cursor.col as u16,
-                area.y + (cursor.row - top) as u16,
-            );
+            let pos = (area.x + cursor.col as u16, area.y + (cursor.row - top) as u16);
             if let Some(cell) = buf.cell_mut(pos) {
                 cell.set_style(CURSOR_STYLE);
             }
@@ -301,8 +300,7 @@ impl Default for Pane {
 fn rule(buf: &mut Buffer, area: Rect) {
     for col in area.columns() {
         if let Some(cell) = buf.cell_mut((col.x, area.y)) {
-            cell.set_symbol(symbols::line::HORIZONTAL)
-                .set_style(DIM_STYLE);
+            cell.set_symbol(symbols::line::HORIZONTAL).set_style(DIM_STYLE);
         }
     }
 }
@@ -364,10 +362,7 @@ impl Editor {
             if i > 0 {
                 self.new_line();
             }
-            let cleaned: String = part
-                .chars()
-                .filter(|c| !c.is_control() || *c == '\t')
-                .collect();
+            let cleaned: String = part.chars().filter(|c| !c.is_control() || *c == '\t').collect();
             let line = &mut self.lines[self.line];
             line.insert_str(g_to_byte(line, self.g), &cleaned);
             self.g += graphemes(&cleaned);
@@ -491,11 +486,10 @@ impl Transcript {
     /// Glue one unbroken fragment onto the transcript.
     fn append_fragment(&mut self, span: Span<'static>) {
         let glue = self.open
-            && self.messages.last().is_some_and(|line| {
-                line.spans
-                    .last()
-                    .is_some_and(|last| last.style == span.style)
-            });
+            && self
+                .messages
+                .last()
+                .is_some_and(|line| line.spans.last().is_some_and(|last| last.style == span.style));
         if glue {
             // The cache already counted the line being extended: drop its
             // stale rows and hand the message back for the next sync.
@@ -572,11 +566,7 @@ impl CopyCursor {
 /// The cursor after one key step, clamped to the transcript edges.
 fn moved(rows: &[Line<'static>], cursor: CopyCursor, key: KeyCode) -> CopyCursor {
     if rows.is_empty() {
-        return CopyCursor {
-            row: 0,
-            col: 0,
-            ..cursor
-        };
+        return CopyCursor { row: 0, col: 0, ..cursor };
     }
     let last = rows.len() - 1;
     let mut c = cursor;
@@ -794,12 +784,7 @@ mod tests {
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect()
-            })
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect()
     }
 
@@ -901,11 +886,7 @@ mod tests {
         }
         transcript.sync(80);
         assert_fresh(&transcript);
-        assert!(
-            !texts(&transcript.rows)
-                .iter()
-                .any(|row| row.contains("aaaa"))
-        );
+        assert!(!texts(&transcript.rows).iter().any(|row| row.contains("aaaa")));
     }
 
     #[test]
@@ -917,12 +898,7 @@ mod tests {
         assert_eq!(window_top(10, 5, Some((4, 2))), 2); // inside: stays
 
         let rows = wrap_lines(&[Line::from("abc"), Line::from("de")], 10);
-        let cur = |row, col| CopyCursor {
-            row,
-            col,
-            top: 0,
-            visible: 2,
-        };
+        let cur = |row, col| CopyCursor { row, col, top: 0, visible: 2 };
         assert_eq!(moved(&rows, cur(0, 0), KeyCode::Right), cur(0, 1));
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::Left), cur(0, 2)); // wraps
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::PageUp), cur(0, 0));

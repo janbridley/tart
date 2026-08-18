@@ -24,10 +24,7 @@ pub(crate) fn derive_query(editor: &Editor) -> Option<(String, usize)> {
     let line = &editor.lines[editor.line];
     let prefix = &line[..g_to_byte(line, editor.g)];
     let at = prefix.rfind('@')?;
-    let word_start = prefix[..at]
-        .chars()
-        .next_back()
-        .is_none_or(char::is_whitespace);
+    let word_start = prefix[..at].chars().next_back().is_none_or(char::is_whitespace);
     word_start.then(|| (prefix[at + 1..].to_string(), at))
 }
 
@@ -176,11 +173,7 @@ pub(crate) fn render(frame: &mut Frame, popup: &mut FilePopup, anchor: Rect) {
             .collect()
     };
     // "+" if we have more files than fit, empty otherwise
-    let more = if popup.total > popup.matches.len() {
-        "+"
-    } else {
-        ""
-    };
+    let more = if popup.total > popup.matches.len() { "+" } else { "" };
     let list = List::new(items)
         .block(
             Block::bordered()
@@ -235,18 +228,10 @@ mod tests {
         // a caret move, or a fresh `@` re-arm it.
         let mut slot = None;
         editor.insert_str(" more");
-        update(
-            &editor,
-            &mut slot,
-            rearm(&KeyEvent::from(KeyCode::Char('x'))),
-        );
+        update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Char('x'))));
         assert!(slot.is_none());
         editor.backspace();
-        update(
-            &editor,
-            &mut slot,
-            rearm(&KeyEvent::from(KeyCode::Backspace)),
-        );
+        update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Backspace)));
         assert!(slot.is_some());
         slot = None;
         editor.left();
@@ -254,11 +239,7 @@ mod tests {
         assert!(slot.is_some());
         slot = None;
         editor.insert_str(" @ne");
-        update(
-            &editor,
-            &mut slot,
-            rearm(&KeyEvent::from(KeyCode::Char('@'))),
-        );
+        update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Char('@'))));
         assert!(slot.is_some());
     }
 }
