@@ -329,9 +329,10 @@ fn generate(
             Err(error) => return on_event(GenerationEvent::Failed(error)),
         }
     }
+    let usage = stream.usage();
     on_event(GenerationEvent::Done {
         message: stream.message(),
-        usage: stream.usage(),
+        usage,
     });
 }
 
@@ -388,18 +389,17 @@ impl CompletionStream {
         self.usage
     }
 
-    /// The assembled assistant message; `Some` only after the stream ran to
-    /// completion.
-    pub fn message(&self) -> Option<Message> {
+    /// Move the assembled `content` out of the stream into a [`Message`].
+    pub fn message(self) -> Option<Message> {
         (self.done && !self.errored && self.finish_reason.is_some()).then(|| Message {
             role: Role::Assistant,
-            content: self.content.clone(),
+            content: self.content,
         })
     }
 
     /// Decode one SSE payload into a delta, if it carries one.
     fn decode(&mut self, data: &str) -> Option<anyhow::Result<Delta>> {
-        let chunk: CompletionChunk = match serde_json::from_str(data) {
+        let mut chunk: CompletionChunk = match serde_json::from_str(data) {
             Ok(chunk) => chunk,
             Err(error) => {
                 self.errored = true;
@@ -414,27 +414,29 @@ impl CompletionStream {
             self.usage = Some(usage.into());
         }
         // Chunks may legitimately carry an empty `choices` array.
-        let choice = chunk.choices.first()?;
+        let choice = chunk.choices.first_mut()?;
         self.finish_reason = choice.finish_reason.or(self.finish_reason);
 
         // A chunk may carry reasoning and content together. If so, defer content
         // until we empty all reasoning data.
-        let content = choice.delta.content.as_deref().filter(|c| !c.is_empty());
+        let mut content = choice.delta.content.take().filter(|c| !c.is_empty());
         let reasoning = choice
             .delta
             .reasoning_content
-            .as_deref()
+            .take()
             .filter(|r| !r.is_empty());
 
-        content.inspect(|c| self.content.push_str(c));
-
-        if let Some(r) = reasoning {
-            self.thinking.push_str(r);
-            self.pending = content.map(String::from);
-            return Some(Ok(Delta::Thinking(r.to_string())));
+        if let Some(c) = &content {
+            self.content.push_str(c);
         }
 
-        Some(Ok(Delta::Answer(content?.to_string())))
+        if let Some(r) = reasoning {
+            self.thinking.push_str(&r);
+            self.pending = content.take();
+            return Some(Ok(Delta::Thinking(r)));
+        }
+
+        Some(Ok(Delta::Answer(content?)))
     }
 
     /// Exhaust the stream, forwarding each delta and returning the assembled
@@ -482,7 +484,7 @@ impl CompletionStream {
         Ok((
             Message {
                 role: Role::Assistant,
-                content: self.content.clone(),
+                content: std::mem::take(&mut self.content),
             },
             finish_reason,
         ))
