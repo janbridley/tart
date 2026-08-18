@@ -108,10 +108,11 @@ pub struct ChatCompletionsClient {
 
 impl ChatCompletionsClient {
     /// Configure a client for an OpenAI-compatible endpoint.
-    pub fn new(
-        completions_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
+    #[inline]
+    pub fn new<U: Into<String>, K: Into<String>, M: Into<String>>(
+        completions_url: U,
+        api_key: K,
+        model: M,
     ) -> Self {
         let agent = ureq::AgentBuilder::new()
             // If we can't *connect* within 15 seconds, fail.
@@ -131,6 +132,8 @@ impl ChatCompletionsClient {
     }
 
     /// Set how hard the model reasons before answering.
+    #[must_use]
+    #[inline]
     pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self
@@ -142,6 +145,7 @@ impl ChatCompletionsClient {
     /// - Content deltas arrive as a stream, which can be iterated to completion
     ///   (or consumed entirely by [`CompletionStream::complete`])
     /// - Dropping the stream early closes the connection
+    #[inline]
     pub fn create(&self, history: &ContextHistory) -> anyhow::Result<CompletionStream> {
         post(
             &self.http_agent,
@@ -224,11 +228,12 @@ impl ChatCompletionsClient {
     /// assert_eq!(answer, "Hi");
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn spawn(
+    #[inline]
+    pub fn spawn<F: Fn(GenerationEvent) + Send + 'static>(
         &self,
         id: u64,
         history: &ContextHistory,
-        on_event: impl Fn(GenerationEvent) + Send + 'static,
+        on_event: F,
     ) -> anyhow::Result<()> {
         let body = self.try_serialize_history(history)?;
 
@@ -247,12 +252,13 @@ impl ChatCompletionsClient {
         std::thread::spawn(move || {
             // Deregister however we leave, cancelled or not.
             let _guard = GenerationGuard { generations, id };
-            generate(agent, url, api_key, body, cancelled, on_event);
+            generate(&agent, &url, &api_key, &body, &cancelled, on_event);
         });
         Ok(())
     }
 
     /// Cancel the background generation `id`, closing the connection on the next delta.
+    #[inline]
     pub fn cancel(&self, id: u64) {
         if let Some(cancelled) = self.lock_generations().remove(&id) {
             cancelled.store(true, Ordering::Relaxed);
@@ -260,6 +266,7 @@ impl ChatCompletionsClient {
     }
 
     /// Whether any background generation is running.
+    #[inline]
     pub fn is_generating(&self) -> bool {
         !self.lock_generations().is_empty()
     }
@@ -313,15 +320,15 @@ fn post(
 }
 
 /// Drive one generation on the current thread, reporting progress.
-fn generate(
-    agent: ureq::Agent,
-    completions_url: String,
-    api_key: String,
-    body: String,
-    cancelled: Arc<AtomicBool>,
-    on_event: impl Fn(GenerationEvent) + Send + 'static,
+fn generate<F: Fn(GenerationEvent) + Send + 'static>(
+    agent: &ureq::Agent,
+    completions_url: &str,
+    api_key: &str,
+    body: &str,
+    cancelled: &AtomicBool,
+    on_event: F,
 ) {
-    let mut stream = match post(&agent, &completions_url, &api_key, &body) {
+    let mut stream = match post(agent, completions_url, api_key, body) {
         Ok(stream) => stream,
         Err(error) => return on_event(GenerationEvent::Failed(error)),
     };
@@ -381,21 +388,25 @@ impl CompletionStream {
     }
 
     /// The chain-of-thought reasoning seen so far.
+    #[inline]
     pub fn thinking(&self) -> &str {
         &self.thinking
     }
 
     /// The reason generation stopped; `Some` once the terminal chunk has been seen.
+    #[inline]
     pub fn finish_reason(&self) -> Option<FinishReason> {
         self.finish_reason
     }
 
     /// Token usage for the request; `Some` once it has been received.
+    #[inline]
     pub fn usage(&self) -> Option<Usage> {
         self.usage
     }
 
     /// Move the assembled `content` out of the stream into a [`Message`].
+    #[inline]
     pub fn message(self) -> Option<Message> {
         (self.done && !self.errored && self.finish_reason.is_some()).then_some(Message {
             role: Role::Assistant,
@@ -475,9 +486,10 @@ impl CompletionStream {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn complete(
+    #[inline]
+    pub fn complete<F: FnMut(Delta)>(
         &mut self,
-        mut on_delta: impl FnMut(Delta),
+        mut on_delta: F,
     ) -> anyhow::Result<(Message, FinishReason)> {
         for delta in self.by_ref() {
             on_delta(delta?);
@@ -500,6 +512,7 @@ impl CompletionStream {
 impl Iterator for CompletionStream {
     type Item = anyhow::Result<Delta>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.done || self.errored {
             return None;
@@ -537,9 +550,8 @@ impl Iterator for CompletionStream {
                 return None;
             }
 
-            match self.decode(payload) {
-                Some(delta) => return Some(delta),
-                None => continue,
+            if let Some(delta) = self.decode(payload) {
+                return Some(delta);
             }
         }
     }
@@ -622,6 +634,7 @@ struct CompletionTokensDetails {
 }
 
 impl From<WireUsage> for Usage {
+    #[inline]
     fn from(wire: WireUsage) -> Self {
         Self {
             prompt_tokens: wire.prompt_tokens,
