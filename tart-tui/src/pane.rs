@@ -136,8 +136,8 @@ impl Pane {
     }
 
     /// Append a streaming fragment; see [`Transcript::append`].
-    pub fn append(&mut self, span: Span<'static>) {
-        self.transcript.append(&span);
+    pub fn append(&mut self, span: &Span<'static>) {
+        self.transcript.append(span);
     }
 
     pub fn clear(&mut self) {
@@ -189,58 +189,16 @@ impl Pane {
         ])
         .areas(area);
 
-        // Wrap only what is new at an unchanged width, or rewrap if width changed.
-        let rows = self.transcript.sync(transcript.width as usize);
-        if let Some(cursor) = &mut self.copy
-            && !rows.is_empty()
-        {
-            cursor.row = cursor.row.min(rows.len() - 1);
-            cursor.col = cursor.col.min(rows[cursor.row].width().saturating_sub(1));
-        }
-        let visible = transcript.height as usize;
-        let top = window_top(rows.len(), visible, self.copy.map(|c| (c.row, c.top)));
-        if let Some(cursor) = &mut self.copy {
-            cursor.top = top;
-            cursor.visible = visible;
-        }
-        let buf = frame.buffer_mut();
-        let shown = visible.min(rows.len().saturating_sub(top));
-        rows[top..top + shown]
-            .iter()
-            .zip(transcript.y..)
-            .for_each(|(row, y)| {
-                buf.set_line(transcript.x, y, row, transcript.width);
-            });
-        if let Some(cursor) = self.copy {
-            let pos = (
-                transcript.x + cursor.col as u16,
-                transcript.y + (cursor.row - top) as u16,
-            );
-            if let Some(cell) = buf.cell_mut(pos) {
-                cell.set_style(CURSOR_STYLE);
-            }
-        }
-        rule(buf, bar_top);
-        rule(buf, bar_bottom);
-
+        self.render_transcript(transcript, bar_top, bar_bottom, frame);
         if self.copy.is_some() {
-            if prompt_area.height > 0 {
-                buf.set_line(
-                    prompt_area.x,
-                    prompt_area.y,
-                    &Line::from(Span::styled(
-                        "▲ scrollback · ←↑↓→ move · PgUp/PgDn/Home/End · q to exit",
-                        Style::new().fg(Color::Yellow),
-                    )),
-                    prompt_area.width,
-                );
-            }
+            Self::render_scrollback_hint(frame, prompt_area);
             return;
         }
 
         if prompt_area.height == 0 || prompt_area.width < GUTTER {
             return;
         }
+        let buf = frame.buffer_mut();
         // Live prompt: the "❯ " gutter, then the wrapped draft. The inverted caret
         // cell marks the cursor, so the terminal cursor stays hidden and the prompt
         // viewport can never misplace it.
@@ -278,6 +236,57 @@ impl Pane {
         // The @file popup overlays the transcript, anchored above the top rule.
         if let Some(popup) = self.popup.as_mut() {
             file_mentions::render(frame, popup, bar_top);
+        }
+    }
+    /// Sync, window, and paint the transcript, then draw its two rules.
+    fn render_transcript(&mut self, area: Rect, bar_top: Rect, bar_bottom: Rect, frame: &mut Frame) {
+        // Wrap only what is new at an unchanged width, or rewrap if width changed.
+        let rows = self.transcript.sync(area.width as usize);
+        if let Some(cursor) = &mut self.copy
+            && !rows.is_empty()
+        {
+            cursor.row = cursor.row.min(rows.len() - 1);
+            cursor.col = cursor.col.min(rows[cursor.row].width().saturating_sub(1));
+        }
+        let visible = area.height as usize;
+        let top = window_top(rows.len(), visible, self.copy.map(|c| (c.row, c.top)));
+        if let Some(cursor) = &mut self.copy {
+            cursor.top = top;
+            cursor.visible = visible;
+        }
+        let buf = frame.buffer_mut();
+        let shown = visible.min(rows.len().saturating_sub(top));
+        rows[top..top + shown]
+            .iter()
+            .zip(area.y..)
+            .for_each(|(row, y)| {
+                buf.set_line(area.x, y, row, area.width);
+            });
+        if let Some(cursor) = self.copy {
+            let pos = (
+                area.x + cursor.col as u16,
+                area.y + (cursor.row - top) as u16,
+            );
+            if let Some(cell) = buf.cell_mut(pos) {
+                cell.set_style(CURSOR_STYLE);
+            }
+        }
+        rule(buf, bar_top);
+        rule(buf, bar_bottom);
+    }
+
+    /// In copy mode the prompt area shows the scrollback keybindings.
+    fn render_scrollback_hint(frame: &mut Frame, prompt_area: Rect) {
+        if prompt_area.height > 0 {
+            frame.buffer_mut().set_line(
+                prompt_area.x,
+                prompt_area.y,
+                &Line::from(Span::styled(
+                    "▲ scrollback · ←↑↓→ move · PgUp/PgDn/Home/End · q to exit",
+                    Style::new().fg(Color::Yellow),
+                )),
+                prompt_area.width,
+            );
         }
     }
 }
