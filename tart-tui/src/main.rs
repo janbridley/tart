@@ -16,6 +16,7 @@ mod tmux_override;
 mod testutil;
 
 use std::io::stdout;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
@@ -82,7 +83,19 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         "deepseek-v4-flash",
     )
     .reasoning_effort(ReasoningEffort::Max);
-    let mut history = ContextHistory::from(tart_ai::openai::Message::system());
+    let mut history = ContextHistory::from(Message::system());
+
+    // Forward terminal input onto the wake channel so the event loop has a single wait point.
+    let (wake, wake_receiver) = mpsc::channel();
+    std::thread::spawn({
+        let sender = wake.clone();
+        move || -> Option<()> {
+            loop {
+                let event = event::read().ok()?;
+                sender.send(Wake::Input(event)).ok()?;
+            }
+        }
+    });
 
     // The parrot's reply, streamed word by word between frames.
     let mut quit = false;
