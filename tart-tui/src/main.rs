@@ -30,7 +30,7 @@ use tmux_override::{override_shift_up, restore_tmux};
 
 use tart_ai::{
     ContextHistory, ReasoningEffort,
-    openai::{ChatCompletionsClient, Delta, Message},
+    openai::{ChatCompletionsClient, Delta, GenerationEvent, Message},
 };
 
 pub const DRAW_INTERVAL_MS: u64 = 33;
@@ -57,6 +57,14 @@ fn install_panic_hook() {
         let _ = execute!(stdout(), DisableBracketedPaste);
         hook(info);
     }));
+}
+
+/// One wake source for the event loop.
+enum Wake {
+    /// Terminal input, read on its own thread.
+    Input(Event),
+    /// Progress from the background generation.
+    Generation(GenerationEvent),
 }
 
 fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
