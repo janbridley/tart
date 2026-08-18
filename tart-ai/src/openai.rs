@@ -1,6 +1,9 @@
 //! OpenAI Chat Completions interface.
 
 use std::io::{BufRead, BufReader, Read};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Mutex;
+use std::thread::JoinHandle;
 
 use crate::{ContextHistory, ReasoningEffort, Usage};
 use serde::{Deserialize, Serialize};
@@ -78,6 +81,8 @@ pub struct ChatCompletionsClient {
     model: String,
     /// How hard the model reasons. `None` uses the provider default.
     reasoning_effort: Option<ReasoningEffort>,
+    /// The single active background generation, if any.
+    generation: Mutex<Option<Generation>>,
 }
 
 impl ChatCompletionsClient {
@@ -93,6 +98,7 @@ impl ChatCompletionsClient {
             api_key: api_key.into(),
             model: model.into(),
             reasoning_effort: None,
+            generation: Mutex::new(None),
         }
     }
 
@@ -133,6 +139,70 @@ impl ChatCompletionsClient {
         };
 
         Ok(CompletionStream::from_reader(response.into_reader()))
+    }
+
+    /// Begin a streaming completion on a worker thread. Connection failures
+    /// and provider error bodies come through as `Err` here; the generation
+    /// itself is driven by [`poll`](Self::poll). Only one generation runs at a
+    /// time; dropping the client cancels an in-flight one.
+    pub fn create_async(&self, history: &ContextHistory) -> anyhow::Result<()> {
+        let stream = self.create(history)?;
+
+        let mut generation = self.generation.lock().expect("generation lock poisoned");
+        if generation.is_some() {
+            anyhow::bail!("a generation is already running");
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || stream.pump(sender));
+        *generation = Some(Generation { receiver, handle });
+        Ok(())
+    }
+
+    /// Deliver the background generation's new deltas to `on_delta`, never
+    /// blocking. Returns the generation's outcome once it ends; `None` while
+    /// it runs or when no generation is active.
+    pub fn poll(
+        &self,
+        mut on_delta: impl FnMut(Delta),
+    ) -> Option<anyhow::Result<(Message, FinishReason, Option<Usage>)>> {
+        let mut generation = self.generation.lock().expect("generation lock poisoned");
+        let Some(active) = generation.as_mut() else {
+            return None;
+        };
+
+        loop {
+            match active.receiver.try_recv() {
+                Ok(delta) => on_delta(delta),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    let finished = generation.take().expect("generation is active");
+                    let outcome = finished
+                        .handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("generation worker panicked"))
+                        .and_then(|outcome| outcome);
+                    return Some(outcome);
+                }
+            }
+        }
+    }
+
+    /// Whether a background generation is running.
+    pub fn is_generating(&self) -> bool {
+        self.generation
+            .lock()
+            .expect("generation lock poisoned")
+            .is_some()
+    }
+
+    /// Cancel the background generation: delivery stops and the worker closes
+    /// the connection on its next delta.
+    pub fn cancel(&self) {
+        self.generation
+            .lock()
+            .expect("generation lock poisoned")
+            .take();
     }
 }
 
@@ -239,6 +309,11 @@ impl CompletionStream {
             on_delta(delta?);
         }
 
+        self.finish()
+    }
+
+    /// The assembled message and finish reason, once the stream is exhausted.
+    fn finish(&self) -> anyhow::Result<(Message, FinishReason)> {
         let Some(finish_reason) = self.finish_reason else {
             anyhow::bail!("stream ended without a finish reason");
         };
@@ -251,6 +326,28 @@ impl CompletionStream {
             finish_reason,
         ))
     }
+
+    /// Pump the stream's deltas into `sender`, then assemble the outcome. A
+    /// dropped receiver (a cancelled generation) stops the pump.
+    fn pump(
+        mut self,
+        sender: Sender<Delta>,
+    ) -> anyhow::Result<(Message, FinishReason, Option<Usage>)> {
+        for delta in self.by_ref() {
+            if sender.send(delta?).is_err() {
+                anyhow::bail!("generation cancelled");
+            }
+        }
+
+        let (message, finish_reason) = self.finish()?;
+        Ok((message, finish_reason, self.usage()))
+    }
+}
+
+/// A background generation in flight.
+struct Generation {
+    receiver: Receiver<Delta>,
+    handle: JoinHandle<anyhow::Result<(Message, FinishReason, Option<Usage>)>>,
 }
 
 impl Iterator for CompletionStream {
@@ -547,5 +644,34 @@ mod tests {
         assert!(stream.next().unwrap().is_err());
         assert!(stream.next().is_none());
         assert!(stream.message().is_none());
+    }
+
+    #[test]
+    fn pump_delivers_deltas_then_outcome() {
+        let sse = concat!(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Let me think"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n",
+        );
+        let (sender, receiver) = mpsc::channel();
+        let handle =
+            std::thread::spawn(move || CompletionStream::from_reader(sse.as_bytes()).pump(sender));
+
+        let deltas: Vec<_> = receiver.iter().collect();
+        let (message, finish_reason, usage) = handle.join().unwrap().unwrap();
+        assert_eq!(
+            deltas,
+            vec![
+                Delta::Thinking("Let me think".into()),
+                Delta::Answer("Hi".into())
+            ]
+        );
+        assert_eq!(message.content, "Hi");
+        assert_eq!(finish_reason, FinishReason::Stop);
+        assert_eq!(usage, None);
     }
 }

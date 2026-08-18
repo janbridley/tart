@@ -15,9 +15,8 @@ mod tmux_override;
 #[cfg(test)]
 mod testutil;
 
-use std::collections::VecDeque;
 use std::io::stdout;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -77,9 +76,6 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     .reasoning_effort(ReasoningEffort::Max);
     let mut history = ContextHistory::from(tart_ai::openai::Message::system());
 
-    // The parrot's reply, streamed word by word between frames.
-    let mut pending: VecDeque<String> = VecDeque::new();
-    let mut next_chunk = Instant::now();
     let mut quit = false;
     while !quit {
         terminal.draw(|frame| pane.render(frame, frame.area()))?;
@@ -91,17 +87,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     Some(PaneEvent::Submit(line)) => match line.trim() {
                         "/clear" => pane.clear(),
                         "/quit" | "/exit" => quit = true,
+                        _ if client.is_generating() => {}
                         _ => {
                             history.append_message(Message::user(line));
-                            let mut stream = client.create(&history)?;
-                            let (message, finish_reason) = stream.complete(|delta| {
-                                pane.append(match delta {
-                                    Delta::Thinking(text) => {
-                                        Span::styled(text, DIM_STYLE))
-                                    }
-                                    Delta::Answer(text) => Span::raw(text)),
-                                });
-                            })?;
+                            client.create_async(&history)?;
                         }
                     },
                     None => {}
@@ -111,14 +100,21 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 _ => {}
             }
         }
-        if Instant::now() >= next_chunk
-            && let Some(chunk) = pending.pop_front()
-        {
-            pane.append(Span::raw(chunk));
-            if pending.is_empty() {
-                pane.break_line();
+        // Deliver new generation deltas between frames; polling never blocks.
+        if let Some(outcome) = client.poll(|delta| match delta {
+            // Dim the chain-of-thought; it precedes the answer.
+            Delta::Thinking(text) => pane.append(Span::styled(text, DIM_STYLE)),
+            Delta::Answer(text) => pane.append(Span::raw(text)),
+        }) {
+            match outcome {
+                Ok((message, _finish_reason, usage)) => {
+                    if let Some(usage) = usage {
+                        history.record_usage(usage);
+                    }
+                    history.append_message(message);
+                }
+                Err(error) => pane.append(Span::styled(error.to_string(), DIM_STYLE)),
             }
-            next_chunk = Instant::now() + Duration::from_millis(80);
         }
     }
     Ok(())
