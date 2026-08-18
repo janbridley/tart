@@ -706,7 +706,7 @@ impl Wrapper {
 /// invisible, anything else renders as itself.
 fn feed(wrapper: &mut Wrapper, grapheme: &str, style: Style) {
     match grapheme {
-        "\t" => wrapper.push(&"        "[..TAB_WIDTH], style), // Zero-allocation slice!
+        "\t" => (0..TAB_WIDTH).for_each(|_| wrapper.push(" ", style)),
         _ if !grapheme.chars().any(char::is_control) => wrapper.push(grapheme, style),
         _ => {} // Ignore unhandled control characters
     }
