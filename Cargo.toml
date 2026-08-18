@@ -22,6 +22,10 @@ similar_names = "allow"
 inline_always = "allow"
 must_use_candidate = "allow"
 
+# Doc-comment requirements
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
 # opt-in to restrictions
 allow_attributes_without_reason = "warn"
 exhaustive_enums = "warn"
