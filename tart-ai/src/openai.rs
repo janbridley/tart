@@ -1,8 +1,8 @@
 //! OpenAI Chat Completions interface.
 
 use std::io::{BufRead, BufReader, Read};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 
 use crate::{ContextHistory, ReasoningEffort, Usage};
@@ -167,9 +167,7 @@ impl ChatCompletionsClient {
         mut on_delta: impl FnMut(Delta),
     ) -> Option<anyhow::Result<(Message, FinishReason, Option<Usage>)>> {
         let mut generation = self.generation.lock().expect("generation lock poisoned");
-        let Some(active) = generation.as_mut() else {
-            return None;
-        };
+        let active = generation.as_mut();
 
         loop {
             match active.receiver.try_recv() {
