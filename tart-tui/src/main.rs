@@ -62,7 +62,7 @@ fn install_panic_hook() {
 fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
-        "tart demo — Enter sends · Alt+Enter newline · paste works · Shift+↑ scrollback \
+        "tart · Enter sends · Alt+Enter newline · Shift+↑ scrollback \
          (q exits) · Ctrl+C quits",
         DIM_STYLE,
     ));
