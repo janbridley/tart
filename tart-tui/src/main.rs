@@ -16,7 +16,7 @@ mod tmux_override;
 mod testutil;
 
 use std::collections::VecDeque;
-use std::io::{self, stdout};
+use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
@@ -29,7 +29,10 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Pane, PaneEvent};
 use tmux_override::{override_shift_up, restore_tmux};
 
-use tart_ai::{ReasoningEffort, openai::ChatCompletionsClient};
+use tart_ai::{
+    ContextHistory, ReasoningEffort,
+    openai::{ChatCompletionsClient, Delta, Message},
+};
 
 pub const DRAW_INTERVAL_MS: u64 = 33;
 
@@ -72,6 +75,7 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         "deepseek-v4-flash",
     )
     .reasoning_effort(ReasoningEffort::Max);
+    let mut history = ContextHistory::from(tart_ai::openai::Message::system());
 
     // The parrot's reply, streamed word by word between frames.
     let mut pending: VecDeque<String> = VecDeque::new();
@@ -88,9 +92,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                         "/clear" => pane.clear(),
                         "/quit" | "/exit" => quit = true,
                         _ => {
-                            let reply = format!("You said: {line}");
-                            pending.extend(reply.split(' ').map(|word| format!("{word} ")));
-                            next_chunk = Instant::now() + Duration::from_millis(80);
+                            history.append_message(Message::user(line));
+                            let mut stream = client.create(&history)?;
+                            let (message, finish_reason) = stream.complete(|_| {})?;
+                            pane.append(Span::raw(message.content.clone()));
                         }
                     },
                     None => {}
