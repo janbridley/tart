@@ -652,14 +652,17 @@ impl From<WireUsage> for Usage {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
     use super::*;
 
     /// An SSE body delivering `payloads`, terminated by `[DONE]`.
     fn sse(payloads: &[&str]) -> std::io::Cursor<Vec<u8>> {
-        let mut body = payloads
-            .iter()
-            .map(|payload| format!("data: {payload}\n\n"))
-            .collect::<String>();
+        let mut body = String::new();
+        for payload in payloads {
+            body.push_str("data: ");
+            body.push_str(payload);
+            body.push_str("\n\n");
+        }
         body.push_str("data: [DONE]\n");
         std::io::Cursor::new(body.into_bytes())
     }
