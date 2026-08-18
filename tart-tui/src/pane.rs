@@ -967,7 +967,7 @@ mod tests {
         for _ in 0..5 {
             pane.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         }
-        assert!(pane.copy.unwrap().row > 10);
+        assert!(pane.copy.expect("copy cursor").row > 10);
         pane.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)); // eaten
         pane.on_key(key(KeyCode::PageUp, KeyModifiers::NONE));
 
