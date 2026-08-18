@@ -71,8 +71,8 @@ enum Wake {
 fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
-        "tart demo — Enter sends · Alt+Enter newline · paste works · Shift+↑ scrollback \
-         (q exits) · Ctrl+C quits",
+        "tart · Enter sends text · Alt+Enter for newline · Shift+↑ to enter \
+        scrollback",
         DIM_STYLE,
     ));
 
