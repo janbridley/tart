@@ -35,6 +35,13 @@ impl Message {
             content: SYSTEM.to_string(),
         }
     }
+    #[inline]
+    pub fn user(content: String) -> Self {
+        Self {
+            role: Role::System,
+            content,
+        }
+    }
 }
 
 /// Why the model stopped generating.
