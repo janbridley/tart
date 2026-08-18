@@ -1164,6 +1164,7 @@ dependencies = [
  "ignore",
  "nucleo-matcher",
  "ratatui",
+ "tart-ai",
  "unicode-segmentation",
 ]
 
