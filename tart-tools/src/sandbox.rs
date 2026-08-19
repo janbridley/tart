@@ -28,7 +28,7 @@
 //! The module is built for running commands requested by a model, so it is
 //! deny-by-default beyond the filesystem grants:
 //!
-//! - Network access is denied (the base profile is `(deny default)`
+//! - Network access is denied (the base profile is `(deny default)`).
 //! - The child environment is cleared except for a minimal `PATH` and the granted temp
 //!   directory, so secrets held by the caller cannot be printed into captured output.
 //!   Re-add variables with the usual `std` methods.
@@ -77,7 +77,7 @@ pub struct Policy {
     /// Paths that are *writable* in the sandboxed environment.
     writable: Vec<PathBuf>,
     read_only: Vec<PathBuf>,
-    /// Subpaths (e.g. `.git`) that are kept kept read-only inside every writable root.
+    /// Subpaths (e.g. `.git`) that are kept read-only inside every writable root.
     excluded: Vec<OsString>,
     /// The canonicalized temp directory granted as a writable root, if available.
     ///
