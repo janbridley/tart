@@ -325,7 +325,7 @@ impl Policy {
             read_rules.push(format!(r#"(allow file-read* (subpath (param "{name}")))"#));
         }
 
-        // Deny raw ttys to prevent sidechannel attackes
+        // Deny raw ttys to prevent sidechannel attacks
         deny_rules.push(
             r#"(deny file-read-data file-write-data file-ioctl (regex #"^/dev/ttys[0-9]+$"))"#
                 .to_owned(),
@@ -386,7 +386,7 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// Create a unique directory removed when the guard drops, so parallel tests dont
+    /// Create a unique directory removed when the guard drops, so parallel tests don't
     /// share state.
     struct ScratchDir(PathBuf);
 
@@ -430,7 +430,7 @@ mod tests {
         assert!(rendered.contains(r#"(subpath "/opt/homebrew/lib")"#));
     }
 
-    /// A writable root without exclusions gets one plain read allow and one plan write.
+    /// A writable root without exclusions gets one plain read allow and one plain write.
     #[test]
     fn writable_root_emits_unguarded_read_and_write_allows() {
         let dir = ScratchDir::new("writable");
