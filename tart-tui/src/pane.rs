@@ -261,11 +261,13 @@ impl Pane {
     ) {
         // Wrap only what is new at an unchanged width, or rewrap if width changed.
         let rows = self.transcript.sync(area.width as usize);
-        if let Some(cursor) = &mut self.copy
-            && !rows.is_empty()
-        {
-            cursor.row = cursor.row.min(rows.len() - 1);
-            cursor.col = cursor.col.min(rows[cursor.row].width().saturating_sub(1));
+        // Clamp to the wrapped rows, moving the cursor to (0, 0) when empry
+        if let Some(cursor) = &mut self.copy {
+            cursor.row = cursor.row.min(rows.len().saturating_sub(1));
+            cursor.col = cursor.col.min(
+                rows.get(cursor.row)
+                    .map_or(0, |row| row.width().saturating_sub(1)),
+            );
         }
         let visible = area.height as usize;
         let top = window_top(rows.len(), visible, self.copy.map(|c| (c.row, c.top)));
