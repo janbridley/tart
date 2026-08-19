@@ -705,6 +705,8 @@ impl Transcript {
 struct CopyCursor {
     row: usize,
     col: usize,
+    /// Selection start cell; `None` until Space anchors one.
+    anchor: Option<(usize, usize)>,
     /// `usize::MAX` means we start at the end, and position is clamped on render
     top: usize,
     /// Rows the last render showed.
@@ -717,6 +719,7 @@ impl CopyCursor {
         Self {
             row: rows_len.saturating_sub(1),
             col: 0,
+            anchor: None,
             top: usize::MAX,
             visible: 0,
         }
@@ -931,7 +934,7 @@ fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize) -> PromptL
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::draw;
+    use crate::testutil::{draw, draw_backgrounds};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1071,12 +1074,23 @@ mod tests {
         assert_eq!(window_top(10, 5, Some((4, 2))), 2); // inside: stays
 
         let rows = wrap_lines(&[Line::from("abc"), Line::from("de")], 10);
-        let cur = |row, col| CopyCursor { row, col, top: 0, visible: 2 };
+        let cur = |row, col| CopyCursor {
+            row,
+            col,
+            anchor: None,
+            top: 0,
+            visible: 2,
+        };
         assert_eq!(moved(&rows, cur(0, 0), KeyCode::Right), cur(0, 1));
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::Left), cur(0, 2)); // wraps
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::PageUp), cur(0, 0));
         assert_eq!(moved(&rows, cur(0, 0), KeyCode::PageDown), cur(1, 0));
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::Char('x')), cur(1, 0));
+
+        // A move reshapes a selection; it never drops the anchor.
+        let mut anchored = cur(0, 0);
+        anchored.anchor = Some((1, 1));
+        assert_eq!(moved(&rows, anchored, KeyCode::Right).anchor, Some((1, 1)));
     }
 
     /// Editing operates on graphemes: a line-start backspace joins lines, the caret
@@ -1126,6 +1140,73 @@ mod tests {
 
         assert!(pane.escape());
         assert!(render(&mut pane, (40, 10)).contains("❯ ")); // live again
+    }
+
+    /// Space anchors, movement reshapes, Enter ships the selection out and
+    /// leaves copy mode.
+    #[test]
+    fn enter_copies_the_selection_and_exits() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abc def"));
+        render(&mut pane, (20, 8)); // rows exist before the cursor walks them
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // enter, at (0, 0)
+        pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to (0, 1)
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor
+        for _ in 1.."abc def".len() {
+            pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to row end
+        }
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Copy("bc def".into()))
+        );
+        assert!(pane.copy.is_none());
+        assert!(render(&mut pane, (40, 10)).contains("❯ ")); // live again
+    }
+
+    /// `q`, a bare Enter, and an anchored-but-empty selection all leave
+    /// without clobbering the clipboard.
+    #[test]
+    fn leaving_without_a_selection_copies_nothing() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abc"));
+        render(&mut pane, (20, 8));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(pane.on_key(key(KeyCode::Char('q'), KeyModifiers::NONE)), None);
+        assert!(pane.copy.is_none());
+
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // back in
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(pane.copy.is_none());
+
+        let mut empty = Pane::new(); // anchored, but no rows to select
+        render(&mut empty, (20, 8));
+        empty.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        empty.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(empty.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(empty.copy.is_none());
+    }
+
+    /// The band lights exactly the copied cells: light-black over the
+    /// selection, nothing anywhere else on screen.
+    #[test]
+    fn selection_paints_a_dark_gray_band() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abc def"));
+        render(&mut pane, (20, 8)); // rows exist before the cursor walks them
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        pane.on_key(key(KeyCode::Home, KeyModifiers::NONE));
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor (0, 0)
+        for _ in 1.."abc def".len() {
+            pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to (0, 6)
+        }
+        let grid = draw_backgrounds(|frame, area| pane.render(frame, area), (20, 8));
+        let mut lines = grid.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!("{}{}", "#".repeat(7), ".".repeat(13)).as_str())
+        );
+        assert!(lines.all(|line| !line.contains('#')));
     }
 
     #[test]
