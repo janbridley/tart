@@ -568,8 +568,8 @@ impl Transcript {
             return;
         }
         let before = self.messages.len();
-        // Never glue thinking into the messages that follow its run.
-        if late {
+        // Skip gluing thinking if we have a late thinking fragment or the run is empty
+        if late || self.run.is_some_and(|run| run.start == run.end) {
             self.break_line();
         }
         for (i, part) in span.content.split('\n').enumerate() {
