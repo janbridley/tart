@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::clipboard::Selection;
 use crate::file_mentions::{self, FilePopup};
 
 pub const PROMPT: &str = "❯ ";
@@ -27,6 +28,8 @@ const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 #[derive(Debug, PartialEq)]
 pub enum PaneEvent {
     Submit(String),
+    /// Text chosen in copy mode, ready for the clipboard.
+    Copy(String),
     Quit,
 }
 
