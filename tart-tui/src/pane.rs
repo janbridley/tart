@@ -558,13 +558,15 @@ impl Transcript {
 
     /// Append a chain-of-thought fragment into the current thinking run.
     fn append_thinking(&mut self, span: &Span<'static>) {
-        if self.run.is_none() {
-            let at = self.messages.len();
-            self.run = Some(ThinkingRun { start: at, end: at });
-        }
-        // The answer (or an echoed draft) already started: collect fresh
-        // messages and move them back above it.
+        // Open a run if none exists yet (e.g. thinking after a `/clear`).
+        let at = self.messages.len();
+        self.run.get_or_insert(ThinkingRun { start: at, end: at });
+        // The answer already started: move the fragment back above it
         let late = self.run.is_some_and(|run| run.end < self.messages.len());
+        if late && span.content.split('\n').all(str::is_empty) {
+            // Nothing to splice back: leave the wrap cache and the answer run alone
+            return;
+        }
         let before = self.messages.len();
         // Never glue thinking into the messages that follow its run.
         if late {
@@ -580,16 +582,19 @@ impl Transcript {
             return;
         };
         if late {
-            // Splice the fresh messages back to the run's end, shifting the
-            // tail that followed it.
-            let mut fresh = self.messages.split_off(before);
-            let mut tail = self.messages.split_off(run.end);
-            let count = fresh.len();
-            self.messages.append(&mut fresh);
-            self.messages.append(&mut tail);
-            run.end += count;
-            self.rows.clear();
-            self.cache.1 = 0;
+            let end = run.end;
+            let count = self.messages.len() - before;
+            // Rotate the fresh messages back above the tail that followed the run.
+            self.messages[end..].rotate_left(before - end);
+            run.end = end + count;
+            // Rewrap from the splice point, dropping only the rows the already-folded
+            // tail occupied.
+            if self.cache.0 > 0 && self.cache.1 > end {
+                let stale =
+                    wrap_lines(&self.messages[run.end..self.cache.1 + count], self.cache.0).len();
+                self.rows.truncate(self.rows.len() - stale);
+            }
+            self.cache.1 = self.cache.1.min(end);
         } else {
             run.end = self.messages.len();
         }
@@ -1275,6 +1280,48 @@ mod tests {
                 20
             ))
         );
+    }
+
+    /// Make sure late fragments (reasoning AFTER text) rewrap only the spliced data.
+    #[test]
+    fn late_fragments_rewrap_from_the_splice_point() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ echo"));
+        t.begin_response();
+        t.append_thinking(&Span::styled("t1", DIM_STYLE));
+        t.append(&Span::raw("a1"));
+        t.sync(40);
+        t.append_thinking(&Span::styled("t2", DIM_STYLE)); // late, tail folded
+        assert_eq!(t.cache, (40, 2), "the pre-run messages stay cached");
+        t.sync(40);
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+
+        // A second late fragment with an unsynced glued answer in between.
+        t.append(&Span::raw(" a2"));
+        t.append_thinking(&Span::styled("t3", DIM_STYLE));
+        t.sync(40);
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+        assert_eq!(texts(&t.messages), ["❯ echo", "t1", "t2", "t3", "a1 a2"]);
+    }
+
+    /// A late fragment without text shouldn't break the cache or current run.
+    #[test]
+    fn empty_late_fragments_change_nothing() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ echo"));
+        t.begin_response();
+        t.append_thinking(&Span::styled("t1", DIM_STYLE));
+        t.append(&Span::raw("a1"));
+        t.sync(40);
+        let (rows, cache) = (texts(&t.rows), t.cache);
+        t.append_thinking(&Span::styled("\n\n", DIM_STYLE));
+        assert_eq!(t.cache, cache);
+        assert_eq!(texts(&t.rows), rows);
+        assert_eq!(texts(&t.messages), ["❯ echo", "t1", "a1"]);
+        // The answer is still open: later text joins its message.
+        t.append(&Span::raw(" more"));
+        t.sync(40);
+        assert_eq!(texts(&t.messages), ["❯ echo", "t1", "a1 more"]);
     }
 
     #[test]
