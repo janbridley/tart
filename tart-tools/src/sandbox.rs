@@ -1,6 +1,6 @@
 //! Run commands inside the macOS Seatbelt sandbox.
 //!
-//! A [`Policy`] allows for rust-native configuration of `seatbelt-exec` policies for
+//! A [`Policy`] allows for rust-native configuration of `sandbox-exec` policies for
 //! efficient sandboxing. [`Policy::command`] returns a [`std::process::Command`] that
 //! runs the program under that policy:
 //!
