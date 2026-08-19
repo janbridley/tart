@@ -1158,6 +1158,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tart-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "tart-tui"
 version = "0.1.0"
 dependencies = [
