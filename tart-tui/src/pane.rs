@@ -281,7 +281,7 @@ impl Pane {
     ) {
         // Wrap only what is new at an unchanged width, or rewrap if width changed.
         let rows = self.transcript.sync(area.width as usize);
-        // Clamp to the wrapped rows, moving the cursor to (0, 0) when empry
+        // Clamp to the wrapped rows, moving the cursor to (0, 0) when empty.
         if let Some(cursor) = &mut self.copy {
             cursor.row = cursor.row.min(rows.len().saturating_sub(1));
             cursor.col = cursor.col.min(
