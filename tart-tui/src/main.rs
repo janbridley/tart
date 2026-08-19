@@ -8,6 +8,7 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+mod clipboard;
 mod file_mentions;
 mod pane;
 mod tmux_override;
@@ -107,6 +108,8 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match on_key(&mut pane, key) {
                 Some(PaneEvent::Quit) => quit = true,
+                // Copy the selected text when we exit copy mode.
+                Some(PaneEvent::Copy(text)) => clipboard::copy(&text)?,
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     "/clear" => pane.clear(),
                     "/quit" | "/exit" => quit = true,
