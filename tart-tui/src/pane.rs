@@ -72,6 +72,23 @@ impl Pane {
         if let Some(cursor) = self.copy {
             match key.code {
                 KeyCode::Char('q' | 'Q') => self.copy = None,
+                // Space (unconditionally) begins a selection at the current position
+                KeyCode::Char(' ') => {
+                    self.copy = Some(CopyCursor {
+                        anchor: Some((cursor.row, cursor.col)),
+                        ..cursor
+                    });
+                }
+                // Enter copies the selection to clipboard and exits copy mode.
+                KeyCode::Enter => {
+                    let text = Selection::between(cursor.anchor, (cursor.row, cursor.col))
+                        .map(|selection| selection.text(self.transcript.rows()))
+                        .filter(|text| !text.is_empty());
+                    self.copy = None;
+                    if let Some(text) = text {
+                        return Some(PaneEvent::Copy(text));
+                    }
+                }
                 _ => self.copy = Some(moved(self.transcript.rows(), cursor, key.code)),
             }
             return None;
