@@ -301,6 +301,9 @@ impl Pane {
             buf.set_line(area.x, y, row, area.width);
         });
         if let Some(cursor) = self.copy {
+            if let Some(selection) = Selection::between(cursor.anchor, (cursor.row, cursor.col)) {
+                selection.paint(buf, rows, area, top, shown);
+            }
             let pos = (area.x + cursor.col as u16, area.y + (cursor.row - top) as u16);
             if let Some(cell) = buf.cell_mut(pos) {
                 cell.set_style(CURSOR_STYLE);
@@ -317,7 +320,7 @@ impl Pane {
                 prompt_area.x,
                 prompt_area.y,
                 &Line::from(Span::styled(
-                    "▲ scrollback · ←↑↓→ move · PgUp/PgDn/Home/End · q to exit",
+                    "▲ scrollback · ←↑↓→/PgUp/Home/End · Space select · Enter copy · q to exit",
                     Style::new().fg(Color::Yellow),
                 )),
                 prompt_area.width,
