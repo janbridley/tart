@@ -10,6 +10,7 @@
 
 mod clipboard;
 mod file_mentions;
+mod keybinds;
 mod pane;
 mod tmux_override;
 
