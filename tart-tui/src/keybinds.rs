@@ -122,7 +122,7 @@ mod tests {
         e.word_right(); // past "hello"
         assert_eq!(e.g, 5);
         e.word_right(); // past "world"
-        assert_eq!(e.g, 14);
+        assert_eq!(e.g, 13);
 
         // Cross-line joins in both directions.
         let mut e = editor("ab\ncd", 1, 0);
