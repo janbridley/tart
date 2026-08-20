@@ -1,4 +1,4 @@
-//! A terminal chat front end for the `async-openai` Responses API.
+//! A terminal chat front end for the tart agent harness.
 //!
 //! ```text
 //! │ transcript (wraps, auto-tails)          │
@@ -17,22 +17,10 @@ mod tmux_override;
 #[cfg(test)]
 mod testutil;
 
-use std::collections::HashMap;
 use std::io::stdout;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-use async_compat::Compat;
-use async_openai::{
-    Client,
-    config::OpenAIConfig,
-    types::responses::{
-        CreateResponseArgs, EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam,
-        FunctionTool, FunctionToolCall, InputItem, InputParam, Item, OutputItem, Reasoning,
-        ReasoningEffort, ResponseStreamEvent, Role, Tool,
-    },
-};
-use futures::{StreamExt, executor::block_on};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -107,6 +95,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut quit = false;
     while !quit {
         terminal.draw(|frame| pane.render(frame, frame.area()))?;
+        #[allow(
+            clippy::match_same_arms,
+            reason = "different wake sources that happen to need no handling"
+        )]
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match on_key(&mut pane, key) {
                 Some(PaneEvent::Quit) => quit = true,
