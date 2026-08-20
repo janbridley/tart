@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["tart-tools", "tart-tui"]
+members = ["tart-agents", "tart-tui"]
 
 
 [workspace.lints.clippy]
