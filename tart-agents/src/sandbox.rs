@@ -5,7 +5,7 @@
 //! runs the program under that policy:
 //!
 //! ```
-//! use tart_tools::sandbox::Policy;
+//! use tart_agents::sandbox::Policy;
 //! # fn main() -> anyhow::Result<()> {
 //! let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
 //! let out = policy.command("echo").arg("hello!").output()?;
@@ -247,7 +247,7 @@ impl Policy {
     /// its children inherit the sandbox.
     ///
     /// ```
-    /// use tart_tools::sandbox::Policy;
+    /// use tart_agents::sandbox::Policy;
     /// # fn main() -> anyhow::Result<()> {
     /// let policy = Policy::new(std::env::temp_dir())?.exclude_git();
     /// let status = policy.command("/usr/bin/true").status()?;
