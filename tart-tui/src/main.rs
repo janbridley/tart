@@ -26,8 +26,8 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::responses::{
-        CreateResponse, CreateResponseArgs, EasyInputContent, EasyInputMessage, InputItem,
-        InputParam, MessageType, Reasoning, ReasoningEffort, ResponseStreamEvent, Role,
+        CreateResponse, CreateResponseArgs, EasyInputMessageArgs, InputItem, InputParam, Reasoning,
+        ReasoningEffort, ResponseStreamEvent, Role,
     },
 };
 use futures::{StreamExt, executor::block_on};
@@ -91,15 +91,12 @@ enum Progress {
 }
 
 /// One message in the conversation, as the Responses API sends it.
-fn input_message(role: Role, text: String) -> InputItem {
-    // TODO: other constructors?
-    EasyInputMessage {
-        r#type: MessageType::Message,
-        role,
-        content: EasyInputContent::Text(text),
-        phase: None,
-    }
-    .into()
+fn input_message(role: Role, text: String) -> anyhow::Result<InputItem> {
+    Ok(EasyInputMessageArgs::default()
+        .role(role)
+        .content(text)
+        .build()?
+        .into())
 }
 
 /// Drive one streaming generation to completion, reporting progress to `on_progress`.
@@ -161,7 +158,7 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         .with_api_base("https://api.deepseek.com")
         .with_api_key(&api_key);
     let client = Client::with_config(config);
-    let mut history: Vec<InputItem> = vec![input_message(Role::System, SYSTEM.to_string())];
+    let mut history: Vec<InputItem> = vec![input_message(Role::System, SYSTEM.to_string())?];
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
@@ -192,7 +189,7 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     _ => {
                         // New response clears the thinking box for the previous one
                         pane.begin_response();
-                        history.push(input_message(Role::User, line));
+                        history.push(input_message(Role::User, line)?);
                         let request = CreateResponseArgs::default()
                             .model("deepseek-v4-flash")
                             .stream(true)
@@ -229,7 +226,7 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             Ok(Wake::Generation(Progress::Done { message })) => {
                 generating = false;
                 if let Some(text) = message {
-                    history.push(input_message(Role::Assistant, text));
+                    history.push(input_message(Role::Assistant, text)?);
                 }
             }
             // If the model *fails* for some reason, show the error.
