@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 
 use async_compat::Compat;
@@ -83,11 +82,16 @@ impl Agent {
     /// command runs here under the agent's sandbox policy, its output is recorded in
     /// the transcript, and the next round continues from there. The generation ends after at most `max_rounds` rounds,
     /// always with exactly one terminal event: [`Progress::Done`] with the final answer
-    /// (`None` if nothing arrived), or [`Progress::Failed`] on a request or stream
-    /// error. A stream that closes without a terminal event still ends its round with
-    /// whatever the model produced.
+    /// (`None` if nothing arrived), or [`Progress::Failed`] on a request error, an
+    /// explicit error or incomplete event, or a truncated stream (one that ended mid
+    /// tool call or delivered nothing). A stream that closes without a terminal event
+    /// still ends its round with whatever the model produced.
     ///
     /// Blocks the current thread until the generation finishes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the round loop reads best as one straight-line function"
+    )]
     fn run<F: Fn(Progress)>(&self, mut transcript: Transcript, on_progress: &F) {
         for _ in 0..self.max_rounds {
             let request = match CreateResponseArgs::default()
@@ -113,42 +117,39 @@ impl Agent {
                 };
 
             let mut answer = String::new();
-            // Track function-call metadata (name, call_id) and streamed arguments by item_id
-            let mut call_meta: HashMap<String, (String, String)> = HashMap::new();
-            let mut call_args: HashMap<String, String> = HashMap::new();
+            // The completed call, captured from its finished output item.
             let mut function_call: Option<FunctionToolCall> = None;
+            // A function-call item started but never reported done.
+            let mut call_in_flight = false;
+            // Some output arrived, so the stream was delivering.
+            let mut saw_output = false;
+            // The last transport error, skipped so a trailing one cannot discard an
+            // otherwise complete answer.
+            let mut last_error: Option<String> = None;
 
             while let Some(item) = block_on(stream.next()) {
                 match item {
                     Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
                         answer.push_str(&delta.delta);
+                        saw_output = true;
                         on_progress(Progress::Answer(delta.delta));
                     }
                     Ok(ResponseStreamEvent::ResponseReasoningTextDelta(delta)) => {
+                        saw_output = true;
                         on_progress(Progress::Thinking(delta.delta));
                     }
                     Ok(ResponseStreamEvent::ResponseOutputItemAdded(added)) => {
-                        if let OutputItem::FunctionCall(fc) = &added.item {
-                            let item_id = fc.id.clone().unwrap_or_default();
-                            call_meta.insert(item_id, (fc.name.clone(), fc.call_id.clone()));
+                        if matches!(added.item, OutputItem::FunctionCall(_)) {
+                            call_in_flight = true;
                         }
                     }
-                    Ok(ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta)) => {
-                        call_args
-                            .entry(delta.item_id.clone())
-                            .or_default()
-                            .push_str(&delta.delta);
-                    }
-                    Ok(ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done)) => {
-                        if let Some((name, call_id)) = call_meta.get(&done.item_id) {
-                            function_call = Some(FunctionToolCall {
-                                namespace: None,
-                                name: name.clone(),
-                                arguments: call_args.remove(&done.item_id).unwrap_or_default(),
-                                call_id: call_id.clone(),
-                                id: Some(done.item_id.clone()),
-                                status: None,
-                            });
+                    Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => {
+                        // The finished item is authoritative: it carries the
+                        // server-assembled call, arguments and all.
+                        if let OutputItem::FunctionCall(call) = &done.item {
+                            function_call = Some(call.clone());
+                            call_in_flight = false;
+                            saw_output = true;
                         }
                     }
                     Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
@@ -157,9 +158,43 @@ impl Agent {
                             |error| error.message,
                         )));
                     }
+                    // The provider said the stream broke; not recoverable here.
+                    Ok(ResponseStreamEvent::ResponseError(error)) => {
+                        return on_progress(Progress::Failed(format!(
+                            "{}: {}",
+                            error.code.unwrap_or_else(|| "error".to_string()),
+                            error.message
+                        )));
+                    }
+                    // Truncated (max output tokens, content filter): report it
+                    Ok(ResponseStreamEvent::ResponseIncomplete(incomplete)) => {
+                        let reason = incomplete
+                            .response
+                            .incomplete_details
+                            .map_or_else(|| "unknown reason".to_string(), |details| details.reason);
+                        return on_progress(Progress::Failed(format!(
+                            "response incomplete: {reason}"
+                        )));
+                    }
                     Ok(_) => {}
-                    Err(error) => return on_progress(Progress::Failed(error.to_string())),
+                    // Transport errors are skipped: the stream ends on its own,
+                    // and the checks after the loop decide what the round got.
+                    Err(error) => last_error = Some(error.to_string()),
                 }
+            }
+
+            if call_in_flight {
+                return on_progress(Progress::Failed(with_last_error(
+                    "stream ended mid tool call",
+                    last_error, // The stream ended mid tool call
+                )));
+            }
+
+            if !saw_output {
+                return on_progress(Progress::Failed(with_last_error(
+                    "stream ended without output",
+                    last_error, // Nothing arrived at all
+                )));
             }
 
             // No call pending: this round's answer is the turn's message.
@@ -176,5 +211,13 @@ impl Agent {
         }
         let rounds = self.max_rounds;
         on_progress(Progress::Failed(format!("gave up after {rounds} tool rounds")));
+    }
+}
+
+/// A failure message with the last skipped transport error, if any, appended.
+fn with_last_error(message: &str, last_error: Option<String>) -> String {
+    match last_error {
+        Some(error) => format!("{message}: {error}"),
+        None => message.to_string(),
     }
 }
