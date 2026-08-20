@@ -105,6 +105,11 @@ impl Pane {
             }
             return None;
         }
+        // macOS word/line bindings (Option/Cmd + arrows/Backspace); unclaimed
+        // Option-chars fall through to `insert_char`.
+        if crate::keybinds::mac_modifiers(&mut self.prompt, &key) {
+            return None;
+        }
         // The @file popup is the highest priority UI element in live mode: arrows move
         // the selection, and Tab/Enter insert.
         if let Some(popup) = self.popup.as_mut()
@@ -368,7 +373,7 @@ impl Default for Editor {
 
 impl Editor {
     /// The whole draft, lines joined by '\n'.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         self.lines.join("\n")
     }
 
@@ -380,7 +385,7 @@ impl Editor {
     }
 
     /// Graphemes on the current line.
-    fn line_len(&self) -> usize {
+    pub(crate) fn line_len(&self) -> usize {
         graphemes(&self.lines[self.line])
     }
 
@@ -470,12 +475,12 @@ impl Editor {
     }
 
     /// To the line start.
-    fn home(&mut self) {
+    pub(crate) fn home(&mut self) {
         self.g = 0;
     }
 
     /// To the line end.
-    fn end(&mut self) {
+    pub(crate) fn end(&mut self) {
         self.g = self.line_len();
     }
 }
