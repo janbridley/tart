@@ -61,8 +61,10 @@ impl Pane {
             return None;
         }
         let event = self.route(key);
-        // @file popup updates on keystroke
-        file_mentions::update(&self.prompt, &mut self.popup, file_mentions::rearm(&key));
+        // @file popup updates on keystroke except in copy mode.
+        if self.copy.is_none() {
+            file_mentions::update(&self.prompt, &mut self.popup, file_mentions::rearm(&key));
+        }
         event
     }
 
