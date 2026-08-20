@@ -107,7 +107,7 @@ fn input_message(role: Role, text: String) -> anyhow::Result<InputItem> {
 /// without a terminal event still reports `Done` with whatever the model produced.
 ///
 /// Blocks the current thread until the generation finishes.
-fn generate<F: Fn(Progress) + Send + 'static>(
+fn generate<F: Fn(Progress) + Send>(
     client: &Client<OpenAIConfig>,
     request: CreateResponse,
     on_progress: F,
