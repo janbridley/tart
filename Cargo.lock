@@ -2022,16 +2022,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tart-tiny"
-version = "0.1.0"
-dependencies = [
- "async-compat",
- "async-openai",
- "futures",
- "serde_json",
-]
-
-[[package]]
 name = "tart-tools"
 version = "0.1.0"
 dependencies = [
