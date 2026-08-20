@@ -102,17 +102,20 @@ fn input_message(role: Role, text: String) -> InputItem {
     .into()
 }
 
-/// Drive one streaming generation on the current thread, reporting progress.
+/// Drive one streaming generation to completion, reporting progress to `on_progress`.
 ///
-/// `Compat` enters the lazily-created global tokio runtime that `async-openai`
-/// needs (reqwest's reactor plus its internally spawned SSE pump), while the
-/// executor is plain `block_on`. A stream that ends without a terminal event
-/// still yields whatever the model produced.
+/// Fragments arrive as the model works, and the generation always ends with exactly
+/// one terminal event: [`Progress::Done`] with the assembled answer (`None` if nothing
+/// arrived), or [`Progress::Failed`] on a request or stream error. A stream that closes
+/// without a terminal event still reports `Done` with whatever the model produced.
+///
+/// Blocks the current thread until the generation finishes.
 fn generate<F: Fn(Progress) + Send + 'static>(
     client: &Client<OpenAIConfig>,
     request: CreateResponse,
     on_progress: F,
 ) {
+    // `Compat` enters the global tokio runtime and exposes `futures` blocking control.
     let mut stream = match block_on(Compat::new(client.responses().create_stream(request))) {
         Ok(stream) => stream,
         Err(error) => return on_progress(Progress::Failed(error.to_string())),
