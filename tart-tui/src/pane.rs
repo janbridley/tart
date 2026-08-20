@@ -285,11 +285,8 @@ impl Pane {
         let rows = self.transcript.sync(area.width as usize);
         // Clamp to the wrapped rows, moving the cursor to (0, 0) when empty.
         if let Some(cursor) = &mut self.copy {
-            cursor.row = cursor.row.min(rows.len().saturating_sub(1));
-            cursor.col = cursor.col.min(
-                rows.get(cursor.row)
-                    .map_or(0, |row| row.width().saturating_sub(1)),
-            );
+            (cursor.row, cursor.col) = clamp_cell(rows, cursor.row, cursor.col);
+            cursor.anchor = cursor.anchor.map(|(row, col)| clamp_cell(rows, row, col));
         }
         let visible = area.height as usize;
         let top = window_top(rows.len(), visible, self.copy.map(|c| (c.row, c.top)));
@@ -774,6 +771,14 @@ fn window_top(rows_len: usize, visible: usize, anchor: Option<(usize, usize)>) -
     })
 }
 
+/// A cell clamped into the wrapped rows: the last row, that row's last cell.
+#[inline]
+fn clamp_cell(rows: &[Line<'static>], row: usize, col: usize) -> (usize, usize) {
+    let row = row.min(rows.len().saturating_sub(1));
+    let col = col.min(rows.get(row).map_or(0, |row| row.width().saturating_sub(1)));
+    (row, col)
+}
+
 /// One wrapped row under construction: (&'a grapheme, style, cell width).
 type Row<'a> = Vec<(&'a str, Style, usize)>;
 
@@ -1209,6 +1214,27 @@ mod tests {
             Some(format!("{}{}", "#".repeat(7), ".".repeat(13)).as_str())
         );
         assert!(lines.all(|line| !line.contains('#')));
+    }
+
+    /// A rewrap between Space and Enter re-clamps the anchor with the cursor
+    #[test]
+    fn anchored_selection_survives_a_rewrap() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abcdef"));
+        pane.push(Line::from("z"));
+        render(&mut pane, (40, 8)); // rows: ["abcdef", "z"]
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // (1, 0)
+        pane.on_key(key(KeyCode::Up, KeyModifiers::NONE)); // (0, 0)
+        for _ in 0..5 {
+            pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // (0, 5)
+        }
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor
+        pane.on_key(key(KeyCode::Down, KeyModifiers::NONE)); // (1, 0)
+        render(&mut pane, (3, 8)); // rows: ["abc", "def", "z"]
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Copy("c\nd".into()))
+        );
     }
 
     #[test]
