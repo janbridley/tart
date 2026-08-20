@@ -1,14 +1,18 @@
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 
-use crate::Progress;
+use crate::{Progress, sandbox::Policy};
 
-/// Basic, *unsandboxed* bash tool. TODO: REPLACE!!
+/// The bash tool; commands execute under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn bash() -> Tool {
     Tool::Function(FunctionTool {
         defer_loading: None,
         name: "bash".to_string(),
-        description: Some("Run a bash command and return its stdout/stderr".to_string()),
+        description: Some(
+            "Run a bash command in a sandbox (writes restricted to granted roots, no network) \
+            and return its combined stdout/stderr"
+                .to_string(),
+        ),
         parameters: Some(serde_json::json!({
             "type": "object",
             "properties": {
@@ -30,12 +34,14 @@ fn parse_command(arguments: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))
 }
 
-/// Run one tool call, report each step to `on_progress`, and return output to the model
+/// Run one tool call under `policy`, report each step to `on_progress`, and return
+/// output to the model
 ///
-/// Tool *failures* (a non-zero exit) are not errors here: their output is content that
-/// the model should see.
+/// Tool *failures* (a non-zero exit, or a command the sandbox denies) are not errors
+/// here: their output is content that the model should see.
 pub(crate) fn execute<F: Fn(Progress)>(
     call: &FunctionToolCall,
+    policy: &Policy,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     if call.name != "bash" {
@@ -43,21 +49,12 @@ pub(crate) fn execute<F: Fn(Progress)>(
     }
     let command = parse_command(&call.arguments)?;
     on_progress(Progress::Command(command.clone()));
-    let output = run_bash(&command);
-    on_progress(Progress::CommandOutput(output.clone()));
-    Ok(output)
-}
-
-/// Run `command` under `bash -c`, returning its combined stdout and stderr.
-///
-/// A failure to launch comes back as an error string rather than a `Result`,
-/// so the output can be handed straight back to the model.
-#[must_use]
-#[inline]
-pub fn run_bash(command: &str) -> String {
-    std::process::Command::new("bash")
+    // A failure to launch comes back as an error string rather than a `Result`,
+    // so the output can be handed straight back to the model.
+    let output = policy
+        .command("/bin/bash")
         .arg("-c")
-        .arg(command)
+        .arg(&command)
         .output()
         .map_or_else(
             |error| format!("error: {error}"),
@@ -68,7 +65,9 @@ pub fn run_bash(command: &str) -> String {
                     String::from_utf8_lossy(&output.stderr)
                 )
             },
-        )
+        );
+    on_progress(Progress::CommandOutput(output.clone()));
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -117,10 +116,12 @@ mod tests {
         assert!(error.contains("missing 'command'"), "{error}");
     }
 
+    /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
     #[test]
     fn execute_reports_command_then_output() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
-        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &|progress| {
+        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &policy, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -135,10 +136,11 @@ mod tests {
 
     #[test]
     fn execute_rejects_unknown_tool_names() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
 
-        let error = execute(&call, &|_| {}).unwrap_err().to_string();
+        let error = execute(&call, &policy, &|_| {}).unwrap_err().to_string();
 
         assert!(error.contains("unknown tool"), "{error}");
     }

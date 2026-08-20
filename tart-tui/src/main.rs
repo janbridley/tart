@@ -29,7 +29,7 @@ use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Pane, PaneEvent};
-use tart_agents::{Agent, Progress, ReasoningEffort, Transcript};
+use tart_agents::{Agent, Progress, ReasoningEffort, Transcript, sandbox::Policy};
 use tmux_override::{override_shift_up, restore_tmux};
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
@@ -75,8 +75,13 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     ));
 
     let api_key = std::env::var("DEEPSEEK_API_KEY")?;
-    let agent = Agent::new("https://api.deepseek.com", api_key, "deepseek-v4-flash")
-        .reasoning_effort(ReasoningEffort::High);
+    let agent = Agent::new(
+        "https://api.deepseek.com",
+        api_key,
+        "deepseek-v4-flash",
+        Policy::new(std::env::current_dir()?)?.exclude_git(),
+    )
+    .reasoning_effort(ReasoningEffort::High);
     let mut transcript = Transcript::new()?;
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.

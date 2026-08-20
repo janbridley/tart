@@ -37,16 +37,6 @@
 //! - Binaries outside the platform read baseline (for example `/opt/homebrew/bin`)
 //!   cannot be executed unless their directory is granted with
 //!   [`Policy::add_read_only_root`].
-//!
-//! Known limits of the vendored platform defaults, which this module cannot
-//! remove: writes are allowed under the system temp trees (`/tmp`,
-//! `/private/tmp`, `/var/tmp`) regardless of the granted roots — so a
-//! workspace inside a temp tree is not write-restricted. Exclusions are still
-//! honored there: each is emitted as an explicit `(deny file-write* …)`, which
-//! outranks the platform-default allows. And because Seatbelt filters match
-//! paths, not inodes, a hard link created inside a writable root can route
-//! writes into an excluded file; treat exclusions as tamper-evident, not
-//! tamper-proof.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -230,9 +220,8 @@ impl Policy {
 
     /// The complete SBPL profile text, exactly as passed to `sandbox-exec -p`.
     ///
-    /// Granted paths appear only as `(param "NAME")` references; their values
-    /// travel separately as `-DNAME=value` argv elements (see
-    /// [`Policy::command`]).
+    /// Granted paths appear only as `(param "NAME")` references; their values travel
+    /// separately as `-DNAME=value` argv elements (see [`Policy::command`]).
     #[must_use]
     #[inline]
     pub fn render(&self) -> String {

@@ -10,7 +10,6 @@ pub mod sandbox;
 
 pub use history::Transcript;
 pub use progress::Progress;
-pub use tools::run_bash;
 
 pub use agent::Agent;
 

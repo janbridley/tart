@@ -12,7 +12,7 @@ use async_openai::{
 };
 use futures::{StreamExt, executor::block_on};
 
-use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, tools};
+use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, sandbox::Policy, tools};
 
 /// A Responses-API model configured to run the tart tool loop.
 #[derive(Clone)]
@@ -25,15 +25,19 @@ pub struct Agent {
     effort: Option<ReasoningEffort>,
     /// Most tool rounds one generation may take.
     max_rounds: usize,
+    /// The seatbelt policy every bash tool call runs under.
+    policy: Policy,
 }
 
 impl Agent {
-    /// Configure a client for an OpenAI-compatible Responses endpoint.
+    /// Configure a client for an OpenAI-compatible Responses endpoint, running
+    /// tool calls under `policy`.
     #[inline]
     pub fn new<U: Into<String>, K: Into<String>, M: Into<String>>(
         base_url: U,
         api_key: K,
         model: M,
+        policy: Policy,
     ) -> Self {
         let config = OpenAIConfig::new()
             .with_api_base(base_url.into())
@@ -43,6 +47,7 @@ impl Agent {
             model: model.into(),
             effort: None,
             max_rounds: MAX_TOOL_ROUNDS,
+            policy,
         }
     }
 
@@ -75,8 +80,8 @@ impl Agent {
     /// Drive one generation to completion on the current thread.
     ///
     /// Each round streams model output; when the model calls the shell tool, the
-    /// command runs here, its output is recorded in the transcript, and the next round
-    /// continues from there. The generation ends after at most `max_rounds` rounds,
+    /// command runs here under the agent's sandbox policy, its output is recorded in
+    /// the transcript, and the next round continues from there. The generation ends after at most `max_rounds` rounds,
     /// always with exactly one terminal event: [`Progress::Done`] with the final answer
     /// (`None` if nothing arrived), or [`Progress::Failed`] on a request or stream
     /// error. A stream that closes without a terminal event still ends its round with
@@ -164,7 +169,7 @@ impl Agent {
                 });
             };
 
-            match tools::execute(&call, on_progress) {
+            match tools::execute(&call, &self.policy, on_progress) {
                 Ok(output) => transcript.push_tool_round(call, output),
                 Err(error) => return on_progress(Progress::Failed(error.to_string())),
             }
