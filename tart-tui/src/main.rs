@@ -1,4 +1,4 @@
-//! A terminal chat front end for the `tart-ai` client.
+//! A terminal chat front end for the `async-openai` Responses API.
 //!
 //! ```text
 //! │ transcript (wraps, auto-tails)          │
@@ -21,6 +21,16 @@ use std::io::stdout;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
+use async_compat::Compat;
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::responses::{
+        CreateResponse, CreateResponseArgs, EasyInputContent, EasyInputMessage, InputItem,
+        InputParam, MessageType, Reasoning, ReasoningEffort, ResponseStreamEvent, Role,
+    },
+};
+use futures::{StreamExt, executor::block_on};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -31,10 +41,8 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Pane, PaneEvent};
 use tmux_override::{override_shift_up, restore_tmux};
 
-use tart_ai::{
-    ContextHistory, ReasoningEffort,
-    openai::{ChatCompletionsClient, Delta, GenerationEvent, Message},
-};
+/// The personality tart brings to every conversation.
+const SYSTEM: &str = include_str!("data/SYSTEM.md");
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
@@ -67,7 +75,74 @@ enum Wake {
     /// Terminal input, read on its own thread.
     Input(Event),
     /// Progress from the background generation.
-    Generation(GenerationEvent),
+    Generation(Progress),
+}
+
+/// Progress from one background generation.
+enum Progress {
+    /// A fragment of the model's chain-of-thought reasoning.
+    Thinking(String),
+    /// A fragment of the final answer.
+    Answer(String),
+    /// The stream ended; the assembled answer, if any arrived.
+    Done { message: Option<String> },
+    /// The request or stream failed.
+    Failed(String),
+}
+
+/// One message in the conversation, as the Responses API sends it.
+fn input_message(role: Role, text: String) -> InputItem {
+    // TODO: other constructors?
+    EasyInputMessage {
+        r#type: MessageType::Message,
+        role,
+        content: EasyInputContent::Text(text),
+        phase: None,
+    }
+    .into()
+}
+
+/// Drive one streaming generation on the current thread, reporting progress.
+///
+/// `Compat` enters the lazily-created global tokio runtime that `async-openai`
+/// needs (reqwest's reactor plus its internally spawned SSE pump), while the
+/// executor is plain `block_on`. A stream that ends without a terminal event
+/// still yields whatever the model produced.
+fn generate<F: Fn(Progress) + Send + 'static>(
+    client: &Client<OpenAIConfig>,
+    request: CreateResponse,
+    on_progress: F,
+) {
+    let mut stream = match block_on(Compat::new(client.responses().create_stream(request))) {
+        Ok(stream) => stream,
+        Err(error) => return on_progress(Progress::Failed(error.to_string())),
+    };
+
+    let mut answer = String::new();
+    while let Some(item) = block_on(stream.next()) {
+        match item {
+            Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
+                answer.push_str(&delta.delta);
+                on_progress(Progress::Answer(delta.delta));
+            }
+            Ok(ResponseStreamEvent::ResponseReasoningTextDelta(delta)) => {
+                on_progress(Progress::Thinking(delta.delta));
+            }
+            Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
+                return on_progress(Progress::Failed(
+                    failed
+                        .response
+                        .error
+                        .map_or_else(|| "response failed".to_string(), |error| error.message),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return on_progress(Progress::Failed(error.to_string())),
+        }
+    }
+    on_progress(Progress::Done {
+        message: (!answer.is_empty()).then_some(answer),
+    });
 }
 
 fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
@@ -79,13 +154,11 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     ));
 
     let api_key = std::env::var("DEEPSEEK_API_KEY")?;
-    let client = ChatCompletionsClient::new(
-        "https://api.deepseek.com/chat/completions",
-        api_key,
-        "deepseek-v4-flash",
-    )
-    .reasoning_effort(ReasoningEffort::Max);
-    let mut history = ContextHistory::from(Message::system());
+    let config = OpenAIConfig::new()
+        .with_api_base("https://api.deepseek.com")
+        .with_api_key(&api_key);
+    let client = Client::with_config(config);
+    let mut history: Vec<InputItem> = vec![input_message(Role::System, SYSTEM.to_string())];
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
@@ -99,13 +172,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         }
     });
 
+    let mut generating = false;
     let mut quit = false;
     while !quit {
         terminal.draw(|frame| pane.render(frame, frame.area()))?;
-        #[allow(
-            clippy::match_same_arms,
-            reason = "different wake sources that happen to need no handling"
-        )]
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match on_key(&mut pane, key) {
                 Some(PaneEvent::Quit) => quit = true,
@@ -114,17 +184,30 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     "/clear" => pane.clear(),
                     "/quit" | "/exit" => quit = true,
-                    // Don't submit text while the agent is generating code
-                    _ if client.is_generating() => {}
+                    // Don't submit text while the model is generating
+                    _ if generating => {}
                     _ => {
                         // New response clears the thinking box for the previous one
                         pane.begin_response();
-                        history.append_message(Message::user(line));
+                        history.push(input_message(Role::User, line));
+                        let request = CreateResponseArgs::default()
+                            .model("deepseek-v4-flash")
+                            .stream(true)
+                            .reasoning(Reasoning {
+                                effort: Some(ReasoningEffort::High),
+                                summary: None,
+                            })
+                            .input(InputParam::Items(history.clone()))
+                            .build()?;
+                        generating = true;
+                        let client = client.clone();
                         let sender = wake.clone();
-                        client.spawn(0, &history, move |event| {
-                            // Run the generation on its own thread
-                            let _ = sender.send(Wake::Generation(event));
-                        })?;
+                        // Run the generation on its own thread
+                        std::thread::spawn(move || {
+                            generate(&client, request, move |progress| {
+                                let _ = sender.send(Wake::Generation(progress));
+                            });
+                        });
                     }
                 },
                 None => {}
@@ -133,31 +216,24 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             // Resizes are handled at render time (see Pane::render); the redraw
             // timer just loops around and draws again.
             Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
             // Update the pane when we recieve new text
-            Ok(Wake::Generation(GenerationEvent::Delta(delta))) => match delta {
-                // Dim the chain-of-thought preceding the answer
-                Delta::Thinking(text) => pane.append_thinking(&Span::styled(text, DIM_STYLE)),
-                Delta::Answer(text) => pane.append(&Span::raw(text)),
-                // `Delta` is non-exhaustive, nothing else exists yet.
-                _ => {}
-            },
-
-            // When the model is done generating, record data
-            Ok(Wake::Generation(GenerationEvent::Done { message, usage })) => {
-                if let Some(usage) = usage {
-                    history.record_usage(usage);
-                }
-                if let Some(message) = message {
-                    history.append_message(message);
+            Ok(Wake::Generation(Progress::Thinking(text))) => {
+                pane.append_thinking(&Span::styled(text, DIM_STYLE));
+            }
+            Ok(Wake::Generation(Progress::Answer(text))) => pane.append(&Span::raw(text)),
+            // When the model is done, carry the turn into the next request
+            Ok(Wake::Generation(Progress::Done { message })) => {
+                generating = false;
+                if let Some(text) = message {
+                    history.push(input_message(Role::Assistant, text));
                 }
             }
             // If the model *fails* for some reason, show the error.
-            Ok(Wake::Generation(GenerationEvent::Failed(error))) => {
-                pane.append(&Span::styled(error.to_string(), DIM_STYLE));
+            Ok(Wake::Generation(Progress::Failed(error))) => {
+                generating = false;
+                pane.append(&Span::styled(error, DIM_STYLE));
             }
-            // `GenerationEvent` is non-exhaustive, nothing else exists yet.
-            Ok(Wake::Generation(_)) => {}
-            Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
         }
     }
     Ok(())
