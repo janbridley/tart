@@ -1,3 +1,4 @@
+use async_compat::Compat;
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -8,7 +9,7 @@ use async_openai::{
         ResponseStreamEvent, Tool,
     },
 };
-use futures::StreamExt;
+use futures::{StreamExt, executor::block_on};
 use std::{
     collections::HashMap,
     env,
@@ -33,8 +34,7 @@ fn run_bash(command: &str) -> String {
         )
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY not set!");
     let config = OpenAIConfig::new()
         .with_api_base("https://api.deepseek.com")
@@ -68,7 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tools(tools.clone())
         .build()?;
 
-    let mut stream = client.responses().create_stream(request).await?;
+    // Compat enters a lazily-created global tokio runtime
+    let mut stream = block_on(Compat::new(client.responses().create_stream(request)))?;
     let mut lock = stdout().lock();
 
     // Track function-call metadata (name, call_id) and streamed arguments by item_id
@@ -76,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut call_args: HashMap<String, String> = HashMap::new();
     let mut function_call: Option<FunctionToolCall> = None;
 
-    while let Some(result) = stream.next().await {
+    while let Some(result) = block_on(stream.next()) {
         let event = result?;
         match &event {
             ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
@@ -144,8 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tools(tools)
         .build()?;
 
-    let mut stream = client.responses().create_stream(request).await?;
-    while let Some(result) = stream.next().await {
+    let mut stream = block_on(Compat::new(client.responses().create_stream(request)))?;
+    while let Some(result) = block_on(stream.next()) {
         if let ResponseStreamEvent::ResponseOutputTextDelta(delta) = result? {
             write!(lock, "{}", delta.delta)?;
             stdout().flush()?;
