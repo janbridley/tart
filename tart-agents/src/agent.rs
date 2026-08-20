@@ -78,14 +78,15 @@ impl Agent {
 
     /// Drive one generation to completion on the current thread.
     ///
-    /// Each round streams model output; when the model calls the shell tool, the
-    /// command runs here under the agent's sandbox policy, its output is recorded in
-    /// the transcript, and the next round continues from there. The generation ends after at most `max_rounds` rounds,
-    /// always with exactly one terminal event: [`Progress::Done`] with the final answer
-    /// (`None` if nothing arrived), or [`Progress::Failed`] on a request error, an
-    /// explicit error or incomplete event, or a truncated stream (one that ended mid
-    /// tool call or delivered nothing). A stream that closes without a terminal event
-    /// still ends its round with whatever the model produced.
+    /// Each round streams model output; when the model calls the shell tool (which
+    /// could happen more than once per round) the output(s) are recorded in the
+    /// transcript and the next round continues from there. The generation ends after at
+    /// most `max_rounds` rounds, always with exactly one terminal event:
+    /// [`Progress::Done`] with the final answer (`None` if nothing arrived), or
+    /// [`Progress::Failed`] on a request error, an explicit error or incomplete event,
+    /// or a truncated stream (one that ended mid tool call or delivered nothing).
+    /// A stream that closes without a terminal event still ends its round with whatever
+    /// the model produced.
     ///
     /// Blocks the current thread until the generation finishes.
     #[allow(
@@ -117,8 +118,8 @@ impl Agent {
                 };
 
             let mut answer = String::new();
-            // The completed call, captured from its finished output item.
-            let mut function_call: Option<FunctionToolCall> = None;
+            // Completed calls, captured from finished output items, in stream order.
+            let mut calls: Vec<FunctionToolCall> = Vec::new();
             // A function-call item started but never reported done.
             let mut call_in_flight = false;
             // Some output arrived, so the stream was delivering.
@@ -147,7 +148,7 @@ impl Agent {
                         // The finished item is authoritative: it carries the
                         // server-assembled call, arguments and all.
                         if let OutputItem::FunctionCall(call) = &done.item {
-                            function_call = Some(call.clone());
+                            calls.push(call.clone());
                             call_in_flight = false;
                             saw_output = true;
                         }
@@ -197,16 +198,19 @@ impl Agent {
                 )));
             }
 
-            // No call pending: this round's answer is the turn's message.
-            let Some(call) = function_call else {
+            // No calls pending: this round's answer is the turn's message.
+            if calls.is_empty() {
                 return on_progress(Progress::Done {
                     message: (!answer.is_empty()).then_some(answer),
                 });
-            };
+            }
 
-            match tools::execute(&call, &self.policy, on_progress) {
-                Ok(output) => transcript.push_tool_round(call, output),
-                Err(error) => return on_progress(Progress::Failed(error.to_string())),
+            // Run the round's calls in order; each exchange feeds the next round.
+            for call in calls {
+                match tools::execute(&call, &self.policy, on_progress) {
+                    Ok(output) => transcript.push_tool_round(call, output),
+                    Err(error) => return on_progress(Progress::Failed(error.to_string())),
+                }
             }
         }
         let rounds = self.max_rounds;
