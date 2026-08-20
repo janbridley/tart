@@ -41,10 +41,8 @@ use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Pane, PaneEvent};
+use tart_agents::{Agent, Progress, ReasoningEffort, Transcript};
 use tmux_override::{override_shift_up, restore_tmux};
-
-/// The personality tart brings to every conversation.
-const SYSTEM: &str = include_str!("data/SYSTEM.md");
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
@@ -80,186 +78,6 @@ enum Wake {
     Generation(Progress),
 }
 
-/// Progress from one background generation.
-enum Progress {
-    /// A fragment of the model's chain-of-thought reasoning.
-    Thinking(String),
-    /// A fragment of the final answer.
-    Answer(String),
-    /// A command the model asked to run.
-    Command(String),
-    /// The combined output of a finished command.
-    CommandOutput(String),
-    /// The stream ended; the assembled answer, if any arrived.
-    Done { message: Option<String> },
-    /// The request or stream failed.
-    Failed(String),
-}
-
-/// Most model rounds one generation may take before giving up.
-const MAX_TOOL_ROUNDS: usize = 10;
-
-/// One message in the conversation, as the Responses API sends it.
-fn input_message(role: Role, text: String) -> anyhow::Result<InputItem> {
-    Ok(EasyInputMessageArgs::default()
-        .role(role)
-        .content(text)
-        .build()?
-        .into())
-}
-
-/// The shell tool the model can call.
-fn bash_tool() -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: "bash".to_string(),
-        description: Some("Run a bash command and return its stdout/stderr".to_string()),
-        parameters: Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The bash command to run"}
-            },
-            "required": ["command"]
-        })),
-        strict: None,
-    })
-}
-
-/// Drive one generation to completion, reporting progress to `on_progress`.
-///
-/// Each round streams model output; when the model calls the shell tool, the
-/// command runs here, its output is appended to the conversation, and the next
-/// round continues from there. The generation ends after at most
-/// [`MAX_TOOL_ROUNDS`] rounds, always with exactly one terminal event:
-/// [`Progress::Done`] with the final answer (`None` if nothing arrived), or
-/// [`Progress::Failed`] on a request or stream error. A stream that closes
-/// without a terminal event still ends its round with whatever the model
-/// produced.
-///
-/// Blocks the current thread until the generation finishes.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the round loop reads best as one straight-line function"
-)]
-fn generate<F: Fn(Progress) + Send>(
-    client: &Client<OpenAIConfig>,
-    history: Vec<InputItem>,
-    on_progress: F,
-) {
-    let mut items = history;
-    for _ in 0..MAX_TOOL_ROUNDS {
-        let request = match CreateResponseArgs::default()
-            .model("deepseek-v4-flash")
-            .stream(true)
-            .reasoning(Reasoning {
-                effort: Some(ReasoningEffort::High),
-                summary: None,
-            })
-            .input(InputParam::Items(items.clone()))
-            .tools(vec![bash_tool()])
-            .build()
-        {
-            Ok(request) => request,
-            Err(error) => return on_progress(Progress::Failed(error.to_string())),
-        };
-
-        // `Compat` enters the global tokio runtime and exposes `futures` blocking control.
-        let mut stream = match block_on(Compat::new(client.responses().create_stream(request))) {
-            Ok(stream) => stream,
-            Err(error) => return on_progress(Progress::Failed(error.to_string())),
-        };
-
-        let mut answer = String::new();
-        // Track function-call metadata (name, call_id) and streamed arguments by item_id
-        let mut call_meta: HashMap<String, (String, String)> = HashMap::new();
-        let mut call_args: HashMap<String, String> = HashMap::new();
-        let mut function_call: Option<FunctionToolCall> = None;
-
-        while let Some(item) = block_on(stream.next()) {
-            match item {
-                Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
-                    answer.push_str(&delta.delta);
-                    on_progress(Progress::Answer(delta.delta));
-                }
-                Ok(ResponseStreamEvent::ResponseReasoningTextDelta(delta)) => {
-                    on_progress(Progress::Thinking(delta.delta));
-                }
-                Ok(ResponseStreamEvent::ResponseOutputItemAdded(added)) => {
-                    if let OutputItem::FunctionCall(fc) = &added.item {
-                        let item_id = fc.id.clone().unwrap_or_default();
-                        call_meta.insert(item_id, (fc.name.clone(), fc.call_id.clone()));
-                    }
-                }
-                Ok(ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta)) => {
-                    call_args
-                        .entry(delta.item_id.clone())
-                        .or_default()
-                        .push_str(&delta.delta);
-                }
-                Ok(ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done)) => {
-                    if let Some((name, call_id)) = call_meta.get(&done.item_id) {
-                        function_call = Some(FunctionToolCall {
-                            namespace: None,
-                            name: name.clone(),
-                            arguments: call_args.remove(&done.item_id).unwrap_or_default(),
-                            call_id: call_id.clone(),
-                            id: Some(done.item_id.clone()),
-                            status: None,
-                        });
-                    }
-                }
-                Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
-                    return on_progress(Progress::Failed(
-                        failed
-                            .response
-                            .error
-                            .map_or_else(|| "response failed".to_string(), |error| error.message),
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) => return on_progress(Progress::Failed(error.to_string())),
-            }
-        }
-
-        // No call pending: this round's answer is the turn's message.
-        let Some(call) = function_call else {
-            return on_progress(Progress::Done {
-                message: (!answer.is_empty()).then_some(answer),
-            });
-        };
-
-        // Run the tool and hand its output back for the next round.
-        let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
-            Ok(args) => args,
-            Err(error) => {
-                return on_progress(Progress::Failed(format!(
-                    "tool arguments weren't JSON: {error}"
-                )));
-            }
-        };
-        let Some(command) = args["command"].as_str() else {
-            return on_progress(Progress::Failed("tool call missing 'command'".to_string()));
-        };
-        on_progress(Progress::Command(command.to_string()));
-        let output = tart_agents::run_bash(command);
-        on_progress(Progress::CommandOutput(output.clone()));
-
-        let call_id = call.call_id.clone();
-        items.push(InputItem::Item(Item::FunctionCall(call)));
-        items.push(InputItem::Item(Item::FunctionCallOutput(
-            FunctionCallOutputItemParam {
-                call_id,
-                output: FunctionCallOutput::Text(output),
-                id: None,
-                status: None,
-            },
-        )));
-    }
-    on_progress(Progress::Failed(format!(
-        "gave up after {MAX_TOOL_ROUNDS} tool rounds"
-    )));
-}
-
 fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
@@ -269,11 +87,9 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     ));
 
     let api_key = std::env::var("DEEPSEEK_API_KEY")?;
-    let config = OpenAIConfig::new()
-        .with_api_base("https://api.deepseek.com")
-        .with_api_key(&api_key);
-    let client = Client::with_config(config);
-    let mut history: Vec<InputItem> = vec![input_message(Role::System, SYSTEM.to_string())?];
+    let agent = Agent::new("https://api.deepseek.com", api_key, "deepseek-v4-flash")
+        .reasoning_effort(ReasoningEffort::High);
+    let mut transcript = Transcript::new()?;
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
@@ -304,16 +120,12 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     _ => {
                         // New response clears the thinking box for the previous one
                         pane.begin_response();
-                        history.push(input_message(Role::User, line)?);
+                        transcript.push_user(line)?;
                         generating = true;
-                        let client = client.clone();
                         let sender = wake.clone();
-                        let items = history.clone();
-                        // Run the generation on its own thread
-                        std::thread::spawn(move || {
-                            generate(&client, items, move |progress| {
-                                let _ = sender.send(Wake::Generation(progress));
-                            });
+                        // The agent loop runs on its own thread
+                        agent.spawn(&transcript, move |progress| {
+                            let _ = sender.send(Wake::Generation(progress));
                         });
                     }
                 },
@@ -342,7 +154,7 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             Ok(Wake::Generation(Progress::Done { message })) => {
                 generating = false;
                 if let Some(text) = message {
-                    history.push(input_message(Role::Assistant, text)?);
+                    transcript.push_assistant(text)?;
                 }
             }
             // If the model *fails* for some reason, show the error.
@@ -350,6 +162,8 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 generating = false;
                 pane.append(&Span::styled(error, DIM_STYLE));
             }
+            // `Progress` is non-exhaustive; later variants need no handling yet.
+            Ok(Wake::Generation(_)) => {}
         }
     }
     Ok(())
