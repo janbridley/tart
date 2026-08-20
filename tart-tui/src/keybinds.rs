@@ -24,8 +24,7 @@ impl Editor {
         boundary
     }
 
-    /// Grapheme index just past the end of the first word after `g`, or the
-    /// line length.
+    /// Grapheme index just past the end of the first word after `g`, or the line length
     fn next_word_end(&self, g: usize) -> usize {
         let mut count = 0;
         let mut boundary = self.line_len();
@@ -60,8 +59,7 @@ impl Editor {
         }
     }
 
-    /// Option+Backspace: delete through the previous word start. A no-op at a
-    /// line start — no joining, matching macOS editors.
+    /// Option+Backspace: delete through the previous word start.
     pub(crate) fn delete_word(&mut self) {
         let start = self.prev_word_start(self.g);
         if start < self.g {
@@ -80,9 +78,6 @@ impl Editor {
 }
 
 /// Whether `key` is one of the macOS word/line bindings, applied to `prompt`.
-///
-/// The Option-modifier fall-through matters: option+letter arrives as
-/// `ALT + Char(c)` and must keep reaching `insert_char`.
 pub(crate) fn mac_modifiers(prompt: &mut Editor, key: &KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
@@ -172,16 +167,25 @@ mod tests {
     #[test]
     fn modifier_routing() {
         let mut e = editor("a b", 0, 3);
-        assert!(mac_modifiers(&mut e, &KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert!(mac_modifiers(
+            &mut e,
+            &KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)
+        ));
         assert_eq!(e.g, 2);
         assert!(!mac_modifiers(
             &mut e,
             &KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)
         ));
 
-        assert!(mac_modifiers(&mut e, &KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER)));
+        assert!(mac_modifiers(
+            &mut e,
+            &KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER)
+        ));
         assert_eq!(e.g, 0);
-        assert!(mac_modifiers(&mut e, &KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)));
+        assert!(mac_modifiers(
+            &mut e,
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)
+        ));
         assert_eq!(e.text(), "");
     }
 }
