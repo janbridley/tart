@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::clipboard::Selection;
 use crate::file_mentions::{self, FilePopup};
 
 pub const PROMPT: &str = "❯ ";
@@ -27,6 +28,8 @@ const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 #[derive(Debug, PartialEq)]
 pub enum PaneEvent {
     Submit(String),
+    /// Text chosen in copy mode, ready for the clipboard.
+    Copy(String),
     Quit,
 }
 
@@ -58,8 +61,10 @@ impl Pane {
             return None;
         }
         let event = self.route(key);
-        // @file popup updates on keystroke
-        file_mentions::update(&self.prompt, &mut self.popup, file_mentions::rearm(&key));
+        // @file popup updates on keystroke except in copy mode.
+        if self.copy.is_none() {
+            file_mentions::update(&self.prompt, &mut self.popup, file_mentions::rearm(&key));
+        }
         event
     }
 
@@ -69,6 +74,23 @@ impl Pane {
         if let Some(cursor) = self.copy {
             match key.code {
                 KeyCode::Char('q' | 'Q') => self.copy = None,
+                // Space (unconditionally) begins a selection at the current position
+                KeyCode::Char(' ') => {
+                    self.copy = Some(CopyCursor {
+                        anchor: Some((cursor.row, cursor.col)),
+                        ..cursor
+                    });
+                }
+                // Enter copies the selection to clipboard and exits copy mode.
+                KeyCode::Enter => {
+                    let text = Selection::between(cursor.anchor, (cursor.row, cursor.col))
+                        .map(|selection| selection.text(self.transcript.rows()))
+                        .filter(|text| !text.is_empty());
+                    self.copy = None;
+                    if let Some(text) = text {
+                        return Some(PaneEvent::Copy(text));
+                    }
+                }
                 _ => self.copy = Some(moved(self.transcript.rows(), cursor, key.code)),
             }
             return None;
@@ -261,13 +283,10 @@ impl Pane {
     ) {
         // Wrap only what is new at an unchanged width, or rewrap if width changed.
         let rows = self.transcript.sync(area.width as usize);
-        // Clamp to the wrapped rows, moving the cursor to (0, 0) when empry
+        // Clamp to the wrapped rows, moving the cursor to (0, 0) when empty.
         if let Some(cursor) = &mut self.copy {
-            cursor.row = cursor.row.min(rows.len().saturating_sub(1));
-            cursor.col = cursor.col.min(
-                rows.get(cursor.row)
-                    .map_or(0, |row| row.width().saturating_sub(1)),
-            );
+            (cursor.row, cursor.col) = clamp_cell(rows, cursor.row, cursor.col);
+            cursor.anchor = cursor.anchor.map(|(row, col)| clamp_cell(rows, row, col));
         }
         let visible = area.height as usize;
         let top = window_top(rows.len(), visible, self.copy.map(|c| (c.row, c.top)));
@@ -281,6 +300,9 @@ impl Pane {
             buf.set_line(area.x, y, row, area.width);
         });
         if let Some(cursor) = self.copy {
+            if let Some(selection) = Selection::between(cursor.anchor, (cursor.row, cursor.col)) {
+                selection.paint(buf, rows, area, top, shown);
+            }
             let pos = (area.x + cursor.col as u16, area.y + (cursor.row - top) as u16);
             if let Some(cell) = buf.cell_mut(pos) {
                 cell.set_style(CURSOR_STYLE);
@@ -297,7 +319,7 @@ impl Pane {
                 prompt_area.x,
                 prompt_area.y,
                 &Line::from(Span::styled(
-                    "▲ scrollback · ←↑↓→ move · PgUp/PgDn/Home/End · q to exit",
+                    "▲ scrollback · ←↑↓→/PgUp/Home/End · Space select · Enter copy · q to exit",
                     Style::new().fg(Color::Yellow),
                 )),
                 prompt_area.width,
@@ -682,6 +704,8 @@ impl Transcript {
 struct CopyCursor {
     row: usize,
     col: usize,
+    /// Selection start cell; `None` until Space anchors one.
+    anchor: Option<(usize, usize)>,
     /// `usize::MAX` means we start at the end, and position is clamped on render
     top: usize,
     /// Rows the last render showed.
@@ -694,6 +718,7 @@ impl CopyCursor {
         Self {
             row: rows_len.saturating_sub(1),
             col: 0,
+            anchor: None,
             top: usize::MAX,
             visible: 0,
         }
@@ -744,6 +769,14 @@ fn window_top(rows_len: usize, visible: usize, anchor: Option<(usize, usize)>) -
             .min(row)
             .max(row.saturating_add(1).saturating_sub(visible))
     })
+}
+
+/// A cell clamped into the wrapped rows: the last row, that row's last cell.
+#[inline]
+fn clamp_cell(rows: &[Line<'static>], row: usize, col: usize) -> (usize, usize) {
+    let row = row.min(rows.len().saturating_sub(1));
+    let col = col.min(rows.get(row).map_or(0, |row| row.width().saturating_sub(1)));
+    (row, col)
 }
 
 /// One wrapped row under construction: (&'a grapheme, style, cell width).
@@ -908,7 +941,7 @@ fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize) -> PromptL
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::draw;
+    use crate::testutil::{draw, draw_backgrounds};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1048,12 +1081,23 @@ mod tests {
         assert_eq!(window_top(10, 5, Some((4, 2))), 2); // inside: stays
 
         let rows = wrap_lines(&[Line::from("abc"), Line::from("de")], 10);
-        let cur = |row, col| CopyCursor { row, col, top: 0, visible: 2 };
+        let cur = |row, col| CopyCursor {
+            row,
+            col,
+            anchor: None,
+            top: 0,
+            visible: 2,
+        };
         assert_eq!(moved(&rows, cur(0, 0), KeyCode::Right), cur(0, 1));
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::Left), cur(0, 2)); // wraps
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::PageUp), cur(0, 0));
         assert_eq!(moved(&rows, cur(0, 0), KeyCode::PageDown), cur(1, 0));
         assert_eq!(moved(&rows, cur(1, 0), KeyCode::Char('x')), cur(1, 0));
+
+        // A move reshapes a selection; it never drops the anchor.
+        let mut anchored = cur(0, 0);
+        anchored.anchor = Some((1, 1));
+        assert_eq!(moved(&rows, anchored, KeyCode::Right).anchor, Some((1, 1)));
     }
 
     /// Editing operates on graphemes: a line-start backspace joins lines, the caret
@@ -1103,6 +1147,94 @@ mod tests {
 
         assert!(pane.escape());
         assert!(render(&mut pane, (40, 10)).contains("❯ ")); // live again
+    }
+
+    /// Space anchors, movement reshapes, Enter ships the selection out and
+    /// leaves copy mode.
+    #[test]
+    fn enter_copies_the_selection_and_exits() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abc def"));
+        render(&mut pane, (20, 8)); // rows exist before the cursor walks them
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // enter, at (0, 0)
+        pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to (0, 1)
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor
+        for _ in 1.."abc def".len() {
+            pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to row end
+        }
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Copy("bc def".into()))
+        );
+        assert!(pane.copy.is_none());
+        assert!(render(&mut pane, (40, 10)).contains("❯ ")); // live again
+    }
+
+    /// `q`, a bare Enter, and an anchored-but-empty selection all leave
+    /// without clobbering the clipboard.
+    #[test]
+    fn leaving_without_a_selection_copies_nothing() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abc"));
+        render(&mut pane, (20, 8));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(pane.on_key(key(KeyCode::Char('q'), KeyModifiers::NONE)), None);
+        assert!(pane.copy.is_none());
+
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // back in
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(pane.copy.is_none());
+
+        let mut empty = Pane::new(); // anchored, but no rows to select
+        render(&mut empty, (20, 8));
+        empty.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        empty.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(empty.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(empty.copy.is_none());
+    }
+
+    /// The band lights exactly the copied cells: light-black over the
+    /// selection, nothing anywhere else on screen.
+    #[test]
+    fn selection_paints_a_dark_gray_band() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abc def"));
+        render(&mut pane, (20, 8)); // rows exist before the cursor walks them
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        pane.on_key(key(KeyCode::Home, KeyModifiers::NONE));
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor (0, 0)
+        for _ in 1.."abc def".len() {
+            pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to (0, 6)
+        }
+        let grid = draw_backgrounds(|frame, area| pane.render(frame, area), (20, 8));
+        let mut lines = grid.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!("{}{}", "#".repeat(7), ".".repeat(13)).as_str())
+        );
+        assert!(lines.all(|line| !line.contains('#')));
+    }
+
+    /// A rewrap between Space and Enter re-clamps the anchor with the cursor
+    #[test]
+    fn anchored_selection_survives_a_rewrap() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("abcdef"));
+        pane.push(Line::from("z"));
+        render(&mut pane, (40, 8)); // rows: ["abcdef", "z"]
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // (1, 0)
+        pane.on_key(key(KeyCode::Up, KeyModifiers::NONE)); // (0, 0)
+        for _ in 0..5 {
+            pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // (0, 5)
+        }
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor
+        pane.on_key(key(KeyCode::Down, KeyModifiers::NONE)); // (1, 0)
+        render(&mut pane, (3, 8)); // rows: ["abc", "def", "z"]
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Copy("c\nd".into()))
+        );
     }
 
     #[test]
