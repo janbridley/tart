@@ -2026,6 +2026,10 @@ name = "tart-agents"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compat",
+ "async-openai",
+ "futures",
+ "serde_json",
 ]
 
 [[package]]
@@ -2033,14 +2037,10 @@ name = "tart-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-compat",
- "async-openai",
  "crossterm",
- "futures",
  "ignore",
  "nucleo-matcher",
  "ratatui",
- "serde_json",
  "tart-agents",
  "unicode-segmentation",
 ]

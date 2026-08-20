@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+async-compat = "0.2.5"
+async-openai = { version = "0.41.3", features = ["responses"] }
+futures = "0.3.34"
+serde_json = "1"
 
 [lints]
 workspace = true
