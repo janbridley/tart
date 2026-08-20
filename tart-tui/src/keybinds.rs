@@ -182,6 +182,17 @@ mod tests {
             &KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER)
         ));
         assert_eq!(e.g, 0);
+        // At the line start a Cmd+Backspace deletes nothing; from the end it
+        // clears the line.
+        assert!(mac_modifiers(
+            &mut e,
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)
+        ));
+        assert_eq!(e.text(), "a b");
+        assert!(mac_modifiers(
+            &mut e,
+            &KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER)
+        ));
         assert!(mac_modifiers(
             &mut e,
             &KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)
