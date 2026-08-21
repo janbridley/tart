@@ -8,7 +8,9 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+mod cli;
 mod clipboard;
+mod config;
 mod file_mentions;
 mod keybinds;
 mod pane;
@@ -29,18 +31,36 @@ use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Pane, PaneEvent};
-use tart_agents::{Agent, Progress, ReasoningEffort, Transcript, sandbox::Policy};
+use tart_agents::{Agent, Progress, Transcript, sandbox::Policy};
 use tmux_override::{override_shift_up, restore_tmux};
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
+    let path = cli::agents_path();
+    let agent_config = config::Config::load(&path)?.default_agent()?;
+    let label = agent_config.to_string();
+    let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
+    let mut agent = Agent::new(
+        agent_config.base_url,
+        agent_config.api_key,
+        agent_config.model,
+        policy,
+    );
+    if let Some(effort) = agent_config.effort {
+        agent = agent.reasoning_effort(effort);
+    }
+    let transcript = match agent_config.instructions {
+        Some(instructions) => Transcript::with_instructions(instructions)?,
+        None => Transcript::new()?,
+    };
+
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, &agent, transcript, &label);
     ratatui::try_restore()?;
     execute!(stdout(), DisableBracketedPaste)?;
     terminal.show_cursor()?;
@@ -66,23 +86,20 @@ enum Wake {
     Generation(Progress),
 }
 
-fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+fn run(
+    terminal: &mut DefaultTerminal,
+    agent: &Agent,
+    mut transcript: Transcript,
+    label: &str,
+) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
-        "tart · Enter sends text · Alt+Enter for newline · Shift+↑ to enter \
-        scrollback",
+        format!(
+            "tart · {label} · Enter sends text · Alt+Enter for newline · \
+            Shift+↑ to enter scrollback"
+        ),
         DIM_STYLE,
     ));
-
-    let api_key = std::env::var("DEEPSEEK_API_KEY")?;
-    let agent = Agent::new(
-        "https://api.deepseek.com",
-        api_key,
-        "deepseek-v4-flash",
-        Policy::new(std::env::current_dir()?)?.exclude_git(),
-    )
-    .reasoning_effort(ReasoningEffort::High);
-    let mut transcript = Transcript::new()?;
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();

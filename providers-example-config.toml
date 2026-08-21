@@ -1,0 +1,40 @@
+# This is the agent for the primary agent loop in main.rs.
+#
+# All keys demonstrated in this file are required unless otherwise noted.
+[default_agent]
+provider = "zai"
+name = "Coding Specialist"
+
+[zai]
+label = "z.ai" # Optional
+base_url = "https://api.z.ai/api/v1"
+# Strings name an env variable; an array is a command (argv, no shell)
+# api_key = "ZAI_API_KEY"
+api_key = ["security", "find-generic-password", "-a", "zai", "-s", "z_ai_mcp_token", "-w"]
+
+# Agent 1, stored in an array table
+[[zai.agents]]
+name = "Coding Specialist"
+model = "glm-5.3"
+reasoning_effort = "high" # Optional
+
+# Instructions are appended to the system prompt.
+instructions = """
+You are an expert systems programmer. Write performant, safe code.
+""" # Optional
+
+# Agent 2
+[[zai.agents]]
+name = "History Expert"
+model = "glm-4-flash"
+reasoning_effort = "low"
+instructions = """
+You answer history questions clearly and concisely.
+"""
+
+# A second provider. No `label`: the table key is the display name.
+[deepseek]
+base_url = "https://api.deepseek.com"
+api_key = "DEEPSEEK_API_KEY"
+
+# ... agent configuration here
