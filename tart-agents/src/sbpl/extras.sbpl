@@ -1,0 +1,4 @@
+; tart policy extensions granted under every seatbelt.
+
+; Allow reads to libperl.dylib for so perl runs in the seatbelt.
+(allow file-read* file-test-existence file-map-executable (subpath "/System/Library/Perl"))

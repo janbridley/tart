@@ -36,7 +36,7 @@
 //!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices.
 //! - Binaries outside the platform read baseline (for example `/opt/homebrew/bin`)
 //!   cannot be executed unless their directory is granted with
-//!   [`Policy::add_read_only_root`].
+//!   [`Policy::add_read_only_root`] or `sbpl/extras.sbpl`.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -54,6 +54,9 @@ const SANDBOXED_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 // be6e8eac029b183056b7e4402879f15d2c85f61b (v0.147.0), Apache-2.0
 const BASE_POLICY: &str = include_str!("sbpl/seatbelt_base_policy.sbpl");
 const PLATFORM_DEFAULTS: &str = include_str!("sbpl/restricted_read_only_platform_defaults.sbpl");
+
+// tart's own additions, merged into every profile
+const EXTRAS: &str = include_str!("sbpl/extras.sbpl");
 
 /// A macOS Seatbelt sandbox profile under which commands can be run.
 ///
@@ -272,8 +275,8 @@ impl Policy {
         &self.writable
     }
 
-    /// Render the base policy, the generated rules, and the platform defaults into a
-    /// final profile.
+    /// Render the base policy, the generated rules, the platform defaults, and
+    /// the tart extras into a final profile.
     fn compile(&self) -> CompiledPolicy {
         let mut params = Vec::new();
         let mut read_rules = Vec::new();
@@ -330,6 +333,8 @@ impl Policy {
         }
         text.push('\n');
         text.push_str(PLATFORM_DEFAULTS);
+        text.push('\n');
+        text.push_str(EXTRAS);
 
         CompiledPolicy { text, params }
     }
@@ -538,6 +543,18 @@ mod tests {
                 .add_read_only_root(&missing)
                 .is_err()
         );
+    }
+
+    /// The tart extras are merged into every rendered profile, so `/usr/bin/perl`
+    /// can load its runtime library under every policy.
+    #[test]
+    fn render_includes_the_extras() {
+        let dir = ScratchDir::new("extras");
+        let rendered = Policy::new(dir.path()).unwrap().render();
+
+        assert!(rendered.contains(
+            r#"(allow file-read* file-test-existence file-map-executable (subpath "/System/Library/Perl"))"#
+        ));
     }
 
     /// Empty, absolute, escaping, and root-identical exclusions are rejected.
@@ -856,5 +873,28 @@ mod tests {
             "stderr: {}",
             String::from_utf8_lossy(&allowed.stderr)
         );
+    }
+
+    /// `/usr/bin/perl` links a versioned libperl.dylib outside the platform
+    /// read baseline; the extras grant lets it run under every policy.
+    ///
+    /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[test]
+    fn perl_runs_under_the_default_grant() {
+        let dir = ScratchDir::new("perl-live");
+        let out = Policy::new(dir.path())
+            .unwrap()
+            .command("/usr/bin/perl")
+            .arg("-e")
+            .arg("print qq[ok\\n]")
+            .output()
+            .unwrap();
+
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
     }
 }

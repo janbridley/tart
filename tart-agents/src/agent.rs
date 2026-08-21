@@ -106,7 +106,7 @@ impl Agent {
                     summary: None,
                 })
                 .input(InputParam::Items(transcript.request_items()))
-                .tools(vec![tools::bash()])
+                .tools(vec![tools::bash(), tools::read(), tools::edit()])
                 .build()
             {
                 Ok(request) => request,
