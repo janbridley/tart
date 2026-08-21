@@ -11,6 +11,15 @@ use crate::{Progress, sandbox::Policy};
 /// Exits 1 with a warning, file untouched, or when the match count is wrong.
 const EDIT_PROGRAM: &str = include_str!("data/edit.pl");
 
+const READ_PROGRAM: &str = r#"printf "%6d\t%s", $., $_"#;
+
+/// Cat a (subregion of a) file, numbering the lines in the output.
+fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
+    let s = start.map(|v| format!(" if $. >= {v}")).unwrap_or_default();
+    let e = end.map(|v| format!(" exit if $. >= {v};")).unwrap_or_default();
+    format!("{READ_PROGRAM}{s};{e}")
+}
+
 /// The bash tool; commands execute under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn bash() -> Tool {
@@ -28,6 +37,31 @@ pub(crate) fn bash() -> Tool {
                 "command": {"type": "string", "description": "The bash command to run"}
             },
             "required": ["command"]
+        })),
+        strict: None,
+    })
+}
+
+/// The read tool; files are read under the caller's [`Policy`].
+#[must_use]
+pub(crate) fn read() -> Tool {
+    Tool::Function(FunctionTool {
+        defer_loading: None,
+        name: "read".to_string(),
+        description: Some(
+            "Read a file with line numbers (cat -n style) in a sandbox (reads restricted to \
+            granted roots); optionally pass start_line/end_line (1-based, inclusive) to read \
+            a range"
+                .to_string(),
+        ),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The file to read"},
+                "start_line": {"type": "integer", "description": "First line to read (1-based); omit to start at the top"},
+                "end_line": {"type": "integer", "description": "Last line to read (inclusive); omit to read to the end"}
+            },
+            "required": ["path"]
         })),
         strict: None,
     })
@@ -69,6 +103,33 @@ fn parse_command(arguments: &str) -> anyhow::Result<String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))
+}
+
+/// One parsed read tool call.
+#[derive(Debug)]
+struct Read {
+    /// The file to read.
+    path: String,
+    /// First line to read, 1-based; `None` starts at the top.
+    start_line: Option<u64>,
+    /// Last line to read, inclusive; `None` reads to the end.
+    end_line: Option<u64>,
+}
+
+/// Extract the fields from a read tool call's JSON arguments.
+///
+/// The line bounds are optional; wrong-typed bounds are ignored.
+fn parse_read(arguments: &str) -> anyhow::Result<Read> {
+    let args: serde_json::Value = serde_json::from_str(arguments)
+        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
+    Ok(Read {
+        path: args["path"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("tool call missing 'path'"))?,
+        start_line: args["start_line"].as_u64(),
+        end_line: args["end_line"].as_u64(),
+    })
 }
 
 /// One parsed edit tool call.
@@ -117,6 +178,7 @@ pub(crate) fn execute<F: Fn(Progress)>(
 ) -> anyhow::Result<String> {
     match call.name.as_str() {
         "bash" => run_bash(call, policy, on_progress),
+        "read" => run_read(call, policy, on_progress),
         "edit" => run_edit(call, policy, on_progress),
         other => anyhow::bail!("unknown tool: {other}"),
     }
@@ -147,6 +209,35 @@ fn run_bash<F: Fn(Progress)>(
                 )
             },
         );
+    on_progress(Progress::CommandOutput(output.clone()));
+    Ok(output)
+}
+
+/// Run one read tool call under `policy`, reporting its steps to `on_progress`.
+fn run_read<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    policy: &Policy,
+    on_progress: &F,
+) -> anyhow::Result<String> {
+    let read = parse_read(&call.arguments)?;
+    on_progress(Progress::Command(format!("read {}", read.path)));
+    let mut command = policy.command("/usr/bin/perl");
+    command
+        .arg("-ne")
+        .arg(numbered_read(read.start_line, read.end_line))
+        .arg("--")
+        .arg(&read.path);
+    // A failure to launch comes back as an error string for the model to deal with.
+    let output = command.output().map_or_else(
+        |error| format!("error: {error}"),
+        |output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        },
+    );
     on_progress(Progress::CommandOutput(output.clone()));
     Ok(output)
 }
@@ -456,5 +547,90 @@ mod tests {
             std::fs::read_to_string(file.path()).unwrap(),
             "one uno alpha\ntwo dos beta\n"
         );
+    }
+
+    #[test]
+    fn read_definition_requires_path() {
+        let tool = serde_json::to_value(read()).unwrap();
+
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "read");
+        assert_eq!(tool["parameters"]["required"][0], "path");
+        assert!(tool["parameters"]["properties"]["start_line"].is_object());
+        assert!(tool["parameters"]["properties"]["end_line"].is_object());
+    }
+
+    #[test]
+    fn parse_read_reads_the_path_and_bounds() {
+        let read = parse_read(r#"{"path":"src/main.rs","start_line":10,"end_line":50}"#).unwrap();
+
+        assert_eq!(read.path, "src/main.rs");
+        assert_eq!((read.start_line, read.end_line), (Some(10), Some(50)));
+
+        let whole = parse_read(r#"{"path":"src/main.rs"}"#).unwrap();
+        assert_eq!((whole.start_line, whole.end_line), (None, None));
+    }
+
+    #[test]
+    fn parse_read_rejects_a_missing_path() {
+        let error = parse_read(r#"{"start_line":1}"#).unwrap_err().to_string();
+
+        assert!(error.contains("missing 'path'"), "{error}");
+    }
+
+    /// A `read` tool call for `path`, optionally bounded to a line range.
+    fn read_call(path: &Path, start_line: Option<u64>, end_line: Option<u64>) -> FunctionToolCall {
+        FunctionToolCall {
+            namespace: None,
+            name: "read".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "start_line": start_line,
+                "end_line": end_line,
+            })
+            .to_string(),
+            call_id: "call_0".to_string(),
+            id: Some("item_0".to_string()),
+            status: None,
+        }
+    }
+
+    /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[test]
+    fn read_returns_numbered_contents_and_ranges() {
+        let mut contents = String::new();
+        for line in 1..=30 {
+            contents.push_str("line ");
+            contents.push_str(&line.to_string());
+            contents.push('\n');
+        }
+        let file = Scratch::new("read", &contents);
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let whole = execute(&read_call(file.path(), None, None), &policy, &|progress| {
+            events.borrow_mut().push(progress);
+        })
+        .unwrap();
+
+        assert!(whole.starts_with("     1\tline 1\n"), "{whole}");
+        assert!(whole.ends_with("    30\tline 30\n"), "{whole}");
+        assert_eq!(whole.lines().count(), 30);
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [Progress::Command(command), Progress::CommandOutput(_)]
+                if command == &format!("read {}", file.path().display())
+        ));
+
+        let range = execute(&read_call(file.path(), Some(10), Some(12)), &policy, &|_| {}).unwrap();
+        assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
+
+        let tail = execute(&read_call(file.path(), Some(28), None), &policy, &|_| {}).unwrap();
+        assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
+        assert_eq!(tail.lines().count(), 3);
+
+        let missing = std::env::temp_dir().join("tart-read-does-not-exist");
+        let absent = execute(&read_call(&missing, None, None), &policy, &|_| {}).unwrap();
+        assert!(absent.contains("No such file or directory"), "{absent}");
     }
 }
