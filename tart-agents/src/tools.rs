@@ -4,13 +4,12 @@ use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 
 use crate::{Progress, sandbox::Policy};
 
-/// Replace the first instance of `$TART_OLD` with `$TART_NEW`.
+/// Perform a raw string find-and-replace operation, holding a lock for thread safety..
 ///
-/// `\Q...\E` quotes the old text so it matches literally.
-const EDIT_PROGRAM: &str = "s/\\Q$ENV{TART_OLD}\\E/$ENV{TART_NEW}/";
-
-/// [`EDIT_PROGRAM`] with `/g` to replace every occurrence.
-const EDIT_PROGRAM_ALL: &str = "s/\\Q$ENV{TART_OLD}\\E/$ENV{TART_NEW}/g";
+/// This string contains perl source code to perform the required work, dispatching a
+/// platform independent flock to ensure concurrent agents cannot collide.
+/// Exits 1 with a warning, file untouched, or when the match count is wrong.
+const EDIT_PROGRAM: &str = include_str!("data/edit.pl");
 
 /// The bash tool; commands execute under the caller's [`Policy`].
 #[must_use]
@@ -41,7 +40,7 @@ pub(crate) fn edit() -> Tool {
         defer_loading: None,
         name: "edit".to_string(),
         description: Some(
-            "Replace an exact string in an existing file. old_string must match the file exactly, including whitespace and
+            "Replace an exact string in an existing file. old_string must match the file exactly, including whitespace and \
             newlines, and occur exactly once unless replace_all is true: include surrounding \
             lines to make it unique. An empty new_string deletes old_string. The file must \
             already exist and be valid UTF-8, so use bash to create files. Prefer this tool \
@@ -170,6 +169,9 @@ fn run_edit<F: Fn(Progress)>(
 }
 
 /// Apply one parsed edit under `policy`, returning the outcome message.
+///
+/// We pre-check that the edit is valid in rust for performance, though the perl script
+/// verifies to ensure we don't run into TOCTOU issues between here and the lock.
 fn apply_edit(edit: &Edit, policy: &Policy) -> String {
     let path = Path::new(&edit.path);
     if edit.old_string.is_empty() {
@@ -199,37 +201,36 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> String {
             path.display()
         );
     }
-    let expected = if edit.replace_all {
-        content.replace(&edit.old_string, &edit.new_string)
-    } else {
-        content.replacen(&edit.old_string, &edit.new_string, 1)
-    };
+    spawn_perl(edit, &mut policy.command("/usr/bin/perl"))
+}
 
-    let ran = policy
-        .command("/usr/bin/perl")
-        .arg("-0777")
-        .arg("-i")
-        .arg("-pe")
-        .arg(if edit.replace_all { EDIT_PROGRAM_ALL } else { EDIT_PROGRAM })
+/// Run [`EDIT_PROGRAM`] through an already-configured `perl` command and map
+/// its exit status to the message the model sees: perl's report on success,
+/// its warning as retryable content otherwise.
+///
+/// Split out so tests can drive the program with a plain command, exercising
+/// its locking and matching semantics without the sandbox.
+fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> String {
+    let path = Path::new(&edit.path);
+    cmd.arg("-e")
+        .arg(EDIT_PROGRAM)
         .arg("--")
         .arg(&edit.path)
         .env("TART_OLD", &edit.old_string)
         .env("TART_NEW", &edit.new_string)
-        .output();
-    if let (Ok(_), Ok(updated)) = (&ran, std::fs::read_to_string(path))
-        && updated == expected
-    {
-        return format!("edited {}: {count} replacement(s)", path.display());
-    }
-    let detail = match &ran {
+        .envs(edit.replace_all.then_some(("TART_ALL", "1")));
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim_end().to_string()
+        }
         Ok(output) => format!(
-            "{}{}",
+            "edit failed on {}: {}{}",
+            path.display(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ),
-        Err(error) => format!("failed to run perl: {error}"),
-    };
-    format!("edit failed on {}: {detail}", path.display())
+        Err(error) => format!("edit failed on {}: failed to run perl: {error}", path.display()),
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +306,155 @@ mod tests {
         let error = execute(&call, &policy, &|_| {}).unwrap_err().to_string();
 
         assert!(error.contains("unknown tool"), "{error}");
+    }
+
+    /// A scratch file removed when the guard drops, so parallel tests don't
+    /// share state.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        /// Create the guard under the temp directory.
+        fn new(tag: &str, contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("tart-edit-{tag}-{}", std::process::id()));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// An `edit` tool call replacing `old` with `new` in `path`.
+    fn edit_call(path: &Path, old: &str, new: &str) -> FunctionToolCall {
+        FunctionToolCall {
+            namespace: None,
+            name: "edit".to_string(),
+            arguments: serde_json::json!({"path": path, "old_string": old, "new_string": new})
+                .to_string(),
+            call_id: "call_0".to_string(),
+            id: Some("item_0".to_string()),
+            status: None,
+        }
+    }
+
+    /// Drive [`EDIT_PROGRAM`] with a plain, unsandboxed perl command.
+    fn perl_edit(path: &Path, old: &str, new: &str, replace_all: bool) -> String {
+        spawn_perl(
+            &Edit {
+                path: path.display().to_string(),
+                old_string: old.to_string(),
+                new_string: new.to_string(),
+                replace_all,
+            },
+            &mut std::process::Command::new("/usr/bin/perl"),
+        )
+    }
+
+    #[test]
+    fn perl_edit_replaces_a_unique_multiline_string_literally() {
+        let file = Scratch::new("literal", "line1: cost $5.00 (a)\nline2: b.*x [y]\nline3\n");
+        let output = perl_edit(file.path(), "b.*x [y]\nline3", r"REPL($1)$&\E", false);
+
+        assert_eq!(
+            output,
+            format!("edited {}: 1 replacement(s)", file.path().display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "line1: cost $5.00 (a)\nline2: REPL($1)$&\\E\n"
+        );
+    }
+
+    #[test]
+    fn perl_edit_replaces_every_occurrence_with_replace_all() {
+        let file = Scratch::new("replace-all", "a a a\n");
+        let output = perl_edit(file.path(), "a", "b", true);
+
+        assert_eq!(
+            output,
+            format!("edited {}: 3 replacement(s)", file.path().display())
+        );
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "b b b\n");
+    }
+
+    #[test]
+    fn perl_edit_deletes_via_an_empty_new_string() {
+        let file = Scratch::new("delete", "keep\ndrop me\nkeep\n");
+        let output = perl_edit(file.path(), "drop me\n", "", false);
+
+        assert!(output.contains("1 replacement(s)"), "{output}");
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "keep\nkeep\n");
+    }
+
+    #[test]
+    fn perl_edit_reports_a_missing_match_and_leaves_the_file_untouched() {
+        let file = Scratch::new("missing-match", "alpha beta\n");
+        let output = perl_edit(file.path(), "gamma", "delta", false);
+
+        assert!(output.contains("not found"), "{output}");
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "alpha beta\n");
+    }
+
+    #[test]
+    fn perl_edit_reports_an_ambiguous_match_without_replace_all() {
+        let file = Scratch::new("ambiguous", "x x x\n");
+        let output = perl_edit(file.path(), "x", "y", false);
+
+        assert!(output.contains("matches 3 times"), "{output}");
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "x x x\n");
+    }
+
+    #[test]
+    fn perl_edit_reports_an_unopenable_file() {
+        let missing = std::env::temp_dir().join("tart-edit-does-not-exist");
+        let output = perl_edit(&missing, "a", "b", false);
+
+        assert!(output.contains("cannot open"), "{output}");
+    }
+
+    #[test]
+    fn concurrent_perl_edits_to_one_file_both_apply() {
+        let file = Scratch::new("concurrent-perl", "AA eleven\nmid\nBB twelve\n");
+        let spawn_edit = |old: &'static str, new: &'static str| {
+            let path = file.path().to_path_buf();
+            std::thread::spawn(move || perl_edit(&path, old, new, false))
+        };
+        let first = spawn_edit("AA", "aa");
+        let second = spawn_edit("BB", "bb");
+
+        assert!(first.join().unwrap().contains("1 replacement(s)"));
+        assert!(second.join().unwrap().contains("1 replacement(s)"));
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "aa eleven\nmid\nbb twelve\n"
+        );
+    }
+
+    /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[test]
+    fn concurrent_edits_to_one_file_both_apply() {
+        let file = Scratch::new("concurrent", "one UNO alpha\ntwo DOS beta\n");
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let spawn_edit = |old: &str, new: &str| {
+            let call = edit_call(file.path(), old, new);
+            let policy = policy.clone();
+            std::thread::spawn(move || execute(&call, &policy, &|_| {}).unwrap())
+        };
+        let first = spawn_edit("UNO", "uno");
+        let second = spawn_edit("DOS", "dos");
+
+        assert!(first.join().unwrap().contains("1 replacement(s)"));
+        assert!(second.join().unwrap().contains("1 replacement(s)"));
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "one uno alpha\ntwo dos beta\n"
+        );
     }
 }
