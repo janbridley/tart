@@ -6,7 +6,7 @@ use async_openai::{
     config::OpenAIConfig,
     types::responses::{
         CreateResponseArgs, FunctionToolCall, InputParam, OutputItem, Reasoning, ReasoningEffort,
-        ResponseStreamEvent,
+        ReasoningItem, ResponseStreamEvent,
     },
 };
 use futures::{StreamExt, executor::block_on};
@@ -120,6 +120,8 @@ impl Agent {
             let mut answer = String::new();
             // Completed calls, captured from finished output items, in stream order.
             let mut calls: Vec<FunctionToolCall> = Vec::new();
+            // The reasoning that preceded them; thinking mode requires its replay.
+            let mut reasoning: Option<ReasoningItem> = None;
             // A function-call item started but never reported done.
             let mut call_in_flight = false;
             // Some output arrived, so the stream was delivering.
@@ -144,15 +146,22 @@ impl Agent {
                             call_in_flight = true;
                         }
                     }
-                    Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => {
-                        // The finished item is authoritative: it carries the
-                        // server-assembled call, arguments and all.
-                        if let OutputItem::FunctionCall(call) = &done.item {
+                    Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => match &done.item {
+                        OutputItem::Reasoning(item) => {
+                            dump_json(
+                                "captured reasoning item",
+                                &serde_json::to_string(item).unwrap_or_default(),
+                            );
+                            reasoning = Some(item.clone());
+                            saw_output = true;
+                        }
+                        OutputItem::FunctionCall(call) => {
                             calls.push(call.clone());
                             call_in_flight = false;
                             saw_output = true;
                         }
-                    }
+                        _ => {}
+                    },
                     Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
                         return on_progress(Progress::Failed(failed.response.error.map_or_else(
                             || "response failed".to_string(),
@@ -205,13 +214,20 @@ impl Agent {
                 });
             }
 
-            // Run the round's calls in order; each exchange feeds the next round.
+            // The round's reasoning precedes its calls, as it streamed.
+            if let Some(item) = reasoning {
+                transcript.push_reasoning(item);
+            }
+
+            // Run the round's calls in order, then record the round as a group.
+            let mut exchanges = Vec::with_capacity(calls.len());
             for call in calls {
                 match tools::execute(&call, &self.policy, on_progress) {
-                    Ok(output) => transcript.push_tool_round(call, output),
+                    Ok(output) => exchanges.push((call, output)),
                     Err(error) => return on_progress(Progress::Failed(error.to_string())),
                 }
             }
+            transcript.push_tool_round(exchanges);
         }
         let rounds = self.max_rounds;
         on_progress(Progress::Failed(format!("gave up after {rounds} tool rounds")));
