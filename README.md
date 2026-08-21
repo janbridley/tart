@@ -16,7 +16,7 @@ filesystem tools run without approval. In practice, this means that the model is
 unrestricted access to both the working directory, `/tmp`, and `$TMPDIR`, so plan
 accordingly.
 
-We choose `seatbelt-exec` as a lightweight sandbox option, as it effectively balances
+We choose `sandbox-exec` as a lightweight sandbox option, as it effectively balances
 safety with memory usage and complexity. While running the agent in a container seems
 beneficial, the real safety bottleneck is syncing local data with the agent's copies.
 Manual approvals make this step safe in theory, but agentic workloads are capable of
@@ -33,9 +33,9 @@ extract a subset of lines in the file. `Bash` provides a standardized tool calli
 interface with the ability to execute command-line tools within the sandbox. `Edit` is
 the most complex, as agents require the ability to find-and-replace *only when a unique
 match is found*. This is implemented in `tart-agents/src/data/edit.pl`, which provides a
-custom stream editor similar to sed's raw string mode. Both the `Read` and `Edit` tools
-operate under the sandbox and are thread safe (meaning parallel agents cannot read or
-create partial modifications).
+custom stream editor similar to sed's regex escape mode. Both the `Read` and `Edit`
+tools operate under the sandbox and are thread-safe (meaning parallel agents cannot read
+or create partial modifications).
 
 ## Package Structure
 
@@ -47,5 +47,5 @@ endpoints, but we welcome PRs for a wider variety of providers.
 
 ## LLM Policy
 
-PRs, issues, and code comments MUST be handwritten. You can use LLMs as part of you’re
-development workflow, but I’d like a human to explain the goal of their changes.
+PRs, issues, and code comments MUST be handwritten. You can use LLMs as part of your
+development workflow, but I'd like a human to explain the goal of their changes.
