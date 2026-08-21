@@ -1,4 +1,5 @@
 use warnings;
+our ($start, $end);
 
 # Number a file's lines `cat -n` style, keeping only the bounded lines. The
 # The harness prepends a preamble assigning $start and $end, or unbounded if not set.
