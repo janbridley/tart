@@ -1,4 +1,4 @@
-//! A terminal chat front end for the `async-openai` Responses API.
+//! A terminal chat front end for the tart agent harness.
 //!
 //! ```text
 //! │ transcript (wraps, auto-tails)          │
@@ -21,16 +21,6 @@ use std::io::stdout;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-use async_compat::Compat;
-use async_openai::{
-    Client,
-    config::OpenAIConfig,
-    types::responses::{
-        CreateResponse, CreateResponseArgs, EasyInputMessageArgs, InputItem, InputParam, Reasoning,
-        ReasoningEffort, ResponseStreamEvent, Role,
-    },
-};
-use futures::{StreamExt, executor::block_on};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -39,10 +29,8 @@ use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Pane, PaneEvent};
+use tart_agents::{Agent, Progress, ReasoningEffort, Transcript, sandbox::Policy};
 use tmux_override::{override_shift_up, restore_tmux};
-
-/// The personality tart brings to every conversation.
-const SYSTEM: &str = include_str!("data/SYSTEM.md");
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
@@ -78,73 +66,6 @@ enum Wake {
     Generation(Progress),
 }
 
-/// Progress from one background generation.
-enum Progress {
-    /// A fragment of the model's chain-of-thought reasoning.
-    Thinking(String),
-    /// A fragment of the final answer.
-    Answer(String),
-    /// The stream ended; the assembled answer, if any arrived.
-    Done { message: Option<String> },
-    /// The request or stream failed.
-    Failed(String),
-}
-
-/// One message in the conversation, as the Responses API sends it.
-fn input_message(role: Role, text: String) -> anyhow::Result<InputItem> {
-    Ok(EasyInputMessageArgs::default()
-        .role(role)
-        .content(text)
-        .build()?
-        .into())
-}
-
-/// Drive one streaming generation to completion, reporting progress to `on_progress`.
-///
-/// Fragments arrive as the model works, and the generation always ends with exactly
-/// one terminal event: [`Progress::Done`] with the assembled answer (`None` if nothing
-/// arrived), or [`Progress::Failed`] on a request or stream error. A stream that closes
-/// without a terminal event still reports `Done` with whatever the model produced.
-///
-/// Blocks the current thread until the generation finishes.
-fn generate<F: Fn(Progress) + Send>(
-    client: &Client<OpenAIConfig>,
-    request: CreateResponse,
-    on_progress: F,
-) {
-    // `Compat` enters the global tokio runtime and exposes `futures` blocking control.
-    let mut stream = match block_on(Compat::new(client.responses().create_stream(request))) {
-        Ok(stream) => stream,
-        Err(error) => return on_progress(Progress::Failed(error.to_string())),
-    };
-
-    let mut answer = String::new();
-    while let Some(item) = block_on(stream.next()) {
-        match item {
-            Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
-                answer.push_str(&delta.delta);
-                on_progress(Progress::Answer(delta.delta));
-            }
-            Ok(ResponseStreamEvent::ResponseReasoningTextDelta(delta)) => {
-                on_progress(Progress::Thinking(delta.delta));
-            }
-            Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
-                return on_progress(Progress::Failed(
-                    failed
-                        .response
-                        .error
-                        .map_or_else(|| "response failed".to_string(), |error| error.message),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) => return on_progress(Progress::Failed(error.to_string())),
-        }
-    }
-    on_progress(Progress::Done {
-        message: (!answer.is_empty()).then_some(answer),
-    });
-}
-
 fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
@@ -154,11 +75,14 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     ));
 
     let api_key = std::env::var("DEEPSEEK_API_KEY")?;
-    let config = OpenAIConfig::new()
-        .with_api_base("https://api.deepseek.com")
-        .with_api_key(&api_key);
-    let client = Client::with_config(config);
-    let mut history: Vec<InputItem> = vec![input_message(Role::System, SYSTEM.to_string())?];
+    let agent = Agent::new(
+        "https://api.deepseek.com",
+        api_key,
+        "deepseek-v4-flash",
+        Policy::new(std::env::current_dir()?)?.exclude_git(),
+    )
+    .reasoning_effort(ReasoningEffort::High);
+    let mut transcript = Transcript::new()?;
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
@@ -176,6 +100,10 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     let mut quit = false;
     while !quit {
         terminal.draw(|frame| pane.render(frame, frame.area()))?;
+        #[allow(
+            clippy::match_same_arms,
+            reason = "different wake sources that happen to need no handling"
+        )]
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match on_key(&mut pane, key) {
                 Some(PaneEvent::Quit) => quit = true,
@@ -189,24 +117,12 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                     _ => {
                         // New response clears the thinking box for the previous one
                         pane.begin_response();
-                        history.push(input_message(Role::User, line)?);
-                        let request = CreateResponseArgs::default()
-                            .model("deepseek-v4-flash")
-                            .stream(true)
-                            .reasoning(Reasoning {
-                                effort: Some(ReasoningEffort::High),
-                                summary: None,
-                            })
-                            .input(InputParam::Items(history.clone()))
-                            .build()?;
+                        transcript.push_user(line)?;
                         generating = true;
-                        let client = client.clone();
                         let sender = wake.clone();
-                        // Run the generation on its own thread
-                        std::thread::spawn(move || {
-                            generate(&client, request, move |progress| {
-                                let _ = sender.send(Wake::Generation(progress));
-                            });
+                        // The agent loop runs on its own thread
+                        agent.spawn(&transcript, move |progress| {
+                            let _ = sender.send(Wake::Generation(progress));
                         });
                     }
                 },
@@ -222,11 +138,20 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 pane.append_thinking(&Span::styled(text, DIM_STYLE));
             }
             Ok(Wake::Generation(Progress::Answer(text))) => pane.append(&Span::raw(text)),
+            // Show what the model ran, and what came back, dimmed like thinking
+            Ok(Wake::Generation(Progress::Command(command))) => {
+                pane.push(Span::styled(format!("$ {command}"), DIM_STYLE));
+            }
+            Ok(Wake::Generation(Progress::CommandOutput(output))) => {
+                for line in output.split('\n') {
+                    pane.push(Span::styled(line.to_string(), DIM_STYLE));
+                }
+            }
             // When the model is done, carry the turn into the next request
             Ok(Wake::Generation(Progress::Done { message })) => {
                 generating = false;
                 if let Some(text) = message {
-                    history.push(input_message(Role::Assistant, text)?);
+                    transcript.push_assistant(text)?;
                 }
             }
             // If the model *fails* for some reason, show the error.
@@ -234,6 +159,8 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
                 generating = false;
                 pane.append(&Span::styled(error, DIM_STYLE));
             }
+            // `Progress` is non-exhaustive; later variants need no handling yet.
+            Ok(Wake::Generation(_)) => {}
         }
     }
     Ok(())
