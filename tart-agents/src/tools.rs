@@ -11,13 +11,16 @@ use crate::{Progress, sandbox::Policy};
 /// Exits 1 with a warning, file untouched, or when the match count is wrong.
 const EDIT_PROGRAM: &str = include_str!("data/edit.pl");
 
-const READ_PROGRAM: &str = r#"printf "%6d\t%s", $., $_"#;
+/// Emulate `cat -n … | sed -n …` , using a shared `flock` with the edit tool.
+const READ_PROGRAM: &str = include_str!("data/read.pl");
 
 /// Cat a (subregion of a) file, numbering the lines in the output.
 fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
-    let s = start.map(|v| format!(" if $. >= {v}")).unwrap_or_default();
-    let e = end.map(|v| format!(" exit if $. >= {v};")).unwrap_or_default();
-    format!("{READ_PROGRAM}{s};{e}")
+    format!(
+        "$start = {}; $end = {};\n{READ_PROGRAM}", // Bake the bounds into the script
+        start.unwrap_or(0),
+        end.unwrap_or(0)
+    )
 }
 
 /// The bash tool; commands execute under the caller's [`Policy`].
@@ -223,7 +226,7 @@ fn run_read<F: Fn(Progress)>(
     on_progress(Progress::Command(format!("read {}", read.path)));
     let mut command = policy.command("/usr/bin/perl");
     command
-        .arg("-ne")
+        .arg("-e")
         .arg(numbered_read(read.start_line, read.end_line))
         .arg("--")
         .arg(&read.path);
@@ -593,6 +596,34 @@ mod tests {
             id: Some("item_0".to_string()),
             status: None,
         }
+    }
+
+    #[test]
+    fn reads_wait_for_the_edit_lock() {
+        let file = Scratch::new("read-lock", "one\ntwo\n");
+        // Stand in for an in-flight edit: an exclusive flock, as edit.pl takes.
+        let editor = std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .unwrap();
+        editor.lock().unwrap();
+        let path = file.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            let output = std::process::Command::new("/usr/bin/perl")
+                .arg("-e")
+                .arg(numbered_read(None, None))
+                .arg("--")
+                .arg(&path)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).to_string()
+        });
+
+        // The read blocks on the shared lock until the "edit" finishes.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!reader.is_finished());
+        drop(editor);
+        assert_eq!(reader.join().unwrap(), "     1\tone\n     2\ttwo\n");
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
