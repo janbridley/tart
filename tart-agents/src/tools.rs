@@ -119,7 +119,7 @@ mod tests {
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
     #[test]
     fn execute_reports_command_then_output() {
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
         let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &policy, &|progress| {
             events.borrow_mut().push(progress);
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn execute_rejects_unknown_tool_names() {
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
 
