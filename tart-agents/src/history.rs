@@ -25,6 +25,15 @@ impl Transcript {
         })
     }
 
+    /// A transcript opening with the tart system prompt, followed by the
+    /// agent's `instructions` as a second system message.
+    #[inline]
+    pub fn with_instructions(instructions: String) -> anyhow::Result<Self> {
+        let mut transcript = Self::new()?;
+        transcript.items.push(input_message(Role::System, instructions)?);
+        Ok(transcript)
+    }
+
     /// Record the user's turn.
     #[inline]
     pub fn push_user(&mut self, text: String) -> anyhow::Result<()> {
@@ -106,6 +115,15 @@ mod tests {
 
         assert_eq!(items[0]["role"], "system");
         assert_eq!(items[0]["content"], SYSTEM);
+    }
+
+    #[test]
+    fn instructions_follow_the_system_prompt() {
+        let transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+
+        assert_eq!(items[1]["role"], "system");
+        assert_eq!(items[1]["content"], "be terse");
     }
 
     #[test]
