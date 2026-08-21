@@ -11,7 +11,7 @@ use async_openai::{
 };
 use futures::{StreamExt, executor::block_on};
 
-use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, sandbox::Policy, tools};
+use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
 
 /// A Responses-API model configured to run the tart tool loop.
 #[derive(Clone)]
@@ -71,7 +71,10 @@ impl Agent {
             let outcome =
                 std::panic::catch_unwind(AssertUnwindSafe(|| agent.run(transcript, &on_progress)));
             if outcome.is_err() {
-                on_progress(Progress::Failed("generation panicked".to_string()));
+                terminate_and_log(
+                    &on_progress,
+                    Progress::Failed("generation panicked".to_string()),
+                );
             }
         });
     }
@@ -107,14 +110,20 @@ impl Agent {
                 .build()
             {
                 Ok(request) => request,
-                Err(error) => return on_progress(Progress::Failed(error.to_string())),
+                Err(error) => {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
             };
+
+            debug::log_json("round request", || serde_json::to_string(&request));
 
             // `Compat` enters the global tokio runtime and exposes `futures` blocking control.
             let mut stream =
                 match block_on(Compat::new(self.client.responses().create_stream(request))) {
                     Ok(stream) => stream,
-                    Err(error) => return on_progress(Progress::Failed(error.to_string())),
+                    Err(error) => {
+                        return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                    }
                 };
 
             let mut answer = String::new();
@@ -148,6 +157,9 @@ impl Agent {
                     }
                     Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => match &done.item {
                         OutputItem::Reasoning(item) => {
+                            debug::log_json("captured reasoning item", || {
+                                serde_json::to_string(item)
+                            });
                             reasoning = Some(item.clone());
                             saw_output = true;
                         }
@@ -159,55 +171,80 @@ impl Agent {
                         _ => {}
                     },
                     Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
-                        return on_progress(Progress::Failed(failed.response.error.map_or_else(
-                            || "response failed".to_string(),
-                            |error| error.message,
-                        )));
+                        debug::log_json("response failed event", || serde_json::to_string(&failed));
+                        return terminate_and_log(
+                            on_progress,
+                            Progress::Failed(failed.response.error.map_or_else(
+                                || "response failed".to_string(),
+                                |error| error.message,
+                            )),
+                        );
                     }
                     // The provider said the stream broke; not recoverable here.
                     Ok(ResponseStreamEvent::ResponseError(error)) => {
-                        return on_progress(Progress::Failed(format!(
-                            "{}: {}",
-                            error.code.unwrap_or_else(|| "error".to_string()),
-                            error.message
-                        )));
+                        debug::log_json("response error event", || serde_json::to_string(&error));
+                        return terminate_and_log(
+                            on_progress,
+                            Progress::Failed(format!(
+                                "{}: {}",
+                                error.code.unwrap_or_else(|| "error".to_string()),
+                                error.message
+                            )),
+                        );
                     }
                     // Truncated (max output tokens, content filter): report it
                     Ok(ResponseStreamEvent::ResponseIncomplete(incomplete)) => {
+                        debug::log_json("response incomplete event", || {
+                            serde_json::to_string(&incomplete)
+                        });
                         let reason = incomplete
                             .response
                             .incomplete_details
                             .map_or_else(|| "unknown reason".to_string(), |details| details.reason);
-                        return on_progress(Progress::Failed(format!(
-                            "response incomplete: {reason}"
-                        )));
+                        return terminate_and_log(
+                            on_progress,
+                            Progress::Failed(format!("response incomplete: {reason}")),
+                        );
                     }
                     Ok(_) => {}
                     // Transport errors are skipped: the stream ends on its own,
                     // and the checks after the loop decide what the round got.
-                    Err(error) => last_error = Some(error.to_string()),
+                    Err(error) => {
+                        let error = error.to_string();
+                        debug::log("stream error", || error.clone());
+                        last_error = Some(error);
+                    }
                 }
             }
 
             if call_in_flight {
-                return on_progress(Progress::Failed(with_last_error(
-                    "stream ended mid tool call",
-                    last_error, // The stream ended mid tool call
-                )));
+                return terminate_and_log(
+                    on_progress,
+                    Progress::Failed(with_last_error(
+                        "stream ended mid tool call",
+                        last_error, // The stream ended mid tool call
+                    )),
+                );
             }
 
             if !saw_output {
-                return on_progress(Progress::Failed(with_last_error(
-                    "stream ended without output",
-                    last_error, // Nothing arrived at all
-                )));
+                return terminate_and_log(
+                    on_progress,
+                    Progress::Failed(with_last_error(
+                        "stream ended without output",
+                        last_error, // Nothing arrived at all
+                    )),
+                );
             }
 
             // No calls pending: this round's answer is the turn's message.
             if calls.is_empty() {
-                return on_progress(Progress::Done {
-                    message: (!answer.is_empty()).then_some(answer),
-                });
+                return terminate_and_log(
+                    on_progress,
+                    Progress::Done {
+                        message: (!answer.is_empty()).then_some(answer),
+                    },
+                );
             }
 
             // The round's reasoning precedes its calls, as it streamed.
@@ -220,13 +257,18 @@ impl Agent {
             for call in calls {
                 match tools::execute(&call, &self.policy, on_progress) {
                     Ok(output) => exchanges.push((call, output)),
-                    Err(error) => return on_progress(Progress::Failed(error.to_string())),
+                    Err(error) => {
+                        return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                    }
                 }
             }
             transcript.push_tool_round(exchanges);
         }
         let rounds = self.max_rounds;
-        on_progress(Progress::Failed(format!("gave up after {rounds} tool rounds")));
+        terminate_and_log(
+            on_progress,
+            Progress::Failed(format!("gave up after {rounds} tool rounds")),
+        );
     }
 }
 
@@ -236,4 +278,16 @@ fn with_last_error(message: &str, last_error: Option<String>) -> String {
         Some(error) => format!("{message}: {error}"),
         None => message.to_string(),
     }
+}
+
+/// Deliver the generation's terminal event, mirroring its outcome to the debug lob.
+fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
+    debug::log("generation outcome", || match &event {
+        Progress::Done { message } => {
+            format!("done ({} answer chars)", message.as_deref().map_or(0, str::len))
+        }
+        Progress::Failed(reason) => format!("failed: {reason}"),
+        _ => "not a terminal event".to_string(),
+    });
+    on_progress(event);
 }
