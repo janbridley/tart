@@ -148,10 +148,6 @@ impl Agent {
                     }
                     Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => match &done.item {
                         OutputItem::Reasoning(item) => {
-                            dump_json(
-                                "captured reasoning item",
-                                &serde_json::to_string(item).unwrap_or_default(),
-                            );
                             reasoning = Some(item.clone());
                             saw_output = true;
                         }
