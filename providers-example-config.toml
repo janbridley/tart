@@ -10,7 +10,7 @@ label = "z.ai" # Optional
 base_url = "https://api.z.ai/api/v1"
 # Strings name an env variable; an array is a command (argv, no shell)
 # api_key = "ZAI_API_KEY"
-api_key = ["security", "find-generic-password", "-a", "zai", "-s", "z_ai_mcp_token", "-w"]
+api_key = ["security", "find-generic-password", "-a", "account", "-s", "service", "-w"]
 
 # Agent 1, stored in an array table
 [[zai.agents]]
