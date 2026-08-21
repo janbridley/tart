@@ -45,3 +45,7 @@ unwrap_used = "warn"
 fallible_impl_from = "warn"
 needless_collect = "warn"
 needless_pass_by_ref_mut = "warn"
+
+# Speed up compiles. Can override with CARGO_PROFILE_DEV_DEBUG=full.
+[profile.dev]
+debug = "line-tables-only"

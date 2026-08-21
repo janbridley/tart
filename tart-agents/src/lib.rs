@@ -1,6 +1,7 @@
 //! The *tart* agent harness.
 
 mod agent;
+mod debug;
 mod history;
 mod progress;
 mod tools;
