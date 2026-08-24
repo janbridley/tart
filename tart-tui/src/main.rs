@@ -164,12 +164,10 @@ fn run(
                     pane.push(Span::styled(line.to_string(), DIM_STYLE));
                 }
             }
-            // When the model is done, carry the turn into the next request
-            Ok(Wake::Generation(Progress::Done { message })) => {
+            // When the model is done, the worker has already recorded the entire turn
+            // (including tool calls) into the transcript
+            Ok(Wake::Generation(Progress::Done { .. })) => {
                 generating = false;
-                if let Some(text) = message {
-                    transcript.push_assistant(text)?;
-                }
             }
             // If the model *fails* for some reason, show the error.
             Ok(Wake::Generation(Progress::Failed(error))) => {
