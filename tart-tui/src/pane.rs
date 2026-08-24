@@ -1061,7 +1061,8 @@ impl<'a> Wrapper<'a> {
 
     /// Add one rendered cell; `sym` is a single space for expanded tabs.
     fn push(&mut self, sym: &'a str, style: Style) {
-        let gw = Span::raw(sym).width();
+        // Single-byte symbols can be printed without looking up width.
+        let gw = if sym.len() == 1 { 1 } else { Span::raw(sym).width() };
         let space = sym == " ";
         if self.row_width + gw > self.width && !self.row.is_empty() && gw > 0 {
             if space {
