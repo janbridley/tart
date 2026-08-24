@@ -20,6 +20,16 @@ const TAB_WIDTH: usize = 4;
 pub const DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
 /// Stands in for a hidden thinking run.
 const THINKING_HIDDEN: &str = "[Thinking… ctrl+t to toggle]";
+
+/// A tool box's collapsed output keeps this many head and tail lines.
+const TOOL_HEAD: usize = 3;
+const TOOL_TAIL: usize = 2;
+/// Standin for a tool that produced no output.
+const TOOL_NO_OUTPUT: &str = "(no output)";
+/// The bullet and name of a tool box header: running, succeeded, or failed.
+const TOOL_RUNNING: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const TOOL_OK: Style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+const TOOL_ERR: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 /// The copy cursor and the editor caret are the cell under them, inverted.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
