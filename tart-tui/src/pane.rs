@@ -70,6 +70,8 @@ pub struct Pane {
     usage: Option<Usage>,
     /// The model's context window, from the agents file.
     context_tokens: Option<u64>,
+    /// Whether the model is generating; Enter then keeps the draft.
+    generating: bool,
 }
 
 impl Pane {
@@ -82,6 +84,7 @@ impl Pane {
             perf: None,
             usage: None,
             context_tokens: None,
+            generating: false,
         }
     }
 
@@ -165,6 +168,8 @@ impl Pane {
         }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
+            // A draft cannot go out mid-generation; Enter keeps it for later.
+            KeyCode::Enter if self.generating => {}
             KeyCode::Enter => return self.submit().map(PaneEvent::Submit),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
@@ -266,6 +271,11 @@ impl Pane {
     /// Update the `/perf` stats line; `None` restores the bottom rule.
     pub fn set_perf(&mut self, perf: Option<String>) {
         self.perf = perf;
+    }
+
+    /// Mark the model busy; Enter keeps the draft instead of submitting it.
+    pub fn set_generating(&mut self, generating: bool) {
+        self.generating = generating;
     }
 
     /// Echo the draft into the transcript and clear it.
@@ -1326,6 +1336,28 @@ mod tests {
         assert!(!plain.contains("rows"));
         assert!(perf.contains("fps 60"));
         assert!(perf.contains("rows"));
+    }
+
+    #[test]
+    fn enter_while_generating_keeps_the_draft() {
+        let mut pane = Pane::default();
+        for c in ['h', 'i'] {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.set_generating(true);
+        // Enter neither echoes nor clears; Alt+Enter still edits the draft.
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        pane.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(pane.prompt.lines.len(), 2);
+        assert_eq!(pane.prompt.text(), "hi\n");
+        assert!(message_texts(&pane.transcript).is_empty());
+        // Once the model is done, Enter submits the intact draft.
+        pane.set_generating(false);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Submit("hi\n".into()))
+        );
+        assert_eq!(pane.prompt.text(), "");
     }
 
     fn texts(lines: &[Line<'static>]) -> Vec<String> {

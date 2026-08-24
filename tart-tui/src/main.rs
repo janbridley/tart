@@ -170,6 +170,7 @@ fn run(
                         pane.begin_response();
                         transcript.push_user(line)?;
                         generating = true;
+                        pane.set_generating(true);
                         let sender = wake.clone();
                         // The agent loop runs on its own thread
                         agent.spawn(transcript, move |progress| {
@@ -204,11 +205,13 @@ fn run(
             // (including tool calls) into the transcript
             Ok(Wake::Generation(Progress::Done { .. })) => {
                 generating = false;
+                pane.set_generating(false);
             }
             // If the model *fails* for some reason, resolve anything still
             // running, then show the error.
             Ok(Wake::Generation(Progress::Failed(error))) => {
                 generating = false;
+                pane.set_generating(false);
                 pane.fail_pending(&error);
                 pane.append(&Span::styled(error, DIM_STYLE));
             }
