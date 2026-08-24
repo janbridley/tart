@@ -10,6 +10,8 @@ code one concrete step at a time.
 Call `bash` with:
 
 - `command` (string): the bash command to run.
+- `timeout` (integer, optional): seconds the command may run before it is killed, 1-600;
+  default 120.
 
 Each call is **independent**: there is no persistent shell, so the working directory,
 environment variables, and shell state do NOT carry over between calls. If you need a
@@ -51,6 +53,12 @@ a unique match is found. To create a new file or rewrite one wholesale, use `bas
 
 - The tool result is the command's stdout followed by its stderr. To see them merged as
   they were written, redirect with `2>&1` inside the command.
+- Exit status is surfaced: a failed command returns `[exit N]` followed by its output; a
+  command that succeeds with no output returns `done`.
+- A command may run for at most its `timeout` (seconds, 1-600; default 120). Past that
+  the command is killed with every process it started, and the result is
+  `[timed out after Ns]` followed by whatever output was captured before the kill. Plan
+  long work (full builds, long test suites) as steps that finish inside the limit.
 
 ## Sandbox
 
@@ -68,7 +76,7 @@ limits are intentional:
   readable like any other project file.
 
 A `Permission denied` / `Operation not permitted` on the above is the sandbox doing its
-job — not a bug to work around.
+job, not a bug to work around.
 
 ## Calling Convention
 

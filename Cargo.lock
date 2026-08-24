@@ -2089,6 +2089,7 @@ dependencies = [
  "async-compat",
  "async-openai",
  "futures",
+ "libc",
  "serde_json",
 ]
 

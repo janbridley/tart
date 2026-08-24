@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
-    let result = run(&mut terminal, &agent, transcript, &label);
+    let result = run(&mut terminal, &agent, &transcript, &label);
     ratatui::try_restore()?;
     execute!(stdout(), DisableBracketedPaste)?;
     terminal.show_cursor()?;
@@ -89,7 +89,7 @@ enum Wake {
 fn run(
     terminal: &mut DefaultTerminal,
     agent: &Agent,
-    mut transcript: Transcript,
+    transcript: &Transcript,
     label: &str,
 ) -> anyhow::Result<()> {
     let mut pane = Pane::default();
@@ -138,7 +138,7 @@ fn run(
                         generating = true;
                         let sender = wake.clone();
                         // The agent loop runs on its own thread
-                        agent.spawn(&transcript, move |progress| {
+                        agent.spawn(transcript, move |progress| {
                             let _ = sender.send(Wake::Generation(progress));
                         });
                     }
@@ -155,25 +155,23 @@ fn run(
                 pane.append_thinking(&Span::styled(text, DIM_STYLE));
             }
             Ok(Wake::Generation(Progress::Answer(text))) => pane.append(&Span::raw(text)),
-            // Show what the model ran, and what came back, dimmed like thinking
-            Ok(Wake::Generation(Progress::Command(command))) => {
-                pane.push(Span::styled(format!("$ {command}"), DIM_STYLE));
+            // Tool calls render as live boxes in the transcript
+            Ok(Wake::Generation(Progress::ToolStart { id, name, digest })) => {
+                pane.start_tool(id, name, digest);
             }
-            Ok(Wake::Generation(Progress::CommandOutput(output))) => {
-                for line in output.split('\n') {
-                    pane.push(Span::styled(line.to_string(), DIM_STYLE));
-                }
+            Ok(Wake::Generation(Progress::ToolOutput { id, output, exit })) => {
+                pane.finish_tool(&id, output, exit);
             }
-            // When the model is done, carry the turn into the next request
-            Ok(Wake::Generation(Progress::Done { message })) => {
+            // When the model is done, the worker has already recorded the entire turn
+            // (including tool calls) into the transcript
+            Ok(Wake::Generation(Progress::Done { .. })) => {
                 generating = false;
-                if let Some(text) = message {
-                    transcript.push_assistant(text)?;
-                }
             }
-            // If the model *fails* for some reason, show the error.
+            // If the model *fails* for some reason, resolve anything still
+            // running, then show the error.
             Ok(Wake::Generation(Progress::Failed(error))) => {
                 generating = false;
+                pane.fail_pending(&error);
                 pane.append(&Span::styled(error, DIM_STYLE));
             }
             // `Progress` is non-exhaustive; later variants need no handling yet.
