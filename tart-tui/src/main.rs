@@ -155,23 +155,23 @@ fn run(
                 pane.append_thinking(&Span::styled(text, DIM_STYLE));
             }
             Ok(Wake::Generation(Progress::Answer(text))) => pane.append(&Span::raw(text)),
-            // Show what the model ran, and what came back, dimmed like thinking
-            Ok(Wake::Generation(Progress::Command(command))) => {
-                pane.push(Span::styled(format!("$ {command}"), DIM_STYLE));
+            // Tool calls render as live boxes in the transcript
+            Ok(Wake::Generation(Progress::ToolStart { id, name, digest })) => {
+                pane.start_tool(id, name, digest);
             }
-            Ok(Wake::Generation(Progress::CommandOutput(output))) => {
-                for line in output.split('\n') {
-                    pane.push(Span::styled(line.to_string(), DIM_STYLE));
-                }
+            Ok(Wake::Generation(Progress::ToolOutput { id, output, exit })) => {
+                pane.finish_tool(&id, output, exit);
             }
             // When the model is done, the worker has already recorded the entire turn
             // (including tool calls) into the transcript
             Ok(Wake::Generation(Progress::Done { .. })) => {
                 generating = false;
             }
-            // If the model *fails* for some reason, show the error.
+            // If the model *fails* for some reason, resolve anything still
+            // running, then show the error.
             Ok(Wake::Generation(Progress::Failed(error))) => {
                 generating = false;
+                pane.fail_pending(&error);
                 pane.append(&Span::styled(error, DIM_STYLE));
             }
             // `Progress` is non-exhaustive; later variants need no handling yet.
