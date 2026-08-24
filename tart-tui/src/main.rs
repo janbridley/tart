@@ -62,7 +62,13 @@ fn main() -> anyhow::Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
-    let result = run(&mut terminal, &agent, &transcript, &label);
+    let result = run(
+        &mut terminal,
+        &agent,
+        &transcript,
+        &label,
+        agent_config.context_tokens,
+    );
     ratatui::try_restore()?;
     execute!(stdout(), DisableBracketedPaste)?;
     terminal.show_cursor()?;
@@ -93,6 +99,7 @@ fn run(
     agent: &Agent,
     transcript: &Transcript,
     label: &str,
+    context_tokens: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
@@ -102,6 +109,9 @@ fn run(
         ),
         DIM_STYLE,
     ));
+    if let Some(tokens) = context_tokens {
+        pane.set_context_tokens(tokens);
+    }
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
@@ -179,6 +189,10 @@ fn run(
             }
             Ok(Wake::Generation(Progress::ToolOutput { id, output, exit })) => {
                 pane.finish_tool(&id, output, exit);
+            }
+            // The status line's usage measurements
+            Ok(Wake::Generation(Progress::Usage { input, cached, output })) => {
+                pane.set_usage(input, cached, output);
             }
             // When the model is done, the worker has already recorded the entire turn
             // (including tool calls) into the transcript
