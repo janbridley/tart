@@ -27,6 +27,15 @@ pub enum Progress {
         /// The process exit code; `None` when no process ran (spawn error).
         exit: Option<i32>,
     },
+    /// One finished response's token usage, as the provider measured it.
+    Usage {
+        /// All input tokens, cache included.
+        input: u64,
+        /// The input tokens served from the prompt cache.
+        cached: u64,
+        /// The tokens the model generated.
+        output: u64,
+    },
     /// The assembled answer at the end of the stream, if any arrived.
     Done {
         /// The full answer text, unless the model produced `None`.
