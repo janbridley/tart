@@ -51,6 +51,8 @@ a unique match is found. To create a new file or rewrite one wholesale, use `bas
 
 - The tool result is the command's stdout followed by its stderr. To see them merged as
   they were written, redirect with `2>&1` inside the command.
+- Exit status is surfaced: a failed command returns `[exit N]` followed by its output; a
+  command that succeeds with no output returns `done`.
 
 ## Sandbox
 

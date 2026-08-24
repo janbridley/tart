@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Output;
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 
@@ -187,6 +188,23 @@ pub(crate) fn execute<F: Fn(Progress)>(
     }
 }
 
+/// The tool result for one finished command: its stdout then its stderr, prefixed
+/// with `[exit N]` when it failed, or `done` when a success printed nothing.
+fn command_result(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = format!("{stdout}{stderr}");
+
+    if output.status.success() {
+        return if text.is_empty() { "done".to_string() } else { text };
+    }
+
+    let status = output.status.code().map_or("signal".into(), |c| c.to_string());
+
+    let separator = if text.is_empty() { "" } else { "\n" };
+    format!("[exit {status}]{separator}{text}")
+}
+
 /// Run one bash tool call under `policy`, reporting its steps to `on_progress`.
 fn run_bash<F: Fn(Progress)>(
     call: &FunctionToolCall,
@@ -204,13 +222,7 @@ fn run_bash<F: Fn(Progress)>(
         .output()
         .map_or_else(
             |error| format!("error: {error}"),
-            |output| {
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                )
-            },
+            |output| command_result(&output),
         );
     on_progress(Progress::CommandOutput(output.clone()));
     Ok(output)
@@ -371,6 +383,53 @@ mod tests {
         let error = parse_command(r#"{"other":1}"#).unwrap_err().to_string();
 
         assert!(error.contains("missing 'command'"), "{error}");
+    }
+
+    /// A finished command's captured streams, with a Unix wait status: 0 is a
+    /// success, `code << 8` an exit code, a small number a signal.
+    fn command_output(raw: i32, stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(raw),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn command_result_passes_successful_output_through() {
+        let output = command_output(0, "hi\n", "");
+
+        assert_eq!(command_result(&output), "hi\n");
+    }
+
+    #[test]
+    fn command_result_reports_a_silent_success_as_done() {
+        let output = command_output(0, "", "");
+
+        assert_eq!(command_result(&output), "done");
+    }
+
+    #[test]
+    fn command_result_prefixes_a_failure_with_its_exit_code() {
+        let output = command_output(1 << 8, "hi\n", "boom\n");
+
+        assert_eq!(command_result(&output), "[exit 1]\nhi\nboom\n");
+    }
+
+    #[test]
+    fn command_result_marks_a_silent_failure_with_just_the_exit_code() {
+        let output = command_output(1 << 8, "", "");
+
+        assert_eq!(command_result(&output), "[exit 1]");
+    }
+
+    #[test]
+    fn command_result_marks_a_signal_death() {
+        let output = command_output(9, "", "");
+
+        assert_eq!(command_result(&output), "[exit signal]");
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
