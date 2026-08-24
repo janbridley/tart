@@ -188,12 +188,19 @@ pub(crate) fn execute<F: Fn(Progress)>(
     }
 }
 
+/// One finished process's combined streams: stdout then stderr, lossily decoded.
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 /// The tool result for one finished command: its stdout then its stderr, prefixed
 /// with `[exit N]` when it failed, or `done` when a success printed nothing.
 fn command_result(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = format!("{stdout}{stderr}");
+    let text = combined_output(output);
 
     if output.status.success() {
         return if text.is_empty() { "done".to_string() } else { text };
@@ -243,17 +250,15 @@ fn run_read<F: Fn(Progress)>(
         .arg("--")
         .arg(&read.path);
     // A failure to launch comes back as an error string for the model to deal with.
-    let output = command.output().map_or_else(
-        |error| format!("error: {error}"),
-        |output| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        },
-    );
-    on_progress(Progress::CommandOutput(output.clone()));
+    let (output, exit) = match &command.output() {
+        Ok(spawned) => (combined_output(spawned), spawned.status.code()),
+        Err(error) => (format!("error: {error}"), None),
+    };
+    on_progress(Progress::ToolOutput {
+        id: call.call_id.clone(),
+        output: output.clone(),
+        exit,
+    });
     Ok(output)
 }
 
