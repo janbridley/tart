@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use async_openai::types::responses::{
     EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
     InputItem, Item, ReasoningItem, Role,
@@ -8,20 +10,29 @@ const SYSTEM: &str = include_str!("data/SYSTEM.md");
 
 /// An append-only conversation record for one tart session.
 ///
-/// Tool exchanges are recorded by the agent loop for the turn that made them
-/// and do not persist into later requests.
+/// Clones share one record, so the agent loop writes reasoning, tool exchanges, and the
+/// final answer to the callers transcript. After accumulation, the transcript is passed
+/// back into the model and the conversation continues.
 #[derive(Clone, Debug)]
 pub struct Transcript {
     /// Every item, oldest first, starting with the system prompt.
-    items: Vec<InputItem>,
+    items: Arc<Mutex<Vec<InputItem>>>,
 }
 
 impl Transcript {
+    /// The record under its lock.
+    ///
+    /// If a worker panics mid turn and poisons the lock, we recover the original record
+    /// rather than killing the session.
+    fn items(&self) -> MutexGuard<'_, Vec<InputItem>> {
+        self.items.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A transcript opening with the tart system prompt.
     #[inline]
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            items: vec![input_message(Role::System, SYSTEM.to_string())?],
+            items: Arc::new(Mutex::new(vec![input_message(Role::System, SYSTEM.to_string())?])),
         })
     }
 
@@ -29,22 +40,24 @@ impl Transcript {
     /// agent's `instructions` as a second system message.
     #[inline]
     pub fn with_instructions(instructions: String) -> anyhow::Result<Self> {
-        let mut transcript = Self::new()?;
-        transcript.items.push(input_message(Role::System, instructions)?);
+        let transcript = Self::new()?;
+        transcript
+            .items()
+            .push(input_message(Role::System, instructions)?);
         Ok(transcript)
     }
 
     /// Record the user's turn.
     #[inline]
-    pub fn push_user(&mut self, text: String) -> anyhow::Result<()> {
-        self.items.push(input_message(Role::User, text)?);
+    pub fn push_user(&self, text: String) -> anyhow::Result<()> {
+        self.items().push(input_message(Role::User, text)?);
         Ok(())
     }
 
     /// Record the assistant's final answer for the current turn.
     #[inline]
-    pub fn push_assistant(&mut self, text: String) -> anyhow::Result<()> {
-        self.items.push(input_message(Role::Assistant, text)?);
+    pub fn push_assistant(&self, text: String) -> anyhow::Result<()> {
+        self.items().push(input_message(Role::Assistant, text)?);
         Ok(())
     }
 
@@ -52,12 +65,13 @@ impl Transcript {
     ///
     /// This is critical for `DeepSeek`'s thinking mode, which breaks on concurrent tool
     /// calls without it.
-    pub(crate) fn push_reasoning(&mut self, item: ReasoningItem) {
-        self.items.push(InputItem::Item(item.into()));
+    pub(crate) fn push_reasoning(&self, item: ReasoningItem) {
+        self.items().push(InputItem::Item(item.into()));
     }
 
     /// Record one round of tool exchanges.
-    pub(crate) fn push_tool_round(&mut self, round: Vec<(FunctionToolCall, String)>) {
+    pub(crate) fn push_tool_round(&self, round: Vec<(FunctionToolCall, String)>) {
+        let mut items = self.items();
         let mut outputs = Vec::with_capacity(round.len());
         for (call, output) in round {
             outputs.push(FunctionCallOutputItemParam {
@@ -66,10 +80,10 @@ impl Transcript {
                 id: None,
                 status: None,
             });
-            self.items.push(InputItem::Item(Item::FunctionCall(call)));
+            items.push(InputItem::Item(Item::FunctionCall(call)));
         }
         for output in outputs {
-            self.items.push(InputItem::Item(Item::FunctionCallOutput(output)));
+            items.push(InputItem::Item(Item::FunctionCallOutput(output)));
         }
     }
 
@@ -77,7 +91,7 @@ impl Transcript {
     #[inline]
     #[must_use]
     pub(crate) fn request_items(&self) -> Vec<InputItem> {
-        self.items.clone()
+        self.items().clone()
     }
 }
 
@@ -109,6 +123,19 @@ mod tests {
         }
     }
 
+    /// A reasoning item, as the agent loop captures one.
+    fn reasoning_item() -> ReasoningItem {
+        ReasoningItem {
+            id: Some("rs_0".to_string()),
+            summary: Vec::new(),
+            content: Some(vec![ReasoningItemContent::ReasoningText(ReasoningTextContent {
+                text: "thinking".to_string(),
+            })]),
+            encrypted_content: None,
+            status: None,
+        }
+    }
+
     #[test]
     fn transcript_opens_with_the_system_prompt() {
         let items = serde_json::to_value(Transcript::new().unwrap().request_items()).unwrap();
@@ -128,7 +155,7 @@ mod tests {
 
     #[test]
     fn pushed_turns_serialize_in_order() {
-        let mut transcript = Transcript::new().unwrap();
+        let transcript = Transcript::new().unwrap();
         transcript.push_user("hello".to_string()).unwrap();
         transcript.push_assistant("hi there".to_string()).unwrap();
 
@@ -143,7 +170,7 @@ mod tests {
 
     #[test]
     fn tool_rounds_replay_calls_grouped_before_outputs() {
-        let mut transcript = Transcript::new().unwrap();
+        let transcript = Transcript::new().unwrap();
         let mut second = bash_call();
         second.call_id = "call_1".to_string();
         transcript.push_tool_round(vec![
@@ -166,17 +193,45 @@ mod tests {
     }
 
     #[test]
+    fn clones_share_one_record() {
+        let transcript = Transcript::new().unwrap();
+        let worker = transcript.clone();
+        worker.push_user("hello".to_string()).unwrap();
+        worker.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
+
+        // What the agent loop records lands in the caller's transcript.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items.as_array().unwrap().len(), 4);
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn a_recorded_turn_replays_in_spec_order() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        transcript.push_reasoning(reasoning_item());
+        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
+        transcript.push_assistant("done".to_string()).unwrap();
+
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+
+        // message, reasoning, call, output, message — each call paired with
+        // its output by `call_id`.
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[2]["type"], "reasoning");
+        assert_eq!(items[3]["type"], "function_call");
+        assert_eq!(items[4]["type"], "function_call_output");
+        assert_eq!(items[3]["call_id"], items[4]["call_id"]);
+        assert_eq!(items[5]["role"], "assistant");
+        assert_eq!(items[5]["content"], "done");
+    }
+
+    #[test]
     fn reasoning_replays_as_a_reasoning_item() {
-        let mut transcript = Transcript::new().unwrap();
-        transcript.push_reasoning(ReasoningItem {
-            id: Some("rs_0".to_string()),
-            summary: Vec::new(),
-            content: Some(vec![ReasoningItemContent::ReasoningText(ReasoningTextContent {
-                text: "thinking".to_string(),
-            })]),
-            encrypted_content: None,
-            status: None,
-        });
+        let transcript = Transcript::new().unwrap();
+        transcript.push_reasoning(reasoning_item());
 
         let items = serde_json::to_value(transcript.request_items()).unwrap();
 
