@@ -172,6 +172,10 @@ fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
 /// Run one tool call under `policy`, report each step to `on_progress`, and return
 /// output to the model
 ///
+/// Each tool announces itself with [`Progress::ToolStart`] once its arguments
+/// parse and always follows with a [`Progress::ToolOutput`] so the front end knows the
+/// task concluded.
+///
 /// Tool *failures* (a non-zero exit, an edit that did not apply, or a command the
 /// sandbox denies) are not errors here: their output is content that the model
 /// should see.
@@ -219,20 +223,41 @@ fn run_bash<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let command = parse_command(&call.arguments)?;
-    on_progress(Progress::Command(command.clone()));
+    on_progress(Progress::ToolStart {
+        id: call.call_id.clone(),
+        name: "Bash",
+        digest: command.clone(),
+    });
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
-    let output = policy
-        .command("/bin/bash")
-        .arg("-c")
-        .arg(&command)
-        .output()
-        .map_or_else(
-            |error| format!("error: {error}"),
-            |output| command_result(&output),
-        );
-    on_progress(Progress::CommandOutput(output.clone()));
-    Ok(output)
+    let spawned = policy.command("/bin/bash").arg("-c").arg(&command).output();
+    let (result, output, exit) = match &spawned {
+        Ok(spawned) => (
+            command_result(spawned),
+            combined_output(spawned),
+            spawned.status.code(),
+        ),
+        Err(error) => {
+            let text = format!("error: {error}");
+            (text.clone(), text, None)
+        }
+    };
+    on_progress(Progress::ToolOutput {
+        id: call.call_id.clone(),
+        output,
+        exit,
+    });
+    Ok(result)
+}
+
+/// The digest for a read call: the path, with any bounds as `path:start-end`.
+fn read_digest(read: &Read) -> String {
+    match (read.start_line, read.end_line) {
+        (None, None) => read.path.clone(),
+        (Some(start), Some(end)) => format!("{}:{start}-{end}", read.path),
+        (Some(start), None) => format!("{}:{start}-", read.path),
+        (None, Some(end)) => format!("{}:-{end}", read.path),
+    }
 }
 
 /// Run one read tool call under `policy`, reporting its steps to `on_progress`.
@@ -242,7 +267,11 @@ fn run_read<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let read = parse_read(&call.arguments)?;
-    on_progress(Progress::Command(format!("read {}", read.path)));
+    on_progress(Progress::ToolStart {
+        id: call.call_id.clone(),
+        name: "Read",
+        digest: read_digest(&read),
+    });
     let mut command = policy.command("/usr/bin/perl");
     command
         .arg("-e")
@@ -273,43 +302,66 @@ fn run_edit<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
-    on_progress(Progress::Command(format!("edit {}", edit.path)));
-    let result = apply_edit(&edit, policy);
-    on_progress(Progress::CommandOutput(result.clone()));
+    on_progress(Progress::ToolStart {
+        id: call.call_id.clone(),
+        name: "Edit",
+        digest: edit.path.clone(),
+    });
+    let (result, exit) = apply_edit(&edit, policy);
+    on_progress(Progress::ToolOutput {
+        id: call.call_id.clone(),
+        output: result.clone(),
+        exit,
+    });
     Ok(result)
 }
 
-/// Apply one parsed edit under `policy`, returning the outcome message.
+/// Apply one parsed edit under `policy`, returning outcome message and the exit code.
 ///
 /// We pre-check that the edit is valid in rust for performance, though the perl script
 /// verifies to ensure we don't run into TOCTOU issues between here and the lock.
-fn apply_edit(edit: &Edit, policy: &Policy) -> String {
+///
+/// The exit is `None` whenever no process ran: pre-check refusals join spawn
+/// errors in reporting "nothing exited" — the box still colors red.
+fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
     let path = Path::new(&edit.path);
     if edit.old_string.is_empty() {
-        return format!("edit: old_string must not be empty: {}", path.display());
+        return (
+            format!("edit: old_string must not be empty: {}", path.display()),
+            None,
+        );
     }
     if edit.old_string == edit.new_string {
-        return format!(
-            "edit: old_string and new_string are identical: {}",
-            path.display()
+        return (
+            format!(
+                "edit: old_string and new_string are identical: {}",
+                path.display()
+            ),
+            None,
         );
     }
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
-        Err(error) => return format!("edit: cannot read {}: {error}", path.display()),
+        Err(error) => return (format!("edit: cannot read {}: {error}", path.display()), None),
     };
     let count = content.matches(&edit.old_string).count();
     if count == 0 {
-        return format!(
-            "edit: old_string not found in {}; the match must be exact, including whitespace",
-            path.display()
+        return (
+            format!(
+                "edit: old_string not found in {}; the match must be exact, including whitespace",
+                path.display()
+            ),
+            None,
         );
     }
     if count > 1 && !edit.replace_all {
-        return format!(
-            "edit: old_string matches {count} times in {}; pass replace_all or include more \
-            surrounding lines to make it unique",
-            path.display()
+        return (
+            format!(
+                "edit: old_string matches {count} times in {}; pass replace_all or include more \
+                surrounding lines to make it unique",
+                path.display()
+            ),
+            None,
         );
     }
     spawn_perl(edit, &mut policy.command("/usr/bin/perl"))
@@ -321,7 +373,7 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> String {
 ///
 /// Split out so tests can drive the program with a plain command, exercising
 /// its locking and matching semantics without the sandbox.
-fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> String {
+fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i32>) {
     let path = Path::new(&edit.path);
     cmd.arg("-e")
         .arg(EDIT_PROGRAM)
@@ -331,16 +383,23 @@ fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> String {
         .env("TART_NEW", &edit.new_string)
         .envs(edit.replace_all.then_some(("TART_ALL", "1")));
     match cmd.output() {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim_end().to_string()
-        }
-        Ok(output) => format!(
-            "edit failed on {}: {}{}",
-            path.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        Ok(output) if output.status.success() => (
+            String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
+            Some(0),
         ),
-        Err(error) => format!("edit failed on {}: failed to run perl: {error}", path.display()),
+        Ok(output) => (
+            format!(
+                "edit failed on {}: {}{}",
+                path.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Some(1),
+        ),
+        Err(error) => (
+            format!("edit failed on {}: failed to run perl: {error}", path.display()),
+            None,
+        ),
     }
 }
 
@@ -450,9 +509,29 @@ mod tests {
         assert_eq!(output, "hi\n");
         assert!(matches!(
             events.borrow().as_slice(),
-            [Progress::Command(command), Progress::CommandOutput(output)]
-                if command == "echo hi" && output == "hi\n"
+            [
+                Progress::ToolStart {
+                    id,
+                    name: "Bash",
+                    digest
+                },
+                Progress::ToolOutput {
+                    output,
+                    exit: Some(0),
+                    ..
+                }
+            ] if id == "call_0" && digest == "echo hi" && output == "hi\n"
         ));
+
+        // The exit status reaches the model verbatim.
+        assert_eq!(
+            execute(&bash_call(r#"{"command":"false"}"#), &policy, &|_| {}).unwrap(),
+            "[exit 1]"
+        );
+        assert_eq!(
+            execute(&bash_call(r#"{"command":"true"}"#), &policy, &|_| {}).unwrap(),
+            "done"
+        );
     }
 
     #[test]
@@ -513,6 +592,7 @@ mod tests {
             },
             &mut std::process::Command::new("/usr/bin/perl"),
         )
+        .0
     }
 
     #[test]
@@ -713,12 +793,32 @@ mod tests {
         assert_eq!(whole.lines().count(), 30);
         assert!(matches!(
             events.borrow().as_slice(),
-            [Progress::Command(command), Progress::CommandOutput(_)]
-                if command == &format!("read {}", file.path().display())
+            [
+                Progress::ToolStart {
+                    name: "Read",
+                    digest,
+                    ..
+                },
+                Progress::ToolOutput { .. }
+            ] if digest == &file.path().display().to_string()
         ));
 
-        let range = execute(&read_call(file.path(), Some(10), Some(12)), &policy, &|_| {}).unwrap();
+        // A bounded read digests its range into the box header.
+        events.borrow_mut().clear();
+        let range = execute(
+            &read_call(file.path(), Some(10), Some(12)),
+            &policy,
+            &|progress| {
+                events.borrow_mut().push(progress);
+            },
+        )
+        .unwrap();
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [Progress::ToolStart { digest, .. }, _]
+                if digest == &format!("{}:10-12", file.path().display())
+        ));
 
         let tail = execute(&read_call(file.path(), Some(28), None), &policy, &|_| {}).unwrap();
         assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
