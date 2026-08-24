@@ -129,6 +129,9 @@ impl Pane {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
                 KeyCode::Char('u') => self.prompt.clear(),
+                // To the line start / end, as readline
+                KeyCode::Char('a') => self.prompt.home(),
+                KeyCode::Char('e') => self.prompt.end(),
                 // Toggle the thinking run's visibility (only in normal mode)
                 KeyCode::Char('t') => self.transcript.toggle_thinking(),
                 // Toggle expanding the tool outputs' collapsed middles

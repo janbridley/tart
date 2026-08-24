@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
@@ -60,6 +61,10 @@ fn main() -> anyhow::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
+    execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
     let result = run(
@@ -70,6 +75,7 @@ fn main() -> anyhow::Result<()> {
         agent_config.context_tokens,
     );
     ratatui::try_restore()?;
+    execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
     terminal.show_cursor()?;
     result
