@@ -1140,8 +1140,10 @@ fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize) -> PromptL
     let (cl, mut gc) = cursor;
     let cl = cl.min(lines.len().saturating_sub(1));
     for (li, line) in lines.iter().enumerate() {
-        let count = line.graphemes(true).count();
+        // Only the caret line needs its grapheme count; skip the extra scan elsewhere.
+        let mut count = 0;
         if li == cl {
+            count = line.graphemes(true).count();
             gc = gc.min(count);
         }
         for (gi, grapheme) in line.graphemes(true).enumerate() {
