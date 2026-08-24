@@ -127,7 +127,11 @@ fn run(
                 // Copy the selected text when we exit copy mode.
                 Some(PaneEvent::Copy(text)) => clipboard::copy(&text)?,
                 Some(PaneEvent::Submit(line)) => match line.trim() {
-                    "/clear" => pane.clear(),
+                    // Clear the display and the model's memory of the session
+                    "/clear" => {
+                        pane.clear();
+                        transcript.clear();
+                    }
                     "/quit" | "/exit" => quit = true,
                     // Don't submit text while the model is generating
                     _ if generating => {}
