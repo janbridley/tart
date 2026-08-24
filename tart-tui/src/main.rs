@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
-    let result = run(&mut terminal, &agent, transcript, &label);
+    let result = run(&mut terminal, &agent, &transcript, &label);
     ratatui::try_restore()?;
     execute!(stdout(), DisableBracketedPaste)?;
     terminal.show_cursor()?;
@@ -89,7 +89,7 @@ enum Wake {
 fn run(
     terminal: &mut DefaultTerminal,
     agent: &Agent,
-    mut transcript: Transcript,
+    transcript: &Transcript,
     label: &str,
 ) -> anyhow::Result<()> {
     let mut pane = Pane::default();
@@ -138,7 +138,7 @@ fn run(
                         generating = true;
                         let sender = wake.clone();
                         // The agent loop runs on its own thread
-                        agent.spawn(&transcript, move |progress| {
+                        agent.spawn(transcript, move |progress| {
                             let _ = sender.send(Wake::Generation(progress));
                         });
                     }

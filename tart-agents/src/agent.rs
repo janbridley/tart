@@ -69,7 +69,7 @@ impl Agent {
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
             let outcome =
-                std::panic::catch_unwind(AssertUnwindSafe(|| agent.run(transcript, &on_progress)));
+                std::panic::catch_unwind(AssertUnwindSafe(|| agent.run(&transcript, &on_progress)));
             if outcome.is_err() {
                 terminate_and_log(
                     &on_progress,
@@ -96,7 +96,7 @@ impl Agent {
         clippy::too_many_lines,
         reason = "the round loop reads best as one straight-line function"
     )]
-    fn run<F: Fn(Progress)>(&self, mut transcript: Transcript, on_progress: &F) {
+    fn run<F: Fn(Progress)>(&self, transcript: &Transcript, on_progress: &F) {
         for _ in 0..self.max_rounds {
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
