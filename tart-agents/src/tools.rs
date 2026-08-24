@@ -133,6 +133,11 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))?;
     // `as_i64` so negatives join the clamp instead of falling to the default.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "the clamp bounds the value to 1-600 seconds before either cast"
+    )]
     let seconds = args["timeout"]
         .as_i64()
         .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs() as i64)
