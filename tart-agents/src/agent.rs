@@ -60,8 +60,9 @@ impl Agent {
 
     /// Run one generation on its own thread, reporting progress to `on_progress`.
     ///
-    /// Exactly one terminal event ([`Progress::Done`] or [`Progress::Failed`]) is
-    /// delivered, even if the worker panics.
+    /// The worker records its turns (reasoning, tool exchanges, final answer) into the
+    /// shared transcript as it goes. Exactly one terminal event ([`Progress::Done`] or
+    /// [`Progress::Failed`]) is delivered, even if the worker panics.
     #[inline]
     pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
         let agent = self.clone();
@@ -81,9 +82,12 @@ impl Agent {
 
     /// Drive one generation to completion on the current thread.
     ///
-    /// Each round streams model output; when the model calls the shell tool (which
-    /// could happen more than once per round) the output(s) are recorded in the
-    /// transcript and the next round continues from there. The generation ends after at
+    /// Each round streams model output; when the model calls a tool (which
+    /// could happen more than once per round) the round's reasoning, any text
+    /// it streamed alongside the calls, the calls, and their outputs are
+    /// recorded in the shared transcript and the next round continues from
+    /// there. The final answer is recorded on completion, so later turns replay
+    /// the whole exchange. The generation ends after at
     /// most `max_rounds` rounds, always with exactly one terminal event:
     /// [`Progress::Done`] with the final answer (`None` if nothing arrived), or
     /// [`Progress::Failed`] on a request error, an explicit error or incomplete event,
@@ -239,6 +243,11 @@ impl Agent {
 
             // No calls pending: this round's answer is the turn's message.
             if calls.is_empty() {
+                if !answer.is_empty()
+                    && let Err(error) = transcript.push_assistant(answer.clone())
+                {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
                 return terminate_and_log(
                     on_progress,
                     Progress::Done {
@@ -247,12 +256,7 @@ impl Agent {
                 );
             }
 
-            // The round's reasoning precedes its calls, as it streamed.
-            if let Some(item) = reasoning {
-                transcript.push_reasoning(item);
-            }
-
-            // Run the round's calls in order, then record the round as a group.
+            // Run the round's calls in order, then record the round as one group.
             let mut exchanges = Vec::with_capacity(calls.len());
             for call in calls {
                 match tools::execute(&call, &self.policy, on_progress) {
@@ -261,6 +265,14 @@ impl Agent {
                         return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
                     }
                 }
+            }
+            if let Some(item) = reasoning {
+                transcript.push_reasoning(item);
+            }
+            if !answer.is_empty()
+                && let Err(error) = transcript.push_assistant(std::mem::take(&mut answer))
+            {
+                return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             transcript.push_tool_round(exchanges);
         }
