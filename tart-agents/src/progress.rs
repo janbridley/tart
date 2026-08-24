@@ -10,10 +10,23 @@ pub enum Progress {
     Thinking(String),
     /// A fragment of the final answer.
     Answer(String),
-    /// A command the model asked to run.
-    Command(String),
-    /// The combined output of a finished command.
-    CommandOutput(String),
+    /// A tool invocation started; fires before execution.
+    ToolStart {
+        /// The call's id, pairing the start with its eventual output.
+        id: String,
+        /// The tool's display name — a closed set: `Bash`, `Read`, `Edit`.
+        name: &'static str,
+        /// An argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
+        digest: String,
+    },
+    /// A finished tool invocation, paired with its start by `id`.
+    ToolOutput {
+        id: String,
+        /// The combined output, shown to the user.
+        output: String,
+        /// The process exit code; `None` when no process ran (spawn error).
+        exit: Option<i32>,
+    },
     /// The assembled answer at the end of the stream, if any arrived.
     Done {
         /// The full answer text, unless the model produced `None`.
