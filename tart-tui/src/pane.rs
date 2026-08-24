@@ -683,18 +683,36 @@ impl Transcript {
         self.open = false;
     }
 
-    /// Fill in the pending invocation with `id`, then refold.
+    /// Fill in the pending invocation with `id`, then refold from its box.
     fn finish_tool(&mut self, id: &str, output: String, exit: Option<i32>) {
-        let Some(Entry::Tool(tool)) = self.messages.iter_mut().rev().find(
+        let Some(index) = self.messages.iter().rposition(
             |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_none() && tool.id == id),
         ) else {
             return;
         };
+        if self.cache.0 > 0 && index < self.cache.1 {
+            // The box folds differently once tools finished, so the rows `sync` folded
+            // `messages[index..]` are stale. Recount them before the fill-in, drop
+            // them, and rewind the fold point so the next `sync` refolds just the tail
+            if (index..self.cache.1).any(|i| self.thinking_hidden(i)) {
+                // Hidden thinking requires us to refold EVERYTHING for correctness.
+                self.rows.clear();
+                self.cache.1 = 0;
+            } else {
+                let stale = wrap_lines(
+                    &entry_lines(&self.messages[index..self.cache.1], self.show_tool_output),
+                    self.cache.0,
+                )
+                .len();
+                self.rows.truncate(self.rows.len() - stale);
+                self.cache.1 = index;
+            }
+        }
+        let Some(Entry::Tool(tool)) = self.messages.get_mut(index) else {
+            return;
+        };
         tool.output = Some(output);
         tool.exit = exit;
-        // Refold everything for safety.
-        self.rows.clear();
-        self.cache.1 = 0;
     }
 
     /// Resolve every still-running invocation as failed to prevent stuck boxes.
