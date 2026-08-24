@@ -43,6 +43,17 @@ pub enum PaneEvent {
     Quit,
 }
 
+/// One finished response's token usage, as shown on the status line.
+#[derive(Clone, Copy)]
+struct Usage {
+    /// All input tokens, cached included.
+    input: u64,
+    /// The input tokens served from the prompt cache.
+    cached: u64,
+    /// The tokens the model generated.
+    output: u64,
+}
+
 /// The TUI interface.
 pub struct Pane {
     /// Input interface for the `Pane`.
@@ -55,6 +66,10 @@ pub struct Pane {
     popup: Option<FilePopup>,
     /// The `/perf` stats line, shown on the bottom rule row; `None` when off.
     perf: Option<String>,
+    /// The last response's token usage.
+    usage: Option<Usage>,
+    /// The model's context window, from the agents file.
+    context_tokens: Option<u64>,
 }
 
 impl Pane {
@@ -65,6 +80,8 @@ impl Pane {
             copy: None,
             popup: None,
             perf: None,
+            usage: None,
+            context_tokens: None,
         }
     }
 
@@ -209,6 +226,34 @@ impl Pane {
     /// Resolve still-running invocations; see [`Transcript::fail_pending`].
     pub fn fail_pending(&mut self, reason: &str) {
         self.transcript.fail_pending(reason);
+    }
+
+    /// Record one response's token usage for the status line.
+    pub fn set_usage(&mut self, input: u64, cached: u64, output: u64) {
+        self.usage = Some(Usage { input, cached, output });
+    }
+
+    /// Record the model's context window, from the agents file.
+    pub fn set_context_tokens(&mut self, tokens: u64) {
+        self.context_tokens = Some(tokens);
+    }
+
+    /// The status line's text: the context size against the model's window,
+    /// with the cache share when the provider reports one.
+    fn status_text(&self) -> Option<String> {
+        let usage = self.usage?;
+        let context = usage.input + usage.output;
+        let mut text = match self.context_tokens {
+            Some(window) => format!("{} / {}", token_count(context), token_count(window)),
+            None => format!("{} ", token_count(context)),
+        };
+        if usage.cached > 0 && usage.input > 0 {
+            let percent = usage.cached * 100 / usage.input;
+            text.push_str(" · ");
+            text.push_str(&percent.to_string());
+            text.push_str("% cached");
+        }
+        Some(text)
     }
 
     pub fn clear(&mut self) {
@@ -359,7 +404,7 @@ impl Pane {
                 buf.set_line(bar_bottom.x, bar_bottom.y, &line, bar_bottom.width);
             }
         } else {
-            rule(buf, bar_bottom);
+            status_rule(buf, bar_bottom, self.status_text().as_deref());
         }
     }
 
@@ -391,6 +436,30 @@ fn rule(buf: &mut Buffer, area: Rect) {
         if let Some(cell) = buf.cell_mut((col.x, area.y)) {
             cell.set_symbol(symbols::line::HORIZONTAL).set_style(DIM_STYLE);
         }
+    }
+}
+
+/// A token count in the status line's compact style: `843`, `45k`, `1.2 M`.
+fn token_count(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        1_000..=999_999 => format!("{}k", tokens / 1_000),
+        _ => format!("{}.{} M", tokens / 1_000_000, tokens % 1_000_000 / 100_000),
+    }
+}
+
+/// A full-width dim rule row with the status badge set into it:
+/// `───[ status ]─────…`.
+fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>) {
+    rule(buf, area);
+    if let Some(status) = status {
+        buf.set_stringn(
+            area.x + 3,
+            area.y,
+            format!("[ {status} ]"),
+            area.width.saturating_sub(3) as usize,
+            DIM_STYLE,
+        );
     }
 }
 
@@ -1196,6 +1265,40 @@ mod tests {
 
     fn render(pane: &mut Pane, size: (u16, u16)) -> String {
         draw(|frame, area| pane.render(frame, area), size)
+    }
+
+    #[test]
+    fn token_count_formats_compactly() {
+        assert_eq!(token_count(0), "0");
+        assert_eq!(token_count(843), "843");
+        assert_eq!(token_count(1_000), "1k");
+        assert_eq!(token_count(45_600), "45k");
+        assert_eq!(token_count(1_234_567), "1.2 M");
+        assert_eq!(token_count(999_999_999), "999.9 M");
+    }
+
+    /// The bottom rule carries the token gauge; plain until usage arrives,
+    /// and `perf` still overrides it.
+    #[test]
+    fn the_bottom_rule_carries_the_usage_badge() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("text"));
+        assert!(!render(&mut pane, (60, 8)).contains('['));
+
+        pane.set_context_tokens(200_000);
+        pane.set_usage(45_000, 40_000, 3_000);
+        let gauge = render(&mut pane, (60, 8));
+        assert!(gauge.contains("───[ 48k / 200k tok · 88% cached ]"), "{gauge}");
+
+        // No cache reported drops the suffix.
+        pane.set_usage(1_000, 0, 0);
+        assert!(render(&mut pane, (60, 8)).contains("[ 1k / 200k tok ]"));
+
+        // No window configured drops the ratio.
+        let mut bare = Pane::new();
+        bare.push(Line::from("text"));
+        bare.set_usage(45_000, 0, 3_000);
+        assert!(render(&mut bare, (60, 8)).contains("[ 48k tok ]"));
     }
 
     #[test]
