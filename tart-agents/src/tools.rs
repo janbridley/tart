@@ -1,5 +1,11 @@
+use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{ExitStatus, Output};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 
@@ -14,6 +20,12 @@ const EDIT_PROGRAM: &str = include_str!("data/edit.pl");
 
 /// Emulate `cat -n … | sed -n …` , using a shared `flock` with the edit tool.
 const READ_PROGRAM: &str = include_str!("data/read.pl");
+
+/// The timeout a bash call runs under when none is requested.
+const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The longest timeout a bash call may ask for.
+const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Cat a (subregion of a) file, numbering the lines in the output.
 fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
@@ -38,7 +50,11 @@ pub(crate) fn bash() -> Tool {
         parameters: Some(serde_json::json!({
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "The bash command to run"}
+                "command": {"type": "string", "description": "The bash command to run"},
+                "timeout": {
+                    "type": "integer",
+                    "description": "Seconds the command may run before it is killed (1-600); default 120"
+                }
             },
             "required": ["command"]
         })),
@@ -99,14 +115,31 @@ pub(crate) fn edit() -> Tool {
     })
 }
 
-/// Extract the command from a bash tool call's JSON arguments.
-fn parse_command(arguments: &str) -> anyhow::Result<String> {
+/// One parsed bash tool call.
+#[derive(Debug)]
+struct Bash {
+    /// The command to run.
+    command: String,
+    /// How long the command may run, clamped into the allowed range.
+    timeout: Duration,
+}
+
+/// Extract the fields from a bash tool call's JSON arguments.
+fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
     let args: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
-    args["command"]
+    let command = args["command"]
         .as_str()
         .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))
+        .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))?;
+    let seconds = args["timeout"]
+        .as_u64()
+        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs())
+        .clamp(1, MAX_BASH_TIMEOUT.as_secs());
+    Ok(Bash {
+        command,
+        timeout: Duration::from_secs(seconds),
+    })
 }
 
 /// One parsed read tool call.
@@ -218,26 +251,92 @@ fn command_text(text: &str, status: ExitStatus) -> String {
     format!("[exit {status}]{separator}{text}")
 }
 
+/// One bash command run under a deadline.
+struct TimedRun {
+    /// The command's streams and exit status, as `output()` returns them.
+    output: Output,
+    /// The deadline elapsed and the process group was killed.
+    timed_out: bool,
+}
+
+/// Model-facing explanation for a command the timeout killed.
+fn timeout_text(text: &str, timeout: Duration) -> String {
+    let separator = if text.is_empty() { "" } else { "\n" };
+    format!("[timed out after {}s]{separator}{text}", timeout.as_secs())
+}
+
+/// Run `command` to completion, killing its process group if it outlives `timeout`.
+fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<TimedRun> {
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn()?;
+    // // The child leads its own group, so the group id is its pid.
+    let group = child.id() as libc::pid_t;
+
+    let timed_out = Arc::new(AtomicBool::new(false));
+    // The sender drops once the command is reaped, waking the watchdog immediatedly
+    let (finished, slept) = mpsc::channel::<()>();
+    let flagged = Arc::clone(&timed_out);
+    let watchdog = std::thread::spawn(move || {
+        if matches!(slept.recv_timeout(timeout), Err(RecvTimeoutError::Timeout)) {
+            // Flag before killing, so the caller cannot mistake the death for a
+            // natural signal once the wait returns.
+            flagged.store(true, Ordering::Release);
+            // SAFETY: one signal to our own child's process group.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        }
+    });
+
+    let output = child.wait_with_output();
+    drop(finished);
+    // Double check we've killed everything even if the wait errors.
+    if output.is_err() {
+        // SAFETY: as above.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+    let _ = watchdog.join();
+
+    Ok(TimedRun {
+        output: output?,
+        timed_out: timed_out.load(Ordering::Acquire),
+    })
+}
+
 /// Run one bash tool call under `policy`, reporting its steps to `on_progress`.
+///
+/// A command that outlives its timeout is killed with everything it started.
+/// The model sees `[timed out after Ns]` and any partial output.
 fn run_bash<F: Fn(Progress)>(
     call: &FunctionToolCall,
     policy: &Policy,
     on_progress: &F,
 ) -> anyhow::Result<String> {
-    let command = parse_command(&call.arguments)?;
+    let bash = parse_bash(&call.arguments)?;
     on_progress(Progress::ToolStart {
         id: call.call_id.clone(),
         name: "Bash",
-        digest: command.clone(),
+        digest: bash.command.clone(),
     });
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
-    let spawned = policy.command("/bin/bash").arg("-c").arg(&command).output();
+    let mut sandboxed = policy.command("/bin/bash");
+    sandboxed.arg("-c").arg(&bash.command);
     // Decode the stream into output for the front and backends.
-    let (result, output, exit) = match &spawned {
-        Ok(spawned) => {
-            let text = combined_output(spawned);
-            (command_text(&text, spawned.status), text, spawned.status.code())
+    let (result, output, exit) = match run_with_timeout(&mut sandboxed, bash.timeout) {
+        Ok(run) => {
+            let TimedRun { output, timed_out } = run;
+            let text = combined_output(&output);
+            let exit = output.status.code();
+            if timed_out {
+                // A timeout has no exit code for the header, so we mark up the body.
+                let marked = timeout_text(&text, bash.timeout);
+                (marked.clone(), marked, exit)
+            } else {
+                (command_text(&text, output.status), text, exit)
+            }
         }
         Err(error) => {
             let text = format!("error: {error}");
@@ -410,6 +509,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use std::time::Instant;
 
     /// A `bash` tool call requesting `command`.
     fn bash_call(arguments: &str) -> FunctionToolCall {
@@ -433,20 +533,55 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_reads_the_command_field() {
-        assert_eq!(parse_command(r#"{"command":"ls -la"}"#).unwrap(), "ls -la");
+    fn bash_definition_offers_an_optional_timeout_parameter() {
+        let tool = serde_json::to_value(bash()).unwrap();
+
+        assert_eq!(tool["parameters"]["properties"]["timeout"]["type"], "integer");
+        // Only the command is required; the timeout keeps its default.
+        assert_eq!(tool["parameters"]["required"].as_array().unwrap().len(), 1);
     }
 
     #[test]
-    fn parse_command_rejects_non_json() {
-        let error = parse_command("not json").unwrap_err().to_string();
+    fn parse_bash_reads_the_command_field() {
+        assert_eq!(parse_bash(r#"{"command":"ls -la"}"#).unwrap().command, "ls -la");
+    }
+
+    #[test]
+    fn parse_bash_defaults_the_timeout_when_absent() {
+        let bash = parse_bash(r#"{"command":"ls"}"#).unwrap();
+
+        assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
+    }
+
+    #[test]
+    fn parse_bash_clamps_out_of_range_timeouts() {
+        let bash = parse_bash(r#"{"command":"sleep 5","timeout":9000}"#).unwrap();
+        assert_eq!(bash.timeout, MAX_BASH_TIMEOUT);
+
+        // Both ends: a negative joins the clamp rather than falling to the default
+        let bash = parse_bash(r#"{"command":"ls","timeout":0}"#).unwrap();
+        assert_eq!(bash.timeout, Duration::from_secs(1));
+        let bash = parse_bash(r#"{"command":"ls","timeout":-5}"#).unwrap();
+        assert_eq!(bash.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parse_bash_ignores_a_wrong_typed_timeout() {
+        let bash = parse_bash(r#"{"command":"ls","timeout":"300"}"#).unwrap();
+
+        assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
+    }
+
+    #[test]
+    fn parse_bash_rejects_non_json() {
+        let error = parse_bash("not json").unwrap_err().to_string();
 
         assert!(error.contains("weren't JSON"), "{error}");
     }
 
     #[test]
-    fn parse_command_rejects_a_missing_command() {
-        let error = parse_command(r#"{"other":1}"#).unwrap_err().to_string();
+    fn parse_bash_rejects_a_missing_command() {
+        let error = parse_bash(r#"{"other":1}"#).unwrap_err().to_string();
 
         assert!(error.contains("missing 'command'"), "{error}");
     }
@@ -487,6 +622,78 @@ mod tests {
     #[test]
     fn command_result_marks_a_signal_death() {
         assert_eq!(framed(9, "", ""), "[exit signal]");
+    }
+
+    #[test]
+    fn timeout_text_prefixes_the_partial_output() {
+        assert_eq!(
+            timeout_text("partial\ntail\n", DEFAULT_BASH_TIMEOUT),
+            "[timed out after 120s]\npartial\ntail\n"
+        );
+        assert_eq!(
+            timeout_text("still going\n", MAX_BASH_TIMEOUT),
+            "[timed out after 600s]\nstill going\n"
+        );
+    }
+
+    #[test]
+    fn timeout_text_without_output_is_just_the_marker() {
+        assert_eq!(timeout_text("", DEFAULT_BASH_TIMEOUT), "[timed out after 120s]");
+    }
+
+    /// These drive `run_with_timeout` with plain commands, so they run without
+    /// the sandbox; their deadlines are milliseconds to stay fast.
+    #[test]
+    fn run_with_timeout_returns_a_fast_command_normally() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("hi");
+
+        let run = run_with_timeout(&mut command, Duration::from_secs(10)).unwrap();
+
+        assert!(!run.timed_out);
+        assert_eq!(combined_output(&run.output), "hi\n");
+        assert!(run.output.status.success());
+    }
+
+    #[test]
+    fn run_with_timeout_kills_a_command_that_outruns_the_deadline() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let started = Instant::now();
+
+        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+
+        assert!(run.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!run.output.status.success());
+    }
+
+    #[test]
+    fn run_with_timeout_kills_the_whole_process_group() {
+        // The backgrounded sleeps outlive bash and hold the output pipe; only a
+        // group kill frees the capture, so returning promptly proves they died.
+        let mut command = Command::new("/bin/bash");
+        command.arg("-c").arg("sleep 9871 & sleep 9871 & wait");
+        let started = Instant::now();
+
+        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+
+        assert!(run.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn run_with_timeout_wakes_the_watchdog_when_the_command_finishes_early() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("hi");
+        let started = Instant::now();
+
+        let run = run_with_timeout(&mut command, DEFAULT_BASH_TIMEOUT).unwrap();
+
+        assert!(!run.timed_out);
+        // The sender's drop joins the watchdog at once rather than letting it
+        // sleep out the full timeout.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
