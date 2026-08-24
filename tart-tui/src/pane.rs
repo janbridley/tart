@@ -245,7 +245,7 @@ impl Pane {
         let context = usage.input + usage.output;
         let mut text = match self.context_tokens {
             Some(window) => format!("{} / {}", token_count(context), token_count(window)),
-            None => format!("{} ", token_count(context)),
+            None => token_count(context),
         };
         if usage.cached > 0 && usage.input > 0 {
             let percent = usage.cached * 100 / usage.input;
@@ -452,7 +452,10 @@ fn token_count(tokens: u64) -> String {
 /// `───[ status ]─────…`.
 fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>) {
     rule(buf, area);
-    if let Some(status) = status {
+    // The bar can be parked past the last row.
+    if let Some(status) = status
+        && area.y < buf.area.height
+    {
         buf.set_stringn(
             area.x + 3,
             area.y,
@@ -1271,8 +1274,11 @@ mod tests {
     fn token_count_formats_compactly() {
         assert_eq!(token_count(0), "0");
         assert_eq!(token_count(843), "843");
+        assert_eq!(token_count(999), "999");
         assert_eq!(token_count(1_000), "1k");
         assert_eq!(token_count(45_600), "45k");
+        assert_eq!(token_count(999_999), "999k");
+        assert_eq!(token_count(1_000_000), "1.0 M");
         assert_eq!(token_count(1_234_567), "1.2 M");
         assert_eq!(token_count(999_999_999), "999.9 M");
     }
@@ -1288,17 +1294,24 @@ mod tests {
         pane.set_context_tokens(200_000);
         pane.set_usage(45_000, 40_000, 3_000);
         let gauge = render(&mut pane, (60, 8));
-        assert!(gauge.contains("───[ 48k / 200k tok · 88% cached ]"), "{gauge}");
+        assert!(gauge.contains("───[ 48k / 200k · 88% cached ]"), "{gauge}");
+
+        // The perf line replaces the badge when both are set.
+        pane.set_perf(Some(" fps 60 ".into()));
+        let perf = render(&mut pane, (60, 8));
+        assert!(perf.contains("rows"));
+        assert!(!perf.contains("48k"), "{perf}");
+        pane.set_perf(None);
 
         // No cache reported drops the suffix.
         pane.set_usage(1_000, 0, 0);
-        assert!(render(&mut pane, (60, 8)).contains("[ 1k / 200k tok ]"));
+        assert!(render(&mut pane, (60, 8)).contains("[ 1k / 200k ]"));
 
         // No window configured drops the ratio.
         let mut bare = Pane::new();
         bare.push(Line::from("text"));
         bare.set_usage(45_000, 0, 3_000);
-        assert!(render(&mut bare, (60, 8)).contains("[ 48k tok ]"));
+        assert!(render(&mut bare, (60, 8)).contains("[ 48k ]"));
     }
 
     #[test]
@@ -1644,6 +1657,9 @@ mod tests {
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));
+        // The badge must skip out-of-bounds bars like `rule` does.
+        pane.set_usage(45_000, 0, 3_000);
+        render(&mut pane, (6, 3));
         // The /perf line must skip out-of-bounds bars like `rule` does.
         pane.set_perf(Some(" fps 60 ".into()));
         render(&mut pane, (6, 3));
