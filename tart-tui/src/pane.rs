@@ -244,17 +244,18 @@ impl Pane {
             return;
         }
         // The prompt grows with its wrapped content, always leaving space for the
-        // transcript and the two rules.
-        let layout = wrap_draft(
-            &self.prompt.lines,
-            (self.prompt.line, self.prompt.g),
-            area.width.saturating_sub(GUTTER) as usize,
-        );
+        // transcript and the two rules. Copy mode swaps the prompt for a one-row hint,
+        // so the draft is only wrapped when the prompt actually renders.
         let cap = area.height.saturating_sub(4).max(1) as usize;
-        let prompt_height = if self.copy.is_some() {
-            1
+        let (prompt_height, layout) = if self.copy.is_some() {
+            (1, None)
         } else {
-            layout.rows.len().min(cap).max(1) as u16
+            let layout = wrap_draft(
+                &self.prompt.lines,
+                (self.prompt.line, self.prompt.g),
+                area.width.saturating_sub(GUTTER) as usize,
+            );
+            (layout.rows.len().min(cap).max(1) as u16, Some(layout))
         };
         let [transcript, bar_top, prompt_area, bar_bottom] = Layout::vertical([
             Constraint::Min(1),
@@ -265,10 +266,11 @@ impl Pane {
         .areas(area);
 
         self.render_transcript(transcript, bar_top, bar_bottom, frame);
-        if self.copy.is_some() {
+        // No layout means copy mode: show the scrollback hint instead.
+        let Some(layout) = layout else {
             Self::render_scrollback_hint(frame, prompt_area);
             return;
-        }
+        };
 
         if prompt_area.height == 0 || prompt_area.width < GUTTER {
             return;
