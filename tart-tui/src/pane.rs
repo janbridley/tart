@@ -111,6 +111,8 @@ impl Pane {
                 KeyCode::Char('u') => self.prompt.clear(),
                 // Toggle the thinking run's visibility (only in normal mode)
                 KeyCode::Char('t') => self.transcript.toggle_thinking(),
+                // Toggle expanding the tool outputs' collapsed middles
+                KeyCode::Char('o') => self.transcript.toggle_expand(),
                 _ => {}
             }
             return None;
@@ -189,6 +191,21 @@ impl Pane {
     /// Retire the previous response's thinking; see [`Transcript::begin_response`].
     pub fn begin_response(&mut self) {
         self.transcript.begin_response();
+    }
+
+    /// Record a tool invocation's start; see [`Transcript::start_tool`].
+    pub fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
+        self.transcript.start_tool(id, name, digest);
+    }
+
+    /// Fill in the pending invocation; see [`Transcript::finish_tool`].
+    pub fn finish_tool(&mut self, id: &str, output: String, exit: Option<i32>) {
+        self.transcript.finish_tool(id, output, exit);
+    }
+
+    /// Resolve still-running invocations; see [`Transcript::fail_pending`].
+    pub fn fail_pending(&mut self, reason: &str) {
+        self.transcript.fail_pending(reason);
     }
 
     pub fn clear(&mut self) {
@@ -509,6 +526,72 @@ fn thinking_placeholder() -> Line<'static> {
     Line::from(Span::styled(THINKING_HIDDEN, DIM_STYLE))
 }
 
+/// One dim `⎿` output row of a tool box.
+fn tool_row(text: &str) -> Line<'static> {
+    Line::from(Span::styled(format!("  ⎿ {text}"), DIM_STYLE))
+}
+
+/// A status header and then the output rendered for a running tool call
+///
+/// Running calls show just the header with a dim ellipsis; finished ones add
+/// their output rows, collapsed to [`TOOL_HEAD`] head and [`TOOL_TAIL`] tail
+/// lines around a count of the hidden middle unless `expanded`.
+fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
+    let status = match (&tool.output, tool.exit) {
+        (None, _) => TOOL_RUNNING,
+        (_, Some(0)) => TOOL_OK,
+        _ => TOOL_ERR,
+    };
+
+    let mut header = vec![
+        Span::styled("● ", status),
+        Span::styled(tool.name, status),
+        Span::styled(format!("({})", tool.digest), DIM_STYLE),
+    ];
+
+    let Some(output) = &tool.output else {
+        header.push(Span::styled(" …", DIM_STYLE));
+        return vec![Line::from(header)];
+    };
+
+    if let Some(c) = tool.exit.filter(|&c| c != 0) {
+        header.push(Span::styled(format!(" exit {c}"), TOOL_ERR));
+    }
+
+    let lines: Vec<_> = output.lines().collect();
+    let limit = TOOL_HEAD + TOOL_TAIL;
+
+    let body: Vec<Line<'static>> = match lines.as_slice() {
+        [] => vec![tool_row(TOOL_NO_OUTPUT)],
+        _ if !expanded && lines.len() > limit => {
+            let hidden = lines.len() - limit;
+            lines[..TOOL_HEAD]
+                .iter()
+                .copied()
+                .map(tool_row)
+                .chain(std::iter::once(tool_row(&format!(
+                    "… +{hidden} lines (ctrl+o to expand)"
+                ))))
+                .chain(lines[lines.len() - TOOL_TAIL..].iter().copied().map(tool_row))
+                .collect()
+        }
+        _ => lines.into_iter().map(tool_row).collect(),
+    };
+
+    [vec![Line::from(header)], body].concat()
+}
+
+/// The display lines a run of entries renders as.
+fn entry_lines(entries: &[Entry], expanded: bool) -> Vec<Line<'static>> {
+    entries
+        .iter()
+        .flat_map(|entry| match entry {
+            Entry::Text(line) => std::iter::once(line.clone()).collect::<Vec<_>>(),
+            Entry::Tool(tool) => tool_lines(tool, expanded),
+        })
+        .collect()
+}
+
 /// One response's chain-of-thought, as a message-index range into `Transcript::messages`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ThinkingRun {
@@ -519,6 +602,28 @@ struct ThinkingRun {
     end: usize,
 }
 
+/// One tool invocation, updated in place when its output arrives.
+#[derive(Clone)]
+struct ToolCall {
+    /// Pairs the finishing `ToolOutput` with this start.
+    id: String,
+    /// Display name: `Bash`, `Read`, or `Edit`.
+    name: &'static str,
+    /// Argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
+    digest: String,
+    /// Combined output; `None` while the call is still running.
+    output: Option<String>,
+    /// The process exit code, for the status color.
+    exit: Option<i32>,
+}
+
+/// One transcript message: a text line or a live tool invocation.
+#[derive(Clone)]
+enum Entry {
+    Text(Line<'static>),
+    Tool(ToolCall),
+}
+
 /// One view's message log, kept pre-wrapped to the display width:
 ///
 /// Call `sync` to re-wrap the new content. The current response's thinking lives in
@@ -526,7 +631,7 @@ struct ThinkingRun {
 /// are drained when the next response begins.
 #[derive(Default)]
 struct Transcript {
-    messages: Vec<Line<'static>>,
+    messages: Vec<Entry>,
     /// Whether the last message is still open for `append` runs.
     open: bool,
     rows: Vec<Line<'static>>,
@@ -536,13 +641,86 @@ struct Transcript {
     run: Option<ThinkingRun>,
     /// Whether the thinking run renders; sticky across turns. Starts hidden.
     show_thinking: bool,
+    /// Whether tool outputs render in full; sticky, flipped by Ctrl+O. Starts
+    /// collapsed.
+    show_tool_output: bool,
 }
 
 impl Transcript {
     /// Append a committed line, ending any append-run.
     fn push(&mut self, line: impl Into<Line<'static>>) {
-        self.messages.push(line.into());
+        self.messages.push(Entry::Text(line.into()));
         self.open = false;
+    }
+
+    /// Record a tool invocation's start; it renders as a running header until
+    /// finished.
+    fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
+        self.messages.push(Entry::Tool(ToolCall {
+            id,
+            name,
+            digest,
+            output: None,
+            exit: None,
+        }));
+        self.open = false;
+    }
+
+    /// Fill in the pending invocation with `id`, then refold.
+    fn finish_tool(&mut self, id: &str, output: String, exit: Option<i32>) {
+        let Some(Entry::Tool(tool)) = self.messages.iter_mut().rev().find(
+            |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_none() && tool.id == id),
+        ) else {
+            return;
+        };
+        tool.output = Some(output);
+        tool.exit = exit;
+        // Refold everything for safety.
+        self.rows.clear();
+        self.cache.1 = 0;
+    }
+
+    /// Resolve every still-running invocation as failed to prevent stuck boxes.
+    fn fail_pending(&mut self, reason: &str) {
+        let mut failed = false;
+        for entry in &mut self.messages {
+            if let Entry::Tool(tool) = entry
+                && tool.output.is_none()
+            {
+                tool.output = Some(reason.to_string());
+                tool.exit = None;
+                failed = true;
+            }
+        }
+        if failed {
+            self.rows.clear();
+            self.cache.1 = 0;
+        }
+    }
+
+    /// Expand or collapse every tool output.
+    fn toggle_expand(&mut self) {
+        if self.messages.iter().any(|entry| matches!(entry, Entry::Tool(_))) {
+            self.show_tool_output = !self.show_tool_output;
+            self.rows.clear();
+            self.cache.1 = 0;
+        }
+    }
+
+    /// The last message when it is text, for append-run gluing.
+    fn text_last(&self) -> Option<&Line<'static>> {
+        match self.messages.last() {
+            Some(Entry::Text(line)) => Some(line),
+            _ => None,
+        }
+    }
+
+    /// The last message when it is text, mutably, for span extension.
+    fn text_last_mut(&mut self) -> Option<&mut Line<'static>> {
+        match self.messages.last_mut() {
+            Some(Entry::Text(line)) => Some(line),
+            _ => None,
+        }
     }
 
     /// Append a streaming fragment, gluing onto the previous fragment while style matches.
@@ -564,8 +742,7 @@ impl Transcript {
     fn append_fragment(&mut self, span: Span<'static>) {
         let glue = self.open
             && self
-                .messages
-                .last()
+                .text_last()
                 .is_some_and(|line| line.spans.last().is_some_and(|last| last.style == span.style));
         if glue {
             // The cache already counted the line being extended: drop its stale rows
@@ -575,17 +752,20 @@ impl Transcript {
                 && self.cache.0 > 0
                 && !self.thinking_hidden(self.messages.len() - 1)
             {
-                let stale =
-                    wrap_lines(&self.messages[self.messages.len() - 1..], self.cache.0).len();
+                let stale = wrap_lines(
+                    &entry_lines(&self.messages[self.messages.len() - 1..], self.show_tool_output),
+                    self.cache.0,
+                )
+                .len();
                 self.rows.truncate(self.rows.len() - stale);
                 self.cache.1 -= 1;
             }
-            if let Some(last) = self.messages.last_mut().and_then(|l| l.spans.last_mut()) {
+            if let Some(last) = self.text_last_mut().and_then(|l| l.spans.last_mut()) {
                 // Extend the last matching span if available to save memory.
                 last.content.to_mut().push_str(&span.content);
             }
         } else {
-            self.messages.push(Line::from(span));
+            self.messages.push(Entry::Text(Line::from(span)));
             self.open = true;
         }
     }
@@ -629,8 +809,14 @@ impl Transcript {
             // Rewrap from the splice point, dropping only the rows the already-folded
             // tail occupied.
             if self.cache.0 > 0 && self.cache.1 > end {
-                let stale =
-                    wrap_lines(&self.messages[run.end..self.cache.1 + count], self.cache.0).len();
+                let stale = wrap_lines(
+                    &entry_lines(
+                        &self.messages[run.end..self.cache.1 + count],
+                        self.show_tool_output,
+                    ),
+                    self.cache.0,
+                )
+                .len();
                 self.rows.truncate(self.rows.len() - stale);
             }
             self.cache.1 = self.cache.1.min(end);
@@ -687,22 +873,28 @@ impl Transcript {
             self.rows.clear();
             self.cache = (width, 0);
         }
+        let expanded = self.show_tool_output;
         let done = self.cache.1;
         if let Some(run) = &self.run
             && !self.show_thinking
             && run.start < run.end
         {
             let (start, end) = (run.start, run.end);
-            self.rows
-                .extend(wrap_lines(&self.messages[done.min(start)..start], width));
+            self.rows.extend(wrap_lines(
+                &entry_lines(&self.messages[done.min(start)..start], expanded),
+                width,
+            ));
             // If the fold point is before the run we need to render, otherwise skip.
             if start >= done {
                 self.rows.extend(wrap_lines(&[thinking_placeholder()], width));
             }
-            self.rows
-                .extend(wrap_lines(&self.messages[end.max(done)..], width));
+            self.rows.extend(wrap_lines(
+                &entry_lines(&self.messages[end.max(done)..], expanded),
+                width,
+            ));
         } else {
-            self.rows.extend(wrap_lines(&self.messages[done..], width));
+            self.rows
+                .extend(wrap_lines(&entry_lines(&self.messages[done..], expanded), width));
         }
         self.cache.1 = self.messages.len();
         &self.rows
@@ -976,14 +1168,39 @@ mod tests {
     /// The messages the transcript renders: the log with a hidden run
     /// replaced by its placeholder row.
     fn visible(t: &Transcript) -> Vec<Line<'static>> {
-        let mut messages = t.messages.clone();
+        let mut entries = t.messages.clone();
         if let Some(run) = t.run
             && !t.show_thinking
             && run.start < run.end
         {
-            messages.splice(run.start..run.end, std::iter::once(thinking_placeholder()));
+            entries.splice(
+                run.start..run.end,
+                std::iter::once(Entry::Text(thinking_placeholder())),
+            );
         }
-        messages
+        entry_lines(&entries, t.show_tool_output)
+    }
+
+    /// The text of the transcript's plain messages, tool boxes aside.
+    fn message_texts(t: &Transcript) -> Vec<String> {
+        t.messages
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Text(line) => Some(
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>(),
+                ),
+                Entry::Tool(_) => None,
+            })
+            .collect()
+    }
+
+    /// Start a pending `Bash(echo hi)` invocation, as the pane would on a
+    /// `ToolStart` event.
+    fn start_bash(t: &mut Transcript, id: &str) {
+        t.start_tool(id.to_string(), "Bash", "echo hi".to_string());
     }
 
     #[test]
@@ -1023,7 +1240,7 @@ mod tests {
         transcript.append(&Span::styled(" (thinking)", dim));
         transcript.append(&Span::styled(" more", dim));
         assert_eq!(
-            texts(&transcript.messages),
+            message_texts(&transcript),
             ["prompt", "Hello world", " (thinking) more"]
         );
 
@@ -1033,7 +1250,7 @@ mod tests {
         transcript.break_line();
         transcript.append(&Span::raw("again"));
         assert_eq!(
-            texts(&transcript.messages),
+            message_texts(&transcript),
             [
                 "prompt",
                 "Hello world",
@@ -1056,7 +1273,10 @@ mod tests {
         let assert_fresh = |transcript: &Transcript| {
             assert_eq!(
                 texts(&transcript.rows),
-                texts(&wrap_lines(&transcript.messages, transcript.cache.0))
+                texts(&wrap_lines(
+                    &entry_lines(&transcript.messages, transcript.show_tool_output),
+                    transcript.cache.0
+                ))
             );
         };
         transcript.sync(20);
@@ -1075,6 +1295,17 @@ mod tests {
         transcript.sync(80);
         assert_fresh(&transcript);
         transcript.append(&Span::raw(" cccc dddd"));
+        transcript.sync(80);
+        assert_fresh(&transcript);
+
+        // Tool boxes mutate mid-log: the running header, then the finished block.
+        start_bash(&mut transcript, "call_0");
+        transcript.sync(80);
+        assert_fresh(&transcript);
+        transcript.finish_tool("call_0", "one\ntwo\nthree\n".to_string(), Some(0));
+        transcript.sync(80);
+        assert_fresh(&transcript);
+        transcript.toggle_expand();
         transcript.sync(80);
         assert_fresh(&transcript);
 
@@ -1286,6 +1517,18 @@ mod tests {
         t.sync(20);
         assert_fresh(&t);
 
+        // A tool box lands after the answer, finishes, and round-two reasoning
+        // splices back above both.
+        start_bash(&mut t, "c0");
+        t.sync(20);
+        assert_fresh(&t);
+        t.finish_tool("c0", "out aaaa".to_string(), Some(0));
+        t.sync(20);
+        assert_fresh(&t);
+        t.append_thinking(&Span::styled(" mid", DIM_STYLE));
+        t.sync(20);
+        assert_fresh(&t);
+
         t.sync(80); // width change rebuilds
         assert_fresh(&t);
         t.append_thinking(&Span::styled(" late", DIM_STYLE)); // splices above the answer
@@ -1349,7 +1592,7 @@ mod tests {
         t.append(&Span::raw("old answer"));
         t.push(Line::from("❯ two"));
         t.begin_response();
-        let messages = texts(&t.messages);
+        let messages = message_texts(&t);
         assert!(messages.iter().all(|m| !m.contains("old reasoning")));
         assert!(messages.iter().any(|m| m.contains("old answer")));
         assert!(messages.iter().any(|m| m.contains("❯ two")));
@@ -1375,9 +1618,9 @@ mod tests {
         // Same dim style as the thinking: without the append boundary it
         // would glue into the run and drain away with it.
         t.append(&Span::styled("boom: network down", DIM_STYLE));
-        assert_eq!(texts(&t.messages), ["doomed reasoning", "boom: network down"]);
+        assert_eq!(message_texts(&t), ["doomed reasoning", "boom: network down"]);
         t.begin_response();
-        let messages = texts(&t.messages);
+        let messages = message_texts(&t);
         assert!(messages.iter().any(|m| m.contains("boom")));
         assert!(messages.iter().all(|m| !m.contains("doomed")));
         t.sync(40);
@@ -1391,7 +1634,7 @@ mod tests {
         t.append_thinking(&Span::styled("t1", DIM_STYLE));
         t.append(&Span::raw("a1"));
         t.append_thinking(&Span::styled("t2", DIM_STYLE));
-        assert_eq!(texts(&t.messages), ["t1", "t2", "a1"]);
+        assert_eq!(message_texts(&t), ["t1", "t2", "a1"]);
         let run = t.run.expect("run");
         assert_eq!((run.start, run.end), (0, 2));
 
@@ -1406,7 +1649,7 @@ mod tests {
         assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
 
         t.begin_response();
-        assert_eq!(texts(&t.messages), ["a1"]);
+        assert_eq!(message_texts(&t), ["a1"]);
     }
 
     /// Gluing a hidden thinking fragment must not truncate the cached rows of
@@ -1450,7 +1693,7 @@ mod tests {
         t.append_thinking(&Span::styled("t3", DIM_STYLE));
         t.sync(40);
         assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
-        assert_eq!(texts(&t.messages), ["❯ echo", "t1", "t2", "t3", "a1 a2"]);
+        assert_eq!(message_texts(&t), ["❯ echo", "t1", "t2", "t3", "a1 a2"]);
     }
 
     /// A late fragment without text shouldn't break the cache or current run.
@@ -1466,11 +1709,150 @@ mod tests {
         t.append_thinking(&Span::styled("\n\n", DIM_STYLE));
         assert_eq!(t.cache, cache);
         assert_eq!(texts(&t.rows), rows);
-        assert_eq!(texts(&t.messages), ["❯ echo", "t1", "a1"]);
+        assert_eq!(message_texts(&t), ["❯ echo", "t1", "a1"]);
         // The answer is still open: later text joins its message.
         t.append(&Span::raw(" more"));
         t.sync(40);
-        assert_eq!(texts(&t.messages), ["❯ echo", "t1", "a1 more"]);
+        assert_eq!(message_texts(&t), ["❯ echo", "t1", "a1 more"]);
+    }
+
+    /// Tool boxes render, update in place, collapse, and color by outcome.
+    #[test]
+    fn tool_calls_render_update_and_collapse() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ run it"));
+        t.begin_response();
+        start_bash(&mut t, "call_0");
+        t.sync(40);
+        assert!(texts(&t.rows).iter().any(|row| row.contains("● Bash(echo hi) …")));
+
+        t.finish_tool("call_0", "hi\n".to_string(), Some(0));
+        t.sync(40);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("● Bash(echo hi)")));
+        assert!(!rows.iter().any(|row| row.contains('…')));
+        assert!(rows.iter().any(|row| row.contains("⎿ hi")));
+
+        // A long output collapses to head + count + tail; Ctrl+O expands it.
+        start_bash(&mut t, "call_1");
+        let mut long = String::new();
+        for i in 0..20 {
+            long.push_str("line ");
+            long.push_str(&i.to_string());
+            long.push('\n');
+        }
+        t.finish_tool("call_1", long, Some(0));
+        t.sync(40);
+        let collapsed = texts(&t.rows);
+        assert!(
+            collapsed
+                .iter()
+                .any(|row| row.contains("… +15 lines (ctrl+o to expand)"))
+        );
+        assert!(!collapsed.iter().any(|row| row.contains("line 10")));
+
+        t.toggle_expand();
+        t.sync(40);
+        assert!(texts(&t.rows).iter().any(|row| row.contains("line 10")));
+        t.toggle_expand();
+        t.sync(40);
+        assert!(!texts(&t.rows).iter().any(|row| row.contains("line 10")));
+
+        // A failure shows its code, an empty output says so, and an unknown id
+        // finishes nothing.
+        start_bash(&mut t, "call_2");
+        t.finish_tool("call_2", String::new(), Some(1));
+        t.finish_tool("call_404", "nope".to_string(), Some(0));
+        t.sync(40);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("exit 1")));
+        assert!(rows.iter().any(|row| row.contains(TOOL_NO_OUTPUT)));
+        assert!(!rows.iter().any(|row| row.contains("nope")));
+    }
+
+    /// A failed generation resolves its still-running boxes instead of
+    /// leaving them pending forever.
+    #[test]
+    fn failed_generations_resolve_pending_tools() {
+        let mut t = Transcript::default();
+        start_bash(&mut t, "call_0");
+        t.sync(40);
+        assert!(texts(&t.rows).iter().any(|row| row.contains('…')));
+
+        t.fail_pending("generation panicked");
+        t.sync(40);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("generation panicked")));
+        assert!(!rows.iter().any(|row| row.contains('…')));
+    }
+
+    /// Text streamed after a tool box never glues onto it.
+    #[test]
+    fn appends_after_a_tool_start_a_new_line() {
+        let mut t = Transcript::default();
+        t.append(&Span::raw("answer"));
+        start_bash(&mut t, "call_0");
+        t.append(&Span::raw("more"));
+        assert_eq!(message_texts(&t), ["answer", "more"]);
+    }
+
+    /// The round-two splice rotates tool entries with the tail; the cache stays
+    /// honest through toggles and width changes.
+    #[test]
+    fn late_thinking_splices_above_tool_boxes() {
+        let mut t = Transcript::default();
+        let assert_fresh = |t: &Transcript| {
+            assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(t), t.cache.0)));
+        };
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        t.append_thinking(&Span::styled("t1", DIM_STYLE));
+        t.append(&Span::raw("a1"));
+        start_bash(&mut t, "call_0");
+        t.finish_tool("call_0", "out\n".to_string(), Some(0));
+        t.sync(40);
+        assert_fresh(&t);
+
+        t.append_thinking(&Span::styled("t2", DIM_STYLE)); // splices above a1 and the box
+        t.sync(40);
+        assert_fresh(&t);
+        assert_eq!(message_texts(&t), ["❯ go", "t1", "t2", "a1"]);
+
+        t.toggle_thinking();
+        t.sync(40);
+        assert_fresh(&t);
+        t.toggle_expand();
+        t.sync(40);
+        assert_fresh(&t);
+        t.sync(80);
+        assert_fresh(&t);
+    }
+
+    #[test]
+    fn ctrl_o_expands_tool_output_in_live_mode_only() {
+        let mut pane = Pane::new();
+        pane.start_tool("call_0".to_string(), "Bash", "seq 20".to_string());
+        let mut output = String::new();
+        for i in 0..20 {
+            output.push_str("line ");
+            output.push_str(&i.to_string());
+            output.push('\n');
+        }
+        pane.finish_tool("call_0", output, Some(0));
+        let collapsed = render(&mut pane, (60, 30));
+        assert!(collapsed.contains("ctrl+o to expand"));
+
+        pane.on_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(render(&mut pane, (60, 30)).contains("line 10"));
+
+        // Copy mode swallows Ctrl+O before the control branch.
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        pane.on_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(pane.copy.is_some(), "still in copy mode");
+
+        pane.escape();
+        pane.on_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!render(&mut pane, (60, 30)).contains("line 10"));
     }
 
     #[test]
