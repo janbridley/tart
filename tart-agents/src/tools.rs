@@ -132,10 +132,11 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))?;
+    // `as_i64` so negatives join the clamp instead of falling to the default.
     let seconds = args["timeout"]
-        .as_u64()
-        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs())
-        .clamp(1, MAX_BASH_TIMEOUT.as_secs());
+        .as_i64()
+        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs() as i64)
+        .clamp(1, MAX_BASH_TIMEOUT.as_secs() as i64) as u64;
     Ok(Bash {
         command,
         timeout: Duration::from_secs(seconds),
