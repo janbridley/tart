@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::Output;
+use std::process::{ExitStatus, Output};
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 
@@ -201,16 +201,18 @@ fn combined_output(output: &Output) -> String {
     )
 }
 
-/// The tool result for one finished command: its stdout then its stderr, prefixed
-/// with `[exit N]` when it failed, or `done` when a success printed nothing.
-fn command_result(output: &Output) -> String {
-    let text = combined_output(output);
-
-    if output.status.success() {
-        return if text.is_empty() { "done".to_string() } else { text };
+/// The model-facing framing of a finished command's text: prefixed with
+/// `[exit N]` when it failed, or `done` when a success printed nothing.
+fn command_text(text: &str, status: ExitStatus) -> String {
+    if status.success() {
+        return if text.is_empty() {
+            "done".to_string()
+        } else {
+            text.to_string()
+        };
     }
 
-    let status = output.status.code().map_or("signal".into(), |c| c.to_string());
+    let status = status.code().map_or("signal".into(), |c| c.to_string());
 
     let separator = if text.is_empty() { "" } else { "\n" };
     format!("[exit {status}]{separator}{text}")
@@ -231,12 +233,12 @@ fn run_bash<F: Fn(Progress)>(
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
     let spawned = policy.command("/bin/bash").arg("-c").arg(&command).output();
+    // Decode the stream into output for the front and backends.
     let (result, output, exit) = match &spawned {
-        Ok(spawned) => (
-            command_result(spawned),
-            combined_output(spawned),
-            spawned.status.code(),
-        ),
+        Ok(spawned) => {
+            let text = combined_output(spawned);
+            (command_text(&text, spawned.status), text, spawned.status.code())
+        }
         Err(error) => {
             let text = format!("error: {error}");
             (text.clone(), text, None)
@@ -449,51 +451,42 @@ mod tests {
         assert!(error.contains("missing 'command'"), "{error}");
     }
 
-    /// A finished command's captured streams, with a Unix wait status: 0 is a
-    /// success, `code << 8` an exit code, a small number a signal.
-    fn command_output(raw: i32, stdout: &str, stderr: &str) -> Output {
+    /// The tool result for a finished command with a Unix wait status: 0 is a success,
+    /// `code << 8` an exit code, a small number a signal, framed as in the tui.
+    fn framed(raw: i32, stdout: &str, stderr: &str) -> String {
         use std::os::unix::process::ExitStatusExt;
 
-        Output {
+        let output = Output {
             status: std::process::ExitStatus::from_raw(raw),
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
-        }
+        };
+        command_text(&combined_output(&output), output.status)
     }
 
     #[test]
     fn command_result_passes_successful_output_through() {
-        let output = command_output(0, "hi\n", "");
-
-        assert_eq!(command_result(&output), "hi\n");
+        assert_eq!(framed(0, "hi\n", ""), "hi\n");
     }
 
     #[test]
     fn command_result_reports_a_silent_success_as_done() {
-        let output = command_output(0, "", "");
-
-        assert_eq!(command_result(&output), "done");
+        assert_eq!(framed(0, "", ""), "done");
     }
 
     #[test]
     fn command_result_prefixes_a_failure_with_its_exit_code() {
-        let output = command_output(1 << 8, "hi\n", "boom\n");
-
-        assert_eq!(command_result(&output), "[exit 1]\nhi\nboom\n");
+        assert_eq!(framed(1 << 8, "hi\n", "boom\n"), "[exit 1]\nhi\nboom\n");
     }
 
     #[test]
     fn command_result_marks_a_silent_failure_with_just_the_exit_code() {
-        let output = command_output(1 << 8, "", "");
-
-        assert_eq!(command_result(&output), "[exit 1]");
+        assert_eq!(framed(1 << 8, "", ""), "[exit 1]");
     }
 
     #[test]
     fn command_result_marks_a_signal_death() {
-        let output = command_output(9, "", "");
-
-        assert_eq!(command_result(&output), "[exit signal]");
+        assert_eq!(framed(9, "", ""), "[exit signal]");
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
