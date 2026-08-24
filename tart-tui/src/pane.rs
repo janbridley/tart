@@ -53,6 +53,8 @@ pub struct Pane {
     copy: Option<CopyCursor>,
     /// The `@file` typeahead, open while an `@` word is being typed.
     popup: Option<FilePopup>,
+    /// The `/perf` stats line, shown on the bottom rule row; `None` when off.
+    perf: Option<String>,
 }
 
 impl Pane {
@@ -62,6 +64,7 @@ impl Pane {
             transcript: Transcript::default(),
             copy: None,
             popup: None,
+            perf: None,
         }
     }
 
@@ -212,6 +215,11 @@ impl Pane {
         self.transcript.clear();
     }
 
+    /// Update the `/perf` stats line; `None` restores the bottom rule.
+    pub fn set_perf(&mut self, perf: Option<String>) {
+        self.perf = perf;
+    }
+
     /// Echo the draft into the transcript and clear it.
     fn submit(&mut self) -> Option<String> {
         if self.prompt.text().trim().is_empty() {
@@ -341,7 +349,16 @@ impl Pane {
             }
         }
         rule(buf, bar_top);
-        rule(buf, bar_bottom);
+        if let Some(perf) = &self.perf {
+            // Replace the statusline with the perf counters
+            let line = Line::from(Span::styled(format!("{perf} · {} rows", rows.len()), DIM_STYLE));
+            // Layout overflow can park a zero-height bar past the last row.
+            if bar_bottom.y < buf.area.height {
+                buf.set_line(bar_bottom.x, bar_bottom.y, &line, bar_bottom.width);
+            }
+        } else {
+            rule(buf, bar_bottom);
+        }
     }
 
     /// In copy mode the prompt area shows the scrollback keybindings.
@@ -1158,6 +1175,17 @@ mod tests {
         draw(|frame, area| pane.render(frame, area), size)
     }
 
+    #[test]
+    fn perf_line_replaces_the_bottom_rule() {
+        let mut pane = Pane::default();
+        let plain = render(&mut pane, (60, 10));
+        pane.set_perf(Some(" fps 60 ".into()));
+        let perf = render(&mut pane, (60, 10));
+        assert!(!plain.contains("rows"));
+        assert!(perf.contains("fps 60"));
+        assert!(perf.contains("rows"));
+    }
+
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
@@ -1487,6 +1515,11 @@ mod tests {
     fn tiny_terminal_renders_without_panic() {
         let mut pane = Pane::new();
         pane.push(Line::from("text"));
+        render(&mut pane, (6, 3));
+        render(&mut pane, (2, 1));
+        render(&mut pane, (1, 0));
+        // The /perf line must skip out-of-bounds bars like `rule` does.
+        pane.set_perf(Some(" fps 60 ".into()));
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));

@@ -14,6 +14,7 @@ mod config;
 mod file_mentions;
 mod keybinds;
 mod pane;
+mod perf;
 mod tmux_override;
 
 #[cfg(test)]
@@ -21,7 +22,7 @@ mod testutil;
 
 use std::io::stdout;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -31,6 +32,7 @@ use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Pane, PaneEvent};
+use perf::Perf;
 use tart_agents::{Agent, Progress, Transcript, sandbox::Policy};
 use tmux_override::{override_shift_up, restore_tmux};
 
@@ -115,8 +117,16 @@ fn run(
 
     let mut generating = false;
     let mut quit = false;
+    let mut perf_on = false;
+    let mut perf = Perf::default();
     while !quit {
-        terminal.draw(|frame| pane.render(frame, frame.area()))?;
+        let t0 = Instant::now();
+        let done = terminal.draw(|frame| pane.render(frame, frame.area()))?;
+        if perf_on {
+            pane.set_perf(Some(perf.frame(t0.elapsed(), done.buffer)));
+        } else {
+            pane.set_perf(None);
+        }
         #[allow(
             clippy::match_same_arms,
             reason = "different wake sources that happen to need no handling"
@@ -133,6 +143,10 @@ fn run(
                         transcript.clear();
                     }
                     "/quit" | "/exit" => quit = true,
+                    "/perf" => {
+                        perf_on = !perf_on;
+                        perf = Perf::default();
+                    }
                     // Don't submit text while the model is generating
                     _ if generating => {}
                     _ => {
