@@ -138,6 +138,10 @@ pub(crate) fn rearm(key: &KeyEvent) -> bool {
 /// query refilters, a vanished one closes. Once closed, only [`rearm`]
 /// re-opens it — otherwise it would pop back open after a completed path.
 pub(crate) fn update(editor: &Editor, popup: &mut Option<FilePopup>, rearm: bool) {
+    // Closed and not re-arming -> skip the update.
+    if popup.is_none() && !rearm {
+        return;
+    }
     let Some((query, _)) = derive_query(editor) else {
         *popup = None;
         return;

@@ -53,6 +53,8 @@ pub struct Pane {
     copy: Option<CopyCursor>,
     /// The `@file` typeahead, open while an `@` word is being typed.
     popup: Option<FilePopup>,
+    /// The `/perf` stats line, shown on the bottom rule row; `None` when off.
+    perf: Option<String>,
 }
 
 impl Pane {
@@ -62,6 +64,7 @@ impl Pane {
             transcript: Transcript::default(),
             copy: None,
             popup: None,
+            perf: None,
         }
     }
 
@@ -212,6 +215,11 @@ impl Pane {
         self.transcript.clear();
     }
 
+    /// Update the `/perf` stats line; `None` restores the bottom rule.
+    pub fn set_perf(&mut self, perf: Option<String>) {
+        self.perf = perf;
+    }
+
     /// Echo the draft into the transcript and clear it.
     fn submit(&mut self) -> Option<String> {
         if self.prompt.text().trim().is_empty() {
@@ -236,17 +244,18 @@ impl Pane {
             return;
         }
         // The prompt grows with its wrapped content, always leaving space for the
-        // transcript and the two rules.
-        let layout = wrap_draft(
-            &self.prompt.lines,
-            (self.prompt.line, self.prompt.g),
-            area.width.saturating_sub(GUTTER) as usize,
-        );
+        // transcript and the two rules. Copy mode swaps the prompt for a one-row hint,
+        // so the draft is only wrapped when the prompt actually renders.
         let cap = area.height.saturating_sub(4).max(1) as usize;
-        let prompt_height = if self.copy.is_some() {
-            1
+        let (prompt_height, layout) = if self.copy.is_some() {
+            (1, None)
         } else {
-            layout.rows.len().min(cap).max(1) as u16
+            let layout = wrap_draft(
+                &self.prompt.lines,
+                (self.prompt.line, self.prompt.g),
+                area.width.saturating_sub(GUTTER) as usize,
+            );
+            (layout.rows.len().min(cap).max(1) as u16, Some(layout))
         };
         let [transcript, bar_top, prompt_area, bar_bottom] = Layout::vertical([
             Constraint::Min(1),
@@ -257,10 +266,11 @@ impl Pane {
         .areas(area);
 
         self.render_transcript(transcript, bar_top, bar_bottom, frame);
-        if self.copy.is_some() {
+        // No layout means copy mode: show the scrollback hint instead.
+        let Some(layout) = layout else {
             Self::render_scrollback_hint(frame, prompt_area);
             return;
-        }
+        };
 
         if prompt_area.height == 0 || prompt_area.width < GUTTER {
             return;
@@ -341,7 +351,16 @@ impl Pane {
             }
         }
         rule(buf, bar_top);
-        rule(buf, bar_bottom);
+        if let Some(perf) = &self.perf {
+            // Replace the statusline with the perf counters
+            let line = Line::from(Span::styled(format!("{perf} · {} rows", rows.len()), DIM_STYLE));
+            // Layout overflow can park a zero-height bar past the last row.
+            if bar_bottom.y < buf.area.height {
+                buf.set_line(bar_bottom.x, bar_bottom.y, &line, bar_bottom.width);
+            }
+        } else {
+            rule(buf, bar_bottom);
+        }
     }
 
     /// In copy mode the prompt area shows the scrollback keybindings.
@@ -666,18 +685,36 @@ impl Transcript {
         self.open = false;
     }
 
-    /// Fill in the pending invocation with `id`, then refold.
+    /// Fill in the pending invocation with `id`, then refold from its box.
     fn finish_tool(&mut self, id: &str, output: String, exit: Option<i32>) {
-        let Some(Entry::Tool(tool)) = self.messages.iter_mut().rev().find(
+        let Some(index) = self.messages.iter().rposition(
             |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_none() && tool.id == id),
         ) else {
             return;
         };
+        if self.cache.0 > 0 && index < self.cache.1 {
+            // The box folds differently once tools finished, so the rows `sync` folded
+            // `messages[index..]` are stale. Recount them before the fill-in, drop
+            // them, and rewind the fold point so the next `sync` refolds just the tail
+            if (index..self.cache.1).any(|i| self.thinking_hidden(i)) {
+                // Hidden thinking requires us to refold EVERYTHING for correctness.
+                self.rows.clear();
+                self.cache.1 = 0;
+            } else {
+                let stale = wrap_lines(
+                    &entry_lines(&self.messages[index..self.cache.1], self.show_tool_output),
+                    self.cache.0,
+                )
+                .len();
+                self.rows.truncate(self.rows.len() - stale);
+                self.cache.1 = index;
+            }
+        }
+        let Some(Entry::Tool(tool)) = self.messages.get_mut(index) else {
+            return;
+        };
         tool.output = Some(output);
         tool.exit = exit;
-        // Refold everything for safety.
-        self.rows.clear();
-        self.cache.1 = 0;
     }
 
     /// Resolve every still-running invocation as failed to prevent stuck boxes.
@@ -1024,7 +1061,8 @@ impl<'a> Wrapper<'a> {
 
     /// Add one rendered cell; `sym` is a single space for expanded tabs.
     fn push(&mut self, sym: &'a str, style: Style) {
-        let gw = Span::raw(sym).width();
+        // Single-byte symbols can be printed without looking up width.
+        let gw = if sym.len() == 1 { 1 } else { Span::raw(sym).width() };
         let space = sym == " ";
         if self.row_width + gw > self.width && !self.row.is_empty() && gw > 0 {
             if space {
@@ -1123,8 +1161,10 @@ fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize) -> PromptL
     let (cl, mut gc) = cursor;
     let cl = cl.min(lines.len().saturating_sub(1));
     for (li, line) in lines.iter().enumerate() {
-        let count = line.graphemes(true).count();
+        // Only the caret line needs its grapheme count; skip the extra scan elsewhere.
+        let mut count = 0;
         if li == cl {
+            count = line.graphemes(true).count();
             gc = gc.min(count);
         }
         for (gi, grapheme) in line.graphemes(true).enumerate() {
@@ -1156,6 +1196,17 @@ mod tests {
 
     fn render(pane: &mut Pane, size: (u16, u16)) -> String {
         draw(|frame, area| pane.render(frame, area), size)
+    }
+
+    #[test]
+    fn perf_line_replaces_the_bottom_rule() {
+        let mut pane = Pane::default();
+        let plain = render(&mut pane, (60, 10));
+        pane.set_perf(Some(" fps 60 ".into()));
+        let perf = render(&mut pane, (60, 10));
+        assert!(!plain.contains("rows"));
+        assert!(perf.contains("fps 60"));
+        assert!(perf.contains("rows"));
     }
 
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
@@ -1487,6 +1538,11 @@ mod tests {
     fn tiny_terminal_renders_without_panic() {
         let mut pane = Pane::new();
         pane.push(Line::from("text"));
+        render(&mut pane, (6, 3));
+        render(&mut pane, (2, 1));
+        render(&mut pane, (1, 0));
+        // The /perf line must skip out-of-bounds bars like `rule` does.
+        pane.set_perf(Some(" fps 60 ".into()));
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));

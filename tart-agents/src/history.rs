@@ -47,6 +47,17 @@ impl Transcript {
         Ok(transcript)
     }
 
+    /// Drop the conversation, keeping the leading system items.
+    #[inline]
+    pub fn clear(&self) {
+        let mut items = self.items();
+        let systems = items
+            .iter()
+            .take_while(|item| matches!(item, InputItem::EasyMessage(m) if m.role == Role::System))
+            .count();
+        items.truncate(systems);
+    }
+
     /// Record the user's turn.
     #[inline]
     pub fn push_user(&self, text: String) -> anyhow::Result<()> {
@@ -238,6 +249,29 @@ mod tests {
         assert_eq!(items[1]["type"], "reasoning");
         assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
         assert_eq!(items[1]["content"][0]["text"], "thinking");
+    }
+
+    #[test]
+    fn clear_keeps_only_the_leading_system_items() {
+        let transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
+        transcript.push_assistant("hi".to_string()).unwrap();
+
+        transcript.clear();
+
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items.as_array().unwrap().len(), 2);
+        assert_eq!(items[0]["content"], SYSTEM);
+        assert_eq!(items[1]["content"], "be terse");
+
+        // Without instructions, only the prompt survives.
+        let plain = Transcript::new().unwrap();
+        plain.push_user("hello".to_string()).unwrap();
+        plain.clear();
+        let items = serde_json::to_value(plain.request_items()).unwrap();
+        assert_eq!(items.as_array().unwrap().len(), 1);
+        assert_eq!(items[0]["content"], SYSTEM);
     }
 
     #[test]
