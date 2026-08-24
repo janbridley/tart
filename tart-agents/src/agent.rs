@@ -258,11 +258,16 @@ impl Agent {
 
             // Run the round's calls in order, then record the round as one group.
             let mut exchanges = Vec::with_capacity(calls.len());
+            // A call the harness cannot run ends the round, but is recorded with its
+            // error so the round's earlier effects stay in the transcript.
+            let mut failure: Option<String> = None;
             for call in calls {
                 match tools::execute(&call, &self.policy, on_progress) {
                     Ok(output) => exchanges.push((call, output)),
                     Err(error) => {
-                        return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                        exchanges.push((call, format!("error: {error}")));
+                        failure = Some(error.to_string());
+                        break;
                     }
                 }
             }
@@ -275,6 +280,9 @@ impl Agent {
                 return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             transcript.push_tool_round(exchanges);
+            if let Some(reason) = failure {
+                return terminate_and_log(on_progress, Progress::Failed(reason));
+            }
         }
         let rounds = self.max_rounds;
         terminate_and_log(
