@@ -62,6 +62,7 @@ impl Transcript {
     #[inline]
     pub fn drop_last_turn(&self) {
         let mut items = self.items();
+        // TODO: can we somehow combine this and clear?
         let at = items
             .iter()
             .rposition(|item| matches!(item, InputItem::EasyMessage(m) if m.role == Role::User))
