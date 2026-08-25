@@ -1,4 +1,5 @@
 use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_compat::Compat;
 use async_openai::{
@@ -9,6 +10,8 @@ use async_openai::{
         ReasoningItem, ResponseStreamEvent,
     },
 };
+use futures::channel::mpsc;
+use futures::future::{Either, select};
 use futures::{StreamExt, executor::block_on};
 
 use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
@@ -26,6 +29,8 @@ pub struct Agent {
     max_rounds: usize,
     /// The seatbelt policy every bash tool call runs under.
     policy: Policy,
+    /// The running turn's cancel sender, where Esc can reach it.
+    cancel: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 }
 
 impl Agent {
@@ -47,6 +52,23 @@ impl Agent {
             effort: None,
             max_rounds: MAX_TOOL_ROUNDS,
             policy,
+            cancel: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The cancel sender under its lock.
+    fn cancel_slot(&self) -> MutexGuard<'_, Option<mpsc::Sender<()>>> {
+        self.cancel.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Cancel the turn by dropping the stream.
+    ///
+    /// NOTE: this must wait until tool calls complete, and the provider will likely
+    /// take the cancelled turn to completion.
+    #[inline]
+    pub fn cancel(&self) {
+        if let Some(sender) = &mut *self.cancel_slot() {
+            let _ = sender.try_send(());
         }
     }
 
@@ -67,10 +89,17 @@ impl Agent {
     pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
         let agent = self.clone();
         let transcript = transcript.clone();
+        // This turn's cancel channel: the sender waits where Esc can reach it, and the
+        // receiver races the stream inside the worker.
+        let (esc_sender, receiver) = mpsc::channel(1);
+        *self.cancel_slot() = Some(esc_sender);
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
-            let outcome =
-                std::panic::catch_unwind(AssertUnwindSafe(|| agent.run(&transcript, &on_progress)));
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                agent.run(&transcript, receiver, &on_progress);
+            }));
+            // The turn is over: Esc can no longer cancel anything.
+            *agent.cancel_slot() = None;
             if outcome.is_err() {
                 terminate_and_log(
                     &on_progress,
@@ -91,7 +120,9 @@ impl Agent {
     /// most `max_rounds` rounds, always with exactly one terminal event:
     /// [`Progress::Done`] with the final answer (`None` if nothing arrived), or
     /// [`Progress::Failed`] on a request error, an explicit error or incomplete event,
-    /// or a truncated stream (one that ended mid tool call or delivered nothing).
+    /// or a truncated stream (one that ended mid tool call or delivered nothing),
+    /// or immediately when the front end cancels the turn.
+    ///
     /// A stream that closes without a terminal event still ends its round with whatever
     /// the model produced.
     ///
@@ -100,8 +131,20 @@ impl Agent {
         clippy::too_many_lines,
         reason = "the round loop reads best as one straight-line function"
     )]
-    fn run<F: Fn(Progress)>(&self, transcript: &Transcript, on_progress: &F) {
+    fn run<F: Fn(Progress)>(
+        &self,
+        transcript: &Transcript,
+        mut cancel_rx: mpsc::Receiver<()>,
+        on_progress: &F,
+    ) {
+        // Set once a cancel is consumed, so the rest of the turn's calls and rounds
+        // skip without re-reading the channel.
+        let mut cancelled = false;
         for _ in 0..self.max_rounds {
+            // A cancelled generation stops before spending another request.
+            if cancelled || matches!(cancel_rx.try_recv(), Ok(())) {
+                return terminate_and_log(on_progress, Progress::Done { message: None });
+            }
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
                 .stream(true)
@@ -143,7 +186,16 @@ impl Agent {
             // otherwise complete answer.
             let mut last_error: Option<String> = None;
 
-            while let Some(item) = block_on(stream.next()) {
+            // Race the stream against Esc; a won cancel returns and drops the stream
+            loop {
+                let item = match block_on(Compat::new(select(stream.next(), cancel_rx.next()))) {
+                    // Esc won: returning drops the stream.
+                    Either::Right(_) => {
+                        return terminate_and_log(on_progress, Progress::Done { message: None });
+                    }
+                    Either::Left((item, _)) => item,
+                };
+                let Some(item) = item else { break };
                 match item {
                     Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
                         answer.push_str(&delta.delta);
@@ -253,6 +305,7 @@ impl Agent {
             }
 
             // No calls pending: this round's answer is the turn's message.
+            // (A cancelled turn's recording is unwound by the front end)
             if calls.is_empty() {
                 if !answer.is_empty()
                     && let Err(error) = transcript.push_assistant(answer.clone())
@@ -273,6 +326,12 @@ impl Agent {
             // error so the round's earlier effects stay in the transcript.
             let mut failure: Option<String> = None;
             for call in calls {
+                // A cancelled turn skips its remaining calls; the one in
+                // flight finishes first.
+                if cancelled || matches!(cancel_rx.try_recv(), Ok(())) {
+                    cancelled = true;
+                    break;
+                }
                 match tools::execute(&call, &self.policy, on_progress) {
                     Ok(output) => exchanges.push((call, output)),
                     Err(error) => {
