@@ -80,6 +80,12 @@ impl Agent {
         self
     }
 
+    /// Change the reasoning effort for subsequent turns.
+    #[inline]
+    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
+        self.effort = Some(effort);
+    }
+
     /// Run one generation on its own thread, reporting progress to `on_progress`.
     ///
     /// The worker records its turns (reasoning, tool exchanges, final answer) into the
