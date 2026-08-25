@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
@@ -100,6 +100,10 @@ enum Wake {
     Generation(Progress),
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the event loop reads best as one straight-line function"
+)]
 fn run(
     terminal: &mut DefaultTerminal,
     agent: &Agent,
@@ -131,10 +135,11 @@ fn run(
         }
     });
 
-    let mut generating = false;
     let mut quit = false;
     let mut perf_on = false;
     let mut perf = Perf::default();
+    // Whether Esc cancelled the turn in flight; when it ends, the turn is unwound
+    let mut cancelled = false;
     while !quit {
         let t0 = Instant::now();
         let done = terminal.draw(|frame| pane.render(frame, frame.area()))?;
@@ -148,8 +153,13 @@ fn run(
             reason = "different wake sources that happen to need no handling"
         )]
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
-            Ok(Wake::Input(Event::Key(key))) => match on_key(&mut pane, key) {
+            Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
+                // Esc with nothing open and running turn aborts the stream and resets.
+                Some(PaneEvent::Cancel) => {
+                    agent.cancel();
+                    cancelled = true;
+                }
                 // Copy the selected text when we exit copy mode.
                 Some(PaneEvent::Copy(text)) => clipboard::copy(&text)?,
                 Some(PaneEvent::Submit(line)) => match line.trim() {
@@ -163,13 +173,10 @@ fn run(
                         perf_on = !perf_on;
                         perf = Perf::default();
                     }
-                    // Don't submit text while the model is generating
-                    _ if generating => {}
                     _ => {
                         // New response clears the thinking box for the previous one
                         pane.begin_response();
                         transcript.push_user(line)?;
-                        generating = true;
                         pane.set_generating(true);
                         let sender = wake.clone();
                         // The agent loop runs on its own thread
@@ -204,14 +211,23 @@ fn run(
             // When the model is done, the worker has already recorded the entire turn
             // (including tool calls) into the transcript
             Ok(Wake::Generation(Progress::Done { .. })) => {
-                generating = false;
                 pane.set_generating(false);
+                if cancelled {
+                    // Reset TUI and context as if the last turn never happened.
+                    transcript.drop_last_turn();
+                    cancelled = false;
+                    pane.cancel_turn();
+                }
             }
             // If the model *fails* for some reason, resolve anything still
             // running, then show the error.
             Ok(Wake::Generation(Progress::Failed(error))) => {
-                generating = false;
                 pane.set_generating(false);
+                if cancelled {
+                    transcript.drop_last_turn();
+                    cancelled = false;
+                    pane.cancel_turn();
+                }
                 pane.fail_pending(&error);
                 pane.append(&Span::styled(error, DIM_STYLE));
             }
@@ -220,13 +236,4 @@ fn run(
         }
     }
     Ok(())
-}
-
-/// Esc leaves copy mode; everything else is the pane's.
-fn on_key(pane: &mut Pane, key: KeyEvent) -> Option<PaneEvent> {
-    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
-        pane.escape();
-        return None;
-    }
-    pane.on_key(key)
 }
