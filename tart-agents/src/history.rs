@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_openai::types::responses::{
-    EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam, FunctionToolCall,
-    InputItem, Item, ReasoningItem, Role,
+    EasyInputContent, EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam,
+    FunctionToolCall, InputItem, Item, ReasoningItem, ReasoningItemContent, Role,
 };
+
+use crate::{Progress, tools};
 
 /// The system prompt for *tart*, included in every conversation.
 const SYSTEM: &str = include_str!("data/SYSTEM.md");
@@ -45,6 +47,12 @@ impl Transcript {
             .items()
             .push(input_message(Role::System, instructions)?);
         Ok(transcript)
+    }
+
+    /// A transcript over `items`, as a session file restored them.
+    #[inline]
+    pub(crate) fn from_items(items: Vec<InputItem>) -> Self {
+        Self { items: Arc::new(Mutex::new(items)) }
     }
 
     /// Drop the conversation, keeping the leading system items.
@@ -115,6 +123,54 @@ impl Transcript {
     #[must_use]
     pub(crate) fn request_items(&self) -> Vec<InputItem> {
         self.items().clone()
+    }
+
+    /// The progress stream that renders this record, in live order, for replay.
+    ///
+    /// Tool exchanges replay headers only, with coloring skipped for simplicity.
+    #[inline]
+    pub fn replay(&self) -> Vec<Progress> {
+        let mut events = Vec::new();
+        for item in &self.request_items() {
+            match item {
+                InputItem::EasyMessage(message) => match (&message.role, &message.content) {
+                    (Role::User, EasyInputContent::Text(text)) => {
+                        events.push(Progress::User(text.clone()));
+                    }
+                    (Role::Assistant, EasyInputContent::Text(text)) => {
+                        events.push(Progress::Answer(text.clone()));
+                    }
+                    _ => {}
+                },
+                InputItem::Item(Item::Reasoning(reasoning)) => {
+                    let text: String = reasoning
+                        .content
+                        .iter()
+                        .flatten()
+                        .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
+                        .collect();
+                    if !text.is_empty() {
+                        events.push(Progress::Thinking(text));
+                    }
+                }
+                InputItem::Item(Item::FunctionCall(call)) => {
+                    // Just show the header, exits/output are not super necessary
+                    let (name, digest) = tools::describe(call);
+                    events.push(Progress::ToolStart {
+                        id: call.call_id.clone(),
+                        name,
+                        digest,
+                    });
+                    events.push(Progress::ToolOutput {
+                        id: call.call_id.clone(),
+                        output: String::new(),
+                        exit: Some(0),
+                    });
+                }
+                _ => {}
+            }
+        }
+        events
     }
 }
 
@@ -317,5 +373,80 @@ mod tests {
         items.clear();
 
         assert_eq!(transcript.request_items().len(), 1);
+    }
+
+    #[test]
+    fn items_round_trip_through_jsonl_lines() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        transcript.push_reasoning(reasoning_item());
+        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
+        transcript.push_assistant("done".to_string()).unwrap();
+
+        // Every shape the harness records is one JSON line that reparses to itself.
+        for item in transcript.request_items() {
+            let line = serde_json::to_string(&item).unwrap();
+            assert!(!line.contains('\n'), "{line}");
+            assert_eq!(serde_json::from_str::<InputItem>(&line).unwrap(), item);
+        }
+    }
+
+    #[test]
+    fn replay_renders_words_and_tool_headers_only() {
+        use Progress::{Answer, Thinking, ToolOutput, ToolStart, User};
+
+        // System items replay as nothing.
+        let transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
+        assert!(transcript.replay().is_empty());
+
+        transcript.push_user("run it".to_string()).unwrap();
+        transcript.push_reasoning(reasoning_item());
+        let mut second = bash_call();
+        second.call_id = "call_1".to_string();
+        transcript.push_tool_round(vec![
+            (bash_call(), "one\n".to_string()),
+            (second, "[exit 2]\ntwo\n".to_string()),
+        ]);
+        transcript.push_assistant("done".to_string()).unwrap();
+
+        let events = transcript.replay();
+
+        // Each call replays as its header, finished empty: no recorded output,
+        // no exit derived from its framing.
+        assert!(matches!(
+            events.as_slice(),
+            [
+                User(text),
+                Thinking(thinking),
+                ToolStart {
+                    id,
+                    name: "Bash",
+                    digest
+                },
+                ToolOutput {
+                    output,
+                    exit: Some(0),
+                    ..
+                },
+                ToolStart {
+                    id: second_id,
+                    name: "Bash",
+                    ..
+                },
+                ToolOutput {
+                    output: second_output,
+                    exit: Some(0),
+                    ..
+                },
+                Answer(answer),
+            ] if text == "run it"
+                && thinking == "thinking"
+                && id == "call_0"
+                && digest == "ls"
+                && output.is_empty()
+                && second_id == "call_1"
+                && second_output.is_empty()
+                && answer == "done"
+        ));
     }
 }
