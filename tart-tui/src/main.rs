@@ -34,7 +34,7 @@ use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Pane, PaneEvent};
 use perf::Perf;
-use tart_agents::{Agent, Progress, Transcript, sandbox::Policy};
+use tart_agents::{Agent, Progress, ReasoningEffort, Transcript, sandbox::Policy};
 use tmux_override::{override_shift_up, restore_tmux};
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     let _tmux = override_shift_up();
     let result = run(
         &mut terminal,
-        &agent,
+        &mut agent,
         &transcript,
         &label,
         agent_config.context_tokens,
@@ -100,13 +100,26 @@ enum Wake {
     Generation(Progress),
 }
 
+/// Parse a `/effort` argument.
+fn effort_of(name: &str) -> Option<ReasoningEffort> {
+    match name {
+        "none" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::Xhigh),
+        _ => None,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the event loop reads best as one straight-line function"
 )]
 fn run(
     terminal: &mut DefaultTerminal,
-    agent: &Agent,
+    agent: &mut Agent,
     transcript: &Transcript,
     label: &str,
     context_tokens: Option<u64>,
@@ -172,6 +185,24 @@ fn run(
                     "/perf" => {
                         perf_on = !perf_on;
                         perf = Perf::default();
+                    }
+                    // Set how hard the model reasons.
+                    _ if let Some(arg) = line.trim().strip_prefix("/effort") => {
+                        let arg = arg.trim();
+                        match effort_of(arg) {
+                            Some(effort) => {
+                                agent.set_reasoning_effort(effort);
+                                pane.push(Span::styled(
+                                    format!("reasoning effort: {arg}"),
+                                    DIM_STYLE,
+                                ));
+                            }
+                            // Bare and unknown arguments both show the usage.
+                            None => pane.push(Span::styled(
+                                "usage: /effort none|minimal|low|medium|high|xhigh",
+                                DIM_STYLE,
+                            )),
+                        }
                     }
                     _ => {
                         // New response clears the thinking box for the previous one
