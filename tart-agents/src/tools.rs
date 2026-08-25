@@ -271,6 +271,29 @@ fn timeout_text(text: &str, timeout: Duration) -> String {
     format!("[timed out after {}s]{separator}{text}", timeout.as_secs())
 }
 
+/// The display name and digest for a recorded call, to be replayed as a tool header.
+///
+/// Recorded arguments are re-parsed so the header matches what the front end showed
+/// live. Unparseable arguments and unknown tools degrade to the raw JSON.
+pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
+    let raw = |_| call.arguments.clone();
+    match call.name.as_str() {
+        "bash" => (
+            "Bash",
+            parse_bash(&call.arguments).map_or_else(raw, |bash| bash.command),
+        ),
+        "read" => (
+            "Read",
+            parse_read(&call.arguments).map_or_else(raw, |read| read_digest(&read)),
+        ),
+        "edit" => (
+            "Edit",
+            parse_edit(&call.arguments).map_or_else(raw, |edit| edit.path),
+        ),
+        _ => ("Tool", call.arguments.clone()),
+    }
+}
+
 /// Run `command` to completion, killing its process group if it outlives `timeout`.
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<TimedRun> {
     command
