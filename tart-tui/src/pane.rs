@@ -40,6 +40,8 @@ pub enum PaneEvent {
     Submit(String),
     /// Text chosen in copy mode, ready for the clipboard.
     Copy(String),
+    /// Esc with nothing open and a turn in flight.
+    Cancel,
     Quit,
 }
 
@@ -52,6 +54,14 @@ struct Usage {
     cached: u64,
     /// The tokens the model generated.
     output: u64,
+}
+
+/// The pane state before a submitted turn, restored if the turn is cancelled.
+struct TurnSnapshot {
+    /// Transcript entries before the turn's echo and stream.
+    entries: usize,
+    /// The draft before it was submitted.
+    draft: Editor,
 }
 
 /// The TUI interface.
@@ -72,6 +82,8 @@ pub struct Pane {
     context_tokens: Option<u64>,
     /// Whether the model is generating; Enter then keeps the draft.
     generating: bool,
+    /// The state before the submitted turn (in case we have to cancel a message).
+    turn: Option<TurnSnapshot>,
 }
 
 impl Pane {
@@ -85,6 +97,7 @@ impl Pane {
             usage: None,
             context_tokens: None,
             generating: false,
+            turn: None,
         }
     }
 
@@ -106,7 +119,8 @@ impl Pane {
         // Copy mode takes every key first, so the draft is immutable while scrolling
         if let Some(cursor) = self.copy {
             match key.code {
-                KeyCode::Char('q' | 'Q') => self.copy = None,
+                // q or Esc leaves copy mode.
+                KeyCode::Char('q' | 'Q') | KeyCode::Esc => self.copy = None,
                 // Space (unconditionally) begins a selection at the current position
                 KeyCode::Char(' ') => {
                     self.copy = Some(CopyCursor {
@@ -171,6 +185,12 @@ impl Pane {
             // A draft cannot go out mid-generation; Enter keeps it for later.
             KeyCode::Enter if self.generating => {}
             KeyCode::Enter => return self.submit().map(PaneEvent::Submit),
+            // Esc with nothing to close cancels the turn in flight.
+            KeyCode::Esc => {
+                if !self.escape() && self.generating {
+                    return Some(PaneEvent::Cancel);
+                }
+            }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
             }
@@ -278,11 +298,33 @@ impl Pane {
         self.generating = generating;
     }
 
+    /// Restore the pane to before the cancelled turn, adding a dim cancelled label.
+    pub fn cancel_turn(&mut self) {
+        let Some(turn) = self.turn.take() else {
+            return;
+        };
+        self.transcript.messages.truncate(turn.entries);
+        self.transcript.rows.clear();
+        self.transcript.cache.1 = 0;
+        self.transcript.run = Some(ThinkingRun {
+            start: turn.entries,
+            end: turn.entries,
+        });
+        self.transcript.open = false;
+        self.prompt = turn.draft;
+        self.push(Span::styled("⎋ cancelled", DIM_STYLE));
+    }
+
     /// Echo the draft into the transcript and clear it.
     fn submit(&mut self) -> Option<String> {
         if self.prompt.text().trim().is_empty() {
             return None;
         }
+        // Snapshot the pre-turn state: a cancelled turn restores to here.
+        self.turn = Some(TurnSnapshot {
+            entries: self.transcript.messages.len(),
+            draft: self.prompt.clone(),
+        });
         let text = self.prompt.text();
         let mut rows = text.split('\n');
         self.transcript.push(Line::from(vec![
@@ -480,6 +522,7 @@ fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>) {
 }
 
 /// The prompt editor: a multi-line draft with a grapheme caret.
+#[derive(Clone)]
 pub(crate) struct Editor {
     /// Draft lines; always at least one.
     pub(crate) lines: Vec<String>,
@@ -1358,6 +1401,45 @@ mod tests {
             Some(PaneEvent::Submit("hi\n".into()))
         );
         assert_eq!(pane.prompt.text(), "");
+    }
+
+    /// Cancelling a turn restores the pane to before the message.
+    #[test]
+    fn cancel_turn_restores_the_pre_turn_state() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("earlier"));
+        pane.begin_response();
+        pane.append(&Span::raw("earlier answer"));
+
+        // The next turn, as main drives it: submit echoes the draft, the
+        // response begins, then the stream and tools arrive.
+        pane.on_paste("write a story");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Submit("write a story".into()))
+        );
+        pane.begin_response();
+        pane.set_generating(true);
+        pane.append_thinking(&Span::styled("thinking", DIM_STYLE));
+        pane.append(&Span::raw("Once upon"));
+        pane.start_tool("call_0".to_string(), "Bash", "sleep 5".to_string());
+
+        pane.cancel_turn();
+
+        let screen = render(&mut pane, (60, 20));
+        assert!(screen.contains("earlier answer"), "{screen}");
+        assert!(screen.contains("⎋ cancelled"), "{screen}");
+        assert!(!screen.contains("Once upon"), "{screen}");
+        assert!(!screen.contains("sleep 5"), "{screen}");
+        assert_eq!(pane.prompt.text(), "write a story");
+        // The restored log folds cleanly.
+        assert_eq!(
+            texts(&pane.transcript.rows),
+            texts(&wrap_lines(
+                &entry_lines(&pane.transcript.messages, pane.transcript.show_tool_output),
+                pane.transcript.cache.0
+            ))
+        );
     }
 
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
