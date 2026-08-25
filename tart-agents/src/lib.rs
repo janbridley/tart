@@ -4,6 +4,7 @@ mod agent;
 mod debug;
 mod history;
 mod progress;
+pub mod session;
 mod tools;
 
 #[cfg(target_os = "macos")]
@@ -11,6 +12,7 @@ pub mod sandbox;
 
 pub use history::Transcript;
 pub use progress::Progress;
+pub use session::{SESSIONS_ROOT, Session};
 
 pub use agent::Agent;
 
