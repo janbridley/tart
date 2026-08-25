@@ -793,7 +793,8 @@ struct Transcript {
     rows: Vec<Line<'static>>,
     /// (width, how many *visible* messages `rows` already contains).
     cache: (usize, usize),
-    /// The current response's chain-of-thought, if one has begun.
+    /// The current response's chain-of-thought, if one has begun. Tool starts
+    /// rotate it below themselves, so it always rides under the tool boxes.
     run: Option<ThinkingRun>,
     /// Whether the thinking run renders; sticky across turns. Starts hidden.
     show_thinking: bool,
@@ -811,14 +812,19 @@ impl Transcript {
 
     /// Record a tool invocation's start; it renders as a running header until
     /// finished. The call supersedes every finished box before it, folding each
-    /// down to its header line.
+    /// down to its header line, and rotates the thinking run below itself so
+    /// the chain-of-thought always renders under the tool boxes.
     fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
         let fold = self.messages.iter().position(
             |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_some() && !tool.superseded),
         );
+        // The rotation below also moves the run's messages, so the stale-row
+        // span starts at whichever of the two comes first.
+        let run_start = self.run.filter(|run| run.start < run.end).map(|run| run.start);
+        let stale = [fold, run_start].into_iter().flatten().min();
         // Rewind before flipping the flags: the stale-row count must reflect the
         // bodies the flags are about to hide.
-        if let Some(index) = fold {
+        if let Some(index) = stale {
             self.rewind(index);
         }
         for entry in &mut self.messages {
@@ -836,6 +842,14 @@ impl Transcript {
             exit: None,
             superseded: false,
         }));
+        // Late thinking fragments then extend the run in place, under the
+        // boxes, instead of splicing back above them.
+        if let Some(run) = self.run.as_mut().filter(|run| run.start < run.end) {
+            let span = run.end - run.start;
+            self.messages[run.start..].rotate_left(span);
+            run.end = self.messages.len();
+            run.start = run.end - span;
+        }
         self.open = false;
     }
 
@@ -2179,10 +2193,11 @@ mod tests {
         assert_eq!(message_texts(&t), ["answer", "more"]);
     }
 
-    /// The round-two splice rotates tool entries with the tail; the cache stays
-    /// honest through toggles and width changes.
+    /// A tool start rotates the thinking run below the new box, and later
+    /// fragments extend it there; the cache stays honest through toggles and
+    /// width changes.
     #[test]
-    fn late_thinking_splices_above_tool_boxes() {
+    fn thinking_rides_below_tool_boxes() {
         let mut t = Transcript::default();
         let assert_fresh = |t: &Transcript| {
             assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(t), t.cache.0)));
@@ -2195,11 +2210,15 @@ mod tests {
         t.finish_tool("call_0", "out\n".to_string(), Some(0));
         t.sync(40);
         assert_fresh(&t);
+        // t1 rotated below the box when the call started, placeholder and all.
+        assert_eq!(message_texts(&t), ["❯ go", "a1", "t1"]);
+        assert!(texts(&t.rows).iter().any(|row| row.contains("Thinking")));
 
-        t.append_thinking(&Span::styled("t2", DIM_STYLE)); // splices above a1 and the box
+        t.append_thinking(&Span::styled("t2", DIM_STYLE)); // extends the run below the box
+        start_bash(&mut t, "call_1"); // a second box stacks above the run
         t.sync(40);
         assert_fresh(&t);
-        assert_eq!(message_texts(&t), ["❯ go", "t1", "t2", "a1"]);
+        assert_eq!(message_texts(&t), ["❯ go", "a1", "t1", "t2"]);
 
         t.toggle_thinking();
         t.sync(40);
