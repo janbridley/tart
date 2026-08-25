@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
+use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::clipboard::Selection;
@@ -33,6 +34,10 @@ const TOOL_ERR: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 /// The copy cursor and the editor caret are the cell under them, inverted.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
+/// Frames for the statusline spinner.
+const SPINNER_FRAMES: [&str; 6] = ["·  ", "·· ", "···", " ··", "  ·", "   "];
+/// Milliseconds per spinner frame.
+const SPINNER_MS: u128 = 200;
 
 /// Key results the pane cannot handle itself.
 #[derive(Debug, PartialEq)]
@@ -80,8 +85,10 @@ pub struct Pane {
     usage: Option<Usage>,
     /// The model's context window, from the agents file.
     context_tokens: Option<u64>,
-    /// Whether the model is generating; Enter then keeps the draft.
-    generating: bool,
+    /// When the generating turn started; `None` when the model is idle.
+    /// Enter keeps the draft while set, and the status rule's spinner runs
+    /// off the elapsed time for a steady frame rate.
+    spin: Option<Instant>,
     /// The state before the submitted turn (in case we have to cancel a message).
     turn: Option<TurnSnapshot>,
 }
@@ -96,7 +103,7 @@ impl Pane {
             perf: None,
             usage: None,
             context_tokens: None,
-            generating: false,
+            spin: None,
             turn: None,
         }
     }
@@ -183,11 +190,11 @@ impl Pane {
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
             // A draft cannot go out mid-generation; Enter keeps it for later.
-            KeyCode::Enter if self.generating => {}
+            KeyCode::Enter if self.spin.is_some() => {}
             KeyCode::Enter => return self.submit().map(PaneEvent::Submit),
             // Esc with nothing to close cancels the turn in flight.
             KeyCode::Esc => {
-                if !self.escape() && self.generating {
+                if !self.escape() && self.spin.is_some() {
                     return Some(PaneEvent::Cancel);
                 }
             }
@@ -284,6 +291,12 @@ impl Pane {
         Some(text)
     }
 
+    /// The status rule's current spinner frame, or None while idle.
+    fn spinner(&self) -> Option<&'static str> {
+        let elapsed = self.spin?.elapsed().as_millis();
+        Some(SPINNER_FRAMES[(elapsed / SPINNER_MS) as usize % SPINNER_FRAMES.len()])
+    }
+
     pub fn clear(&mut self) {
         self.transcript.clear();
     }
@@ -295,7 +308,7 @@ impl Pane {
 
     /// Mark the model busy; Enter keeps the draft instead of submitting it.
     pub fn set_generating(&mut self, generating: bool) {
-        self.generating = generating;
+        self.spin = generating.then(Instant::now);
     }
 
     /// Restore the pane to before the cancelled turn, adding a dim cancelled label.
@@ -459,7 +472,7 @@ impl Pane {
                 buf.set_line(bar_bottom.x, bar_bottom.y, &line, bar_bottom.width);
             }
         } else {
-            status_rule(buf, bar_bottom, self.status_text().as_deref());
+            status_rule(buf, bar_bottom, self.status_text().as_deref(), self.spinner());
         }
     }
 
@@ -504,13 +517,18 @@ fn token_count(tokens: u64) -> String {
 }
 
 /// A full-width dim rule row with the status badge set into it:
-/// `───[ status ]─────…`.
-fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>) {
+/// `───[ status ]─────…`; while generating, a spinner takes the leading
+/// dashes: `···[ status ]─────…`.
+fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>, spinner: Option<&str>) {
     rule(buf, area);
     // The bar can be parked past the last row.
-    if let Some(status) = status
-        && area.y < buf.area.height
-    {
+    if area.y >= buf.area.height {
+        return;
+    }
+    if let Some(spinner) = spinner {
+        buf.set_stringn(area.x, area.y, spinner, 3, DIM_STYLE);
+    }
+    if let Some(status) = status {
         buf.set_stringn(
             area.x + 3,
             area.y,
@@ -1412,6 +1430,13 @@ mod tests {
         // No cache reported drops the suffix.
         pane.set_usage(1_000, 0, 0);
         assert!(render(&mut pane, (60, 8)).contains("[ 1k / 200k ]"));
+
+        // A generating turn spins in the leading dashes
+        pane.set_generating(true);
+        let spinning = render(&mut pane, (60, 8));
+        assert!(spinning.contains("·  [ 1k / 200k ]"), "{spinning}");
+        pane.set_generating(false);
+        assert!(render(&mut pane, (60, 8)).contains("───[ 1k / 200k ]"));
 
         // No window configured drops the ratio.
         let mut bare = Pane::new();
