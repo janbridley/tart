@@ -843,8 +843,10 @@ impl Transcript {
             superseded: false,
         }));
         // Late thinking fragments then extend the run in place, under the
-        // boxes, instead of splicing back above them.
-        if let Some(run) = self.run.as_mut().filter(|run| run.start < run.end) {
+        // boxes, instead of splicing back above them; an empty run moves only
+        // its markers, so thinking that starts after the call still opens
+        // below the box.
+        if let Some(run) = &mut self.run {
             let span = run.end - run.start;
             self.messages[run.start..].rotate_left(span);
             run.end = self.messages.len();
@@ -2219,6 +2221,17 @@ mod tests {
         t.sync(40);
         assert_fresh(&t);
         assert_eq!(message_texts(&t), ["❯ go", "a1", "t1", "t2"]);
+        // Every header must precede the placeholder in the rendered rows.
+        let rows = texts(&t.rows);
+        let last_box = rows
+            .iter()
+            .rposition(|row| row.contains("Bash"))
+            .expect("box headers");
+        let think = rows
+            .iter()
+            .position(|row| row.contains("Thinking"))
+            .expect("placeholder");
+        assert!(last_box < think, "{rows:?}");
 
         t.toggle_thinking();
         t.sync(40);
