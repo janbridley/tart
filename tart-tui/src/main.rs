@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
@@ -60,10 +61,21 @@ fn main() -> anyhow::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
+    execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
-    let result = run(&mut terminal, &agent, &transcript, &label);
+    let result = run(
+        &mut terminal,
+        &agent,
+        &transcript,
+        &label,
+        agent_config.context_tokens,
+    );
     ratatui::try_restore()?;
+    execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
     terminal.show_cursor()?;
     result
@@ -93,6 +105,7 @@ fn run(
     agent: &Agent,
     transcript: &Transcript,
     label: &str,
+    context_tokens: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.push(Span::styled(
@@ -102,6 +115,9 @@ fn run(
         ),
         DIM_STYLE,
     ));
+    if let Some(tokens) = context_tokens {
+        pane.set_context_tokens(tokens);
+    }
 
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
@@ -154,6 +170,7 @@ fn run(
                         pane.begin_response();
                         transcript.push_user(line)?;
                         generating = true;
+                        pane.set_generating(true);
                         let sender = wake.clone();
                         // The agent loop runs on its own thread
                         agent.spawn(transcript, move |progress| {
@@ -180,15 +197,21 @@ fn run(
             Ok(Wake::Generation(Progress::ToolOutput { id, output, exit })) => {
                 pane.finish_tool(&id, output, exit);
             }
+            // The status line's usage measurements
+            Ok(Wake::Generation(Progress::Usage { input, cached, output })) => {
+                pane.set_usage(input, cached, output);
+            }
             // When the model is done, the worker has already recorded the entire turn
             // (including tool calls) into the transcript
             Ok(Wake::Generation(Progress::Done { .. })) => {
                 generating = false;
+                pane.set_generating(false);
             }
             // If the model *fails* for some reason, resolve anything still
             // running, then show the error.
             Ok(Wake::Generation(Progress::Failed(error))) => {
                 generating = false;
+                pane.set_generating(false);
                 pane.fail_pending(&error);
                 pane.append(&Span::styled(error, DIM_STYLE));
             }

@@ -17,6 +17,8 @@ api_key = ["security", "find-generic-password", "-a", "account", "-s", "service"
 name = "Coding Specialist"
 model = "glm-5.3"
 reasoning_effort = "high" # Optional
+# The model's context window, shown in the status line's token gauge.
+context_tokens = 1000000 # Optional
 
 # Instructions are appended to the system prompt.
 instructions = """

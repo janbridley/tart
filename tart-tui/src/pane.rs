@@ -43,6 +43,17 @@ pub enum PaneEvent {
     Quit,
 }
 
+/// One finished response's token usage, as shown on the status line.
+#[derive(Clone, Copy)]
+struct Usage {
+    /// All input tokens, cached included.
+    input: u64,
+    /// The input tokens served from the prompt cache.
+    cached: u64,
+    /// The tokens the model generated.
+    output: u64,
+}
+
 /// The TUI interface.
 pub struct Pane {
     /// Input interface for the `Pane`.
@@ -55,6 +66,12 @@ pub struct Pane {
     popup: Option<FilePopup>,
     /// The `/perf` stats line, shown on the bottom rule row; `None` when off.
     perf: Option<String>,
+    /// The last response's token usage.
+    usage: Option<Usage>,
+    /// The model's context window, from the agents file.
+    context_tokens: Option<u64>,
+    /// Whether the model is generating; Enter then keeps the draft.
+    generating: bool,
 }
 
 impl Pane {
@@ -65,6 +82,9 @@ impl Pane {
             copy: None,
             popup: None,
             perf: None,
+            usage: None,
+            context_tokens: None,
+            generating: false,
         }
     }
 
@@ -112,6 +132,9 @@ impl Pane {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
                 KeyCode::Char('u') => self.prompt.clear(),
+                // To the line start / end, as readline
+                KeyCode::Char('a') => self.prompt.home(),
+                KeyCode::Char('e') => self.prompt.end(),
                 // Toggle the thinking run's visibility (only in normal mode)
                 KeyCode::Char('t') => self.transcript.toggle_thinking(),
                 // Toggle expanding the tool outputs' collapsed middles
@@ -145,6 +168,8 @@ impl Pane {
         }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
+            // A draft cannot go out mid-generation; Enter keeps it for later.
+            KeyCode::Enter if self.generating => {}
             KeyCode::Enter => return self.submit().map(PaneEvent::Submit),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
@@ -211,6 +236,34 @@ impl Pane {
         self.transcript.fail_pending(reason);
     }
 
+    /// Record one response's token usage for the status line.
+    pub fn set_usage(&mut self, input: u64, cached: u64, output: u64) {
+        self.usage = Some(Usage { input, cached, output });
+    }
+
+    /// Record the model's context window, from the agents file.
+    pub fn set_context_tokens(&mut self, tokens: u64) {
+        self.context_tokens = Some(tokens);
+    }
+
+    /// The status line's text: the context size against the model's window,
+    /// with the cache share when the provider reports one.
+    fn status_text(&self) -> Option<String> {
+        let usage = self.usage?;
+        let context = usage.input + usage.output;
+        let mut text = match self.context_tokens {
+            Some(window) => format!("{} / {}", token_count(context), token_count(window)),
+            None => token_count(context),
+        };
+        if usage.cached > 0 && usage.input > 0 {
+            let percent = usage.cached * 100 / usage.input;
+            text.push_str(" · ");
+            text.push_str(&percent.to_string());
+            text.push_str("% cached");
+        }
+        Some(text)
+    }
+
     pub fn clear(&mut self) {
         self.transcript.clear();
     }
@@ -218,6 +271,11 @@ impl Pane {
     /// Update the `/perf` stats line; `None` restores the bottom rule.
     pub fn set_perf(&mut self, perf: Option<String>) {
         self.perf = perf;
+    }
+
+    /// Mark the model busy; Enter keeps the draft instead of submitting it.
+    pub fn set_generating(&mut self, generating: bool) {
+        self.generating = generating;
     }
 
     /// Echo the draft into the transcript and clear it.
@@ -359,7 +417,7 @@ impl Pane {
                 buf.set_line(bar_bottom.x, bar_bottom.y, &line, bar_bottom.width);
             }
         } else {
-            rule(buf, bar_bottom);
+            status_rule(buf, bar_bottom, self.status_text().as_deref());
         }
     }
 
@@ -391,6 +449,33 @@ fn rule(buf: &mut Buffer, area: Rect) {
         if let Some(cell) = buf.cell_mut((col.x, area.y)) {
             cell.set_symbol(symbols::line::HORIZONTAL).set_style(DIM_STYLE);
         }
+    }
+}
+
+/// A token count in the status line's compact style: `843`, `45k`, `1.2 M`.
+fn token_count(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        1_000..=999_999 => format!("{}k", tokens / 1_000),
+        _ => format!("{}.{} M", tokens / 1_000_000, tokens % 1_000_000 / 100_000),
+    }
+}
+
+/// A full-width dim rule row with the status badge set into it:
+/// `───[ status ]─────…`.
+fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>) {
+    rule(buf, area);
+    // The bar can be parked past the last row.
+    if let Some(status) = status
+        && area.y < buf.area.height
+    {
+        buf.set_stringn(
+            area.x + 3,
+            area.y,
+            format!("[ {status} ]"),
+            area.width.saturating_sub(3) as usize,
+            DIM_STYLE,
+        );
     }
 }
 
@@ -1199,6 +1284,50 @@ mod tests {
     }
 
     #[test]
+    fn token_count_formats_compactly() {
+        assert_eq!(token_count(0), "0");
+        assert_eq!(token_count(843), "843");
+        assert_eq!(token_count(999), "999");
+        assert_eq!(token_count(1_000), "1k");
+        assert_eq!(token_count(45_600), "45k");
+        assert_eq!(token_count(999_999), "999k");
+        assert_eq!(token_count(1_000_000), "1.0 M");
+        assert_eq!(token_count(1_234_567), "1.2 M");
+        assert_eq!(token_count(999_999_999), "999.9 M");
+    }
+
+    /// The bottom rule carries the token gauge; plain until usage arrives,
+    /// and `perf` still overrides it.
+    #[test]
+    fn the_bottom_rule_carries_the_usage_badge() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("text"));
+        assert!(!render(&mut pane, (60, 8)).contains('['));
+
+        pane.set_context_tokens(200_000);
+        pane.set_usage(45_000, 40_000, 3_000);
+        let gauge = render(&mut pane, (60, 8));
+        assert!(gauge.contains("───[ 48k / 200k · 88% cached ]"), "{gauge}");
+
+        // The perf line replaces the badge when both are set.
+        pane.set_perf(Some(" fps 60 ".into()));
+        let perf = render(&mut pane, (60, 8));
+        assert!(perf.contains("rows"));
+        assert!(!perf.contains("48k"), "{perf}");
+        pane.set_perf(None);
+
+        // No cache reported drops the suffix.
+        pane.set_usage(1_000, 0, 0);
+        assert!(render(&mut pane, (60, 8)).contains("[ 1k / 200k ]"));
+
+        // No window configured drops the ratio.
+        let mut bare = Pane::new();
+        bare.push(Line::from("text"));
+        bare.set_usage(45_000, 0, 3_000);
+        assert!(render(&mut bare, (60, 8)).contains("[ 48k ]"));
+    }
+
+    #[test]
     fn perf_line_replaces_the_bottom_rule() {
         let mut pane = Pane::default();
         let plain = render(&mut pane, (60, 10));
@@ -1207,6 +1336,28 @@ mod tests {
         assert!(!plain.contains("rows"));
         assert!(perf.contains("fps 60"));
         assert!(perf.contains("rows"));
+    }
+
+    #[test]
+    fn enter_while_generating_keeps_the_draft() {
+        let mut pane = Pane::default();
+        for c in ['h', 'i'] {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.set_generating(true);
+        // Enter neither echoes nor clears; Alt+Enter still edits the draft.
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        pane.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(pane.prompt.lines.len(), 2);
+        assert_eq!(pane.prompt.text(), "hi\n");
+        assert!(message_texts(&pane.transcript).is_empty());
+        // Once the model is done, Enter submits the intact draft.
+        pane.set_generating(false);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Submit("hi\n".into()))
+        );
+        assert_eq!(pane.prompt.text(), "");
     }
 
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
@@ -1541,6 +1692,9 @@ mod tests {
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));
+        // The badge must skip out-of-bounds bars like `rule` does.
+        pane.set_usage(45_000, 0, 3_000);
+        render(&mut pane, (6, 3));
         // The /perf line must skip out-of-bounds bars like `rule` does.
         pane.set_perf(Some(" fps 60 ".into()));
         render(&mut pane, (6, 3));

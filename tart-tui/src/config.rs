@@ -31,6 +31,8 @@ pub(crate) struct ResolvedAgent {
     pub(crate) effort: Option<ReasoningEffort>,
     /// Extra system prompt, appended after the built-in one.
     pub(crate) instructions: Option<String>,
+    /// The model's context window, for the status line's token gauge.
+    pub(crate) context_tokens: Option<u64>,
 }
 
 /// The status-line label, e.g. "z.ai · tart".
@@ -78,6 +80,7 @@ struct AgentSpec {
     model: String,
     reasoning_effort: Option<ReasoningEffort>,
     instructions: Option<String>,
+    context_tokens: Option<u64>,
 }
 
 impl Config {
@@ -141,6 +144,7 @@ impl Config {
             model: agent.model.clone(),
             effort: agent.reasoning_effort.clone(),
             instructions: agent.instructions.clone(),
+            context_tokens: agent.context_tokens,
         })
     }
 }
@@ -326,6 +330,18 @@ instructions = "Write performant, safe code."
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
         assert!(error.contains("instruction"), "{error}");
+    }
+
+    #[test]
+    fn context_tokens_round_trips() {
+        let text = MINIMAL.replacen(
+            "reasoning_effort = \"high\"",
+            "reasoning_effort = \"high\"\ncontext_tokens = 200000",
+            1,
+        );
+        let agent = Config::parse(&text).unwrap().default_agent().unwrap();
+
+        assert_eq!(agent.context_tokens, Some(200_000));
     }
 
     #[test]

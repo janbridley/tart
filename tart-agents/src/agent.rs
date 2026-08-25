@@ -174,6 +174,17 @@ impl Agent {
                         }
                         _ => {}
                     },
+                    Ok(ResponseStreamEvent::ResponseCompleted(completed)) => {
+                        // A completed response is output even when it holds no items.
+                        saw_output = true;
+                        if let Some(usage) = completed.response.usage {
+                            on_progress(Progress::Usage {
+                                input: u64::from(usage.input_tokens),
+                                cached: u64::from(usage.input_tokens_details.cached_tokens),
+                                output: u64::from(usage.output_tokens),
+                            });
+                        }
+                    }
                     Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
                         debug::log_json("response failed event", || serde_json::to_string(&failed));
                         return terminate_and_log(
