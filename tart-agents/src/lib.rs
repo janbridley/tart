@@ -15,7 +15,7 @@ pub use progress::Progress;
 pub use agent::Agent;
 
 /// Most model rounds one generation may take before giving up.
-pub const MAX_TOOL_ROUNDS: usize = 10;
+pub const MAX_TOOL_ROUNDS: usize = 32;
 
 /// Re-exported so callers can pick a reasoning effort without depending on
 /// `async-openai`.

@@ -43,6 +43,8 @@ impl Agent {
         model: M,
         policy: Policy,
     ) -> Self {
+        // Register a cryptography backend, otherwise reqwest rustls-no-provider panics
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = OpenAIConfig::new()
             .with_api_base(base_url.into())
             .with_api_key(api_key.into());
@@ -386,4 +388,20 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
         _ => "not a terminal event".to_string(),
     });
     on_progress(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Agent::new` must install a TLS crypto provider before building its
+    /// reqwest client; the `rustls-no-provider` build panics otherwise.
+    #[test]
+    fn new_installs_tls_provider() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let agent = Agent::new("http://localhost:9", "key", "model", policy);
+        // Reaching here means the client constructed without the provider panic.
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        let _ = agent.model;
+    }
 }

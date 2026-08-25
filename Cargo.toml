@@ -49,3 +49,7 @@ needless_pass_by_ref_mut = "warn"
 # Speed up compiles. Can override with CARGO_PROFILE_DEV_DEBUG=full.
 [profile.dev]
 debug = "line-tables-only"
+
+[profile.rel-dev]
+inherits = "release"
+incremental = true
