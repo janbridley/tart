@@ -682,7 +682,8 @@ fn tool_row(text: &str) -> Line<'static> {
 ///
 /// Running calls show just the header with a dim ellipsis; finished ones add
 /// their output rows, collapsed to [`TOOL_HEAD`] head and [`TOOL_TAIL`] tail
-/// lines around a count of the hidden middle unless `expanded`.
+/// lines around a count of the hidden middle unless `expanded`. A call a later
+/// one superseded only renders its header.
 fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
     let status = match (&tool.output, tool.exit) {
         (None, _) => TOOL_RUNNING,
@@ -703,6 +704,12 @@ fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
 
     if let Some(c) = tool.exit.filter(|&c| c != 0) {
         header.push(Span::styled(format!(" exit {c}"), TOOL_ERR));
+    }
+
+    // A superseded box stays folded down to its header; Ctrl+O governs only
+    // the boxes still standing.
+    if tool.superseded {
+        return vec![Line::from(header)];
     }
 
     let lines: Vec<_> = output.lines().collect();
@@ -762,6 +769,8 @@ struct ToolCall {
     output: Option<String>,
     /// The process exit code, for the status color.
     exit: Option<i32>,
+    /// A later invocation folded this box down to its header line.
+    superseded: bool,
 }
 
 /// One transcript message: a text line or a live tool invocation.
@@ -801,14 +810,31 @@ impl Transcript {
     }
 
     /// Record a tool invocation's start; it renders as a running header until
-    /// finished.
+    /// finished. The call supersedes every finished box before it, folding each
+    /// down to its header line.
     fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
+        let fold = self.messages.iter().position(
+            |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_some() && !tool.superseded),
+        );
+        // Rewind before flipping the flags: the stale-row count must reflect the
+        // bodies the flags are about to hide.
+        if let Some(index) = fold {
+            self.rewind(index);
+        }
+        for entry in &mut self.messages {
+            if let Entry::Tool(tool) = entry
+                && tool.output.is_some()
+            {
+                tool.superseded = true;
+            }
+        }
         self.messages.push(Entry::Tool(ToolCall {
             id,
             name,
             digest,
             output: None,
             exit: None,
+            superseded: false,
         }));
         self.open = false;
     }
@@ -820,29 +846,37 @@ impl Transcript {
         ) else {
             return;
         };
-        if self.cache.0 > 0 && index < self.cache.1 {
-            // The box folds differently once tools finished, so the rows `sync` folded
-            // `messages[index..]` are stale. Recount them before the fill-in, drop
-            // them, and rewind the fold point so the next `sync` refolds just the tail
-            if (index..self.cache.1).any(|i| self.thinking_hidden(i)) {
-                // Hidden thinking requires us to refold EVERYTHING for correctness.
-                self.rows.clear();
-                self.cache.1 = 0;
-            } else {
-                let stale = wrap_lines(
-                    &entry_lines(&self.messages[index..self.cache.1], self.show_tool_output),
-                    self.cache.0,
-                )
-                .len();
-                self.rows.truncate(self.rows.len() - stale);
-                self.cache.1 = index;
-            }
-        }
+        // The box folds differently once tools finished, so the rows `sync` folded
+        // `messages[index..]` are stale. Rewind the fold point so the next `sync`
+        // refolds just the tail.
+        self.rewind(index);
         let Some(Entry::Tool(tool)) = self.messages.get_mut(index) else {
             return;
         };
         tool.output = Some(output);
         tool.exit = exit;
+    }
+
+    /// Drop the cached rows of `messages[index..]` so the next `sync` refolds
+    /// them. A hidden thinking run inside the span forces a full refold: the
+    /// placeholder means the raw row count would not match what `sync` folded.
+    fn rewind(&mut self, index: usize) {
+        if self.cache.0 == 0 || index >= self.cache.1 {
+            return;
+        }
+        if (index..self.cache.1).any(|i| self.thinking_hidden(i)) {
+            // Hidden thinking requires us to refold EVERYTHING for correctness.
+            self.rows.clear();
+            self.cache.1 = 0;
+        } else {
+            let stale = wrap_lines(
+                &entry_lines(&self.messages[index..self.cache.1], self.show_tool_output),
+                self.cache.0,
+            )
+            .len();
+            self.rows.truncate(self.rows.len() - stale);
+            self.cache.1 = index;
+        }
     }
 
     /// Resolve every still-running invocation as failed to prevent stuck boxes.
@@ -2060,6 +2094,63 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("exit 1")));
         assert!(rows.iter().any(|row| row.contains(TOOL_NO_OUTPUT)));
         assert!(!rows.iter().any(|row| row.contains("nope")));
+    }
+
+    /// A new call folds every finished box before it down to its header line,
+    /// Ctrl+O or not; the newest box keeps its body until it is folded too.
+    #[test]
+    fn new_calls_fold_finished_boxes_to_their_headers() {
+        let mut t = Transcript::default();
+        let assert_fresh = |t: &Transcript| {
+            assert_eq!(
+                texts(&t.rows),
+                texts(&wrap_lines(
+                    &entry_lines(&t.messages, t.show_tool_output),
+                    t.cache.0
+                ))
+            );
+        };
+        t.push(Line::from("❯ run it"));
+        t.begin_response();
+        start_bash(&mut t, "call_0");
+        t.finish_tool("call_0", "one\ntwo\nthree\n".to_string(), Some(0));
+        t.sync(40);
+        assert_fresh(&t);
+        assert!(texts(&t.rows).iter().any(|row| row.contains("⎿ one")));
+
+        // The second call folds the first: only the two headers render.
+        t.start_tool("call_1".to_string(), "Bash", "ls -la".to_string());
+        t.sync(40);
+        assert_fresh(&t);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("● Bash(echo hi)")));
+        assert!(rows.iter().any(|row| row.contains("● Bash(ls -la) …")));
+        assert!(!rows.iter().any(|row| row.contains('⎿')));
+
+        // The newest box keeps its collapsed body; the folded one stays hidden.
+        t.finish_tool(
+            "call_1",
+            "out aaaa\nbbbb\ncccc\ndddd\neeee\nffff\n".to_string(),
+            Some(0),
+        );
+        t.sync(40);
+        assert_fresh(&t);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("⎿ out aaaa")));
+        assert!(!rows.iter().any(|row| row.contains("⎿ dddd")));
+        assert!(!rows.iter().any(|row| row.contains("⎿ one")));
+
+        // Ctrl+O expands the standing box only; the folded one stays a header.
+        t.toggle_expand();
+        t.sync(40);
+        assert_fresh(&t);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("⎿ dddd")));
+        assert!(!rows.iter().any(|row| row.contains("⎿ one")));
+        t.toggle_expand();
+        t.sync(40);
+        assert_fresh(&t);
+        assert!(!texts(&t.rows).iter().any(|row| row.contains("⎿ dddd")));
     }
 
     /// A failed generation resolves its still-running boxes instead of
