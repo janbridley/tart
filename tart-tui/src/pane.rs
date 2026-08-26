@@ -1659,30 +1659,13 @@ mod tests {
         assert_eq!(message_texts(&pane.transcript), ["❯ first", "  second"]);
     }
 
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        /// Create the guard under the temp directory.
-        fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("tart-pane-{tag}-{}", std::process::id()));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// A `/resume` line opens the session chooser; Enter swaps to the picked
     /// session, and the chooser never swaps under a running turn.
     #[test]
     fn a_resume_line_opens_the_chooser_and_enter_swaps() {
-        let root = Scratch::new("resume");
+        let root = tempfile::tempdir().unwrap();
         let project = PathBuf::from("/tmp/proj");
-        let dir = root.0.join("tmp-proj");
+        let dir = root.path().join("tmp-proj");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("20260101-000000.jsonl");
         std::fs::write(
@@ -1692,7 +1675,7 @@ mod tests {
         )
         .unwrap();
         let mut pane = Pane::default();
-        pane.set_session_dir(root.0.clone(), project);
+        pane.set_session_dir(root.path().to_path_buf(), project);
 
         for c in "/resume fix".chars() {
             pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));

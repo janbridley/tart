@@ -374,50 +374,13 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use std::ffi::OsStr;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Create a unique directory removed when the guard drops, so parallel tests don't
-    /// share state.
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new(tag: &str) -> Self {
-            Self::under(&std::env::temp_dir(), tag)
-        }
-
-        /// Create the guard under `base`, outside the temp tree when a root
-        /// must not be writable by default.
-        fn under(base: &Path, tag: &str) -> Self {
-            // counter prevents race conditions
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            Self::at(base.join(format!("tart-sandbox-{tag}-{}-{n}", std::process::id())))
-        }
-
-        /// Creates the guard around an explicit location.
-        fn at(path: PathBuf) -> Self {
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// The rendered profile opens with the base policy and ends with the sbpl defaults.
     #[test]
     fn render_embeds_base_policy_and_platform_defaults() {
-        let dir = ScratchDir::new("render");
+        let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
         assert!(rendered.starts_with("(version 1)"));
         assert!(rendered.contains("(deny default)"));
@@ -427,7 +390,7 @@ mod tests {
     /// A writable root without exclusions gets one plain read allow and one plain write.
     #[test]
     fn writable_root_emits_unguarded_read_and_write_allows() {
-        let dir = ScratchDir::new("writable");
+        let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
         assert!(rendered.contains(r#"(allow file-read* (subpath (param "WRITABLE_ROOT_0")))"#));
         assert!(rendered.contains(r#"(allow file-write* (subpath (param "WRITABLE_ROOT_0")))"#));
@@ -435,7 +398,7 @@ mod tests {
 
     #[test]
     fn excluded_subpath_stays_readable_but_not_writable() {
-        let dir = ScratchDir::new("excluded");
+        let dir = tempfile::tempdir().unwrap();
         // `.git` is deliberately not created: the exclusion must still bind.
         let policy = Policy::new(dir.path()).unwrap().exclude_git();
         let rendered = policy.render();
@@ -466,7 +429,7 @@ mod tests {
     /// The profile denies raw terminal devices.
     #[test]
     fn render_denies_terminal_devices() {
-        let dir = ScratchDir::new("ttys");
+        let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
         assert!(rendered.contains(
             r#"(deny file-read-data file-write-data file-ioctl (regex #"^/dev/ttys[0-9]+$"))"#
@@ -477,9 +440,9 @@ mod tests {
     /// A read-only root gets a read allow and no write rule of its own.
     #[test]
     fn read_only_root_emits_read_allow_only() {
-        let writable = ScratchDir::new("ro-w");
+        let writable = tempfile::tempdir().unwrap();
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-        let readable = ScratchDir::under(&home, "ro-r");
+        let readable = tempfile::tempdir_in(&home).unwrap();
         let rendered = Policy::new(writable.path())
             .unwrap()
             .add_read_only_root(readable.path())
@@ -492,8 +455,8 @@ mod tests {
     /// Roots are canonicalized, so a symlinked root grants the real path.
     #[test]
     fn roots_are_canonicalized_through_symlinks() {
-        let real = ScratchDir::new("real");
-        let holder = ScratchDir::new("holder");
+        let real = tempfile::tempdir().unwrap();
+        let holder = tempfile::tempdir().unwrap();
         let link = holder.path().join("link");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
         let policy = Policy::new(&link).unwrap();
@@ -507,7 +470,7 @@ mod tests {
     /// Duplicate roots collapse, including the auto-added temp root.
     #[test]
     fn duplicate_roots_and_temp_dir_deduplicate() {
-        let dir = ScratchDir::new("dedup");
+        let dir = tempfile::tempdir().unwrap();
         let policy = Policy::new(dir.path())
             .unwrap()
             .add_writable_root(dir.path())
@@ -530,7 +493,7 @@ mod tests {
         let missing = std::env::temp_dir().join("tart-sandbox-does-not-exist");
         let err = Policy::new(&missing).unwrap_err().to_string();
         assert!(err.contains("tart-sandbox-does-not-exist"));
-        let dir = ScratchDir::new("missing");
+        let dir = tempfile::tempdir().unwrap();
         assert!(
             Policy::new(dir.path())
                 .unwrap()
@@ -549,7 +512,7 @@ mod tests {
     /// can load its runtime library under every policy.
     #[test]
     fn render_includes_the_extras() {
-        let dir = ScratchDir::new("extras");
+        let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
 
         assert!(rendered.contains(
@@ -560,7 +523,7 @@ mod tests {
     /// Empty, absolute, escaping, and root-identical exclusions are rejected.
     #[test]
     fn bad_exclusions_are_rejected() {
-        let dir = ScratchDir::new("bad-exclusion");
+        let dir = tempfile::tempdir().unwrap();
         let policy = || Policy::new(dir.path()).unwrap();
         for (path, needle) in [
             ("", "empty"),
@@ -578,8 +541,8 @@ mod tests {
     /// instead of silently staying writable.
     #[test]
     fn overlapping_roots_are_rejected_in_both_grant_orders() {
-        let outer = ScratchDir::new("overlap");
-        let inner = ScratchDir::at(outer.path().join("inner"));
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir_in(outer.path()).unwrap();
 
         let err = Policy::new(outer.path())
             .unwrap()
@@ -598,7 +561,7 @@ mod tests {
         // The reverse grant order must be rejected too: a writable root over
         // an existing read-only grant. System paths stand in for the read-only
         // root because scratch dirs live under the temp writable root.
-        let dir = ScratchDir::new("overlap-rev");
+        let dir = tempfile::tempdir().unwrap();
         let err = Policy::new(dir.path())
             .unwrap()
             .add_read_only_root("/usr/local")
@@ -613,7 +576,7 @@ mod tests {
     /// survives unlinking and recreating the name.
     #[test]
     fn symlinked_exclusion_denies_name_and_target() {
-        let dir = ScratchDir::new("symlinked");
+        let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::os::unix::fs::symlink("target", dir.path().join(".git")).unwrap();
         let policy = Policy::new(dir.path()).unwrap().exclude_git();
@@ -638,8 +601,8 @@ mod tests {
     /// Exclusions bind to roots added before or after them, exactly once.
     #[test]
     fn exclusions_apply_to_roots_added_in_any_order() {
-        let a = ScratchDir::new("order-a");
-        let b = ScratchDir::new("order-b");
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
         let git_exclusions = |policy: &Policy| -> Vec<String> {
             policy
                 .command("sh")
@@ -687,7 +650,7 @@ mod tests {
     /// The built command is `sandbox-exec -p <policy> -D... -- program`.
     #[test]
     fn command_prefixes_sandbox_exec_policy_params_and_separator() {
-        let dir = ScratchDir::new("argv");
+        let dir = tempfile::tempdir().unwrap();
         let policy = Policy::new(dir.path()).unwrap().exclude_git();
         let cmd = policy.command("sh");
         assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/sandbox-exec"));
@@ -715,7 +678,7 @@ mod tests {
     /// The child environment carries only the seeded variables.
     #[test]
     fn command_clears_the_environment() {
-        let dir = ScratchDir::new("env");
+        let dir = tempfile::tempdir().unwrap();
         let policy = Policy::new(dir.path()).unwrap();
         let cmd = policy.command("sh");
         let vars: Vec<(&OsStr, &OsStr)> = cmd
@@ -732,7 +695,7 @@ mod tests {
     /// Callers extend the command with plain std methods, after `--`.
     #[test]
     fn command_composes_with_std_command_methods() {
-        let dir = ScratchDir::new("compose");
+        let dir = tempfile::tempdir().unwrap();
         let policy = Policy::new(dir.path()).unwrap();
         let mut cmd = policy.command("sh");
         cmd.arg("-c").arg("echo hi");
@@ -745,7 +708,7 @@ mod tests {
     /// contain no spaces, so sh string interpolation is safe.
     #[test]
     fn write_inside_writable_root_succeeds() {
-        let dir = ScratchDir::new("live-write-ok");
+        let dir = tempfile::tempdir().unwrap();
         let policy = Policy::new(dir.path()).unwrap();
         let file = dir.path().join("file");
         let out = policy
@@ -765,7 +728,7 @@ mod tests {
     /// Writing outside every granted root is denied by the sandbox.
     #[test]
     fn write_outside_granted_roots_is_denied() {
-        let dir = ScratchDir::new("live-write-denied");
+        let dir = tempfile::tempdir().unwrap();
         let policy = Policy::new(dir.path()).unwrap();
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let target = home.join(format!(".tart-sandbox-deny-{}", std::process::id()));
@@ -788,7 +751,7 @@ mod tests {
     #[test]
     fn excluded_git_is_read_only_but_readable() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-        let dir = ScratchDir::under(&home, "git");
+        let dir = tempfile::tempdir_in(&home).unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let head = dir.path().join(".git/HEAD");
         std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
@@ -824,11 +787,11 @@ mod tests {
     /// A read-only root outside the temp tree reads but rejects writes.
     #[test]
     fn read_only_root_denies_writes() {
-        let writable = ScratchDir::new("live-ro-w");
+        let writable = tempfile::tempdir().unwrap();
         // Under HOME, outside the temp writable root, so only the read-only
         // grant makes it accessible.
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-        let readonly = ScratchDir::under(&home, "ro-live");
+        let readonly = tempfile::tempdir_in(&home).unwrap();
         let data = readonly.path().join("data");
         std::fs::write(&data, "contents\n").unwrap();
         let policy = Policy::new(writable.path())
@@ -881,7 +844,7 @@ mod tests {
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
     #[test]
     fn perl_runs_under_the_default_grant() {
-        let dir = ScratchDir::new("perl-live");
+        let dir = tempfile::tempdir().unwrap();
         let out = Policy::new(dir.path())
             .unwrap()
             .command("/usr/bin/perl")

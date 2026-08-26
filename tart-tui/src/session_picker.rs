@@ -62,25 +62,6 @@ mod tests {
 
     use super::*;
 
-    /// A scratch directory removed when the guard drops, so parallel tests dont collide
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        /// Create the guard under the temp directory.
-        fn new(tag: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("tart-picker-{tag}-{}", std::process::id()));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn editor(text: &str) -> Editor {
         let mut editor = Editor::default();
         editor.insert_str(text);
@@ -100,9 +81,9 @@ mod tests {
 
     #[test]
     fn the_chooser_lists_and_picks_this_projects_sessions() {
-        let root = Scratch::new("list");
+        let root = tempfile::tempdir().unwrap();
         let project = Path::new("/tmp/proj");
-        let dir = root.0.join("tmp-proj");
+        let dir = root.path().join("tmp-proj");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("20260101-000000.jsonl"),
@@ -112,11 +93,11 @@ mod tests {
         .unwrap();
 
         // Opened with a query, the match is already highlighted.
-        let mut chooser = SessionPopup::new(&root.0, project, "login".to_string());
+        let mut chooser = SessionPopup::new(root.path(), project, "login".to_string());
         assert_eq!(chooser.selected_path(), Some(dir.join("20260101-000000.jsonl")));
 
         // A project with no sessions opens empty; a query with no match picks nothing
-        let empty = SessionPopup::new(&root.0, Path::new("/tmp/elsewhere"), String::new());
+        let empty = SessionPopup::new(root.path(), Path::new("/tmp/elsewhere"), String::new());
         assert_eq!(empty.selected_path(), None);
         chooser.popup.set_query("nomatch".to_string());
         assert_eq!(chooser.selected_path(), None);
