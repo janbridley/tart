@@ -12,7 +12,7 @@ use tart_agents::session;
 /// `/resume` typeahead over one project's sessions.
 pub(crate) struct SessionPopup {
     /// Fuzzy matcher and file popup over the project's sessions.
-    popup: FilePopup,
+    pub(crate) popup: FilePopup,
     /// Listed sessions, their lines the popup's rows.
     sessions: Vec<(PathBuf, String)>,
 }
@@ -26,19 +26,6 @@ impl SessionPopup {
             popup: FilePopup::from_files(lines, query),
             sessions,
         }
-    }
-
-    /// Point the chooser at a new query, refiltering when it changed.
-    pub(crate) fn set_query(&mut self, query: String) {
-        self.popup.set_query(query);
-    }
-
-    pub(crate) fn select_prev(&mut self) {
-        self.popup.select_prev();
-    }
-
-    pub(crate) fn select_next(&mut self) {
-        self.popup.select_next();
     }
 
     /// The file behind the highlighted row, if any.
@@ -131,7 +118,7 @@ mod tests {
         // A project with no sessions opens empty; a query with no match picks nothing
         let empty = SessionPopup::new(&root.0, Path::new("/tmp/elsewhere"), String::new());
         assert_eq!(empty.selected_path(), None);
-        chooser.set_query("nomatch".to_string());
+        chooser.popup.set_query("nomatch".to_string());
         assert_eq!(chooser.selected_path(), None);
     }
 }
