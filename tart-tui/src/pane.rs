@@ -412,6 +412,8 @@ impl Pane {
 
     pub fn clear(&mut self) {
         self.transcript.clear();
+        // The abandoned conversation's usage leaves with it.
+        self.usage = None;
     }
 
     /// Update the `/perf` stats line; `None` restores the bottom rule.
