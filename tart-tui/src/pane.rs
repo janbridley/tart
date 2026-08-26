@@ -108,6 +108,7 @@ struct TurnSnapshot {
 }
 
 /// The TUI interface.
+#[derive(Default)]
 pub struct Pane {
     /// Input interface for the `Pane`.
     prompt: Editor,
@@ -134,21 +135,6 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn new() -> Self {
-        Self {
-            prompt: Editor::default(),
-            transcript: Transcript::default(),
-            copy: None,
-            popup: None,
-            session_dir: None,
-            perf: None,
-            usage: None,
-            context_tokens: None,
-            spin: None,
-            turn: None,
-        }
-    }
-
     pub fn on_key(&mut self, key: KeyEvent) -> Option<PaneEvent> {
         // Press and Repeat drive the app, Release is not important/useful.
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -633,12 +619,6 @@ impl Extend<Progress> for Pane {
         for event in iter {
             self.apply(&event);
         }
-    }
-}
-
-impl Default for Pane {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1557,7 +1537,7 @@ mod tests {
     /// and `perf` still overrides it.
     #[test]
     fn the_bottom_rule_carries_the_usage_badge() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("text"));
         assert!(!render(&mut pane, (60, 8)).contains('['));
 
@@ -1585,7 +1565,7 @@ mod tests {
         assert!(render(&mut pane, (60, 8)).contains("───[ 1k / 200k ]"));
 
         // No window configured drops the ratio.
-        let mut bare = Pane::new();
+        let mut bare = Pane::default();
         bare.push(Line::from("text"));
         bare.set_usage(45_000, 0, 3_000);
         assert!(render(&mut bare, (60, 8)).contains("[ 48k ]"));
@@ -1627,7 +1607,7 @@ mod tests {
     /// Cancelling a turn restores the pane to before the message.
     #[test]
     fn cancel_turn_restores_the_pre_turn_state() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("earlier"));
         pane.begin_response();
         pane.append(&Span::raw("earlier answer"));
@@ -1711,7 +1691,7 @@ mod tests {
              {\"type\":\"message\",\"role\":\"user\",\"content\":\"fix the login flow\"}\n",
         )
         .unwrap();
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.set_session_dir(root.0.clone(), project);
 
         for c in "/resume fix".chars() {
@@ -1744,7 +1724,7 @@ mod tests {
     /// live stream would have shown — and a later cancel cannot rewind into it.
     #[test]
     fn replayed_turns_render_like_live_ones() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("banner"));
         let replay = [
             Progress::User("run it".to_string()),
@@ -1975,7 +1955,7 @@ mod tests {
     /// caret rides a join, and control characters never enter the draft.
     #[test]
     fn editing_operates_on_graphemes() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.on_paste("日本\n語");
         pane.on_key(key(KeyCode::Home, KeyModifiers::NONE));
         pane.prompt.backspace(); // joins the lines at the boundary
@@ -1985,7 +1965,7 @@ mod tests {
         assert_eq!(pane.prompt.text(), "日本語");
 
         // Left/right cross line joins; the family emoji is one step.
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.on_paste("ab\n🙋‍♂️x");
         pane.prompt.left();
         pane.prompt.left();
@@ -1999,7 +1979,7 @@ mod tests {
     /// Validate copy mode isn't exited prematurely.
     #[test]
     fn copy_mode_swallows_keys_and_survives_resizes() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         for i in 0..10 {
             pane.push(Line::from(format!("message {i} aaaa bbbb cccc dddd")));
         }
@@ -2024,7 +2004,7 @@ mod tests {
     /// leaves copy mode.
     #[test]
     fn enter_copies_the_selection_and_exits() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("abc def"));
         render(&mut pane, (20, 8)); // rows exist before the cursor walks them
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // enter, at (0, 0)
@@ -2045,7 +2025,7 @@ mod tests {
     /// without clobbering the clipboard.
     #[test]
     fn leaving_without_a_selection_copies_nothing() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("abc"));
         render(&mut pane, (20, 8));
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
@@ -2057,7 +2037,7 @@ mod tests {
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
         assert!(pane.copy.is_none());
 
-        let mut empty = Pane::new(); // anchored, but no rows to select
+        let mut empty = Pane::default(); // anchored, but no rows to select
         render(&mut empty, (20, 8));
         empty.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
         empty.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
@@ -2069,7 +2049,7 @@ mod tests {
     /// selection, nothing anywhere else on screen.
     #[test]
     fn selection_paints_a_dark_gray_band() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("abc def"));
         render(&mut pane, (20, 8)); // rows exist before the cursor walks them
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
@@ -2090,7 +2070,7 @@ mod tests {
     /// A rewrap between Space and Enter re-clamps the anchor with the cursor
     #[test]
     fn anchored_selection_survives_a_rewrap() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("abcdef"));
         pane.push(Line::from("z"));
         render(&mut pane, (40, 8)); // rows: ["abcdef", "z"]
@@ -2110,7 +2090,7 @@ mod tests {
 
     #[test]
     fn tiny_terminal_renders_without_panic() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("text"));
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
@@ -2536,7 +2516,7 @@ mod tests {
 
     #[test]
     fn ctrl_o_expands_tool_output_in_live_mode_only() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.start_tool("call_0".to_string(), "Bash", "seq 20".to_string());
         let mut output = String::new();
         for i in 0..20 {
@@ -2563,7 +2543,7 @@ mod tests {
 
     #[test]
     fn ctrl_t_toggles_in_live_mode_and_is_inert_in_copy_mode() {
-        let mut pane = Pane::new();
+        let mut pane = Pane::default();
         pane.push(Line::from("❯ hi"));
         pane.begin_response();
         pane.append_thinking(&Span::styled("visible reasoning", DIM_STYLE));
