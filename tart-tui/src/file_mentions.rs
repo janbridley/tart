@@ -135,7 +135,13 @@ impl FilePopup {
             height: h,
         };
         let items: Vec<ListItem> = if self.matches.is_empty() {
-            vec![ListItem::new(format!("no matches for `{}`", self.query))]
+            let text = if self.files.is_empty() {
+                // An empty source list just shows a nice message.
+                format!("no {label}")
+            } else {
+                format!("no matches for `{}`", self.query)
+            };
+            vec![ListItem::new(text)]
         } else {
             self.matches
                 .iter()
