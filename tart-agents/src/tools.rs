@@ -36,18 +36,26 @@ fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
     )
 }
 
+/// A function tool with the given name, description, and JSON-schema parameters.
+#[must_use]
+fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
+    Tool::Function(FunctionTool {
+        defer_loading: None,
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        parameters: Some(parameters),
+        strict: None,
+    })
+}
+
 /// The bash tool; commands execute under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn bash() -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: "bash".to_string(),
-        description: Some(
-            "Run a bash command in a sandbox (writes restricted to granted roots, no network) \
-            and return its combined stdout/stderr"
-                .to_string(),
-        ),
-        parameters: Some(serde_json::json!({
+    tool(
+        "bash",
+        "Run a bash command in a sandbox (writes restricted to granted roots, no network) \
+        and return its combined stdout/stderr",
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The bash command to run"},
@@ -57,24 +65,19 @@ pub(crate) fn bash() -> Tool {
                 }
             },
             "required": ["command"]
-        })),
-        strict: None,
-    })
+        }),
+    )
 }
 
 /// The read tool; files are read under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn read() -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: "read".to_string(),
-        description: Some(
-            "Read a file with line numbers (cat -n style) in a sandbox (reads restricted to \
-            granted roots); optionally pass start_line/end_line (1-based, inclusive) to read \
-            a range"
-                .to_string(),
-        ),
-        parameters: Some(serde_json::json!({
+    tool(
+        "read",
+        "Read a file with line numbers (cat -n style) in a sandbox (reads restricted to \
+        granted roots); optionally pass start_line/end_line (1-based, inclusive) to read \
+        a range",
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "The file to read"},
@@ -82,26 +85,21 @@ pub(crate) fn read() -> Tool {
                 "end_line": {"type": "integer", "description": "Last line to read (inclusive); omit to read to the end"}
             },
             "required": ["path"]
-        })),
-        strict: None,
-    })
+        }),
+    )
 }
 
 /// The edit tool; replacements execute under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn edit() -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: "edit".to_string(),
-        description: Some(
-            "Replace an exact string in an existing file. old_string must match the file exactly, including whitespace and \
-            newlines, and occur exactly once unless replace_all is true: include surrounding \
-            lines to make it unique. An empty new_string deletes old_string. The file must \
-            already exist and be valid UTF-8, so use bash to create files. Prefer this tool \
-            over bash for changing existing files"
-                .to_string(),
-        ),
-        parameters: Some(serde_json::json!({
+    tool(
+        "edit",
+        "Replace an exact string in an existing file. old_string must match the file exactly, including whitespace and \
+        newlines, and occur exactly once unless replace_all is true: include surrounding \
+        lines to make it unique. An empty new_string deletes old_string. The file must \
+        already exist and be valid UTF-8, so use bash to create files. Prefer this tool \
+        over bash for changing existing files",
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path of the existing file to edit"},
@@ -110,9 +108,22 @@ pub(crate) fn edit() -> Tool {
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of one unique match"}
             },
             "required": ["path", "old_string", "new_string"]
-        })),
-        strict: None,
-    })
+        }),
+    )
+}
+
+/// Parse a tool call's arguments as JSON.
+fn parse_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
+    serde_json::from_str(arguments)
+        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))
+}
+
+/// A required string field from parsed tool arguments.
+fn string_field(args: &serde_json::Value, name: &str) -> anyhow::Result<String> {
+    args[name]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("tool call missing '{name}'"))
 }
 
 /// One parsed bash tool call.
@@ -126,12 +137,7 @@ struct Bash {
 
 /// Extract the fields from a bash tool call's JSON arguments.
 fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
-    let args: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
-    let command = args["command"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))?;
+    let args = parse_arguments(arguments)?;
     // `as_i64` so negatives join the clamp instead of falling to the default.
     #[allow(
         clippy::cast_possible_wrap,
@@ -143,7 +149,7 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs() as i64)
         .clamp(1, MAX_BASH_TIMEOUT.as_secs() as i64) as u64;
     Ok(Bash {
-        command,
+        command: string_field(&args, "command")?,
         timeout: Duration::from_secs(seconds),
     })
 }
@@ -163,13 +169,9 @@ struct Read {
 ///
 /// The line bounds are optional; wrong-typed bounds are ignored.
 fn parse_read(arguments: &str) -> anyhow::Result<Read> {
-    let args: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
+    let args = parse_arguments(arguments)?;
     Ok(Read {
-        path: args["path"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("tool call missing 'path'"))?,
+        path: string_field(&args, "path")?,
         start_line: args["start_line"].as_u64(),
         end_line: args["end_line"].as_u64(),
     })
@@ -192,18 +194,11 @@ struct Edit {
 ///
 /// `replace_all` is optional and defaults to false.
 fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
-    let args: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
-    let field = |name: &str| {
-        args[name]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("tool call missing '{name}'"))
-    };
+    let args = parse_arguments(arguments)?;
     Ok(Edit {
-        path: field("path")?,
-        old_string: field("old_string")?,
-        new_string: field("new_string")?,
+        path: string_field(&args, "path")?,
+        old_string: string_field(&args, "old_string")?,
+        new_string: string_field(&args, "new_string")?,
         replace_all: args["replace_all"].as_bool().unwrap_or(false),
     })
 }
@@ -276,22 +271,16 @@ fn timeout_text(text: &str, timeout: Duration) -> String {
 /// Recorded arguments are re-parsed so the header matches what the front end showed
 /// live. Unparseable arguments and unknown tools degrade to the raw JSON.
 pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
-    let raw = |_| call.arguments.clone();
-    match call.name.as_str() {
-        "bash" => (
-            "Bash",
-            parse_bash(&call.arguments).map_or_else(raw, |bash| bash.command),
-        ),
+    let (name, digest) = match call.name.as_str() {
+        "bash" => ("Bash", parse_bash(&call.arguments).ok().map(|bash| bash.command)),
         "read" => (
             "Read",
-            parse_read(&call.arguments).map_or_else(raw, |read| read_digest(&read)),
+            parse_read(&call.arguments).ok().map(|read| read_digest(&read)),
         ),
-        "edit" => (
-            "Edit",
-            parse_edit(&call.arguments).map_or_else(raw, |edit| edit.path),
-        ),
-        _ => ("Tool", call.arguments.clone()),
-    }
+        "edit" => ("Edit", parse_edit(&call.arguments).ok().map(|edit| edit.path)),
+        _ => ("Tool", None),
+    };
+    (name, digest.unwrap_or_else(|| call.arguments.clone()))
 }
 
 /// Run `command` to completion, killing its process group if it outlives `timeout`.
@@ -334,6 +323,28 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Time
     })
 }
 
+/// Announce a tool call, run it, and report its conclusion.
+fn traced<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    name: &'static str,
+    digest: String,
+    on_progress: &F,
+    run: impl FnOnce() -> (String, String, Option<i32>),
+) -> String {
+    on_progress(Progress::ToolStart {
+        id: call.call_id.clone(),
+        name,
+        digest,
+    });
+    let (result, output, exit) = run();
+    on_progress(Progress::ToolOutput {
+        id: call.call_id.clone(),
+        output,
+        exit,
+    });
+    result
+}
+
 /// Run one bash tool call under `policy`, reporting its steps to `on_progress`.
 ///
 /// A command that outlives its timeout is killed with everything it started.
@@ -344,40 +355,31 @@ fn run_bash<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let bash = parse_bash(&call.arguments)?;
-    on_progress(Progress::ToolStart {
-        id: call.call_id.clone(),
-        name: "Bash",
-        digest: bash.command.clone(),
-    });
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
     let mut sandboxed = policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
-    // Decode the stream into output for the front and backends.
-    let (result, output, exit) = match run_with_timeout(&mut sandboxed, bash.timeout) {
-        Ok(run) => {
-            let TimedRun { output, timed_out } = run;
-            let text = combined_output(&output);
-            let exit = output.status.code();
-            if timed_out {
-                // A timeout has no exit code for the header, so we mark up the body.
-                let marked = timeout_text(&text, bash.timeout);
-                (marked.clone(), marked, exit)
-            } else {
-                (command_text(&text, output.status), text, exit)
+    Ok(traced(call, "Bash", bash.command.clone(), on_progress, || {
+        // Decode the stream into output for the front and backends.
+        match run_with_timeout(&mut sandboxed, bash.timeout) {
+            Ok(run) => {
+                let TimedRun { output, timed_out } = run;
+                let text = combined_output(&output);
+                let exit = output.status.code();
+                if timed_out {
+                    // A timeout has no exit code for the header, so we mark up the body.
+                    let marked = timeout_text(&text, bash.timeout);
+                    (marked.clone(), marked, exit)
+                } else {
+                    (command_text(&text, output.status), text, exit)
+                }
+            }
+            Err(error) => {
+                let text = format!("error: {error}");
+                (text.clone(), text, None)
             }
         }
-        Err(error) => {
-            let text = format!("error: {error}");
-            (text.clone(), text, None)
-        }
-    };
-    on_progress(Progress::ToolOutput {
-        id: call.call_id.clone(),
-        output,
-        exit,
-    });
-    Ok(result)
+    }))
 }
 
 /// The digest for a read call: the path, with any bounds as `path:start-end`.
@@ -397,28 +399,25 @@ fn run_read<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let read = parse_read(&call.arguments)?;
-    on_progress(Progress::ToolStart {
-        id: call.call_id.clone(),
-        name: "Read",
-        digest: read_digest(&read),
-    });
     let mut command = policy.command("/usr/bin/perl");
     command
         .arg("-e")
         .arg(numbered_read(read.start_line, read.end_line))
         .arg("--")
         .arg(&read.path);
-    // A failure to launch comes back as an error string for the model to deal with.
-    let (output, exit) = match &command.output() {
-        Ok(spawned) => (combined_output(spawned), spawned.status.code()),
-        Err(error) => (format!("error: {error}"), None),
-    };
-    on_progress(Progress::ToolOutput {
-        id: call.call_id.clone(),
-        output: output.clone(),
-        exit,
-    });
-    Ok(output)
+    Ok(traced(call, "Read", read_digest(&read), on_progress, || {
+        // A failure to launch comes back as an error string for the model to deal with.
+        match &command.output() {
+            Ok(spawned) => {
+                let text = combined_output(spawned);
+                (text.clone(), text, spawned.status.code())
+            }
+            Err(error) => {
+                let text = format!("error: {error}");
+                (text.clone(), text, None)
+            }
+        }
+    }))
 }
 
 /// Run one edit tool call: report the target, apply it, and report the outcome.
@@ -432,18 +431,10 @@ fn run_edit<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
-    on_progress(Progress::ToolStart {
-        id: call.call_id.clone(),
-        name: "Edit",
-        digest: edit.path.clone(),
-    });
-    let (result, exit) = apply_edit(&edit, policy);
-    on_progress(Progress::ToolOutput {
-        id: call.call_id.clone(),
-        output: result.clone(),
-        exit,
-    });
-    Ok(result)
+    Ok(traced(call, "Edit", edit.path.clone(), on_progress, || {
+        let (result, exit) = apply_edit(&edit, policy);
+        (result.clone(), result, exit)
+    }))
 }
 
 /// Apply one parsed edit under `policy`, returning outcome message and the exit code.
