@@ -63,6 +63,31 @@ pub(crate) enum Popup {
     Sessions(SessionPopup),
 }
 
+impl Popup {
+    /// The list machinery under this popup kind.
+    fn list(&mut self) -> &mut FilePopup {
+        match self {
+            Self::Files(popup) => popup,
+            Self::Sessions(sessions) => &mut sessions.popup,
+        }
+    }
+
+    /// Move the highlight up one row.
+    fn select_prev(&mut self) {
+        self.list().select_prev();
+    }
+
+    /// Move the highlight down one row.
+    fn select_next(&mut self) {
+        self.list().select_next();
+    }
+
+    /// Point the popup at a new query, refiltering when it changed.
+    fn set_query(&mut self, query: String) {
+        self.list().set_query(query);
+    }
+}
+
 /// One finished response's token usage, as shown on the status line.
 #[derive(Clone, Copy)]
 struct Usage {
@@ -141,8 +166,8 @@ impl Pane {
     fn sync_popup(&mut self, key: Option<&KeyEvent>) {
         match session_query(&self.prompt) {
             Some(query) => {
-                if let Some(Popup::Sessions(sessions)) = &mut self.popup {
-                    sessions.set_query(query);
+                if let Some(popup @ Popup::Sessions(_)) = &mut self.popup {
+                    popup.set_query(query);
                 } else if key.is_some_and(|key| key.code != KeyCode::Esc) {
                     self.popup = self.session_dir.as_ref().map(|(root, project)| {
                         Popup::Sessions(SessionPopup::new(root, project, query))
@@ -159,31 +184,31 @@ impl Pane {
         }
     }
 
-    /// One key event that performs some action in the popup.
+    /// One key the open popup owns: arrows move the highlight, Tab/Enter accepts.
     fn popup_key(&mut self, key: KeyEvent) -> Option<PaneEvent> {
+        let popup = self.popup.as_mut()?;
         match key.code {
-            KeyCode::Up => match &mut self.popup {
-                Some(Popup::Files(popup)) => popup.select_prev(),
-                Some(Popup::Sessions(sessions)) => sessions.select_prev(),
-                None => {}
-            },
-            KeyCode::Down => match &mut self.popup {
-                Some(Popup::Files(popup)) => popup.select_next(),
-                Some(Popup::Sessions(sessions)) => sessions.select_next(),
-                None => {}
-            },
-            _ => match self.popup.take() {
-                Some(Popup::Files(popup)) => popup.accept(&mut self.prompt),
-                Some(Popup::Sessions(sessions)) => {
-                    if self.spin.is_none()
-                        && let Some(path) = sessions.selected_path()
-                    {
-                        self.prompt.clear();
-                        return Some(PaneEvent::Resume(path));
-                    }
+            KeyCode::Up => popup.select_prev(),
+            KeyCode::Down => popup.select_next(),
+            KeyCode::Tab | KeyCode::Enter => return self.accept_popup(),
+            _ => {}
+        }
+        None
+    }
+
+    /// Close the open popup and apply its highlighted row.
+    fn accept_popup(&mut self) -> Option<PaneEvent> {
+        match self.popup.take() {
+            Some(Popup::Files(popup)) => popup.accept(&mut self.prompt),
+            Some(Popup::Sessions(sessions)) => {
+                if self.spin.is_none()
+                    && let Some(path) = sessions.selected_path()
+                {
+                    self.prompt.clear();
+                    return Some(PaneEvent::Resume(path));
                 }
-                None => {}
-            },
+            }
+            None => {}
         }
         None
     }
