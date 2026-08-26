@@ -305,25 +305,6 @@ mod tests {
     use super::*;
     use async_openai::types::responses::FunctionToolCall;
 
-    /// A scratch directory removed when the guard drops, so parallel tests don't crash
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        /// Create the guard under the temp directory.
-        fn new(tag: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("tart-session-{tag}-{}", std::process::id()));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// Write `transcript`'s items to `path`, one JSON line each.
     fn write_session(path: &Path, transcript: &Transcript) {
         let mut text = String::new();
@@ -361,10 +342,10 @@ mod tests {
 
     #[test]
     fn record_flushes_turns_once_and_cancelled_turns_nothing() {
-        let root = Scratch::new("flush");
+        let root = tempfile::tempdir().unwrap();
         let project = Path::new("/tmp/proj");
         let transcript = Transcript::new().unwrap();
-        let mut session = Session::start(&root.0, project);
+        let mut session = Session::start(root.path(), project);
 
         // The system prompt lands with the first turn that completes, and
         // recording the same state again writes nothing.
@@ -389,7 +370,7 @@ mod tests {
         session.record(&transcript).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 5);
 
-        let (resumed, _) = Session::open(&root.0, project, &file).unwrap();
+        let (resumed, _) = Session::open(root.path(), project, &file).unwrap();
         assert_eq!(
             serde_json::to_value(resumed.request_items()).unwrap(),
             serde_json::to_value(transcript.request_items()).unwrap()
@@ -398,16 +379,16 @@ mod tests {
 
     #[test]
     fn damaged_tails_end_the_record_and_orphans_are_trimmed() {
-        let root = Scratch::new("damaged");
+        let root = tempfile::tempdir().unwrap();
 
         // A torn final line ends the record, and the file is rewritten as possible
-        let torn = root.0.join("torn.jsonl");
+        let torn = root.path().join("torn.jsonl");
         let transcript = Transcript::new().unwrap();
         transcript.push_user("hello".to_string()).unwrap();
         write_session(&torn, &transcript);
         let ripped = std::fs::read_to_string(&torn).unwrap() + r#"{"type":"message","role":"ass"#;
         std::fs::write(&torn, ripped).unwrap();
-        let (resumed, _) = Session::open(&root.0, Path::new("/tmp/other"), &torn).unwrap();
+        let (resumed, _) = Session::open(root.path(), Path::new("/tmp/other"), &torn).unwrap();
         assert_eq!(resumed.request_items().len(), 2);
         let after = std::fs::read_to_string(&torn).unwrap();
         assert_eq!(after.lines().count(), 2);
@@ -415,7 +396,7 @@ mod tests {
 
         // A well-formed but unpaired trailing call is trimmed from the record
         // *and* the file, so recording a new turn cannot strand it mid-file.
-        let orphan = root.0.join("orphan.jsonl");
+        let orphan = root.path().join("orphan.jsonl");
         let transcript = Transcript::new().unwrap();
         transcript.push_user("run it".to_string()).unwrap();
         write_session(&orphan, &transcript);
@@ -433,7 +414,7 @@ mod tests {
         );
         std::fs::write(&orphan, std::fs::read_to_string(&orphan).unwrap() + &line).unwrap();
         let (resumed, mut session) =
-            Session::open(&root.0, Path::new("/tmp/other"), &orphan).unwrap();
+            Session::open(root.path(), Path::new("/tmp/other"), &orphan).unwrap();
         assert_eq!(
             serde_json::to_value(resumed.request_items())
                 .unwrap()
@@ -450,7 +431,7 @@ mod tests {
         resumed.push_user("again".to_string()).unwrap();
         resumed.push_assistant("ok".to_string()).unwrap();
         session.record(&resumed).unwrap();
-        let (reopened, _) = Session::open(&root.0, Path::new("/tmp/other"), &orphan).unwrap();
+        let (reopened, _) = Session::open(root.path(), Path::new("/tmp/other"), &orphan).unwrap();
         assert!(
             !serde_json::to_value(reopened.request_items())
                 .unwrap()
@@ -461,9 +442,9 @@ mod tests {
 
     #[test]
     fn list_orders_newest_first_and_labels_the_opening_request() {
-        let root = Scratch::new("list");
+        let root = tempfile::tempdir().unwrap();
         let project = Path::new("/tmp/proj");
-        let dir = root.0.join(slug(project));
+        let dir = root.path().join(slug(project));
         std::fs::create_dir_all(&dir).unwrap();
         let old = Transcript::new().unwrap();
         old.push_user("from the old session\nwith a second line".to_string())
@@ -478,7 +459,7 @@ mod tests {
         chatty.push_user("x".repeat(80)).unwrap();
         write_session(&dir.join("20260102-000002.jsonl"), &chatty);
 
-        let listed = list(&root.0, project).unwrap();
+        let listed = list(root.path(), project).unwrap();
 
         // Newest first, each labelled with its stamp and opening request — the
         // first line only, capped with an ellipsis.
@@ -492,11 +473,11 @@ mod tests {
 
     #[test]
     fn a_foreign_file_fails_to_resume_without_being_rewritten() {
-        let root = Scratch::new("foreign");
-        let file = root.0.join("notes.txt");
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("notes.txt");
         std::fs::write(&file, "just some text\n").unwrap();
 
-        let error = Session::open(&root.0, Path::new("/tmp/other"), &file)
+        let error = Session::open(root.path(), Path::new("/tmp/other"), &file)
             .unwrap_err()
             .to_string();
 
@@ -506,18 +487,18 @@ mod tests {
 
     #[test]
     fn list_without_sessions_errors_naming_the_directory() {
-        let root = Scratch::new("empty");
+        let root = tempfile::tempdir().unwrap();
 
-        let error = list(&root.0, Path::new("/tmp/proj")).unwrap_err().to_string();
+        let error = list(root.path(), Path::new("/tmp/proj")).unwrap_err().to_string();
 
         assert!(error.contains("no sessions found"), "{error}");
     }
 
     #[test]
     fn a_session_without_messages_leaves_no_file() {
-        let root = Scratch::new("empty");
+        let root = tempfile::tempdir().unwrap();
         let transcript = Transcript::new().unwrap();
-        let mut session = Session::start(&root.0, Path::new("/tmp/proj"));
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
 
         // Quitting before the first message records nothing: no file appears.
         session.record(&transcript).unwrap();
@@ -528,17 +509,18 @@ mod tests {
         transcript.drop_last_turn();
         session.record(&transcript).unwrap();
         assert!(session.path.is_none());
-        let empty = std::fs::read_dir(&root.0).map_or(true, |mut entries| entries.next().is_none());
+        let empty =
+            std::fs::read_dir(root.path()).map_or(true, |mut entries| entries.next().is_none());
         assert!(empty);
     }
 
     #[test]
     fn unused_bumps_a_suffix_on_collision() {
-        let dir = Scratch::new("suffix");
-        std::fs::write(dir.0.join("20260101-000000.jsonl"), "").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("20260101-000000.jsonl"), "").unwrap();
 
-        let next = unused(&dir.0, "20260101-000000");
+        let next = unused(dir.path(), "20260101-000000");
 
-        assert_eq!(next, dir.0.join("20260101-000000-2.jsonl"));
+        assert_eq!(next, dir.path().join("20260101-000000-2.jsonl"));
     }
 }

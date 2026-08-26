@@ -15,5 +15,9 @@ libc = "0.2"
 serde_json = "1"
 time = { version = "0.3", default-features = false, features = ["std"] }
 
+[dev-dependencies]
+# Test scratch files and directories; tempfile removes them on drop.
+tempfile = "3"
+
 [lints]
 workspace = true
