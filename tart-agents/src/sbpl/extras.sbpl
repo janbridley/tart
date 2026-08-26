@@ -2,3 +2,16 @@
 
 ; Allow reads to libperl.dylib for so perl runs in the seatbelt.
 (allow file-read* file-test-existence file-map-executable (subpath "/System/Library/Perl"))
+
+; Allow uv-managed CPython installs to run in the seatbelt, so venv shims like
+; .venv/bin/python (symlinks into ~/.local/share/uv/python/...) can execute and
+; load their stdlib.
+(allow file-read* file-test-existence file-map-executable
+  (regex #"^/Users/[^/]+/\.local/share/uv/"))
+
+; Allow the rustup cargo shim (~/.cargo/bin/cargo), the cached registry and git
+; checkouts it builds from, and the ~/.rustup toolchains the shim execs into.
+(allow file-read* file-test-existence file-map-executable
+  (regex #"^/Users/[^/]+/\.cargo/(bin|registry|git)/"))
+(allow file-read* file-test-existence file-map-executable
+  (regex #"^/Users/[^/]+/\.rustup/"))
