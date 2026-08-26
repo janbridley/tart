@@ -341,6 +341,11 @@ impl Pane {
         self.transcript.push(line);
     }
 
+    /// Append a dim system line to the UI that is excluded from the sessions record.
+    pub fn note<S: Into<String>>(&mut self, text: S) {
+        self.push(Span::styled(text.into(), DIM_STYLE));
+    }
+
     /// Append a streaming fragment; see [`Transcript::append`].
     pub fn append(&mut self, span: &Span<'static>) {
         self.transcript.append(span);

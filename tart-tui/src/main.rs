@@ -75,12 +75,9 @@ fn main() -> anyhow::Result<()> {
     let _tmux = override_shift_up();
     let mut pane = Pane::default();
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
-    pane.push(Span::styled(
-        format!(
-            "tart · {label} · Enter sends text · Alt+Enter for newline · \
-            Shift+↑ to enter scrollback"
-        ),
-        DIM_STYLE,
+    pane.note(format!(
+        "tart · {label} · Enter sends text · Alt+Enter for newline · \
+        Shift+↑ to enter scrollback"
     ));
     if let Some(tokens) = agent_config.context_tokens {
         pane.set_context_tokens(tokens);
@@ -187,26 +184,19 @@ fn run(
                     }
                     // A submitted `/resume` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
-                    _ if line.trim().starts_with("/resume") => pane.push(Span::styled(
-                        "type /resume and pick a session as you type",
-                        DIM_STYLE,
-                    )),
+                    _ if line.trim().starts_with("/resume") => {
+                        pane.note("type /resume and pick a session as you type");
+                    }
                     // Set how hard the model reasons.
                     _ if let Some(arg) = line.trim().strip_prefix("/effort") => {
                         let arg = arg.trim();
                         match effort_of(arg) {
                             Some(effort) => {
                                 agent.set_reasoning_effort(effort);
-                                pane.push(Span::styled(
-                                    format!("reasoning effort: {arg}"),
-                                    DIM_STYLE,
-                                ));
+                                pane.note(format!("reasoning effort: {arg}"));
                             }
                             // Bare and unknown arguments both show the usage.
-                            None => pane.push(Span::styled(
-                                "usage: /effort none|minimal|low|medium|high|xhigh",
-                                DIM_STYLE,
-                            )),
+                            None => pane.note("usage: /effort none|minimal|low|medium|high|xhigh"),
                         }
                     }
                     _ => {
@@ -234,11 +224,11 @@ fn run(
                             || path.display().to_string(),
                             |stem| stem.to_string_lossy().into_owned(),
                         );
-                        pane.push(Span::styled(format!("resumed {name}"), DIM_STYLE));
+                        pane.note(format!("resumed {name}"));
                         pane.extend(history);
                     }
                     // A file too damaged to open just puts the error into our pane.
-                    Err(error) => pane.push(Span::styled(error.to_string(), DIM_STYLE)),
+                    Err(error) => pane.note(error.to_string()),
                 },
                 None => {}
             },
