@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
-use crate::file_mentions::{FilePopup, render as render_list};
+use crate::file_mentions::FilePopup;
 use crate::pane::Editor;
 use tart_agents::session;
 
@@ -51,9 +51,8 @@ impl SessionPopup {
 
     /// Draw the chooser, anchored above `anchor` like the `@file` popup.
     pub(crate) fn render(&mut self, frame: &mut Frame, anchor: Rect) {
-        render_list(
+        self.popup.render(
             frame,
-            &mut self.popup,
             anchor,
             "sessions",
             "↑↓ select · Enter to resume · Esc to close popup",
