@@ -197,11 +197,8 @@ pub(crate) fn update(editor: &Editor, popup: &mut Option<Popup>, rearm: bool) {
         return;
     };
     match popup {
-        Some(Popup::Files(p)) if p.query == query => {}
-        Some(Popup::Files(p)) => {
-            p.query = query;
-            p.refilter();
-        }
+        // An unchanged query refilters nothing: set_query no-ops on it.
+        Some(Popup::Files(p)) => p.set_query(query),
         Some(Popup::Sessions(_)) | None if rearm => {
             *popup = Some(Popup::Files(FilePopup::new(query)));
         }
