@@ -15,6 +15,7 @@ mod file_mentions;
 mod keybinds;
 mod pane;
 mod perf;
+mod session_picker;
 mod tmux_override;
 
 #[cfg(test)]
@@ -34,7 +35,9 @@ use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Pane, PaneEvent};
 use perf::Perf;
-use tart_agents::{Agent, Progress, ReasoningEffort, Transcript, sandbox::Policy};
+use tart_agents::{
+    Agent, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript, sandbox::Policy,
+};
 use tmux_override::{override_shift_up, restore_tmux};
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
@@ -53,11 +56,14 @@ fn main() -> anyhow::Result<()> {
     if let Some(effort) = agent_config.effort {
         agent = agent.reasoning_effort(effort);
     }
+    let root = &SESSIONS_ROOT;
+    let cwd = std::env::current_dir()?;
+    let mut session = Session::start(root, &cwd);
+    // A fresh conversation opens on the configured prompt and instructions.
     let transcript = match agent_config.instructions {
         Some(instructions) => Transcript::with_instructions(instructions)?,
         None => Transcript::new()?,
     };
-
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
@@ -67,13 +73,16 @@ fn main() -> anyhow::Result<()> {
     )?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
-    let result = run(
-        &mut terminal,
-        &mut agent,
-        &transcript,
-        &label,
-        agent_config.context_tokens,
-    );
+    let mut pane = Pane::default();
+    pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
+    pane.note(format!(
+        "tart · {label} · Enter sends text · Alt+Enter for newline · \
+        Shift+↑ to enter scrollback"
+    ));
+    if let Some(tokens) = agent_config.context_tokens {
+        pane.set_context_tokens(tokens);
+    }
+    let result = run(&mut terminal, &mut agent, transcript, &mut session, &mut pane);
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
@@ -120,22 +129,10 @@ fn effort_of(name: &str) -> Option<ReasoningEffort> {
 fn run(
     terminal: &mut DefaultTerminal,
     agent: &mut Agent,
-    transcript: &Transcript,
-    label: &str,
-    context_tokens: Option<u64>,
+    mut transcript: Transcript,
+    session: &mut Session,
+    pane: &mut Pane,
 ) -> anyhow::Result<()> {
-    let mut pane = Pane::default();
-    pane.push(Span::styled(
-        format!(
-            "tart · {label} · Enter sends text · Alt+Enter for newline · \
-            Shift+↑ to enter scrollback"
-        ),
-        DIM_STYLE,
-    ));
-    if let Some(tokens) = context_tokens {
-        pane.set_context_tokens(tokens);
-    }
-
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
     std::thread::spawn({
@@ -161,10 +158,6 @@ fn run(
         } else {
             pane.set_perf(None);
         }
-        #[allow(
-            clippy::match_same_arms,
-            reason = "different wake sources that happen to need no handling"
-        )]
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
@@ -180,11 +173,19 @@ fn run(
                     "/clear" => {
                         pane.clear();
                         transcript.clear();
+                        // The abandoned file stays as history; the next turn
+                        // starts a fresh one.
+                        session.reset();
                     }
                     "/quit" | "/exit" => quit = true,
                     "/perf" => {
                         perf_on = !perf_on;
                         perf = Perf::default();
+                    }
+                    // A submitted `/resume` line means the chooser was closed;
+                    // it opens by itself while the line is being typed.
+                    _ if line.trim().starts_with("/resume") => {
+                        pane.note("type /resume and pick a session as you type");
                     }
                     // Set how hard the model reasons.
                     _ if let Some(arg) = line.trim().strip_prefix("/effort") => {
@@ -192,16 +193,10 @@ fn run(
                         match effort_of(arg) {
                             Some(effort) => {
                                 agent.set_reasoning_effort(effort);
-                                pane.push(Span::styled(
-                                    format!("reasoning effort: {arg}"),
-                                    DIM_STYLE,
-                                ));
+                                pane.note(format!("reasoning effort: {arg}"));
                             }
                             // Bare and unknown arguments both show the usage.
-                            None => pane.push(Span::styled(
-                                "usage: /effort none|minimal|low|medium|high|xhigh",
-                                DIM_STYLE,
-                            )),
+                            None => pane.note("usage: /effort none|minimal|low|medium|high|xhigh"),
                         }
                     }
                     _ => {
@@ -211,10 +206,29 @@ fn run(
                         pane.set_generating(true);
                         let sender = wake.clone();
                         // The agent loop runs on its own thread
-                        agent.spawn(transcript, move |progress| {
+                        agent.spawn(&transcript, move |progress| {
                             let _ = sender.send(Wake::Generation(progress));
                         });
                     }
+                },
+                // A session picked in the `/resume` chooser swaps the conversation
+                //
+                // We flush the full abandoned file so we can later resume.
+                Some(PaneEvent::Resume(path)) => match session.reopen(&path) {
+                    Ok((restored, resumed)) => {
+                        let history = restored.replay();
+                        *session = resumed;
+                        transcript = restored;
+                        pane.clear();
+                        let name = path.file_stem().map_or_else(
+                            || path.display().to_string(),
+                            |stem| stem.to_string_lossy().into_owned(),
+                        );
+                        pane.note(format!("resumed {name}"));
+                        pane.extend(history);
+                    }
+                    // A file too damaged to open just puts the error into our pane.
+                    Err(error) => pane.note(error.to_string()),
                 },
                 None => {}
             },
@@ -223,48 +237,34 @@ fn run(
             // timer just loops around and draws again.
             Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
-            // Update the pane when we recieve new text
-            Ok(Wake::Generation(Progress::Thinking(text))) => {
-                pane.append_thinking(&Span::styled(text, DIM_STYLE));
-            }
-            Ok(Wake::Generation(Progress::Answer(text))) => pane.append(&Span::raw(text)),
-            // Tool calls render as live boxes in the transcript
-            Ok(Wake::Generation(Progress::ToolStart { id, name, digest })) => {
-                pane.start_tool(id, name, digest);
-            }
-            Ok(Wake::Generation(Progress::ToolOutput { id, output, exit })) => {
-                pane.finish_tool(&id, output, exit);
-            }
-            // The status line's usage measurements
-            Ok(Wake::Generation(Progress::Usage { input, cached, output })) => {
-                pane.set_usage(input, cached, output);
-            }
-            // When the model is done, the worker has already recorded the entire turn
-            // (including tool calls) into the transcript
-            Ok(Wake::Generation(Progress::Done { .. })) => {
-                pane.set_generating(false);
-                if cancelled {
-                    // Reset TUI and context as if the last turn never happened.
-                    transcript.drop_last_turn();
-                    cancelled = false;
-                    pane.cancel_turn();
+            // Update the pane as progress arrives.
+            Ok(Wake::Generation(progress)) => match &progress {
+                // When the turn ends the worker has already recorded the entire turn
+                Progress::Done { .. } | Progress::Failed(_) => {
+                    pane.set_generating(false);
+                    if cancelled {
+                        // Reset TUI and context as if the last turn never happened.
+                        transcript.drop_last_turn();
+                        cancelled = false;
+                        pane.cancel_turn();
+                    }
+                    // A failure also resolves anything still running, then
+                    // shows the error.
+                    if let Progress::Failed(error) = &progress {
+                        pane.fail_pending(error);
+                        pane.append(&Span::styled(error.clone(), DIM_STYLE));
+                    }
+                    session.record(&transcript)?;
                 }
-            }
-            // If the model *fails* for some reason, resolve anything still
-            // running, then show the error.
-            Ok(Wake::Generation(Progress::Failed(error))) => {
-                pane.set_generating(false);
-                if cancelled {
-                    transcript.drop_last_turn();
-                    cancelled = false;
-                    pane.cancel_turn();
-                }
-                pane.fail_pending(&error);
-                pane.append(&Span::styled(error, DIM_STYLE));
-            }
-            // `Progress` is non-exhaustive; later variants need no handling yet.
-            Ok(Wake::Generation(_)) => {}
+                _ => pane.apply(&progress),
+            },
         }
     }
+    // A quit mid-generation keeps the partial turn unless it was cancelled. In-flight
+    // requests (if present) are reconstructed or repaired in the transcript.
+    if cancelled {
+        transcript.drop_last_turn();
+    }
+    session.record(&transcript)?;
     Ok(())
 }

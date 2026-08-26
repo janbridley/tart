@@ -271,6 +271,29 @@ fn timeout_text(text: &str, timeout: Duration) -> String {
     format!("[timed out after {}s]{separator}{text}", timeout.as_secs())
 }
 
+/// The display name and digest for a recorded call, to be replayed as a tool header.
+///
+/// Recorded arguments are re-parsed so the header matches what the front end showed
+/// live. Unparseable arguments and unknown tools degrade to the raw JSON.
+pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
+    let raw = |_| call.arguments.clone();
+    match call.name.as_str() {
+        "bash" => (
+            "Bash",
+            parse_bash(&call.arguments).map_or_else(raw, |bash| bash.command),
+        ),
+        "read" => (
+            "Read",
+            parse_read(&call.arguments).map_or_else(raw, |read| read_digest(&read)),
+        ),
+        "edit" => (
+            "Edit",
+            parse_edit(&call.arguments).map_or_else(raw, |edit| edit.path),
+        ),
+        _ => ("Tool", call.arguments.clone()),
+    }
+}
+
 /// Run `command` to completion, killing its process group if it outlives `timeout`.
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<TimedRun> {
     command
@@ -751,27 +774,12 @@ mod tests {
         assert!(error.contains("unknown tool"), "{error}");
     }
 
-    /// A scratch file removed when the guard drops, so parallel tests don't
-    /// share state.
-    struct Scratch(std::path::PathBuf);
-
-    impl Scratch {
-        /// Create the guard under the temp directory.
-        fn new(tag: &str, contents: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("tart-edit-{tag}-{}", std::process::id()));
-            std::fs::write(&path, contents).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+    /// A temporary file holding `contents`, removed when the guard drops.
+    fn scratch(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file
     }
 
     /// An `edit` tool call replacing `old` with `new` in `path`.
@@ -803,7 +811,7 @@ mod tests {
 
     #[test]
     fn perl_edit_replaces_a_unique_multiline_string_literally() {
-        let file = Scratch::new("literal", "line1: cost $5.00 (a)\nline2: b.*x [y]\nline3\n");
+        let file = scratch("line1: cost $5.00 (a)\nline2: b.*x [y]\nline3\n");
         let output = perl_edit(file.path(), "b.*x [y]\nline3", r"REPL($1)$&\E", false);
 
         assert_eq!(
@@ -818,7 +826,7 @@ mod tests {
 
     #[test]
     fn perl_edit_replaces_every_occurrence_with_replace_all() {
-        let file = Scratch::new("replace-all", "a a a\n");
+        let file = scratch("a a a\n");
         let output = perl_edit(file.path(), "a", "b", true);
 
         assert_eq!(
@@ -830,7 +838,7 @@ mod tests {
 
     #[test]
     fn perl_edit_deletes_via_an_empty_new_string() {
-        let file = Scratch::new("delete", "keep\ndrop me\nkeep\n");
+        let file = scratch("keep\ndrop me\nkeep\n");
         let output = perl_edit(file.path(), "drop me\n", "", false);
 
         assert!(output.contains("1 replacement(s)"), "{output}");
@@ -839,7 +847,7 @@ mod tests {
 
     #[test]
     fn perl_edit_reports_a_missing_match_and_leaves_the_file_untouched() {
-        let file = Scratch::new("missing-match", "alpha beta\n");
+        let file = scratch("alpha beta\n");
         let output = perl_edit(file.path(), "gamma", "delta", false);
 
         assert!(output.contains("not found"), "{output}");
@@ -848,7 +856,7 @@ mod tests {
 
     #[test]
     fn perl_edit_reports_an_ambiguous_match_without_replace_all() {
-        let file = Scratch::new("ambiguous", "x x x\n");
+        let file = scratch("x x x\n");
         let output = perl_edit(file.path(), "x", "y", false);
 
         assert!(output.contains("matches 3 times"), "{output}");
@@ -865,7 +873,7 @@ mod tests {
 
     #[test]
     fn concurrent_perl_edits_to_one_file_both_apply() {
-        let file = Scratch::new("concurrent-perl", "AA eleven\nmid\nBB twelve\n");
+        let file = scratch("AA eleven\nmid\nBB twelve\n");
         let spawn_edit = |old: &'static str, new: &'static str| {
             let path = file.path().to_path_buf();
             std::thread::spawn(move || perl_edit(&path, old, new, false))
@@ -884,7 +892,7 @@ mod tests {
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
     #[test]
     fn concurrent_edits_to_one_file_both_apply() {
-        let file = Scratch::new("concurrent", "one UNO alpha\ntwo DOS beta\n");
+        let file = scratch("one UNO alpha\ntwo DOS beta\n");
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let spawn_edit = |old: &str, new: &str| {
             let call = edit_call(file.path(), old, new);
@@ -950,7 +958,7 @@ mod tests {
 
     #[test]
     fn reads_wait_for_the_edit_lock() {
-        let file = Scratch::new("read-lock", "one\ntwo\n");
+        let file = scratch("one\ntwo\n");
         // Stand in for an in-flight edit: an exclusive flock, as edit.pl takes.
         let editor = std::fs::OpenOptions::new()
             .append(true)
@@ -985,7 +993,7 @@ mod tests {
             contents.push_str(&line.to_string());
             contents.push('\n');
         }
-        let file = Scratch::new("read", &contents);
+        let file = scratch(&contents);
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
 

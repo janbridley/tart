@@ -16,5 +16,9 @@ tart-agents = { path = "../tart-agents" }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 unicode-segmentation = "1"
 
+[dev-dependencies]
+# Test scratch directories; tempfile removes them on drop.
+tempfile = "3"
+
 [lints]
 workspace = true

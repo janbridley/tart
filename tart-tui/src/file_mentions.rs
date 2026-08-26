@@ -13,7 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState};
 
-use crate::pane::{Editor, g_to_byte, graphemes};
+use crate::pane::{Editor, Popup, g_to_byte, graphemes};
 
 /// Bound the matcher's output; the list only renders its visible window.
 const MAX_SHOWN: usize = 256;
@@ -63,7 +63,8 @@ impl FilePopup {
         Self::from_files(walk_current_directory(), query)
     }
 
-    fn from_files(files: Vec<String>, query: String) -> Self {
+    /// A popup over `files`, filtered by `query`.
+    pub(crate) fn from_files(files: Vec<String>, query: String) -> Self {
         let mut popup = Self {
             files,
             query,
@@ -84,27 +85,81 @@ impl FilePopup {
         self.state.select_next();
     }
 
-    /// Replace the word after the `@` with the selected path, quoting paths that contain whitespace.
+    /// Point the popup at a new query, refiltering when it changed.
+    pub(crate) fn set_query(&mut self, query: String) {
+        if self.query != query {
+            self.query = query;
+            self.refilter();
+        }
+    }
+
+    /// The highlighted row, if any.
+    pub(crate) fn selected(&self) -> Option<&str> {
+        self.state
+            .selected()
+            .and_then(|i| self.matches.get(i).map(String::as_str))
+    }
+
+    /// Replace the word after the `@` with the selection, quoting paths w/ whitespace
     pub(crate) fn accept(&self, editor: &mut Editor) {
-        let Some((_, at)) = derive_query(editor) else {
-            return;
-        };
-        let Some(path) = self.state.selected().and_then(|i| self.matches.get(i)) else {
+        let (Some((_, at)), Some(path)) = (derive_query(editor), self.selected()) else {
             return;
         };
         let text = if path.contains(char::is_whitespace) {
             format!("\"{path}\"")
         } else {
-            path.clone()
+            path.to_string()
         };
+
         let line = &mut editor.lines[editor.line];
-        // Replace the whole word after the `@`, not just up to the caret:
-        // stale characters must not survive the insertion.
-        let end = line[at + 1..]
+        // Replace the whole word after the `@`
+        let start = at + 1;
+        let end = line[start..]
             .find(char::is_whitespace)
-            .map_or(line.len(), |i| at + 1 + i);
-        line.replace_range(at + 1..end, &text);
+            .map_or(line.len(), |i| start + i);
+        line.replace_range(start..end, &text);
         editor.g = graphemes(&line[..=at]) + graphemes(&text);
+    }
+
+    /// Draw the popup anchored above `anchor` (the top rule), overlaying the transcript.
+    ///
+    /// `label` names the list in the title and `hint` the keys in the bottom rule,
+    /// since the popup fronts both the `@file` typeahead and the session picker.
+    pub(crate) fn render(&mut self, frame: &mut Frame, anchor: Rect, label: &str, hint: &str) {
+        // Borders plus at least one row; never taller than the space above.
+        let h = (self.matches.len() as u16 + 2).min(anchor.y).max(3);
+        let area = Rect {
+            x: anchor.x + 1,
+            y: anchor.y.saturating_sub(h),
+            width: anchor.width.saturating_sub(2),
+            height: h,
+        };
+        let items: Vec<ListItem> = if self.matches.is_empty() {
+            let text = if self.files.is_empty() {
+                // An empty source list just shows a nice message.
+                format!("no {label}")
+            } else {
+                format!("no matches for `{}`", self.query)
+            };
+            vec![ListItem::new(text)]
+        } else {
+            self.matches
+                .iter()
+                .map(|path| ListItem::new(path.as_str()))
+                .collect()
+        };
+        // "+" if we have more files than fit, empty otherwise
+        let more = if self.total > self.matches.len() { "+" } else { "" };
+        let list = List::new(items)
+            .block(
+                Block::bordered()
+                    .title(format!(" {label} · {}{} ", self.matches.len(), more))
+                    .title_bottom(Line::from(format!(" {hint} "))),
+            )
+            .highlight_style(HIGHLIGHT)
+            .highlight_symbol("❯ ");
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(list, area, &mut self.state);
     }
 
     /// Re-match the query against the file snapshot, reseeding the selection.
@@ -134,10 +189,11 @@ pub(crate) fn rearm(key: &KeyEvent) -> bool {
     }
 }
 
-/// Derive an `@query` from the draft and decide the popup's fate: a changed
-/// query refilters, a vanished one closes. Once closed, only [`rearm`]
-/// re-opens it — otherwise it would pop back open after a completed path.
-pub(crate) fn update(editor: &Editor, popup: &mut Option<FilePopup>, rearm: bool) {
+/// Derive an `@query` from the draft and decide the typeahead's fate.
+///
+/// - A changed query refilters the list
+/// - A vanished query closes any popup.
+pub(crate) fn update(editor: &Editor, popup: &mut Option<Popup>, rearm: bool) {
     // Closed and not re-arming -> skip the update.
     if popup.is_none() && !rearm {
         return;
@@ -147,47 +203,13 @@ pub(crate) fn update(editor: &Editor, popup: &mut Option<FilePopup>, rearm: bool
         return;
     };
     match popup {
-        Some(p) if p.query == query => {}
-        Some(p) => {
-            p.query = query;
-            p.refilter();
+        // An unchanged query refilters nothing: set_query no-ops on it.
+        Some(Popup::Files(p)) => p.set_query(query),
+        Some(Popup::Sessions(_)) | None if rearm => {
+            *popup = Some(Popup::Files(FilePopup::new(query)));
         }
-        None if rearm => *popup = Some(FilePopup::new(query)),
         _ => {}
     }
-}
-
-/// Draw the popup anchored above `anchor` (the top rule), overlaying the transcript.
-pub(crate) fn render(frame: &mut Frame, popup: &mut FilePopup, anchor: Rect) {
-    // Borders plus at least one row; never taller than the space above.
-    let h = (popup.matches.len() as u16 + 2).min(anchor.y).max(3);
-    let area = Rect {
-        x: anchor.x + 1,
-        y: anchor.y.saturating_sub(h),
-        width: anchor.width.saturating_sub(2),
-        height: h,
-    };
-    let items: Vec<ListItem> = if popup.matches.is_empty() {
-        vec![ListItem::new(format!("no matches for `{}`", popup.query))]
-    } else {
-        popup
-            .matches
-            .iter()
-            .map(|path| ListItem::new(path.as_str()))
-            .collect()
-    };
-    // "+" if we have more files than fit, empty otherwise
-    let more = if popup.total > popup.matches.len() { "+" } else { "" };
-    let list = List::new(items)
-        .block(
-            Block::bordered()
-                .title(format!(" files · {}{} ", popup.matches.len(), more))
-                .title_bottom(Line::from(" ↑↓ select · Tab/Enter insert · Esc close ")),
-        )
-        .highlight_style(HIGHLIGHT)
-        .highlight_symbol("❯ ");
-    frame.render_widget(Clear, area);
-    frame.render_stateful_widget(list, area, &mut popup.state);
 }
 
 #[cfg(test)]

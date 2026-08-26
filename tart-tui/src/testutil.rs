@@ -3,6 +3,7 @@
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui::text::Line;
 use ratatui::{Frame, Terminal};
 
 /// Render two frames and hand back the terminal.
@@ -30,6 +31,14 @@ pub(crate) fn draw(render: impl FnMut(&mut Frame, Rect), size: (u16, u16)) -> St
         .content()
         .iter()
         .map(|cell| cell.symbol().to_string())
+        .collect()
+}
+
+/// Concatenate the text of rendered lines.
+pub(crate) fn texts(lines: &[Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
         .collect()
 }
 

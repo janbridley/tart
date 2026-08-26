@@ -6,6 +6,8 @@
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Progress {
+    /// A user message from the record; replay only, never live generation.
+    User(String),
     /// A fragment of the model's reasoning.
     Thinking(String),
     /// A fragment of the final answer.
