@@ -299,10 +299,25 @@ impl Transcript {
         if self.run.is_some_and(|run| run.end == self.messages.len()) {
             self.break_line();
         }
-        for (i, part) in span.content.split('\n').enumerate() {
+        self.append_lines(&span.content, span.style);
+    }
+
+    /// Append one fragment's text: every `\n` ends the line, and an empty part
+    ///
+    /// Newlines trailing the fragment stay pending, and only render once a following
+    /// newline closes the empty whitespace.
+    fn append_lines(&mut self, content: &str, style: Style) {
+        if content.is_empty() {
+            return;
+        }
+        let count = content.split('\n').count();
+        for (i, part) in content.split('\n').enumerate() {
             (i > 0).then(|| self.break_line());
             if !part.is_empty() {
-                self.append_fragment(Span::styled(part.to_string(), span.style));
+                self.append_fragment(Span::styled(part.to_string(), style));
+            } else if !self.open && i + 1 < count {
+                // A line already broke before us and another newline follows.
+                self.append_fragment(Span::styled(String::new(), style));
             }
         }
     }
@@ -360,12 +375,7 @@ impl Transcript {
         if late || self.run.is_some_and(|run| run.start == run.end) {
             self.break_line();
         }
-        for (i, part) in span.content.split('\n').enumerate() {
-            (i > 0).then(|| self.break_line());
-            if !part.is_empty() {
-                self.append_fragment(Span::styled(part.to_string(), span.style));
-            }
-        }
+        self.append_lines(&span.content, span.style);
         let Some(run) = &mut self.run else {
             return;
         };
@@ -575,6 +585,44 @@ mod tests {
                 "committed",
                 "after",
                 "again"
+            ]
+        );
+    }
+
+    /// Blank lines should survive streaming.
+    #[test]
+    fn blank_lines_render_across_fragments() {
+        let mut t = Transcript::default();
+        t.begin_response();
+        t.append_thinking(&Span::styled("hmm\n\nhmm", DIM_STYLE));
+        t.append(&Span::raw("one\n\ntwo\n")); // blank inside one fragment
+        t.append(&Span::raw("three\n")); // a lone trailing newline…
+        t.append(&Span::raw("\nfour\n")); // …that a leading `\n` doubles into a blank
+        t.append(&Span::raw("five\n")); // another lone newline…
+        t.append(&Span::raw("six")); // …only breaks the line
+        t.append(&Span::raw("\n\neven")); // after open text: first `\n` ends it, second blanks
+        assert_eq!(
+            t.message_texts(),
+            [
+                "hmm", "", "hmm", "one", "", "two", "three", "", "four", "five", "six", "", "even"
+            ]
+        );
+        t.sync(40);
+        // Thinking renders hidden by default: its placeholder stands in.
+        assert_eq!(
+            texts(&t.rows),
+            [
+                THINKING_HIDDEN,
+                "one",
+                "",
+                "two",
+                "three",
+                "",
+                "four",
+                "five",
+                "six",
+                "",
+                "even"
             ]
         );
     }
