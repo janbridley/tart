@@ -112,6 +112,20 @@ pub(crate) fn edit() -> Tool {
     )
 }
 
+/// Parse a tool call's arguments as JSON.
+fn parse_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
+    serde_json::from_str(arguments)
+        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))
+}
+
+/// A required string field from parsed tool arguments.
+fn string_field(args: &serde_json::Value, name: &str) -> anyhow::Result<String> {
+    args[name]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("tool call missing '{name}'"))
+}
+
 /// One parsed bash tool call.
 #[derive(Debug)]
 struct Bash {
@@ -123,12 +137,7 @@ struct Bash {
 
 /// Extract the fields from a bash tool call's JSON arguments.
 fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
-    let args: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
-    let command = args["command"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("tool call missing 'command'"))?;
+    let args = parse_arguments(arguments)?;
     // `as_i64` so negatives join the clamp instead of falling to the default.
     #[allow(
         clippy::cast_possible_wrap,
@@ -140,7 +149,7 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs() as i64)
         .clamp(1, MAX_BASH_TIMEOUT.as_secs() as i64) as u64;
     Ok(Bash {
-        command,
+        command: string_field(&args, "command")?,
         timeout: Duration::from_secs(seconds),
     })
 }
@@ -160,13 +169,9 @@ struct Read {
 ///
 /// The line bounds are optional; wrong-typed bounds are ignored.
 fn parse_read(arguments: &str) -> anyhow::Result<Read> {
-    let args: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
+    let args = parse_arguments(arguments)?;
     Ok(Read {
-        path: args["path"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("tool call missing 'path'"))?,
+        path: string_field(&args, "path")?,
         start_line: args["start_line"].as_u64(),
         end_line: args["end_line"].as_u64(),
     })
@@ -189,18 +194,11 @@ struct Edit {
 ///
 /// `replace_all` is optional and defaults to false.
 fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
-    let args: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))?;
-    let field = |name: &str| {
-        args[name]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("tool call missing '{name}'"))
-    };
+    let args = parse_arguments(arguments)?;
     Ok(Edit {
-        path: field("path")?,
-        old_string: field("old_string")?,
-        new_string: field("new_string")?,
+        path: string_field(&args, "path")?,
+        old_string: string_field(&args, "old_string")?,
+        new_string: string_field(&args, "new_string")?,
         replace_all: args["replace_all"].as_bool().unwrap_or(false),
     })
 }
