@@ -121,6 +121,41 @@ impl FilePopup {
         editor.g = graphemes(&line[..=at]) + graphemes(&text);
     }
 
+    /// Draw the popup anchored above `anchor` (the top rule), overlaying the transcript.
+    ///
+    /// `label` names the list in the title and `hint` the keys in the bottom rule,
+    /// since the popup fronts both the `@file` typeahead and the session picker.
+    pub(crate) fn render(&mut self, frame: &mut Frame, anchor: Rect, label: &str, hint: &str) {
+        // Borders plus at least one row; never taller than the space above.
+        let h = (self.matches.len() as u16 + 2).min(anchor.y).max(3);
+        let area = Rect {
+            x: anchor.x + 1,
+            y: anchor.y.saturating_sub(h),
+            width: anchor.width.saturating_sub(2),
+            height: h,
+        };
+        let items: Vec<ListItem> = if self.matches.is_empty() {
+            vec![ListItem::new(format!("no matches for `{}`", self.query))]
+        } else {
+            self.matches
+                .iter()
+                .map(|path| ListItem::new(path.as_str()))
+                .collect()
+        };
+        // "+" if we have more files than fit, empty otherwise
+        let more = if self.total > self.matches.len() { "+" } else { "" };
+        let list = List::new(items)
+            .block(
+                Block::bordered()
+                    .title(format!(" {label} · {}{} ", self.matches.len(), more))
+                    .title_bottom(Line::from(format!(" {hint} "))),
+            )
+            .highlight_style(HIGHLIGHT)
+            .highlight_symbol("❯ ");
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(list, area, &mut self.state);
+    }
+
     /// Re-match the query against the file snapshot, reseeding the selection.
     fn refilter(&mut self) {
         let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
@@ -172,48 +207,6 @@ pub(crate) fn update(editor: &Editor, popup: &mut Option<Popup>, rearm: bool) {
         }
         _ => {}
     }
-}
-
-/// Draw the popup anchored above `anchor` (the top rule), overlaying the transcript.
-///
-/// `label` names the list in the title and `hint` the keys in the bottom rule,
-/// since the popup fronts both the `@file` typeahead and the session picker.
-pub(crate) fn render(
-    frame: &mut Frame,
-    popup: &mut FilePopup,
-    anchor: Rect,
-    label: &str,
-    hint: &str,
-) {
-    // Borders plus at least one row; never taller than the space above.
-    let h = (popup.matches.len() as u16 + 2).min(anchor.y).max(3);
-    let area = Rect {
-        x: anchor.x + 1,
-        y: anchor.y.saturating_sub(h),
-        width: anchor.width.saturating_sub(2),
-        height: h,
-    };
-    let items: Vec<ListItem> = if popup.matches.is_empty() {
-        vec![ListItem::new(format!("no matches for `{}`", popup.query))]
-    } else {
-        popup
-            .matches
-            .iter()
-            .map(|path| ListItem::new(path.as_str()))
-            .collect()
-    };
-    // "+" if we have more files than fit, empty otherwise
-    let more = if popup.total > popup.matches.len() { "+" } else { "" };
-    let list = List::new(items)
-        .block(
-            Block::bordered()
-                .title(format!(" {label} · {}{} ", popup.matches.len(), more))
-                .title_bottom(Line::from(format!(" {hint} "))),
-        )
-        .highlight_style(HIGHLIGHT)
-        .highlight_symbol("❯ ");
-    frame.render_widget(Clear, area);
-    frame.render_stateful_widget(list, area, &mut popup.state);
 }
 
 #[cfg(test)]
