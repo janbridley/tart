@@ -75,10 +75,7 @@ fn main() -> anyhow::Result<()> {
     let _tmux = override_shift_up();
     let mut pane = Pane::default();
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
-    pane.note(format!(
-        "tart · {label} · Enter sends text · Alt+Enter for newline · \
-        Shift+↑ to enter scrollback"
-    ));
+    pane.note(format!("tart · {label}"));
     if let Some(tokens) = agent_config.context_tokens {
         pane.set_context_tokens(tokens);
     }
