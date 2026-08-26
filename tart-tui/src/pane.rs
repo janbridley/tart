@@ -6,11 +6,13 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
+use std::path::PathBuf;
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::clipboard::Selection;
 use crate::file_mentions::{self, FilePopup};
+use crate::session_picker::{SessionPopup, derive_query as session_query};
 
 pub const PROMPT: &str = "❯ ";
 /// Cells before the editor starts (the prompt symbol's width).
@@ -45,9 +47,19 @@ pub enum PaneEvent {
     Submit(String),
     /// Text chosen in copy mode, ready for the clipboard.
     Copy(String),
+    /// A session picked in the `/resume` chooser, ready to swap to.
+    Resume(PathBuf),
     /// Esc with nothing open and a turn in flight.
     Cancel,
     Quit,
+}
+
+/// The popup over the prompt, when one is open.
+pub(crate) enum Popup {
+    /// The `@file` typeahead over the working directory.
+    Files(FilePopup),
+    /// The `/resume` chooser over this project's sessions.
+    Sessions(SessionPopup),
 }
 
 /// One finished response's token usage, as shown on the status line.
@@ -77,8 +89,10 @@ pub struct Pane {
     transcript: Transcript,
     /// A `CopyCursor` in copymode, or `None` otherwise.
     copy: Option<CopyCursor>,
-    /// The `@file` typeahead, open while an `@` word is being typed.
-    popup: Option<FilePopup>,
+    /// The `@file` typeahead or the `/resume` chooser, while either is present
+    popup: Option<Popup>,
+    /// Where `/resume` lists sessions from: the sessions root and project.
+    session_dir: Option<(PathBuf, PathBuf)>,
     /// The `/perf` stats line, shown on the bottom rule row; `None` when off.
     perf: Option<String>,
     /// The last response's token usage.
@@ -100,6 +114,7 @@ impl Pane {
             transcript: Transcript::default(),
             copy: None,
             popup: None,
+            session_dir: None,
             perf: None,
             usage: None,
             context_tokens: None,
@@ -114,11 +129,62 @@ impl Pane {
             return None;
         }
         let event = self.route(key);
-        // @file popup updates on keystroke except in copy mode.
+        // The popups track the draft, except in copy mode.
         if self.copy.is_none() {
-            file_mentions::update(&self.prompt, &mut self.popup, file_mentions::rearm(&key));
+            self.sync_popup(Some(&key));
         }
         event
+    }
+
+    /// Update a popup based on input keystrokes (e.g. `@` opens, `Esc` closes).
+    fn sync_popup(&mut self, key: Option<&KeyEvent>) {
+        match session_query(&self.prompt) {
+            Some(query) => {
+                if let Some(Popup::Sessions(sessions)) = &mut self.popup {
+                    sessions.set_query(query);
+                } else if key.is_some_and(|key| key.code != KeyCode::Esc) {
+                    self.popup = self.session_dir.as_ref().map(|(root, project)| {
+                        Popup::Sessions(SessionPopup::new(root, project, query))
+                    });
+                }
+            }
+            None => {
+                file_mentions::update(
+                    &self.prompt,
+                    &mut self.popup,
+                    key.is_some_and(file_mentions::rearm),
+                );
+            }
+        }
+    }
+
+    /// One key event that performs some action in the popup.
+    fn popup_key(&mut self, key: KeyEvent) -> Option<PaneEvent> {
+        match key.code {
+            KeyCode::Up => match &mut self.popup {
+                Some(Popup::Files(popup)) => popup.select_prev(),
+                Some(Popup::Sessions(sessions)) => sessions.select_prev(),
+                None => {}
+            },
+            KeyCode::Down => match &mut self.popup {
+                Some(Popup::Files(popup)) => popup.select_next(),
+                Some(Popup::Sessions(sessions)) => sessions.select_next(),
+                None => {}
+            },
+            _ => match self.popup.take() {
+                Some(Popup::Files(popup)) => popup.accept(&mut self.prompt),
+                Some(Popup::Sessions(sessions)) => {
+                    if self.spin.is_none()
+                        && let Some(path) = sessions.selected_path()
+                    {
+                        self.prompt.clear();
+                        return Some(PaneEvent::Resume(path));
+                    }
+                }
+                None => {}
+            },
+        }
+        None
     }
 
     /// Key routing without the popup bookkeeping.
@@ -169,23 +235,14 @@ impl Pane {
         if crate::keybinds::mac_modifiers(&mut self.prompt, &key) {
             return None;
         }
-        // The @file popup is the highest priority UI element in live mode: arrows move
-        // the selection, and Tab/Enter insert.
-        if let Some(popup) = self.popup.as_mut()
+        // All popups take arrow keys, Tab, & Enter before the events hit the main pane
+        if self.popup.is_some()
             && matches!(
                 key.code,
                 KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter
             )
         {
-            match key.code {
-                KeyCode::Up => popup.select_prev(),
-                KeyCode::Down => popup.select_next(),
-                _ => {
-                    popup.accept(&mut self.prompt);
-                    self.popup = None;
-                }
-            }
-            return None;
+            return self.popup_key(key);
         }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
@@ -220,7 +277,7 @@ impl Pane {
         if self.copy.is_none() {
             self.prompt.insert_str(text);
             // A paste refilters an open popup but never opens one.
-            file_mentions::update(&self.prompt, &mut self.popup, false);
+            self.sync_popup(None);
         }
     }
 
@@ -271,6 +328,11 @@ impl Pane {
     /// Record the model's context window, from the agents file.
     pub fn set_context_tokens(&mut self, tokens: u64) {
         self.context_tokens = Some(tokens);
+    }
+
+    /// Name the directory `/resume` picks sessions from.
+    pub fn set_session_dir(&mut self, root: PathBuf, project: PathBuf) {
+        self.session_dir = Some((root, project));
     }
 
     /// The status line's text: the context size against the model's window,
@@ -339,6 +401,13 @@ impl Pane {
             draft: self.prompt.clone(),
         });
         let text = self.prompt.text();
+        self.echo(&text);
+        self.prompt.clear();
+        Some(text)
+    }
+
+    /// Echo a submitted line into the transcript, as [`Pane::submit`] renders it.
+    pub fn echo(&mut self, text: &str) {
         let mut rows = text.split('\n');
         self.transcript.push(Line::from(vec![
             Span::styled(PROMPT, PROMPT_STYLE),
@@ -347,8 +416,6 @@ impl Pane {
         for continuation in rows {
             self.transcript.push(Line::from(format!("  {continuation}")));
         }
-        self.prompt.clear();
-        Some(text)
     }
 
     /// Render into the granted area: transcript, rule, prompt, rule.
@@ -423,11 +490,19 @@ impl Pane {
         if let Some(cell) = buf.cell_mut(pos) {
             cell.set_style(CURSOR_STYLE);
         }
-        // The @file popup overlays the transcript, anchored above the top rule.
-        if let Some(popup) = self.popup.as_mut() {
-            file_mentions::render(frame, popup, bar_top);
+        // The popup overlays the transcript, anchored above the top rule.
+        match self.popup.as_mut() {
+            Some(Popup::Files(popup)) => popup.render(
+                frame,
+                bar_top,
+                "files",
+                "↑↓ select · Tab/Enter insert · Esc close",
+            ),
+            Some(Popup::Sessions(sessions)) => sessions.render(frame, bar_top),
+            None => {}
         }
     }
+
     /// Sync, window, and paint the transcript, then draw its two rules.
     fn render_transcript(
         &mut self,
@@ -1383,8 +1458,11 @@ fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize) -> PromptL
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
     use super::*;
     use crate::testutil::{draw, draw_backgrounds};
+    use tart_agents::Progress;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1522,6 +1600,138 @@ mod tests {
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn echo_renders_the_prompt_and_indents_continuations() {
+        let mut pane = Pane::default();
+
+        pane.echo("first\nsecond");
+
+        assert_eq!(message_texts(&pane.transcript), ["❯ first", "  second"]);
+    }
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        /// Create the guard under the temp directory.
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("tart-pane-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A `/resume` line opens the session chooser; Enter swaps to the picked
+    /// session, and the chooser never swaps under a running turn.
+    #[test]
+    fn a_resume_line_opens_the_chooser_and_enter_swaps() {
+        let root = Scratch::new("resume");
+        let project = PathBuf::from("/tmp/proj");
+        let dir = root.0.join("tmp-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("20260101-000000.jsonl");
+        std::fs::write(
+            &file,
+            "{\"type\":\"message\",\"role\":\"system\",\"content\":\"s\"}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"fix the login flow\"}\n",
+        )
+        .unwrap();
+        let mut pane = Pane::new();
+        pane.set_session_dir(root.0.clone(), project);
+
+        for c in "/resume fix".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(matches!(pane.popup, Some(Popup::Sessions(_))));
+
+        // Enter picks the highlighted session and clears the draft.
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Resume(file))
+        );
+        assert_eq!(pane.prompt.text(), "");
+
+        // Esc closes the chooser; the draft survives. Reopened, a generating
+        // turn keeps the chooser from swapping.
+        for c in "/resume fix".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(pane.popup.is_none());
+        assert_eq!(pane.prompt.text(), "/resume fix");
+        pane.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(pane.popup, Some(Popup::Sessions(_))));
+        pane.set_generating(true);
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+    }
+
+    /// Replaying a session renders the echoes, tool headers, and answers the
+    /// live stream would have shown — and a later cancel cannot rewind into it.
+    #[test]
+    fn replayed_turns_render_like_live_ones() {
+        let mut pane = Pane::new();
+        pane.push(Line::from("banner"));
+        let replay = [
+            Progress::User("run it".to_string()),
+            Progress::Thinking("thinking".to_string()),
+            // A replayed tool box: the header, finished empty.
+            Progress::ToolStart {
+                id: "call_0".to_string(),
+                name: "Bash",
+                digest: "ls -la".to_string(),
+            },
+            Progress::ToolOutput {
+                id: "call_0".to_string(),
+                output: String::new(),
+                exit: Some(0),
+            },
+            Progress::Answer("done".to_string()),
+        ];
+        for event in replay {
+            match event {
+                Progress::User(text) => {
+                    pane.begin_response();
+                    pane.echo(&text);
+                }
+                Progress::Thinking(text) => pane.append_thinking(&Span::styled(text, DIM_STYLE)),
+                Progress::Answer(text) => pane.append(&Span::raw(text)),
+                Progress::ToolStart { id, name, digest } => pane.start_tool(id, name, digest),
+                Progress::ToolOutput { id, output, exit } => pane.finish_tool(&id, output, exit),
+                _ => {}
+            }
+        }
+
+        let screen = render(&mut pane, (60, 20));
+        assert!(screen.contains("❯ run it"), "{screen}");
+        assert!(screen.contains("Bash(ls -la)"), "{screen}");
+        assert!(screen.contains("(no output)"), "{screen}");
+        assert!(screen.contains("done"), "{screen}");
+        // The thinking run rides below the echo, exactly as a live turn.
+        let echo_at = screen.find("❯ run it").unwrap();
+        let thinking_at = screen.find("Thinking").unwrap();
+        assert!(echo_at < thinking_at, "{screen}");
+
+        // A live turn that gets cancelled rewinds to its own start, never into
+        // the replayed history. (The draft returns to the prompt editor.)
+        pane.on_paste("cancel me");
+        pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        pane.set_generating(true);
+        pane.cancel_turn();
+        let screen = render(&mut pane, (60, 20));
+        assert!(screen.contains("❯ run it"), "{screen}");
+        assert!(screen.contains("done"), "{screen}");
+        assert!(
+            !message_texts(&pane.transcript)
+                .iter()
+                .any(|text| text.contains("cancel me"))
+        );
     }
 
     /// The messages the transcript renders: the log with a hidden run
