@@ -22,7 +22,6 @@ mod tmux_override;
 mod testutil;
 
 use std::io::stdout;
-use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -74,15 +73,19 @@ fn main() -> anyhow::Result<()> {
     )?;
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
-    let result = run(
-        &mut terminal,
-        &mut agent,
-        transcript,
-        &mut session,
-        (root, &cwd),
-        &label,
-        agent_config.context_tokens,
-    );
+    let mut pane = Pane::default();
+    pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
+    pane.push(Span::styled(
+        format!(
+            "tart · {label} · Enter sends text · Alt+Enter for newline · \
+            Shift+↑ to enter scrollback"
+        ),
+        DIM_STYLE,
+    ));
+    if let Some(tokens) = agent_config.context_tokens {
+        pane.set_context_tokens(tokens);
+    }
+    let result = run(&mut terminal, &mut agent, transcript, &mut session, &mut pane);
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
@@ -131,23 +134,8 @@ fn run(
     agent: &mut Agent,
     mut transcript: Transcript,
     session: &mut Session,
-    sessions: (&Path, &Path),
-    label: &str,
-    context_tokens: Option<u64>,
+    pane: &mut Pane,
 ) -> anyhow::Result<()> {
-    let mut pane = Pane::default();
-    pane.set_session_dir(sessions.0.to_path_buf(), sessions.1.to_path_buf());
-    pane.push(Span::styled(
-        format!(
-            "tart · {label} · Enter sends text · Alt+Enter for newline · \
-            Shift+↑ to enter scrollback"
-        ),
-        DIM_STYLE,
-    ));
-    if let Some(tokens) = context_tokens {
-        pane.set_context_tokens(tokens);
-    }
-
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
     std::thread::spawn({
