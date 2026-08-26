@@ -224,19 +224,22 @@ fn run(
                 // A session picked in the `/resume` chooser swaps the conversation
                 //
                 // We flush the full abandoned file so we can later resume.
-                Some(PaneEvent::Resume(path)) => {
-                    let (restored, resumed) = session.reopen(&path)?;
-                    let history = restored.replay();
-                    *session = resumed;
-                    transcript = restored;
-                    pane.clear();
-                    let name = path.file_stem().map_or_else(
-                        || path.display().to_string(),
-                        |stem| stem.to_string_lossy().into_owned(),
-                    );
-                    pane.push(Span::styled(format!("resumed {name}"), DIM_STYLE));
-                    pane.extend(history);
-                }
+                Some(PaneEvent::Resume(path)) => match session.reopen(&path) {
+                    Ok((restored, resumed)) => {
+                        let history = restored.replay();
+                        *session = resumed;
+                        transcript = restored;
+                        pane.clear();
+                        let name = path.file_stem().map_or_else(
+                            || path.display().to_string(),
+                            |stem| stem.to_string_lossy().into_owned(),
+                        );
+                        pane.push(Span::styled(format!("resumed {name}"), DIM_STYLE));
+                        pane.extend(history);
+                    }
+                    // A file too damaged to open just puts the error into our pane.
+                    Err(error) => pane.push(Span::styled(error.to_string(), DIM_STYLE)),
+                },
                 None => {}
             },
             Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),
