@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
 use std::path::PathBuf;
 use std::time::Instant;
+use tart_agents::Progress;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::clipboard::Selection;
@@ -284,6 +285,31 @@ impl Pane {
     /// Close the file popup, else leave copy mode. Returns whether anything was closed.
     pub fn escape(&mut self) -> bool {
         self.popup.take().is_some() || self.copy.take().is_some()
+    }
+
+    /// Paint one event into the tui
+    pub fn apply(&mut self, progress: &Progress) {
+        match progress {
+            Progress::User(text) => {
+                self.echo(text);
+                self.begin_response();
+            }
+            Progress::Thinking(text) => {
+                self.append_thinking(&Span::styled(text.clone(), DIM_STYLE));
+            }
+            Progress::Answer(text) => self.append(&Span::raw(text.clone())),
+            Progress::ToolStart { id, name, digest } => {
+                self.start_tool(id.clone(), name, digest.clone());
+            }
+            Progress::ToolOutput { id, output, exit } => {
+                self.finish_tool(id, output.clone(), *exit);
+            }
+            Progress::Usage { input, cached, output } => {
+                self.set_usage(*input, *cached, *output);
+            }
+            // `Progress` is non-exhaustive; later variants need no handling yet.
+            _ => {}
+        }
     }
 
     pub fn push<L: Into<Line<'static>>>(&mut self, line: L) {
@@ -563,6 +589,17 @@ impl Pane {
                 )),
                 prompt_area.width,
             );
+        }
+    }
+}
+
+/// Replay events into the pane, painting each as the live stream does.
+///
+/// Tool exchanges arrive as headers only (see `Transcript::replay`).
+impl Extend<Progress> for Pane {
+    fn extend<T: IntoIterator<Item = Progress>>(&mut self, iter: T) {
+        for event in iter {
+            self.apply(&event);
         }
     }
 }
@@ -1462,7 +1499,6 @@ mod tests {
 
     use super::*;
     use crate::testutil::{draw, draw_backgrounds};
-    use tart_agents::Progress;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1694,19 +1730,7 @@ mod tests {
             },
             Progress::Answer("done".to_string()),
         ];
-        for event in replay {
-            match event {
-                Progress::User(text) => {
-                    pane.begin_response();
-                    pane.echo(&text);
-                }
-                Progress::Thinking(text) => pane.append_thinking(&Span::styled(text, DIM_STYLE)),
-                Progress::Answer(text) => pane.append(&Span::raw(text)),
-                Progress::ToolStart { id, name, digest } => pane.start_tool(id, name, digest),
-                Progress::ToolOutput { id, output, exit } => pane.finish_tool(&id, output, exit),
-                _ => {}
-            }
-        }
+        pane.extend(replay);
 
         let screen = render(&mut pane, (60, 20));
         assert!(screen.contains("❯ run it"), "{screen}");

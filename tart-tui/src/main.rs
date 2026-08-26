@@ -90,25 +90,6 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-/// Replay a restored session into the pane.
-///
-/// Tool exchanges replay as headers only (see `Transcript::replay`).
-fn replay_into(pane: &mut Pane, replay: Vec<Progress>) {
-    for event in replay {
-        match event {
-            Progress::User(text) => {
-                pane.echo(&text);
-                pane.begin_response();
-            }
-            Progress::Thinking(text) => pane.append_thinking(&Span::styled(text, DIM_STYLE)),
-            Progress::Answer(text) => pane.append(&Span::raw(text)),
-            Progress::ToolStart { id, name, digest } => pane.start_tool(id, name, digest),
-            Progress::ToolOutput { id, output, exit } => pane.finish_tool(&id, output, exit),
-            _ => {}
-        }
-    }
-}
-
 /// Leave a normal terminal (and the tmux binding restored) even on panic.
 fn install_panic_hook() {
     let hook = std::panic::take_hook();
@@ -192,10 +173,6 @@ fn run(
         } else {
             pane.set_perf(None);
         }
-        #[allow(
-            clippy::match_same_arms,
-            reason = "different wake sources that happen to need no handling"
-        )]
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
@@ -270,7 +247,7 @@ fn run(
                         |stem| stem.to_string_lossy().into_owned(),
                     );
                     pane.push(Span::styled(format!("resumed {name}"), DIM_STYLE));
-                    replay_into(&mut pane, history);
+                    pane.extend(history);
                 }
                 None => {}
             },
@@ -279,49 +256,27 @@ fn run(
             // timer just loops around and draws again.
             Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
-            // Update the pane when we recieve new text
-            Ok(Wake::Generation(Progress::Thinking(text))) => {
-                pane.append_thinking(&Span::styled(text, DIM_STYLE));
-            }
-            Ok(Wake::Generation(Progress::Answer(text))) => pane.append(&Span::raw(text)),
-            // Tool calls render as live boxes in the transcript
-            Ok(Wake::Generation(Progress::ToolStart { id, name, digest })) => {
-                pane.start_tool(id, name, digest);
-            }
-            Ok(Wake::Generation(Progress::ToolOutput { id, output, exit })) => {
-                pane.finish_tool(&id, output, exit);
-            }
-            // The status line's usage measurements
-            Ok(Wake::Generation(Progress::Usage { input, cached, output })) => {
-                pane.set_usage(input, cached, output);
-            }
-            // When the model is done, the worker has already recorded the entire turn
-            // (including tool calls) into the transcript
-            Ok(Wake::Generation(Progress::Done { .. })) => {
-                pane.set_generating(false);
-                if cancelled {
-                    // Reset TUI and context as if the last turn never happened.
-                    transcript.drop_last_turn();
-                    cancelled = false;
-                    pane.cancel_turn();
+            // Update the pane as progress arrives.
+            Ok(Wake::Generation(progress)) => match &progress {
+                // When the turn ends the worker has already recorded the entire turn
+                Progress::Done { .. } | Progress::Failed(_) => {
+                    pane.set_generating(false);
+                    if cancelled {
+                        // Reset TUI and context as if the last turn never happened.
+                        transcript.drop_last_turn();
+                        cancelled = false;
+                        pane.cancel_turn();
+                    }
+                    // A failure also resolves anything still running, then
+                    // shows the error.
+                    if let Progress::Failed(error) = &progress {
+                        pane.fail_pending(error);
+                        pane.append(&Span::styled(error.clone(), DIM_STYLE));
+                    }
+                    session.record(&transcript)?;
                 }
-                session.record(&transcript)?;
-            }
-            // If the model *fails* for some reason, resolve anything still
-            // running, then show the error.
-            Ok(Wake::Generation(Progress::Failed(error))) => {
-                pane.set_generating(false);
-                if cancelled {
-                    transcript.drop_last_turn();
-                    cancelled = false;
-                    pane.cancel_turn();
-                }
-                pane.fail_pending(&error);
-                pane.append(&Span::styled(error, DIM_STYLE));
-                session.record(&transcript)?;
-            }
-            // `Progress` is non-exhaustive; later variants need no handling yet.
-            Ok(Wake::Generation(_)) => {}
+                _ => pane.apply(&progress),
+            },
         }
     }
     // A quit mid-generation keeps the partial turn unless it was cancelled. In-flight
