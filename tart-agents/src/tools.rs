@@ -329,6 +329,28 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Time
     })
 }
 
+/// Announce a tool call, run it, and report its conclusion.
+fn traced<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    name: &'static str,
+    digest: String,
+    on_progress: &F,
+    run: impl FnOnce() -> (String, String, Option<i32>),
+) -> String {
+    on_progress(Progress::ToolStart {
+        id: call.call_id.clone(),
+        name,
+        digest,
+    });
+    let (result, output, exit) = run();
+    on_progress(Progress::ToolOutput {
+        id: call.call_id.clone(),
+        output,
+        exit,
+    });
+    result
+}
+
 /// Run one bash tool call under `policy`, reporting its steps to `on_progress`.
 ///
 /// A command that outlives its timeout is killed with everything it started.
@@ -339,40 +361,31 @@ fn run_bash<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let bash = parse_bash(&call.arguments)?;
-    on_progress(Progress::ToolStart {
-        id: call.call_id.clone(),
-        name: "Bash",
-        digest: bash.command.clone(),
-    });
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
     let mut sandboxed = policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
-    // Decode the stream into output for the front and backends.
-    let (result, output, exit) = match run_with_timeout(&mut sandboxed, bash.timeout) {
-        Ok(run) => {
-            let TimedRun { output, timed_out } = run;
-            let text = combined_output(&output);
-            let exit = output.status.code();
-            if timed_out {
-                // A timeout has no exit code for the header, so we mark up the body.
-                let marked = timeout_text(&text, bash.timeout);
-                (marked.clone(), marked, exit)
-            } else {
-                (command_text(&text, output.status), text, exit)
+    Ok(traced(call, "Bash", bash.command.clone(), on_progress, || {
+        // Decode the stream into output for the front and backends.
+        match run_with_timeout(&mut sandboxed, bash.timeout) {
+            Ok(run) => {
+                let TimedRun { output, timed_out } = run;
+                let text = combined_output(&output);
+                let exit = output.status.code();
+                if timed_out {
+                    // A timeout has no exit code for the header, so we mark up the body.
+                    let marked = timeout_text(&text, bash.timeout);
+                    (marked.clone(), marked, exit)
+                } else {
+                    (command_text(&text, output.status), text, exit)
+                }
+            }
+            Err(error) => {
+                let text = format!("error: {error}");
+                (text.clone(), text, None)
             }
         }
-        Err(error) => {
-            let text = format!("error: {error}");
-            (text.clone(), text, None)
-        }
-    };
-    on_progress(Progress::ToolOutput {
-        id: call.call_id.clone(),
-        output,
-        exit,
-    });
-    Ok(result)
+    }))
 }
 
 /// The digest for a read call: the path, with any bounds as `path:start-end`.
@@ -392,28 +405,25 @@ fn run_read<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let read = parse_read(&call.arguments)?;
-    on_progress(Progress::ToolStart {
-        id: call.call_id.clone(),
-        name: "Read",
-        digest: read_digest(&read),
-    });
     let mut command = policy.command("/usr/bin/perl");
     command
         .arg("-e")
         .arg(numbered_read(read.start_line, read.end_line))
         .arg("--")
         .arg(&read.path);
-    // A failure to launch comes back as an error string for the model to deal with.
-    let (output, exit) = match &command.output() {
-        Ok(spawned) => (combined_output(spawned), spawned.status.code()),
-        Err(error) => (format!("error: {error}"), None),
-    };
-    on_progress(Progress::ToolOutput {
-        id: call.call_id.clone(),
-        output: output.clone(),
-        exit,
-    });
-    Ok(output)
+    Ok(traced(call, "Read", read_digest(&read), on_progress, || {
+        // A failure to launch comes back as an error string for the model to deal with.
+        match &command.output() {
+            Ok(spawned) => {
+                let text = combined_output(spawned);
+                (text.clone(), text, spawned.status.code())
+            }
+            Err(error) => {
+                let text = format!("error: {error}");
+                (text.clone(), text, None)
+            }
+        }
+    }))
 }
 
 /// Run one edit tool call: report the target, apply it, and report the outcome.
@@ -427,18 +437,10 @@ fn run_edit<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
-    on_progress(Progress::ToolStart {
-        id: call.call_id.clone(),
-        name: "Edit",
-        digest: edit.path.clone(),
-    });
-    let (result, exit) = apply_edit(&edit, policy);
-    on_progress(Progress::ToolOutput {
-        id: call.call_id.clone(),
-        output: result.clone(),
-        exit,
-    });
-    Ok(result)
+    Ok(traced(call, "Edit", edit.path.clone(), on_progress, || {
+        let (result, exit) = apply_edit(&edit, policy);
+        (result.clone(), result, exit)
+    }))
 }
 
 /// Apply one parsed edit under `policy`, returning outcome message and the exit code.
