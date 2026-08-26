@@ -36,18 +36,26 @@ fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
     )
 }
 
+/// A function tool with the given name, description, and JSON-schema parameters.
+#[must_use]
+fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
+    Tool::Function(FunctionTool {
+        defer_loading: None,
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        parameters: Some(parameters),
+        strict: None,
+    })
+}
+
 /// The bash tool; commands execute under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn bash() -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: "bash".to_string(),
-        description: Some(
-            "Run a bash command in a sandbox (writes restricted to granted roots, no network) \
-            and return its combined stdout/stderr"
-                .to_string(),
-        ),
-        parameters: Some(serde_json::json!({
+    tool(
+        "bash",
+        "Run a bash command in a sandbox (writes restricted to granted roots, no network) \
+        and return its combined stdout/stderr",
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The bash command to run"},
@@ -57,24 +65,19 @@ pub(crate) fn bash() -> Tool {
                 }
             },
             "required": ["command"]
-        })),
-        strict: None,
-    })
+        }),
+    )
 }
 
 /// The read tool; files are read under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn read() -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: "read".to_string(),
-        description: Some(
-            "Read a file with line numbers (cat -n style) in a sandbox (reads restricted to \
-            granted roots); optionally pass start_line/end_line (1-based, inclusive) to read \
-            a range"
-                .to_string(),
-        ),
-        parameters: Some(serde_json::json!({
+    tool(
+        "read",
+        "Read a file with line numbers (cat -n style) in a sandbox (reads restricted to \
+        granted roots); optionally pass start_line/end_line (1-based, inclusive) to read \
+        a range",
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "The file to read"},
@@ -82,26 +85,21 @@ pub(crate) fn read() -> Tool {
                 "end_line": {"type": "integer", "description": "Last line to read (inclusive); omit to read to the end"}
             },
             "required": ["path"]
-        })),
-        strict: None,
-    })
+        }),
+    )
 }
 
 /// The edit tool; replacements execute under the caller's [`Policy`].
 #[must_use]
 pub(crate) fn edit() -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: "edit".to_string(),
-        description: Some(
-            "Replace an exact string in an existing file. old_string must match the file exactly, including whitespace and \
-            newlines, and occur exactly once unless replace_all is true: include surrounding \
-            lines to make it unique. An empty new_string deletes old_string. The file must \
-            already exist and be valid UTF-8, so use bash to create files. Prefer this tool \
-            over bash for changing existing files"
-                .to_string(),
-        ),
-        parameters: Some(serde_json::json!({
+    tool(
+        "edit",
+        "Replace an exact string in an existing file. old_string must match the file exactly, including whitespace and \
+        newlines, and occur exactly once unless replace_all is true: include surrounding \
+        lines to make it unique. An empty new_string deletes old_string. The file must \
+        already exist and be valid UTF-8, so use bash to create files. Prefer this tool \
+        over bash for changing existing files",
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path of the existing file to edit"},
@@ -110,9 +108,8 @@ pub(crate) fn edit() -> Tool {
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of one unique match"}
             },
             "required": ["path", "old_string", "new_string"]
-        })),
-        strict: None,
-    })
+        }),
+    )
 }
 
 /// One parsed bash tool call.
