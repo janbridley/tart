@@ -19,13 +19,16 @@ use crate::pane::{Editor, Popup, g_to_byte, graphemes};
 const MAX_SHOWN: usize = 256;
 const HIGHLIGHT: Style = Style::new().add_modifier(Modifier::REVERSED);
 
-/// The suffix and byte offset of the last word-start `@` on the caret's line.
+/// The suffix and byte offset of the last word-start `@` on the caret's line,
+/// while the caret is still inside that `@`-word.
 pub(crate) fn derive_query(editor: &Editor) -> Option<(String, usize)> {
     let line = &editor.lines[editor.line];
     let prefix = &line[..g_to_byte(line, editor.g)];
     let at = prefix.rfind('@')?;
     let word_start = prefix[..at].chars().next_back().is_none_or(char::is_whitespace);
-    word_start.then(|| (prefix[at + 1..].to_string(), at))
+    // Whitespace between the `@` and the caret (usually) means the caret left the word.
+    let inside = !prefix[at + 1..].contains(char::is_whitespace);
+    (word_start && inside).then(|| (prefix[at + 1..].to_string(), at))
 }
 
 /// All non-ignored files under the current directory, as sorted relative paths.
@@ -229,6 +232,9 @@ mod tests {
         editor.clear();
         editor.insert_str("see @");
         assert_eq!(derive_query(&editor), Some((String::new(), 4)));
+        editor.clear();
+        editor.insert_str("read @Cargo.toml please");
+        assert_eq!(derive_query(&editor), None); // caret past the mention word
 
         let files: Vec<String> = ["src/main.rs", "docs/manual.md", "Cargo.toml"]
             .into_iter()
@@ -250,19 +256,19 @@ mod tests {
         assert_eq!(editor.lines, ["read @src/main.rs"]);
         assert_eq!(editor.g, 17); // parked after the inserted path
 
-        // Closed after completion: plain typing keeps it closed, while a deletion,
-        // a caret move, or a fresh `@` re-arm it.
+        // Closed after completion: plain typing keeps it closed, and re-arming
+        // keys stay closed too while the caret is outside the mention word.
         let mut slot = None;
         editor.insert_str(" more");
         update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Char('x'))));
         assert!(slot.is_none());
         editor.backspace();
         update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Backspace)));
-        assert!(slot.is_some());
+        assert!(slot.is_none());
         slot = None;
         editor.left();
         update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Left)));
-        assert!(slot.is_some());
+        assert!(slot.is_none());
         slot = None;
         editor.insert_str(" @ne");
         update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Char('@'))));
