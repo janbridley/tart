@@ -29,6 +29,8 @@ pub const PROMPT: &str = "❯ ";
 const GUTTER: u16 = 2;
 
 pub const DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
+/// The highlight for the transcript's actionable hints.
+pub(crate) const HIGHLIGHT_STYLE: Style = Style::new().fg(Color::Blue);
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 /// The copy cursor and the editor caret are the cell under them, inverted.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
@@ -656,7 +658,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use crate::testutil::{draw, draw_backgrounds};
+    use crate::testutil::{draw, draw_backgrounds, draw_highlights};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)

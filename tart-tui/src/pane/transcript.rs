@@ -6,8 +6,8 @@ use ratatui::text::{Line, Span};
 #[cfg(test)]
 use crate::testutil::texts;
 
-use super::DIM_STYLE;
 use super::wrap::wrap_lines;
+use super::{DIM_STYLE, HIGHLIGHT_STYLE};
 
 /// Stands in for a hidden thinking run.
 const THINKING_HIDDEN: &str = "[Thinking… ctrl+t to toggle]";
@@ -22,14 +22,23 @@ const TOOL_RUNNING: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::
 const TOOL_OK: Style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
 const TOOL_ERR: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
 
-/// The row rendered in place of a hidden thinking run.
+/// The highlighted row rendered in place of a hidden thinking run.
 fn thinking_placeholder() -> Line<'static> {
-    Line::from(Span::styled(THINKING_HIDDEN, DIM_STYLE))
+    Line::from(Span::styled(THINKING_HIDDEN, HIGHLIGHT_STYLE))
 }
 
 /// One dim `⎿` output row of a tool box.
 fn tool_row(text: &str) -> Line<'static> {
     Line::from(Span::styled(format!("  ⎿ {text}"), DIM_STYLE))
+}
+
+/// The `⎿` gutter row counting a collapsed middle, with the count and the
+/// expand hint highlighted.
+fn tool_hint_row(hidden: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ⎿ ", DIM_STYLE),
+        Span::styled(format!("… +{hidden} lines (ctrl+o to expand)"), HIGHLIGHT_STYLE),
+    ])
 }
 
 /// A status header and then the output rendered for a running tool call
@@ -45,10 +54,18 @@ fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
         _ => TOOL_ERR,
     };
 
+    // A Bash box's digest is the command it runs — the one argument worth
+    // reading at a glance — so it renders as plain text rather than dim;
+    // other digests stay quiet.
+    let digest = if tool.name == "Bash" {
+        Span::raw(format!("({})", tool.digest))
+    } else {
+        Span::styled(format!("({})", tool.digest), DIM_STYLE)
+    };
     let mut header = vec![
         Span::styled("● ", status),
         Span::styled(tool.name, status),
-        Span::styled(format!("({})", tool.digest), DIM_STYLE),
+        digest,
     ];
 
     let Some(output) = &tool.output else {
@@ -77,9 +94,7 @@ fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
                 .iter()
                 .copied()
                 .map(tool_row)
-                .chain(std::iter::once(tool_row(&format!(
-                    "… +{hidden} lines (ctrl+o to expand)"
-                ))))
+                .chain(std::iter::once(tool_hint_row(hidden)))
                 .chain(lines[lines.len() - TOOL_TAIL..].iter().copied().map(tool_row))
                 .collect()
         }
