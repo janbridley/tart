@@ -29,9 +29,10 @@
 //! deny-by-default beyond the filesystem grants:
 //!
 //! - Network access is denied (the base profile is `(deny default)`).
-//! - The child environment is cleared except for a minimal `PATH` and the granted temp
-//!   directory, so secrets held by the caller cannot be printed into captured output.
-//!   Re-add variables with the usual `std` methods.
+//! - The child environment is cleared except for a minimal `PATH` (the system
+//!   directories, plus the rustup shims in `~/.cargo/bin` when present) and the granted
+//!   temp directory, so secrets held by the caller cannot be printed into captured
+//!   output. Re-add variables with the usual `std` methods.
 //! - Standard input is [`Stdio::null`](std::process::Stdio::null) by default, and the
 //!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices.
 //! - Binaries outside the platform read baseline (for example `/opt/homebrew/bin`)
@@ -49,6 +50,22 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// The only variables the child environment is seeded with after clearing.
 const SANDBOXED_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The `PATH` seeded into the sandboxed child.
+///
+/// Includes the system baseline, plus rustup shims in `~/.cargo/bin` when that
+/// directory exists so agents can run `cargo`.
+fn sandboxed_path() -> OsString {
+    let mut path = OsString::from(SANDBOXED_PATH);
+    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        let cargo_bin = Path::new(&home).join(".cargo/bin");
+        if cargo_bin.is_dir() {
+            path.push(":");
+            path.push(cargo_bin.as_os_str());
+        }
+    }
+    path
+}
 
 // Vendored from openai/codex `codex-rs/sandboxing/src` at commit
 // be6e8eac029b183056b7e4402879f15d2c85f61b (v0.147.0), Apache-2.0
@@ -234,7 +251,7 @@ impl Policy {
     /// A [`Command`] for `program` that runs under this policy:
     /// `sandbox-exec -p <render()> -DNAME=value ... -- <program>`.
     ///
-    /// The command starts from a cleared environment (a minimal `PATH`, plus `TMPDIR`)
+    /// The command starts from a cleared environment (a minimal `PATH`, plus `TMPDIR`
     /// for the granted temp directory) and null standard input. The command and all of
     /// its children inherit the sandbox.
     ///
@@ -261,7 +278,7 @@ impl Policy {
         cmd.arg("--").arg(program.as_ref());
 
         // Clear the environment
-        cmd.env_clear().env("PATH", SANDBOXED_PATH).stdin(Stdio::null());
+        cmd.env_clear().env("PATH", sandboxed_path()).stdin(Stdio::null());
         if let Some(temp) = &self.temp {
             cmd.env("TMPDIR", temp);
         }
@@ -520,6 +537,19 @@ mod tests {
         ));
     }
 
+    /// Extras also grant the user-local interpreter and toolchain trees, so
+    /// `.venv/bin/python` (a symlink into uv's `CPython` install) and the rustup
+    /// `cargo` shim execute under every policy.
+    #[test]
+    fn render_includes_user_toolchain_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered = Policy::new(dir.path()).unwrap().render();
+
+        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.local/share/uv/""#));
+        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo/(bin|registry|git)/""#));
+        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.rustup/""#));
+    }
+
     /// Empty, absolute, escaping, and root-identical exclusions are rejected.
     #[test]
     fn bad_exclusions_are_rejected() {
@@ -686,9 +716,26 @@ mod tests {
             .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect();
         assert_eq!(vars.len(), 1 + usize::from(policy.temp.is_some()));
-        assert!(vars.contains(&(OsStr::new("PATH"), OsStr::new(SANDBOXED_PATH))));
+        assert!(vars.contains(&(OsStr::new("PATH"), sandboxed_path().as_os_str())));
         if let Some(temp) = &policy.temp {
             assert!(vars.contains(&(OsStr::new("TMPDIR"), temp.as_os_str())));
+        }
+    }
+
+    /// The seeded `PATH` is the system baseline, plus the rustup shims only when
+    /// `~/.cargo/bin` exists.
+    #[test]
+    fn sandboxed_path_appends_cargo_bin_only_when_present() {
+        let path = sandboxed_path();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let cargo_bin = home.join(".cargo/bin");
+        if cargo_bin.is_dir() {
+            assert_eq!(
+                path,
+                OsString::from(format!("{SANDBOXED_PATH}:{}", cargo_bin.display()))
+            );
+        } else {
+            assert_eq!(path, OsString::from(SANDBOXED_PATH));
         }
     }
 
