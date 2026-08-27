@@ -77,7 +77,7 @@ pub(crate) fn segments(lines: &[Line<'static>]) -> Vec<Vec<(String, Style)>> {
 ///
 /// - `B` bold · `I` italic · `S` crossed-out
 /// - `c` yellow fg (inline code) · `d` dark-gray fg (dim)
-/// - `b` blue fg · `C` cyan fg
+/// - `b` blue fg · `C` cyan fg · `m` magenta fg (the `!` mode's frame)
 /// - `.` anything else
 pub(crate) fn draw_styles(render: impl FnMut(&mut Frame, Rect), (w, h): (u16, u16)) -> String {
     let terminal = frames(render, (w, h));
@@ -100,6 +100,7 @@ pub(crate) fn draw_styles(render: impl FnMut(&mut Frame, Rect), (w, h): (u16, u1
                             Color::DarkGray => 'd',
                             Color::Blue => 'b',
                             Color::Cyan => 'C',
+                            Color::Magenta => 'm',
                             _ => '.',
                         }
                     }
