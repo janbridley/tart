@@ -14,7 +14,8 @@ Sandboxing is *always* enabled for tart, and there is no way for the model to re
 outside access or edit files outside the sandbox. As a result, all bash commands and
 filesystem tools run without approval. In practice, this means that the model is given
 unrestricted access to both the working directory, `/tmp`, and `$TMPDIR`, so plan
-accordingly.
+accordingly. Web tools are an exception to this, as they are permitted web access but
+are unable to read or write to disk.
 
 We choose `sandbox-exec` as a lightweight sandbox option, as it effectively balances
 safety with memory usage and complexity. While running the agent in a container seems
@@ -26,16 +27,26 @@ tools if your working directory contains data that is not stored elsewhere!*
 
 ### Tools
 
-*tart* provides three basic tools: `Read`, `Edit`, and `Bash`, each of which is
-implemented as a sandboxed shell command run through the sandbox. `Read` is the
-simplest, with `cat -n … | sed -n …` providing line-numbered output with the ability to
-extract a subset of lines in the file. `Bash` provides a standardized tool calling
-interface with the ability to execute command-line tools within the sandbox. `Edit` is
-the most complex, as agents require the ability to find-and-replace *only when a unique
-match is found*. This is implemented in `tart-agents/src/data/edit.pl`, which provides a
-custom stream editor similar to sed's regex escape mode. Both the `Read` and `Edit`
-tools operate under the sandbox and are thread-safe (meaning parallel agents cannot read
-or create partial modifications).
+*tart* provides five tools: `Read`, `Edit`, `Bash`, `Search`, and `Fetch`. The first
+three of which are implemented as sandboxed shell commands run through the sandbox.
+`Read` is the simplest, with `cat -n … | sed -n …` providing line-numbered output with
+the ability to extract a subset of lines in the file. `Bash` provides a standardized
+tool calling interface with the ability to execute command-line tools within the
+sandbox. `Edit` is the most complex, as agents require the ability to find-and-replace
+*only when a unique match is found*. This is implemented in
+`tart-agents/src/data/edit.pl`, which provides a custom stream editor similar to sed's
+regex escape mode. Both the `Read` and `Edit` tools operate under the sandbox and are
+thread-safe (meaning parallel agents cannot read or create partial modifications).
+
+The web pair lives in `tart-agents/src/tools/web.rs` and runs outside the sandbox (see
+above). `Search` shells out to the locally installed
+[ddgs](https://github.com/deedy5/ddgs) CLI and returns a numbered list of title, url,
+and snippet. `Fetch` reads one URL through the [r.jina.ai](https://r.jina.ai) reader
+service, which returns the page as markdown, or directly with `raw=true` for JSON and
+plain-text endpoints. Results are refused for non-public hosts. Each is offered to the
+model only when its binary is installed. `TART_SEARCH_BIN` and `TART_FETCH_BIN` override
+the binary lookups, and `TART_JINA_KEY` adds a bearer token if your reader account needs
+one.
 
 ## Package Structure
 
