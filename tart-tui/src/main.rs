@@ -36,7 +36,8 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Pane, PaneEvent};
 use perf::Perf;
 use tart_agents::{
-    Agent, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript, sandbox::Policy,
+    Agent, CancelToken, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript,
+    manual_command, sandbox::Policy,
 };
 use tmux_override::{override_shift_up, restore_tmux};
 
@@ -105,6 +106,8 @@ enum Wake {
     Input(Event),
     /// Progress from the background generation.
     Generation(Progress),
+    /// A finished manual command's framed output.
+    Command(String),
 }
 
 /// Parse a `/effort` argument.
@@ -118,6 +121,19 @@ fn effort_of(name: &str) -> Option<ReasoningEffort> {
         "xhigh" => Some(ReasoningEffort::Xhigh),
         _ => None,
     }
+}
+
+/// The user message recording one manual command and its framed output, so the
+/// model reads the run like pasted text rather than a tool result.
+///
+/// The fence is four backticks long, so a fence marker inside a command or its
+/// output cannot close it early.
+fn manual_message(command: &str, framed: &str) -> String {
+    format!(
+        "I ran this command myself, outside the sandbox:\n\n\
+         ````console\n$ {command}\n{}\n````",
+        framed.trim_end()
+    )
 }
 
 #[allow(
@@ -147,6 +163,8 @@ fn run(
     let mut perf_on = false;
     let mut perf = Perf::default();
     let control = agent.control();
+    // A manual command's cancel lever, held while one runs; Esc and quit set it.
+    let mut manual_cancel: Option<(CancelToken, std::thread::JoinHandle<()>)> = None;
     // State-mutation time since the last frame.
     let mut work = Duration::ZERO;
     while !quit {
@@ -161,10 +179,30 @@ fn run(
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
-                // Esc with nothing open aborts the running turn, keeping its partial.
-                Some(PaneEvent::Cancel) => control.cancel(),
+                // Esc with nothing open aborts whatever is in flight: the turn
+                // (a no-op when idle) and any manual command.
+                Some(PaneEvent::Cancel) => {
+                    control.cancel();
+                    if let Some((token, _)) = &manual_cancel {
+                        token.cancel();
+                    }
+                }
                 // Copy the selected text when we exit copy mode.
                 Some(PaneEvent::Copy(text)) => clipboard::copy(&text)?,
+                // Run the user's command unsandboxed on its own thread.
+                Some(PaneEvent::Command(command)) => {
+                    pane.manual_running(Some(command.clone()));
+                    let token = CancelToken::new();
+                    let runner = {
+                        let token = token.clone();
+                        let sender = wake.clone();
+                        std::thread::spawn(move || {
+                            let framed = manual_command(&command, &token);
+                            let _ = sender.send(Wake::Command(framed));
+                        })
+                    };
+                    manual_cancel = Some((token, runner));
+                }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     // Clear the display and the model's memory of the session
                     "/clear" => {
@@ -239,6 +277,14 @@ fn run(
             // timer just loops around and draws again.
             Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
+            // A manual command finished: echo it, then record the exchange as user msg
+            Ok(Wake::Command(framed)) => {
+                manual_cancel = None;
+                if let Some(command) = pane.manual_done(&framed) {
+                    transcript.push_user(manual_message(&command, &framed))?;
+                    session.record(&transcript)?;
+                }
+            }
             // Update the pane as progress arrives and time it into `work`.
             Ok(Wake::Generation(progress)) => {
                 let ping = Instant::now();
@@ -254,7 +300,7 @@ fn run(
                         }
                         // A cancelled turn keeps its streamed partial message + notify.
                         // (The pane already spilled any queued steering when
-                        // Esc landed — a cancel is a take-back.)
+                        // Esc landed. A cancel is a take-back.)
                         if matches!(progress, Progress::Cancelled) {
                             pane.note("⎋ cancelled");
                         } else if control.steering().is_some() {
@@ -284,5 +330,10 @@ fn run(
     // A quit mid-generation keeps the partial turn; in-flight requests (if
     // any) are reconstructed or repaired in the transcript.
     session.record(&transcript)?;
+    // A quit mid-manual-command kills it rather than orphaning the group.
+    if let Some((token, runner)) = manual_cancel {
+        token.cancel();
+        let _ = runner.join();
+    }
     Ok(())
 }
