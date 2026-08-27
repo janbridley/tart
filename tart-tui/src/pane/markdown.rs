@@ -4,7 +4,7 @@
 //! rendered, all others stay base text. Copy mode reads the rendered rows so that a
 //! copied answer carries the styled form, markers stripped.
 
-use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -16,6 +16,8 @@ const HEADING1: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD
 const HEADING2: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 /// H3–H6: bold with default color
 const HEADING: Style = Style::new().add_modifier(Modifier::BOLD);
+/// Heading styles by level, H1 first.
+const HEADING_STYLES: [Style; 6] = [HEADING1, HEADING2, HEADING, HEADING, HEADING, HEADING];
 /// Inline `` `code` ``: set apart by color rather than markers.
 const INLINE_CODE: Style = Style::new().fg(Color::Yellow);
 /// Blockquote rails, code-block content, and other quiet chrome.
@@ -43,35 +45,20 @@ fn options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
 }
 
-/// The event walk's state: the rows built so far and the inline context.
+/// The event walk's state: the rows out, the inline row and line context
+/// under construction, and the buffered blocks.
 #[derive(Default)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "each bool is one mode bit of the walk"
-)]
 struct Blocks {
     /// The rendered rows.
     out: Vec<Line<'static>>,
-    /// The current block's first-line prefix.
-    marker: Vec<Span<'static>>,
-    /// The continuation prefix the block's later lines take.
-    cont: Vec<Span<'static>>,
-    /// Whether the next flushed line is the block's first and therefore takes a marker.
-    fresh: bool,
+    /// The inline row under construction; breaks and block ends flush it.
+    inline: Inline,
+    /// The context around the current block's lines.
+    prefix: Prefix,
     /// Whether a blank row separates the next rendered row from the block above
     pending_gap: bool,
     /// Whether the last rendered row was html and should be appended to.
     in_html: bool,
-    /// The inline row under construction; breaks and block ends flush it.
-    spans: Vec<Span<'static>>,
-    /// Whether the next inline text trims its leading whitespace.
-    trim: bool,
-    /// The style of inline text; emphasis and links scope patches onto it.
-    style: Style,
-    /// The inline scopes opened and not yet closed, outermost first.
-    scopes: Vec<Scope>,
-    /// The style stamped on a whole flushed line.
-    block_style: Option<Style>,
     /// The open lists, outermost first.
     lists: Vec<List>,
     /// Blockquote nesting depth.
@@ -82,12 +69,110 @@ struct Blocks {
     table: Option<Table>,
 }
 
-/// One open inline scope (emphasis or a link) restoring the outer style when it closes.
+/// One open inline scope (emphasis, strikethrough, a link, an image): its
+/// style patch applies until the scope closes. Patches must stay add-only;
+/// popping is restoring only because they never subtract.
 struct Scope {
-    /// The style to restore at this scope's end.
-    style: Style,
+    /// The patch this scope applies over the scopes around it.
+    patch: Style,
     /// A link's destination and the label text captured so far.
     link: Option<(String, String)>,
+}
+
+/// The inline row under construction: its spans, the scopes styling them,
+/// and whether the next text trims its leading whitespace.
+#[derive(Default)]
+struct Inline {
+    /// The row's spans so far.
+    spans: Vec<Span<'static>>,
+    /// The scopes opened and not yet closed, outermost first.
+    scopes: Vec<Scope>,
+    /// Whether the next text trims its leading whitespace (a continuation
+    /// line's indent is insignificant).
+    trim: bool,
+}
+
+impl Inline {
+    /// The current style: the base patched by every open scope.
+    fn style(&self) -> Style {
+        self.scopes
+            .iter()
+            .fold(Style::new(), |style, scope| style.patch(scope.patch))
+    }
+
+    /// Open a scope whose patch applies until it closes.
+    fn open(&mut self, patch: Style) {
+        self.scopes.push(Scope { patch, link: None });
+    }
+
+    /// Append styled text, gluing onto the last span when the style matches.
+    fn push(&mut self, text: &str, style: Style) {
+        let text = if self.trim { text.trim_start() } else { text };
+        if text.is_empty() {
+            return;
+        }
+        self.trim = false;
+        if self.spans.last().is_some_and(|last| last.style == style) {
+            if let Some(last) = self.spans.last_mut() {
+                last.content.to_mut().push_str(text);
+            }
+        } else {
+            self.spans.push(Span::styled(text.to_owned(), style));
+        }
+        if let Some((_, label)) = self.scopes.iter_mut().rev().find_map(|scope| scope.link.as_mut())
+        {
+            label.push_str(text);
+        }
+    }
+
+    /// Take the row's spans, dropping the source's invisible trailing whitespace.
+    fn take(&mut self) -> Vec<Span<'static>> {
+        if let Some(last) = self.spans.last_mut() {
+            let owned = last.content.to_mut();
+            let len = owned.trim_end().len();
+            owned.truncate(len);
+        }
+        std::mem::take(&mut self.spans)
+    }
+
+    /// Whether any text is pending.
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+}
+
+/// The context around one block's lines: the spans its first and later
+/// lines carry before their text, and the style stamped on the line.
+#[derive(Default)]
+struct Prefix {
+    /// Spans before the block's first line (a bullet, a rail).
+    first: Vec<Span<'static>>,
+    /// Spans before each later line (indents, a rail).
+    rest: Vec<Span<'static>>,
+    /// The style stamped on every line of the block.
+    style: Style,
+    /// Whether the next line is the block's first.
+    fresh: bool,
+}
+
+impl Prefix {
+    /// Build the block's next line: its first or rest prefix, then the
+    /// spans, stamped with the block's style.
+    fn line(&mut self, mut spans: Vec<Span<'static>>) -> Line<'static> {
+        let lead = if self.fresh {
+            std::mem::take(&mut self.first)
+        } else {
+            self.rest.clone()
+        };
+        self.fresh = false;
+        let mut line = Line::from(lead);
+        line.spans.append(&mut spans);
+        if line.spans.is_empty() {
+            line.spans.push(Span::raw(""));
+        }
+        line.style = self.style;
+        line
+    }
 }
 
 /// One open list's numbering and indents.
@@ -96,8 +181,8 @@ struct List {
     ordered: Option<u64>,
     /// The number the next item renders.
     next: u64,
-    /// The continuation indent of the item now open at this level: the
-    /// level's indent plus its bullet's width in cells.
+    /// This level's own bullet width in cells; the open levels' `cont`s sum
+    /// to the absolute indent.
     cont: String,
 }
 
@@ -123,19 +208,21 @@ impl Blocks {
                 if let Some(code) = &mut self.code {
                     code.push_str(&text);
                 } else {
-                    self.push_inline(&text, self.style);
+                    let style = self.inline.style();
+                    self.inline.push(&text, style);
                 }
             }
             Event::Code(text) => {
                 // Inline code renders verbatim: a break's trim never eats
                 // its leading space.
-                self.trim = false;
-                self.push_inline(&text, self.style.patch(INLINE_CODE));
+                self.inline.trim = false;
+                let style = self.inline.style().patch(INLINE_CODE);
+                self.inline.push(&text, style);
             }
             Event::SoftBreak | Event::HardBreak => self.line_break(),
             Event::Rule => {
                 self.gap();
-                let mut spans = self.prefix();
+                let mut spans = self.indents();
                 spans.push(Span::styled("─".repeat(HR_WIDTH), QUIET));
                 self.push_row(Line::from(spans));
             }
@@ -150,7 +237,10 @@ impl Blocks {
                 self.quiet_rows(&html);
                 self.in_html = true;
             }
-            Event::InlineHtml(html) => self.push_inline(&html, self.style),
+            Event::InlineHtml(html) => {
+                let style = self.inline.style();
+                self.inline.push(&html, style);
+            }
             // Task lists, footnotes, and math don't render specially.
             _ => {}
         }
@@ -161,11 +251,7 @@ impl Blocks {
         match tag {
             Tag::Paragraph => self.open_block(None),
             Tag::Heading { level, .. } => {
-                self.open_block(Some(match level {
-                    HeadingLevel::H1 => HEADING1,
-                    HeadingLevel::H2 => HEADING2,
-                    _ => HEADING,
-                }));
+                self.open_block(Some(HEADING_STYLES[level as usize - 1]));
             }
             Tag::BlockQuote(_) => self.quote += 1,
             // The fenced language tag stays unused for now. TODO: support syntax!
@@ -184,29 +270,33 @@ impl Blocks {
             }
             Tag::Item => {
                 // A nested list opening inside this item flushes the item's own text
-                if !self.spans.is_empty() {
+                if !self.inline.is_empty() {
                     self.flush_line();
                 }
                 let bullet = match self.lists.last() {
                     Some(list) if list.ordered.is_some() => format!("{}. ", list.next),
                     _ => BULLET.to_owned(),
                 };
-                // Every outer level's indent with no part of its own bullet
+                // Each level stores only its own bullet's width in cells, so
+                // the levels sum to the true indent.
+                let pad = " ".repeat(bullet.chars().count());
                 let column = self.lists[..self.lists.len() - 1]
                     .iter()
                     .map(|list| list.cont.as_str())
                     .collect::<String>();
-                // Align line continuations by cell count
-                let cont = format!("{column}{}", " ".repeat(bullet.chars().count()));
                 if let Some(list) = self.lists.last_mut() {
                     list.next = list.next.wrapping_add(1);
-                    list.cont = cont;
+                    list.cont.clone_from(&pad);
                 }
-                let mut marker = self.rail();
-                marker.push(Span::raw(format!("{column}{bullet}")));
-                self.marker = marker;
-                self.cont = self.prefix();
-                self.fresh = true;
+                let style = if self.quote > 0 { QUIET } else { Style::new() };
+                let mut first = self.rail();
+                first.push(Span::raw(format!("{column}{bullet}")));
+                let mut rest = self.rail();
+                let indent = format!("{column}{pad}");
+                if !indent.is_empty() {
+                    rest.push(Span::raw(indent));
+                }
+                self.prefix = Prefix { first, rest, style, fresh: true };
             }
             Tag::Table(aligns) => {
                 self.gap();
@@ -217,22 +307,25 @@ impl Blocks {
                     aligns,
                 });
             }
-            Tag::Strong => self.scope(|style| style.add_modifier(Modifier::BOLD)),
-            Tag::Emphasis => self.scope(|style| style.add_modifier(Modifier::ITALIC)),
-            Tag::Strikethrough => self.scope(|style| style.add_modifier(Modifier::CROSSED_OUT)),
+            Tag::Strong => self.inline.open(Style::new().add_modifier(Modifier::BOLD)),
+            Tag::Emphasis => self.inline.open(Style::new().add_modifier(Modifier::ITALIC)),
+            Tag::Strikethrough => {
+                self.inline.open(Style::new().add_modifier(Modifier::CROSSED_OUT));
+            }
             Tag::Link { dest_url, .. } => {
-                self.scope(|style| style.patch(LINK));
-                if let Some(scope) = self.scopes.last_mut() {
+                self.inline.open(LINK);
+                if let Some(scope) = self.inline.scopes.last_mut() {
                     scope.link = Some((dest_url.to_string(), String::new()));
                 }
             }
             // An image renders its alt text as the label in brackets.
             Tag::Image { dest_url, .. } => {
-                self.scope(|style| style.patch(LINK));
-                if let Some(scope) = self.scopes.last_mut() {
+                self.inline.open(LINK);
+                if let Some(scope) = self.inline.scopes.last_mut() {
                     scope.link = Some((dest_url.to_string(), String::new()));
                 }
-                self.push_inline("[", self.style);
+                let style = self.inline.style();
+                self.inline.push("[", style);
             }
             // The table machinery drives on the cell ends; rows buffer here.
             // An unknown tag changing nothing stays safest.
@@ -240,30 +333,41 @@ impl Blocks {
         }
     }
 
-    /// Open a paragraph or heading, separate from the block above.
+    /// Open a paragraph or heading: separate it from the block above, take
+    /// the line context, and stamp the block's style.
     fn open_block(&mut self, style: Option<Style>) {
         self.gap();
-        self.block_style = style;
+        let style = match style {
+            Some(style) => style,
+            None if self.quote > 0 => QUIET,
+            None => Style::new(),
+        };
         if self.lists.is_empty() {
             let rail = self.rail();
-            self.marker = rail.clone();
-            self.cont = rail;
-        } else if !self.fresh {
-            let prefix = self.prefix();
-            self.marker = prefix.clone();
-            self.cont = prefix;
+            self.prefix = Prefix {
+                first: rail.clone(),
+                rest: rail,
+                style,
+                fresh: true,
+            };
+        } else if self.prefix.fresh {
+            // The item's opening block keeps its bullet context.
+            self.prefix.style = style;
+        } else {
+            let cont = self.indents();
+            self.prefix = Prefix {
+                first: cont.clone(),
+                rest: cont,
+                style,
+                fresh: true,
+            };
         }
-        self.fresh = true;
     }
 
     /// Close a block or inline scope.
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Item => self.end_block(),
-            TagEnd::Heading(_) => {
-                self.end_block();
-                self.block_style = None;
-            }
+            TagEnd::Paragraph | TagEnd::Item | TagEnd::Heading(_) => self.end_block(),
             TagEnd::BlockQuote(_) => self.quote = self.quote.saturating_sub(1),
             TagEnd::CodeBlock => {
                 let Some(code) = self.code.take() else {
@@ -290,52 +394,40 @@ impl Blocks {
                 }
             }
             TagEnd::TableCell => {
-                let cell = std::mem::take(&mut self.spans);
+                let cell = std::mem::take(&mut self.inline.spans);
                 if let Some(table) = &mut self.table {
                     table.row.push(cell);
                 }
             }
             TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough => {
-                if let Some(scope) = self.scopes.pop() {
-                    self.style = scope.style;
-                }
+                self.inline.scopes.pop();
             }
             TagEnd::Link => {
-                if let Some(scope) = self.scopes.pop() {
-                    self.style = scope.style;
+                if let Some(scope) = self.inline.scopes.pop()
                     // The destination rides along dimly unless the label finishes
-                    if let Some((dest, label)) = scope.link
-                        && !dest.is_empty()
-                        && dest != label
-                    {
-                        self.trim = false;
-                        self.push_inline(format!(" ({dest})"), QUIET);
-                    }
+                    && let Some((dest, label)) = scope.link
+                    && !dest.is_empty()
+                    && dest != label
+                {
+                    self.inline.trim = false;
+                    self.inline.push(&format!(" ({dest})"), QUIET);
                 }
             }
             TagEnd::Image => {
                 // Close the bracket while the label style still applies.
-                self.push_inline("]", self.style);
-                if let Some(scope) = self.scopes.pop() {
-                    self.style = scope.style;
-                    if let Some((dest, _)) = scope.link
-                        && !dest.is_empty()
-                    {
-                        self.trim = false;
-                        self.push_inline(format!(" ({dest})"), QUIET);
-                    }
+                let style = self.inline.style();
+                self.inline.push("]", style);
+                if let Some(scope) = self.inline.scopes.pop()
+                    && let Some((dest, _)) = scope.link
+                    && !dest.is_empty()
+                {
+                    self.inline.trim = false;
+                    self.inline.push(&format!(" ({dest})"), QUIET);
                 }
             }
             // An unknown end changing nothing stays safest.
             _ => {}
         }
-    }
-
-    /// Open an inline scope restoring the current style at its end.
-    fn scope(&mut self, patch: impl Fn(Style) -> Style) {
-        let style = self.style;
-        self.scopes.push(Scope { style, link: None });
-        self.style = patch(style);
     }
 
     /// The blockquote rail for the current depth, on every line of a quote.
@@ -347,8 +439,12 @@ impl Blocks {
         }
     }
 
-    /// The prefix rail + indent every row of the current context carries.
-    fn prefix(&self) -> Vec<Span<'static>> {
+    /// The rail plus every open list level's indent.
+    ///
+    /// Buffered rows (code, tables, rules, html) take this because a container's
+    /// first block opens no paragraph, so `Prefix` may still be default.
+    /// Block text instead uses the `Prefix` frozen at its block's open.
+    fn indents(&self) -> Vec<Span<'static>> {
         let mut spans = self.rail();
         let indent = self
             .lists
@@ -364,75 +460,33 @@ impl Blocks {
     /// Push each line of `text` as a quiet row, carrying the context prefix.
     fn quiet_rows(&mut self, text: &str) {
         for line in text.lines() {
-            let mut spans = self.prefix();
+            let mut spans = self.indents();
             spans.push(Span::styled(line.to_owned(), QUIET));
             self.push_row(Line::from(spans));
         }
     }
 
-    /// Append styled inline text, gluing onto the last span when the style
-    /// matches, and capturing it into the nearest open link's label.
-    fn push_inline(&mut self, text: impl AsRef<str>, style: Style) {
-        let text = if self.trim { text.as_ref().trim_start() } else { text.as_ref() };
-        if text.is_empty() {
-            return;
-        }
-        self.trim = false;
-        if self.spans.last().is_some_and(|last| last.style == style) {
-            if let Some(last) = self.spans.last_mut() {
-                last.content.to_mut().push_str(text);
-            }
-        } else {
-            self.spans.push(Span::styled(text.to_owned(), style));
-        }
-        if let Some((_, label)) = self.scopes.iter_mut().rev().find_map(|scope| scope.link.as_mut())
-        {
-            label.push_str(text);
-        }
-    }
-
-    /// A soft or hard break: the block continues on the next line, whose
-    /// leading indent is insignificant.
+    /// A block continues after a break, so indent doesn't matter
     fn line_break(&mut self) {
         if self.table.is_some() {
             // Cell text wraps at the cell, not the row; join with a space.
-            self.push_inline(" ", self.style);
+            let style = self.inline.style();
+            self.inline.push(" ", style);
         } else {
-            self.trim = true;
+            self.inline.trim = true;
             self.flush_line();
         }
     }
 
     /// Flush the inline row as a line.
     fn flush_line(&mut self) {
-        let prefix = if self.fresh {
-            std::mem::take(&mut self.marker)
-        } else {
-            self.cont.clone()
-        };
-        self.fresh = false;
-        // Trailing whitespace from the source is invisible; drop it.
-        if let Some(last) = self.spans.last_mut() {
-            let owned = last.content.to_mut();
-            let len = owned.trim_end().len();
-            owned.truncate(len);
-        }
-        let mut line = Line::from(prefix);
-        line.spans.append(&mut self.spans);
-        if line.spans.is_empty() {
-            line.spans.push(Span::raw(""));
-        }
-        line.style = match (self.block_style, self.quote > 0) {
-            (Some(style), _) => style,
-            (None, true) => QUIET,
-            (None, false) => Style::new(),
-        };
+        let line = self.prefix.line(self.inline.take());
         self.push_row(line);
     }
 
     /// Flush a block's last line when text is pending.
     fn end_block(&mut self) {
-        if !self.spans.is_empty() || self.fresh {
+        if !self.inline.is_empty() || self.prefix.fresh {
             self.flush_line();
         }
     }
@@ -494,17 +548,17 @@ impl Blocks {
             }
             rule.push(Span::styled("─".repeat(*w), QUIET));
         }
-        let prefix = self.prefix();
-        self.push_row(row_line(prefix.clone(), cells(&head), true));
-        self.push_row(row_line(prefix.clone(), vec![rule], false));
+        let surround = self.indents();
+        self.push_row(row_line(surround.clone(), cells(&head), true));
+        self.push_row(row_line(surround.clone(), vec![rule], false));
         for row in &rows {
-            self.push_row(row_line(prefix.clone(), cells(row), false));
+            self.push_row(row_line(surround.clone(), cells(row), false));
         }
     }
 
     /// Close the walk and render stragglers.
     fn finish(mut self) -> Vec<Line<'static>> {
-        if !self.spans.is_empty() {
+        if !self.inline.is_empty() {
             self.flush_line();
         }
         self.flush_table();
@@ -679,6 +733,13 @@ mod tests {
             rows("- a long item\n  wrapped here"),
             ["• a long item", "  wrapped here"]
         );
+    }
+
+    /// Each nesting level indents by its own bullet's width alone.
+    #[test]
+    fn nested_lists_indent_by_level() {
+        assert_eq!(rows("- a\n  - b\n    - c"), ["• a", "  • b", "    • c"]);
+        assert_eq!(rows("- a\n  - b\n    wrapped"), ["• a", "  • b", "    wrapped"]);
     }
 
     #[test]
