@@ -29,8 +29,115 @@ pub struct Agent {
     max_rounds: usize,
     /// The seatbelt policy every bash tool call runs under.
     policy: Policy,
-    /// The running turn's cancel sender, where Esc can reach it.
-    cancel: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    /// The front end's lever on the running turn (cancel + steer).
+    control: TurnControl,
+}
+
+/// The front end's control plane for running turns.
+#[derive(Clone, Default)]
+pub struct TurnControl {
+    state: Arc<Mutex<TurnState>>,
+}
+
+/// The turn control state, under one lock.
+#[derive(Default)]
+struct TurnState {
+    /// Which turn owns the lever; a finishing worker retires only its own.
+    generation: u64,
+    /// The running turn's wake sender, where pokes reach it.
+    sender: Option<mpsc::Sender<()>>,
+    /// Esc was pressed and we should attempt to cancel.
+    cancelled: bool,
+    /// The steering message waiting to interrupt the turn, if any.
+    steer: Option<String>,
+}
+
+impl TurnControl {
+    /// The state under its lock.
+    fn state(&self) -> MutexGuard<'_, TurnState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Cancel the turn by dropping the stream, keeping any partial answer.
+    ///
+    /// NOTE: this must wait until tool calls complete, and the provider will likely
+    /// take the cancelled turn to completion.
+    #[inline]
+    pub fn cancel(&self) {
+        let mut state = self.state();
+        state.cancelled = true;
+        if let Some(sender) = &mut state.sender {
+            // A failed poke means one is already pending; the flag decides.
+            let _ = sender.try_send(());
+        }
+    }
+
+    /// Queue `text` to interrupt and redirect the turn.
+    ///
+    /// One message waits at a time: `false` when one already does, so the
+    /// caller keeps its draft (Option+Up edits the queued message instead).
+    #[must_use = "the caller keeps its draft when the slot is taken"]
+    #[inline]
+    pub fn steer(&self, text: String) -> bool {
+        let mut state = self.state();
+        if state.steer.is_some() {
+            return false;
+        }
+        state.steer = Some(text);
+        if let Some(sender) = &mut state.sender {
+            let _ = sender.try_send(());
+        }
+        true
+    }
+
+    /// A copy of the waiting steering message, if any.
+    #[inline]
+    pub fn steering(&self) -> Option<String> {
+        self.state().steer.clone()
+    }
+
+    /// Take the waiting steering message, if any.
+    #[inline]
+    pub fn take_steer(&self) -> Option<String> {
+        self.state().steer.take()
+    }
+
+    /// Install `sender` as the next turn's lever, forgetting the last turn's
+    /// intents, and report the turn's id.
+    fn claim(&self, sender: mpsc::Sender<()>) -> u64 {
+        let mut state = self.state();
+        state.generation += 1;
+        state.cancelled = false;
+        state.steer = None;
+        state.sender = Some(sender);
+        state.generation
+    }
+
+    /// Retire the lever, unless a newer turn already claimed it. A steering
+    /// message survives: the front end reads it when the terminal event lands.
+    fn release(&self, generation: u64) {
+        let mut state = self.state();
+        if state.generation == generation {
+            state.sender = None;
+            state.cancelled = false;
+        }
+    }
+
+    /// Whether the front end cancelled the turn: pokes only wake a parked wait
+    fn cancelled(&self, cancel_rx: &mut mpsc::Receiver<()>) -> bool {
+        while cancel_rx.try_recv().is_ok() {}
+        self.state().cancelled
+    }
+
+    /// The cancel flag, without draining pokes — the select already woke.
+    fn is_cancelled(&self) -> bool {
+        self.state().cancelled
+    }
+
+    /// Whether a steering message waits.
+    fn has_steer(&self) -> bool {
+        self.state().steer.is_some()
+    }
 }
 
 impl Agent {
@@ -54,24 +161,27 @@ impl Agent {
             effort: None,
             max_rounds: MAX_TOOL_ROUNDS,
             policy,
-            cancel: Arc::new(Mutex::new(None)),
+            control: TurnControl::default(),
         }
     }
 
-    /// The cancel sender under its lock.
-    fn cancel_slot(&self) -> MutexGuard<'_, Option<mpsc::Sender<()>>> {
-        self.cancel.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Cancel the turn by dropping the stream.
-    ///
-    /// NOTE: this must wait until tool calls complete, and the provider will likely
-    /// take the cancelled turn to completion.
+    /// The front end's lever on the running turn, for the pane to hold.
     #[inline]
-    pub fn cancel(&self) {
-        if let Some(sender) = &mut *self.cancel_slot() {
-            let _ = sender.try_send(());
+    pub fn control(&self) -> TurnControl {
+        self.control.clone()
+    }
+
+    /// Record the queued steering message, reporting it so the front end can echo
+    fn record_steer<F: Fn(Progress)>(
+        &self,
+        transcript: &Transcript,
+        on_progress: &F,
+    ) -> anyhow::Result<()> {
+        if let Some(text) = self.control.take_steer() {
+            transcript.push_user(text.clone())?;
+            on_progress(Progress::Steered(text));
         }
+        Ok(())
     }
 
     /// Set how hard the model reasons before answering.
@@ -91,23 +201,24 @@ impl Agent {
     /// Run one generation on its own thread, reporting progress to `on_progress`.
     ///
     /// The worker records its turns (reasoning, tool exchanges, final answer) into the
-    /// shared transcript as it goes. Exactly one terminal event ([`Progress::Done`] or
-    /// [`Progress::Failed`]) is delivered, even if the worker panics.
+    /// shared transcript as it goes. Exactly one terminal event ([`Progress::Done`],
+    /// [`Progress::Failed`], or [`Progress::Cancelled`]) is delivered, even if the
+    /// worker panics.
     #[inline]
     pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
         let agent = self.clone();
         let transcript = transcript.clone();
-        // This turn's cancel channel: the sender waits where Esc can reach it, and the
-        // receiver races the stream inside the worker.
+        // This turn's wake channel: the sender waits where Esc can reach it, and
+        // the receiver races the stream inside the worker.
         let (esc_sender, receiver) = mpsc::channel(1);
-        *self.cancel_slot() = Some(esc_sender);
+        let generation = self.control.claim(esc_sender);
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 agent.run(&transcript, receiver, &on_progress);
             }));
-            // The turn is over: Esc can no longer cancel anything.
-            *agent.cancel_slot() = None;
+            // The turn is over: retire the lever unless a newer turn claimed it.
+            agent.control.release(generation);
             if outcome.is_err() {
                 terminate_and_log(
                     &on_progress,
@@ -129,7 +240,12 @@ impl Agent {
     /// [`Progress::Done`] with the final answer (`None` if nothing arrived), or
     /// [`Progress::Failed`] on a request error, an explicit error or incomplete event,
     /// or a truncated stream (one that ended mid tool call or delivered nothing),
-    /// or immediately when the front end cancels the turn.
+    /// or [`Progress::Cancelled`] when the front end cancels the turn. *Keeps*
+    /// *everything recorded so far, including a partial answer*.
+    ///
+    /// A steering message the front end queues mid-turn interrupts the stream
+    /// the same way, is recorded as the next user message, and the round
+    /// continues from it.
     ///
     /// A stream that closes without a terminal event still ends its round with whatever
     /// the model produced.
@@ -150,8 +266,12 @@ impl Agent {
         let mut cancelled = false;
         for _ in 0..self.max_rounds {
             // A cancelled generation stops before spending another request.
-            if cancelled || matches!(cancel_rx.try_recv(), Ok(())) {
-                return terminate_and_log(on_progress, Progress::Done { message: None });
+            if cancelled || self.control.cancelled(&mut cancel_rx) {
+                return terminate_and_log(on_progress, Progress::Cancelled);
+            }
+            // Steering left over from the last round rides on this request.
+            if let Err(error) = self.record_steer(transcript, on_progress) {
+                return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
@@ -193,13 +313,49 @@ impl Agent {
             // The last transport error, skipped so a trailing one cannot discard an
             // otherwise complete answer.
             let mut last_error: Option<String> = None;
+            // The stream was dropped mid-round for a steering message.
+            let mut aborted = false;
 
-            // Race the stream against Esc; a won cancel returns and drops the stream
+            // Race the stream against Esc and steering pokes; a won cancel
+            // returns and drops the stream, a won steer restarts the round
             loop {
                 let item = match block_on(Compat::new(select(stream.next(), cancel_rx.next()))) {
-                    // Esc won: returning drops the stream.
                     Either::Right(_) => {
-                        return terminate_and_log(on_progress, Progress::Done { message: None });
+                        if self.control.is_cancelled() {
+                            // Esc won: dropping the stream keeps what it streamed.
+                            if !answer.is_empty()
+                                && let Err(error) = transcript.push_assistant(answer.clone())
+                            {
+                                return terminate_and_log(
+                                    on_progress,
+                                    Progress::Failed(error.to_string()),
+                                );
+                            }
+                            return terminate_and_log(on_progress, Progress::Cancelled);
+                        }
+                        if !self.control.has_steer() {
+                            // A stale poke: nothing to do but keep streaming.
+                            continue;
+                        }
+                        // A steer won: record the partial, then the steered input,
+                        // and restart the round from it.
+                        if !answer.is_empty()
+                            && let Err(error) =
+                                transcript.push_assistant(std::mem::take(&mut answer))
+                        {
+                            return terminate_and_log(
+                                on_progress,
+                                Progress::Failed(error.to_string()),
+                            );
+                        }
+                        if let Err(error) = self.record_steer(transcript, on_progress) {
+                            return terminate_and_log(
+                                on_progress,
+                                Progress::Failed(error.to_string()),
+                            );
+                        }
+                        aborted = true;
+                        break;
                     }
                     Either::Left((item, _)) => item,
                 };
@@ -292,6 +448,11 @@ impl Agent {
                 }
             }
 
+            // The stream was dropped for a steer -> rebuild from truncated output
+            if aborted {
+                continue;
+            }
+
             if call_in_flight {
                 return terminate_and_log(
                     on_progress,
@@ -313,7 +474,6 @@ impl Agent {
             }
 
             // No calls pending: this round's answer is the turn's message.
-            // (A cancelled turn's recording is unwound by the front end)
             if calls.is_empty() {
                 if !answer.is_empty()
                     && let Err(error) = transcript.push_assistant(answer.clone())
@@ -333,11 +493,17 @@ impl Agent {
             // A call the harness cannot run ends the round, but is recorded with its
             // error so the round's earlier effects stay in the transcript.
             let mut failure: Option<String> = None;
+            // The tool loop broke early to consume a steering message.
+            let mut steered = false;
             for call in calls {
                 // A cancelled turn skips its remaining calls; the one in
                 // flight finishes first.
-                if cancelled || matches!(cancel_rx.try_recv(), Ok(())) {
+                if cancelled || self.control.cancelled(&mut cancel_rx) {
                     cancelled = true;
+                    break;
+                }
+                if self.control.has_steer() {
+                    steered = true;
                     break;
                 }
                 match tools::execute(&call, &self.policy, on_progress) {
@@ -349,7 +515,11 @@ impl Agent {
                     }
                 }
             }
-            if let Some(item) = reasoning {
+            // A round cut short before its first executed call records no
+            // reasoning: without its calls the item would dangle in the replay.
+            if !exchanges.is_empty()
+                && let Some(item) = reasoning
+            {
                 transcript.push_reasoning(item);
             }
             if !answer.is_empty()
@@ -358,6 +528,17 @@ impl Agent {
                 return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             transcript.push_tool_round(exchanges);
+            if cancelled {
+                // The turn stops here, keeping the rounds recorded so far.
+                return terminate_and_log(on_progress, Progress::Cancelled);
+            }
+            if steered {
+                // The steered input rides on the next round's request.
+                if let Err(error) = self.record_steer(transcript, on_progress) {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
+                continue;
+            }
             if let Some(reason) = failure {
                 return terminate_and_log(on_progress, Progress::Failed(reason));
             }
@@ -385,6 +566,7 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
             format!("done ({} answer chars)", message.as_deref().map_or(0, str::len))
         }
         Progress::Failed(reason) => format!("failed: {reason}"),
+        Progress::Cancelled => "cancelled".to_string(),
         _ => "not a terminal event".to_string(),
     });
     on_progress(event);
@@ -403,5 +585,39 @@ mod tests {
         // Reaching here means the client constructed without the provider panic.
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
         let _ = agent.model;
+    }
+
+    #[test]
+    fn turn_control_intents_are_generation_owned() {
+        let control = TurnControl::default();
+
+        // One message waits at a time: a second submission is refused.
+        assert!(control.steer("first".to_string()));
+        assert!(!control.steer("second".to_string()));
+        assert_eq!(control.steering(), Some("first".to_string()));
+        assert_eq!(control.take_steer(), Some("first".to_string()));
+
+        // Claiming resets both intents and installs the wake sender.
+        let (sender, mut rx) = mpsc::channel(1);
+        let first = control.claim(sender);
+        assert_eq!(control.steering(), None);
+        assert!(!control.cancelled(&mut rx));
+
+        // Cancel pokes the claimed sender; the drained flag decides.
+        control.cancel();
+        assert!(control.cancelled(&mut rx));
+
+        // A stale release must not retire the newer turn's lever.
+        let (sender, _) = mpsc::channel(1);
+        let second = control.claim(sender);
+        control.release(first);
+        control.cancel();
+        assert!(control.is_cancelled());
+
+        // Retiring the right turn clears its intents but not a later steer —
+        // the front end reads that when the terminal event lands.
+        control.release(second);
+        assert!(control.steer("survives".to_string()));
+        assert_eq!(control.take_steer(), Some("survives".to_string()));
     }
 }

@@ -14,7 +14,7 @@ pub use history::Transcript;
 pub use progress::Progress;
 pub use session::{SESSIONS_ROOT, Session};
 
-pub use agent::Agent;
+pub use agent::{Agent, TurnControl};
 
 /// Most model rounds one generation may take before giving up.
 pub const MAX_TOOL_ROUNDS: usize = 32;

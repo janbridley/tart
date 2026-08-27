@@ -16,7 +16,7 @@ pub enum Progress {
     ToolStart {
         /// The call's id, pairing the start with its eventual output.
         id: String,
-        /// The tool's display name — a closed set: `Bash`, `Read`, `Edit`.
+        /// The tool's display name: one of {`Bash`, `Read`, `Edit`}.
         name: &'static str,
         /// An argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
         digest: String,
@@ -45,4 +45,8 @@ pub enum Progress {
     },
     /// The request or stream failed.
     Failed(String),
+    /// The front end cancelled the turn and any partial answer that arrived is recorded
+    Cancelled,
+    /// A steering message the user submitted mid-turn.
+    Steered(String),
 }

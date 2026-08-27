@@ -66,18 +66,6 @@ impl Transcript {
         items.truncate(systems);
     }
 
-    /// Reset such that the last turn (everything since the user message) disappears.
-    #[inline]
-    pub fn drop_last_turn(&self) {
-        let mut items = self.items();
-        // TODO: can we somehow combine this and clear?
-        let at = items
-            .iter()
-            .rposition(|item| matches!(item, InputItem::EasyMessage(m) if m.role == Role::User))
-            .unwrap_or(0);
-        items.truncate(at);
-    }
-
     /// Record the user's turn.
     #[inline]
     pub fn push_user(&self, text: String) -> anyhow::Result<()> {
@@ -248,6 +236,22 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_user_messages_replay_in_order() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        transcript.push_assistant("partial".to_string()).unwrap();
+        transcript.push_user("actually, go faster".to_string()).unwrap();
+
+        // A steered round's user/partial/user shape replays as recorded.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"], "partial");
+        assert_eq!(items[3]["role"], "user");
+        assert_eq!(items[3]["content"], "actually, go faster");
+    }
+
+    #[test]
     fn tool_rounds_replay_calls_grouped_before_outputs() {
         let transcript = Transcript::new().unwrap();
         let mut second = bash_call();
@@ -317,30 +321,6 @@ mod tests {
         assert_eq!(items[1]["type"], "reasoning");
         assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
         assert_eq!(items[1]["content"][0]["text"], "thinking");
-    }
-
-    #[test]
-    fn drop_last_turn_restores_the_pre_turn_state() {
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("first".to_string()).unwrap();
-        transcript.push_assistant("kept".to_string()).unwrap();
-
-        // A second turn is unwound back to the end of the first
-        transcript.push_user("cancel me".to_string()).unwrap();
-        transcript.push_reasoning(reasoning_item());
-        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
-        transcript.push_assistant("partial".to_string()).unwrap();
-        transcript.drop_last_turn();
-
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-        assert_eq!(items.as_array().unwrap().len(), 3);
-        assert_eq!(items[1]["content"], "first");
-        assert_eq!(items[2]["content"], "kept");
-
-        // The conversation continues cleanly from the rewound state.
-        transcript.push_user("next".to_string()).unwrap();
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-        assert_eq!(items[3]["content"], "next");
     }
 
     #[test]

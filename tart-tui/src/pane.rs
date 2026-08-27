@@ -14,7 +14,8 @@ use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
 use std::path::PathBuf;
 use std::time::Instant;
-use tart_agents::Progress;
+use tart_agents::{Progress, TurnControl};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
 
@@ -97,14 +98,6 @@ struct Usage {
     output: u64,
 }
 
-/// The pane state before a submitted turn, restored if the turn is cancelled.
-struct TurnSnapshot {
-    /// Transcript entries before the turn's echo and stream.
-    entries: usize,
-    /// The draft before it was submitted.
-    draft: Editor,
-}
-
 /// The TUI interface.
 #[derive(Default)]
 pub struct Pane {
@@ -128,8 +121,8 @@ pub struct Pane {
     /// Enter keeps the draft while set, and the status rule's spinner runs
     /// off the elapsed time for a steady frame rate.
     spin: Option<Instant>,
-    /// The state before the submitted turn (in case we have to cancel a message).
-    turn: Option<TurnSnapshot>,
+    /// Control parameters for steering or interrupting the model.
+    control: TurnControl,
 }
 
 impl Pane {
@@ -247,6 +240,7 @@ impl Pane {
         }
         // All popups take arrow keys, Tab, & Enter before the events hit the main pane
         if self.popup.is_some()
+            && !key.modifiers.contains(KeyModifiers::ALT)
             && matches!(
                 key.code,
                 KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter
@@ -254,14 +248,35 @@ impl Pane {
         {
             return self.popup_key(key);
         }
+        // Option+Up moves the queued steering into the composer for editing.
+        // Enter re-queues the edited draft as a bew message.
+        if key.code == KeyCode::Up
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && self.control.steering().is_some()
+        {
+            self.spill_steer();
+            return None;
+        }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
-            // A draft cannot go out mid-generation; Enter keeps it for later.
-            KeyCode::Enter if self.spin.is_some() => {}
+            // A draft mid-generation must steer the running turn, but slash commands
+            // still ahve to wait. Only one message can be queued at once
+            KeyCode::Enter if self.spin.is_some() => {
+                let text = self.prompt.text();
+                if !text.trim().is_empty() && !text.trim().starts_with('/') {
+                    if self.control.steer(text) {
+                        self.prompt.clear();
+                    } else {
+                        self.note("message queued: Option+Up to edit");
+                    }
+                }
+            }
             KeyCode::Enter => return self.submit().map(PaneEvent::Submit),
-            // Esc with nothing to close cancels the turn in flight.
+            // Esc with nothing to close cancels the turn in flight, spilling
+            // any queued steering back into the composer.
             KeyCode::Esc => {
                 if !self.escape() && self.spin.is_some() {
+                    self.spill_steer();
                     return Some(PaneEvent::Cancel);
                 }
             }
@@ -315,6 +330,12 @@ impl Pane {
             }
             Progress::Usage { input, cached, output } => {
                 self.set_usage(*input, *cached, *output);
+            }
+            // A steering message aborted that response: retire its thinking
+            // run (the record dropped it too), then echo like a submitted one.
+            Progress::Steered(text) => {
+                self.begin_response();
+                self.echo(text);
             }
             // `Progress` is non-exhaustive; later variants need no handling yet.
             _ => {}
@@ -404,6 +425,11 @@ impl Pane {
         Some(SPINNER_FRAMES[(elapsed / SPINNER_MS) as usize % SPINNER_FRAMES.len()])
     }
 
+    /// The top rule's queued-steering snippet, if a message waits.
+    fn queued_text(&self, width: u16) -> Option<String> {
+        queued_rule_text(&self.control.steering()?, width as usize)
+    }
+
     pub fn clear(&mut self) {
         self.transcript.clear();
         // The abandoned conversation's usage leaves with it.
@@ -420,14 +446,19 @@ impl Pane {
         self.spin = generating.then(Instant::now);
     }
 
-    /// Restore the pane to before the cancelled turn, adding a dim cancelled label.
-    pub fn cancel_turn(&mut self) {
-        let Some(turn) = self.turn.take() else {
-            return;
-        };
-        self.transcript.restore_to(turn.entries);
-        self.prompt = turn.draft;
-        self.push(Span::styled("⎋ cancelled", DIM_STYLE));
+    /// Wire the pane to the agent's turn control.
+    pub fn set_control(&mut self, control: TurnControl) {
+        self.control = control;
+    }
+
+    /// Move the queued steering message into the composer as editable text
+    pub fn spill_steer(&mut self) {
+        if let Some(text) = self.control.take_steer() {
+            if !self.prompt.text().is_empty() {
+                self.prompt.new_line();
+            }
+            self.prompt.insert_str(&text);
+        }
     }
 
     /// Echo the draft into the transcript and clear it.
@@ -435,11 +466,6 @@ impl Pane {
         if self.prompt.text().trim().is_empty() {
             return None;
         }
-        // Snapshot the pre-turn state: a cancelled turn restores to here.
-        self.turn = Some(TurnSnapshot {
-            entries: self.transcript.message_count(),
-            draft: self.prompt.clone(),
-        });
         let text = self.prompt.text();
         self.echo(&text);
         self.prompt.clear();
@@ -551,6 +577,8 @@ impl Pane {
         bar_bottom: Rect,
         frame: &mut Frame,
     ) {
+        // Queued snippet reads the steer queue before `sync` borrows the transcript
+        let queued = self.queued_text(bar_top.width);
         // Wrap only what is new at an unchanged width, or rewrap if width changed.
         let rows = self.transcript.sync(area.width as usize);
         // Clamp to the wrapped rows, moving the cursor to (0, 0) when empty.
@@ -578,7 +606,7 @@ impl Pane {
                 cell.set_style(CURSOR_STYLE);
             }
         }
-        rule(buf, bar_top);
+        queued_rule(buf, bar_top, queued.as_deref());
         if let Some(perf) = &self.perf {
             // Replace the statusline with the perf counters
             let line = Line::from(Span::styled(format!("{perf} · {} rows", rows.len()), DIM_STYLE));
@@ -659,6 +687,55 @@ fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>, spinner: Opti
     }
 }
 
+/// The top rule's steering snippet: `queued: '<message>'`, ellipsized to fit
+/// `width` cells; `None` when the rule is too narrow to hold one.
+fn queued_rule_text(message: &str, width: usize) -> Option<String> {
+    // The preview reads as one line; wide graphemes pay their cell widths.
+    let message = message.replace('\n', " ");
+    // `queued: ''` wraps the snippet, and a dash of rule leads it.
+    if width <= 11 {
+        return None;
+    }
+    let budget = width - 10;
+    let cells = |text: &str| {
+        text.graphemes(true)
+            .map(|g| Span::raw(g).width().max(1))
+            .sum::<usize>()
+    };
+    let snippet = if cells(&message) <= budget {
+        message
+    } else {
+        // One cell stays free so a cut always shows its ellipsis.
+        let mut cut = String::new();
+        let mut used = 0;
+        for grapheme in message.graphemes(true) {
+            let spent = Span::raw(grapheme).width().max(1);
+            if used + spent >= budget {
+                break;
+            }
+            cut.push_str(grapheme);
+            used += spent;
+        }
+        cut.push('…');
+        cut
+    };
+    Some(format!("queued: '{snippet}'"))
+}
+
+/// A full-width dim rule row with the queued-steering snippet set into its
+/// right end: `────────queued: 'fix the login'`.
+fn queued_rule(buf: &mut Buffer, area: Rect, text: Option<&str>) {
+    rule(buf, area);
+    let Some(text) = text else { return };
+    // The bar can be parked past the last row.
+    if area.y >= buf.area.height {
+        return;
+    }
+    let line = Line::from(Span::styled(text, DIM_STYLE));
+    let x = area.x + area.width.saturating_sub(line.width() as u16);
+    buf.set_line(x, area.y, &line, area.width);
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, reason = "test assertions")]
@@ -736,38 +813,175 @@ mod tests {
         assert!(perf.contains("rows"));
     }
 
+    /// Enter mid-generation queues the draft as steering; slash commands wait
     #[test]
-    fn enter_while_generating_keeps_the_draft() {
+    fn enter_while_generating_queues_steering() {
         let mut pane = Pane::default();
         for c in ['h', 'i'] {
             pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
         }
         pane.set_generating(true);
-        // Enter neither echoes nor clears; Alt+Enter still edits the draft.
+        // Enter steers and clears; nothing echoes into the transcript.
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert_eq!(pane.prompt.text(), "");
+        assert_eq!(pane.control.steering(), Some("hi".to_string()));
+        assert!(pane.transcript.message_texts().is_empty());
+
+        // A second message waits: the queue takes one at a time, and the
+        // draft stays in the composer with a note pointing at Option+Up.
+        pane.on_paste("another");
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert_eq!(pane.prompt.text(), "another");
+        assert_eq!(pane.control.steering(), Some("hi".to_string()));
+        let screen = render(&mut pane, (60, 10));
+        assert!(screen.contains("message queued: Option+Up to edit"), "{screen}");
+        pane.prompt.clear();
+
+        // Alt+Enter still edits the fresh draft.
         pane.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
         assert_eq!(pane.prompt.lines.len(), 2);
-        assert_eq!(pane.prompt.text(), "hi\n");
-        assert!(pane.transcript.message_texts().is_empty());
-        // Once the model is done, Enter submits the intact draft.
+
+        // A slash command mid-generation stays in the composer.
+        pane.prompt.clear();
+        pane.on_paste("/effort high");
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert_eq!(pane.prompt.text(), "/effort high");
+
+        // Once the model is done, Enter submits the draft as a normal turn.
+        pane.prompt.clear();
+        pane.on_paste("done waiting");
         pane.set_generating(false);
         assert_eq!(
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(PaneEvent::Submit("hi\n".into()))
+            Some(PaneEvent::Submit("done waiting".into()))
         );
-        assert_eq!(pane.prompt.text(), "");
     }
 
-    /// Cancelling a turn restores the pane to before the message.
+    /// Esc cancels the turn and spills the queued steering into the composer;
+    /// a second submission while one waits is refused.
     #[test]
-    fn cancel_turn_restores_the_pre_turn_state() {
+    fn esc_spills_queued_steering_into_the_composer() {
+        let mut pane = Pane::default();
+        pane.set_generating(true);
+        assert!(pane.control.steer("one".to_string()));
+        assert!(!pane.control.steer("two".to_string())); // one at a time
+        assert_eq!(
+            pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(PaneEvent::Cancel)
+        );
+        assert_eq!(pane.prompt.text(), "one");
+        assert_eq!(pane.control.steering(), None);
+    }
+
+    /// Option+Up moves the queued steering into the composer for editing;
+    /// Enter re-queues the edited draft.
+    #[test]
+    fn alt_up_spills_the_queue_into_the_composer() {
+        let mut pane = Pane::default();
+        pane.set_generating(true);
+        assert!(pane.control.steer("one".to_string()));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(pane.prompt.text(), "one");
+        assert_eq!(pane.control.steering(), None);
+
+        // An edit, then Enter: the draft re-queues as the steering message.
+        pane.on_paste(" now two");
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert_eq!(pane.control.steering(), Some("one now two".to_string()));
+        assert_eq!(pane.prompt.text(), "");
+
+        // A spill onto a non-empty draft lands on a fresh line, and the chord
+        // reaches through an open popup (bare arrows stay the popup's).
+        pane.on_paste("also this");
+        pane.popup = Some(Popup::Files(FilePopup::from_files(vec![], String::new())));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(pane.prompt.text(), "also this\none now two");
+    }
+
+    /// A steered message retires the aborted response's thinking run, then
+    /// echoes into the transcript like a submitted one.
+    #[test]
+    fn steered_messages_echo_into_the_transcript() {
+        let mut pane = Pane::default();
+        pane.begin_response();
+        pane.append_thinking(&Span::styled("doomed reasoning", DIM_STYLE));
+        pane.append_answer("partial");
+        pane.transcript.toggle_thinking(); // reveal the run
+        assert!(render(&mut pane, (60, 10)).contains("doomed"));
+        pane.apply(&Progress::Steered("go faster".to_string()));
+        pane.append_answer(" more");
+        let screen = render(&mut pane, (60, 10));
+        assert!(screen.contains("❯ go faster"), "{screen}");
+        assert!(screen.contains("partial"), "{screen}");
+        assert!(!screen.contains("doomed"), "{screen}");
+    }
+
+    /// The top rule carries the queued-steering snippet, right-aligned.
+    #[test]
+    fn the_top_rule_shows_the_queued_snippet() {
+        let mut pane = Pane::default();
+        pane.push(Line::from("text"));
+        let idle = render(&mut pane, (60, 8));
+        assert!(!idle.contains("queued:"), "{idle}");
+
+        assert!(pane.control.steer("update feature XYZ".to_string()));
+        let screen = render(&mut pane, (60, 8));
+        assert!(screen.contains("queued: 'update feature XYZ'"), "{screen}");
+        // The snippet sits in the rule: dashes run right up to it.
+        let at = screen.find("queued:").expect("snippet");
+        assert!(screen[..at].ends_with('─'), "{screen}");
+
+        // A freed slot takes the next message.
+        pane.control.take_steer();
+        assert!(pane.control.steer("actually, stop".to_string()));
+        let screen = render(&mut pane, (60, 8));
+        assert!(screen.contains("queued: 'actually, stop'"), "{screen}");
+        assert!(!screen.contains("XYZ"), "{screen}");
+    }
+
+    /// The snippet ellipsizes by cells and yields to narrow rules.
+    #[test]
+    fn queued_rule_text_ellipsizes() {
+        assert_eq!(
+            queued_rule_text("fix it", 40),
+            Some("queued: 'fix it'".to_string())
+        );
+        // Newlines read as spaces: the preview is one line.
+        assert_eq!(
+            queued_rule_text("fix the\nlogin flow", 40),
+            Some("queued: 'fix the login flow'".to_string())
+        );
+        // An exactly-in-budget message fits without the ellipsis.
+        assert_eq!(
+            queued_rule_text("abcdefghij", 20),
+            Some("queued: 'abcdefghij'".to_string())
+        );
+        // A long snippet ellipsizes inside the quotes, cut visible.
+        assert_eq!(
+            queued_rule_text("update the login flow today", 20),
+            Some("queued: 'update th…'".to_string())
+        );
+        // Wide graphemes pay two cells, not one count: 6 cells into a
+        // 5-cell budget cuts after two, into a 3-cell budget after one.
+        assert_eq!(
+            queued_rule_text("日本語", 15),
+            Some("queued: '日本…'".to_string())
+        );
+        assert_eq!(queued_rule_text("日本語", 13), Some("queued: '日…'".to_string()));
+        // Too narrow for even the skeleton: no snippet at all.
+        assert_eq!(queued_rule_text("x", 11), None);
+    }
+
+    /// A cancelled turn keeps its partial answer; main adds only the marker.
+    #[test]
+    fn a_cancelled_turn_keeps_its_partial_answer() {
         let mut pane = Pane::default();
         pane.push(Line::from("earlier"));
         pane.begin_response();
         pane.append_answer("earlier answer");
 
         // The next turn, as main drives it: submit echoes the draft, the
-        // response begins, then the stream and tools arrive.
+        // response begins, then the stream arrives and Esc lands.
         pane.on_paste("write a story");
         assert_eq!(
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
@@ -777,18 +991,14 @@ mod tests {
         pane.set_generating(true);
         pane.append_thinking(&Span::styled("thinking", DIM_STYLE));
         pane.append_answer("Once upon");
-        pane.start_tool("call_0".to_string(), "Bash", "sleep 5".to_string());
-
-        pane.cancel_turn();
+        pane.set_generating(false);
+        pane.note("⎋ cancelled");
 
         let screen = render(&mut pane, (60, 20));
         assert!(screen.contains("earlier answer"), "{screen}");
+        assert!(screen.contains("write a story"), "{screen}");
+        assert!(screen.contains("Once upon"), "{screen}");
         assert!(screen.contains("⎋ cancelled"), "{screen}");
-        assert!(!screen.contains("Once upon"), "{screen}");
-        assert!(!screen.contains("sleep 5"), "{screen}");
-        assert_eq!(pane.prompt.text(), "write a story");
-        // The restored log folds cleanly.
-        pane.transcript.assert_rows_match_full_rewrap();
     }
 
     #[test]
@@ -877,23 +1087,6 @@ mod tests {
         let echo_at = screen.find("❯ run it").unwrap();
         let thinking_at = screen.find("Thinking").unwrap();
         assert!(echo_at < thinking_at, "{screen}");
-
-        // A live turn that gets cancelled rewinds to its own start, never into
-        // the replayed history. (The draft returns to the prompt editor.)
-        pane.on_paste("cancel me");
-        pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        pane.set_generating(true);
-        pane.cancel_turn();
-        let screen = render(&mut pane, (60, 20));
-        assert!(screen.contains("❯ run it"), "{screen}");
-        assert!(screen.contains("done"), "{screen}");
-        assert!(
-            !pane
-                .transcript
-                .message_texts()
-                .iter()
-                .any(|text| text.contains("cancel me"))
-        );
     }
 
     /// Validate copy mode isn't exited prematurely.
@@ -1012,6 +1205,11 @@ mod tests {
     fn tiny_terminal_renders_without_panic() {
         let mut pane = Pane::default();
         pane.push(Line::from("text"));
+        render(&mut pane, (6, 3));
+        render(&mut pane, (2, 1));
+        render(&mut pane, (1, 0));
+        // A queued message renders (or skips) at every size too.
+        assert!(pane.control.steer("queued up".to_string()));
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));
