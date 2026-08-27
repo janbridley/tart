@@ -474,7 +474,6 @@ impl Agent {
             }
 
             // No calls pending: this round's answer is the turn's message.
-            // (A cancelled turn's recording is unwound by the front end)
             if calls.is_empty() {
                 if !answer.is_empty()
                     && let Err(error) = transcript.push_assistant(answer.clone())
