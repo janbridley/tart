@@ -34,6 +34,12 @@ pub const DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
 /// The highlight for the transcript's actionable hints.
 pub(crate) const HIGHLIGHT_STYLE: Style = Style::new().fg(Color::Blue);
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+/// The prompt glyph while the `!` manual-command mode is on: also 2 cells.
+const BANG_PROMPT: &str = "! ";
+/// The bang glyph's color, matching the frame it announces.
+const BANG_STYLE: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+/// The rules' color while the mode is on or a run is in flight; see [`reframe`].
+const BANG_RULE: Color = Color::Magenta;
 /// The copy cursor and the editor caret are the cell under them, inverted.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 /// Frames for the statusline spinner.
@@ -45,11 +51,13 @@ const SPINNER_MS: u128 = 200;
 #[derive(Debug, PartialEq)]
 pub enum PaneEvent {
     Submit(String),
+    /// A manual command the user types, ready to run unsandboxed.
+    Command(String),
     /// Text chosen in copy mode, ready for the clipboard.
     Copy(String),
     /// A session picked in the `/resume` chooser, ready to swap to.
     Resume(PathBuf),
-    /// Esc with nothing open and a turn in flight.
+    /// Esc with nothing open, with a turn or a manual command in flight.
     Cancel,
     Quit,
 }
@@ -98,6 +106,14 @@ struct Usage {
     output: u64,
 }
 
+/// One manual command in flight.
+struct ManualCommand {
+    /// The text of the command
+    command: String,
+    /// A timestamp for when the command started
+    started: Instant,
+}
+
 /// The TUI interface.
 #[derive(Default)]
 pub struct Pane {
@@ -121,6 +137,10 @@ pub struct Pane {
     /// Enter keeps the draft while set, and the status rule's spinner runs
     /// off the elapsed time for a steady frame rate.
     spin: Option<Instant>,
+    /// Whether the `!` manual-command mode is enabled
+    bang: bool,
+    /// A manual command in flight, holding the purple frame until its output lands.
+    manual: Option<ManualCommand>,
     /// Control parameters for steering or interrupting the model.
     control: TurnControl,
 }
@@ -141,6 +161,11 @@ impl Pane {
 
     /// Update a popup based on input keystrokes (e.g. `@` opens, `Esc` closes).
     fn sync_popup(&mut self, key: Option<&KeyEvent>) {
+        // Bang mode is a shell command: neither prefix popup applies, so an
+        // `@` or a leading `/resume` in a command stays literal.
+        if self.bang {
+            return;
+        }
         match session_query(&self.prompt) {
             Some(query) => {
                 if let Some(popup @ Popup::Sessions(_)) = &mut self.popup {
@@ -181,7 +206,7 @@ impl Pane {
                 if self.spin.is_none()
                     && let Some(path) = sessions.selected_path()
                 {
-                    self.prompt.clear();
+                    self.clear_prompt();
                     return Some(PaneEvent::Resume(path));
                 }
             }
@@ -221,7 +246,7 @@ impl Pane {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
-                KeyCode::Char('u') => self.prompt.clear(),
+                KeyCode::Char('u') => self.clear_prompt(),
                 // To the line start / end, as readline
                 KeyCode::Char('a') => self.prompt.home(),
                 KeyCode::Char('e') => self.prompt.end(),
@@ -259,32 +284,40 @@ impl Pane {
         }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
+            // Classify manual commands BEFORE steering
+            KeyCode::Enter if self.bang => return self.submit_bang(),
             // A draft mid-generation must steer the running turn, but slash commands
-            // still ahve to wait. Only one message can be queued at once
+            // still have to wait. Only one message can be queued at once
             KeyCode::Enter if self.spin.is_some() => {
                 let text = self.prompt.text();
                 if !text.trim().is_empty() && !text.trim().starts_with('/') {
                     if self.control.steer(text) {
-                        self.prompt.clear();
+                        self.clear_prompt();
                     } else {
                         self.note("message queued: Option+Up to edit");
                     }
                 }
             }
-            KeyCode::Enter => return self.submit().map(PaneEvent::Submit),
-            // Esc with nothing to close cancels the turn in flight, spilling
-            // any queued steering back into the composer.
+            KeyCode::Enter => return self.submit(),
+            // Esc with nothing to close cancels the turn or a manual command.
             KeyCode::Esc => {
-                if !self.escape() && self.spin.is_some() {
-                    self.spill_steer();
+                if !self.escape() && (self.spin.is_some() || self.manual.is_some()) {
+                    if self.spin.is_some() {
+                        self.spill_steer();
+                    }
                     return Some(PaneEvent::Cancel);
                 }
             }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
             }
+            // `!` on an empty draft enters the manual-command mode; anywhere
+            // else (or with the mode already on) it is an ordinary character.
+            KeyCode::Char('!') if !self.bang && self.draft_is_empty() => self.bang = true,
             KeyCode::Char(c) => self.prompt.insert_char(c),
             KeyCode::Tab => self.prompt.insert_char('\t'),
+            // An empty draft's backspace leaves the mode instead of deleting.
+            KeyCode::Backspace if self.bang && self.draft_is_empty() => self.bang = false,
             KeyCode::Backspace => self.prompt.backspace(),
             KeyCode::Left => self.prompt.left(),
             KeyCode::Right => self.prompt.right(),
@@ -300,7 +333,16 @@ impl Pane {
     /// Pastes end up in the prompt box, newlines included.
     pub fn on_paste(&mut self, text: &str) {
         if self.copy.is_none() {
-            self.prompt.insert_str(text);
+            // A pasted command starting with the marker enters the mode.
+            if !self.bang
+                && self.draft_is_empty()
+                && let Some(command) = text.strip_prefix('!')
+            {
+                self.bang = true;
+                self.prompt.insert_str(command);
+            } else {
+                self.prompt.insert_str(text);
+            }
             // A paste refilters an open popup but never opens one.
             self.sync_popup(None);
         }
@@ -417,10 +459,24 @@ impl Pane {
         Some(text)
     }
 
-    /// The status rule's current spinner frame, or None while idle.
+    /// The status rule's current spinner frame, or None while idle: it spins
+    /// for a generating turn first, then for a manual command.
     fn spinner(&self) -> Option<&'static str> {
-        let elapsed = self.spin?.elapsed().as_millis();
+        let started = self
+            .spin
+            .or_else(|| self.manual.as_ref().map(|manual| manual.started))?;
+        let elapsed = started.elapsed().as_millis();
         Some(SPINNER_FRAMES[(elapsed / SPINNER_MS) as usize % SPINNER_FRAMES.len()])
+    }
+
+    /// The bottom rule's badge while a manual command runs: `! <command>`.
+    fn manual_command_badge(&self, width: u16) -> Option<String> {
+        self.manual.as_ref().map(|manual| {
+            // The badge reads `[ ! <command> ]` after the spinner's three cells.
+            let budget = width.saturating_sub(9) as usize;
+            let command = manual.command.replace('\n', " ");
+            format!("! {}", ellipsize(&command, budget))
+        })
     }
 
     /// The top rule's queued-steering snippet, if a message waits.
@@ -459,27 +515,83 @@ impl Pane {
         }
     }
 
+    /// Submit the manual-command draft, or explain why now is not the time.
+    fn submit_bang(&mut self) -> Option<PaneEvent> {
+        let refusal = if self.manual.is_some() {
+            "a manual command is already running"
+        } else if self.spin.is_some() {
+            "manual commands wait for the turn: Esc to cancel"
+        } else if self.prompt.text().trim().is_empty() {
+            "! alone runs nothing"
+        } else {
+            return self.submit();
+        };
+        self.note(refusal);
+        None
+    }
+
     /// Echo the draft into the transcript and clear it.
-    fn submit(&mut self) -> Option<String> {
-        if self.prompt.text().trim().is_empty() {
+    fn submit(&mut self) -> Option<PaneEvent> {
+        let text = self.prompt.text();
+        if text.trim().is_empty() {
             return None;
         }
-        let text = self.prompt.text();
-        self.echo(&text);
+        let bang = self.bang;
+        self.bang = false;
         self.prompt.clear();
-        Some(text)
+        if bang {
+            // A command's echo waits for its run: what the transcript shows
+            // and what it records both land with the framed output.
+            return Some(PaneEvent::Command(text));
+        }
+        self.echo(&text);
+        Some(PaneEvent::Submit(text))
     }
 
     /// Echo a submitted line into the transcript, as [`Pane::submit`] renders it.
     pub fn echo(&mut self, text: &str) {
+        self.echo_styled(PROMPT, PROMPT_STYLE, text);
+    }
+
+    /// [`Pane::echo`] with the glyph swapped, so a manual command's line reads
+    /// exactly like the prompt row that launched it.
+    fn echo_styled(&mut self, glyph: &'static str, style: Style, text: &str) {
         let mut rows = text.split('\n');
         self.transcript.push(Line::from(vec![
-            Span::styled(PROMPT, PROMPT_STYLE),
+            Span::styled(glyph, style),
             Span::raw(rows.next().unwrap_or_default().to_string()),
         ]));
         for continuation in rows {
             self.transcript.push(Line::from(format!("  {continuation}")));
         }
+    }
+
+    /// Mark a manual command in flight: the frame holds the bang styling and
+    /// the status rule carries `! <command>` until [`Pane::manual_done`].
+    pub fn manual_running(&mut self, command: Option<String>) {
+        self.manual = command.map(|command| ManualCommand { command, started: Instant::now() });
+    }
+
+    /// Finish the in-flight manual command by echoing its line and the framed
+    /// output, and hand back the command that ran.
+    pub fn manual_done(&mut self, framed: &str) -> Option<String> {
+        let manual = self.manual.take()?;
+        self.echo_styled(BANG_PROMPT, BANG_STYLE, &manual.command);
+        // The framing already says how it ended, so the output renders dim.
+        self.transcript
+            .append_span(&Span::styled(framed.to_string(), DIM_STYLE));
+        Some(manual.command)
+    }
+
+    /// Whether every line of the draft is empty, i.e. nothing is typed yet.
+    fn draft_is_empty(&self) -> bool {
+        self.prompt.lines.iter().all(String::is_empty)
+    }
+
+    /// Empty the draft, leaving the manual-command mode with it.
+    fn clear_prompt(&mut self) {
+        self.prompt.clear();
+        self.bang = false;
     }
 
     /// Render into the granted area: transcript, rule, prompt, rule.
@@ -520,14 +632,20 @@ impl Pane {
             return;
         }
         let buf = frame.buffer_mut();
-        // Live prompt: the "❯ " gutter, then the wrapped draft. The inverted caret
-        // cell marks the cursor, so the terminal cursor stays hidden and the prompt
-        // viewport can never misplace it.
+        // Live prompt: the "❯ " gutter (or "! " in the manual-command mode),
+        // then the wrapped draft. The inverted caret cell marks the cursor, so
+        // the terminal cursor stays hidden and the prompt viewport can never
+        // misplace it.
         let width = prompt_area.width - GUTTER;
+        let (glyph, glyph_style) = if self.bang {
+            (BANG_PROMPT, BANG_STYLE)
+        } else {
+            (PROMPT, PROMPT_STYLE)
+        };
         buf.set_span(
             prompt_area.x,
             prompt_area.y,
-            &Span::styled(PROMPT, PROMPT_STYLE),
+            &Span::styled(glyph, glyph_style),
             GUTTER,
         );
         self.prompt.top = window_top(
@@ -613,7 +731,15 @@ impl Pane {
                 buf.set_line(bar_bottom.x, bar_bottom.y, &line, bar_bottom.width);
             }
         } else {
-            status_rule(buf, bar_bottom, self.status_text().as_deref(), self.spinner());
+            let status = self
+                .manual_command_badge(bar_bottom.width)
+                .or_else(|| self.status_text());
+            status_rule(buf, bar_bottom, status.as_deref(), self.spinner());
+        }
+        // The manual-command mode colors the frame around the composer.
+        if self.bang || self.manual.is_some() {
+            reframe(buf, bar_top, BANG_RULE);
+            reframe(buf, bar_bottom, BANG_RULE);
         }
     }
 
@@ -653,6 +779,15 @@ fn rule(buf: &mut Buffer, area: Rect) {
     }
 }
 
+/// Recolor one already-drawn rule row.
+fn reframe(buf: &mut Buffer, area: Rect, color: Color) {
+    for col in area.columns() {
+        if let Some(cell) = buf.cell_mut((col.x, area.y)) {
+            cell.set_fg(color);
+        }
+    }
+}
+
 /// A token count in the status line's compact style: `843`, `45k`, `1.2 M`.
 fn token_count(tokens: u64) -> String {
     match tokens {
@@ -660,6 +795,31 @@ fn token_count(tokens: u64) -> String {
         1_000..=999_999 => format!("{}k", tokens / 1_000),
         _ => format!("{}.{} M", tokens / 1_000_000, tokens % 1_000_000 / 100_000),
     }
+}
+
+/// `text` as-is when it fits `budget` cells, else its clipped start and an ellipsis
+fn ellipsize(text: &str, budget: usize) -> String {
+    let cells = |text: &str| {
+        text.graphemes(true)
+            .map(|g| Span::raw(g).width().max(1))
+            .sum::<usize>()
+    };
+    if cells(text) <= budget {
+        return text.to_string();
+    }
+    // One cell stays free so a cut always shows its ellipsis.
+    let mut cut = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let spent = Span::raw(grapheme).width().max(1);
+        if used + spent >= budget {
+            break;
+        }
+        cut.push_str(grapheme);
+        used += spent;
+    }
+    cut.push('…');
+    cut
 }
 
 /// A full-width dim rule row with the status badge set into it:
@@ -694,30 +854,7 @@ fn queued_rule_text(message: &str, width: usize) -> Option<String> {
     if width <= 11 {
         return None;
     }
-    let budget = width - 10;
-    let cells = |text: &str| {
-        text.graphemes(true)
-            .map(|g| Span::raw(g).width().max(1))
-            .sum::<usize>()
-    };
-    let snippet = if cells(&message) <= budget {
-        message
-    } else {
-        // One cell stays free so a cut always shows its ellipsis.
-        let mut cut = String::new();
-        let mut used = 0;
-        for grapheme in message.graphemes(true) {
-            let spent = Span::raw(grapheme).width().max(1);
-            if used + spent >= budget {
-                break;
-            }
-            cut.push_str(grapheme);
-            used += spent;
-        }
-        cut.push('…');
-        cut
-    };
-    Some(format!("queued: '{snippet}'"))
+    Some(format!("queued: '{}'", ellipsize(&message, width - 10)))
 }
 
 /// A full-width dim rule row with the queued-steering snippet set into its
@@ -912,6 +1049,249 @@ mod tests {
         assert!(screen.contains("❯ go faster"), "{screen}");
         assert!(screen.contains("partial"), "{screen}");
         assert!(!screen.contains("doomed"), "{screen}");
+    }
+
+    /// `!` on an empty draft enters the manual-command mode: the glyph swaps to
+    /// `!`, both rules turn magenta, and the marker never reaches the editor
+    #[test]
+    fn bang_on_an_empty_draft_swaps_the_glyph_and_the_rules() {
+        let mut pane = Pane::default();
+        pane.push(Line::from("text"));
+        let idle_styles = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
+        let idle: Vec<&str> = idle_styles.lines().collect();
+        // Rows: five of transcript, top rule, prompt, bottom rule.
+        assert_eq!(idle[5], "d".repeat(40), "{idle_styles}");
+        assert_eq!(idle[7], "d".repeat(40), "{idle_styles}");
+
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(pane.bang, "the mode is on");
+        assert_eq!(pane.prompt.text(), "", "the marker is swallowed");
+        let screen = render(&mut pane, (40, 8));
+        assert!(screen.contains("! "), "{screen}");
+        assert!(!screen.contains("❯"), "{screen}");
+        let bang = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
+        let bang: Vec<&str> = bang.lines().collect();
+        assert_eq!(bang[5], "m".repeat(40), "the top rule is magenta");
+        assert_eq!(bang[7], "m".repeat(40), "the bottom rule is magenta");
+        assert!(bang[6].starts_with('B'), "the glyph is bold: {bang:?}");
+
+        // Backspace on the still-empty draft leaves the mode; typing first
+        // would make the backspace an ordinary deletion.
+        pane.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!pane.bang);
+        let screen = render(&mut pane, (40, 8));
+        assert!(screen.contains("❯ "), "{screen}");
+        let left = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
+        let left: Vec<&str> = left.lines().collect();
+        assert_eq!(left[5], "d".repeat(40));
+        assert_eq!(left[7], "d".repeat(40));
+    }
+
+    /// The marker only enters the mode at the start of an empty draft
+    #[test]
+    fn a_literal_bang_elsewhere_stays_text() {
+        let mut pane = Pane::default();
+        pane.on_paste("hi");
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(!pane.bang);
+        assert_eq!(pane.prompt.text(), "hi!");
+
+        let mut literal = Pane::default();
+        literal.on_paste(" !ls");
+        assert!(!literal.bang);
+        assert_eq!(literal.prompt.text(), " !ls");
+
+        let mut cleared = Pane::default();
+        cleared.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        cleared.on_paste("ls");
+        cleared.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(!cleared.bang);
+        assert_eq!(cleared.prompt.text(), "");
+    }
+
+    /// Enter ships the command as its own event
+    #[test]
+    fn bang_enter_ships_the_command_and_waits_to_echo() {
+        let mut pane = Pane::default();
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        for c in "ls -la".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Command("ls -la".to_string()))
+        );
+        assert!(!pane.bang, "submit leaves the mode");
+        assert_eq!(pane.prompt.text(), "", "submit clears the draft");
+        assert!(pane.transcript.message_texts().is_empty(), "nothing echoed yet");
+
+        // The run holds the frame and claims the status badge, clipped to fit.
+        pane.manual_running(Some("x".repeat(60)));
+        let screen = render(&mut pane, (40, 8));
+        // A 40-cell rule leaves the command 31 cells after the frame.
+        assert!(screen.contains(&format!("[ ! {}… ]", "x".repeat(30))), "{screen}");
+        let running = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
+        let running: Vec<&str> = running.lines().collect();
+        assert_eq!(running[5], "m".repeat(40), "the frame stays bang while running");
+        assert_eq!(running[7], "m".repeat(40));
+
+        // Landing: the line echoes in the bang style, the output dim, and the
+        // pane hands back the command that ran.
+        assert_eq!(pane.manual_done("[exit 1]\nboom"), Some("x".repeat(60)));
+        assert_eq!(
+            pane.transcript.message_texts(),
+            [
+                format!("! {}", "x".repeat(60)),
+                "[exit 1]".to_string(),
+                "boom".to_string()
+            ]
+        );
+        let done = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
+        let done: Vec<&str> = done.lines().collect();
+        assert_eq!(done[5], "d".repeat(40), "the frame relaxes when the run ends");
+        assert_eq!(done[7], "d".repeat(40));
+        // A second landing has nothing to finish.
+        assert_eq!(pane.manual_done("again"), None);
+
+        // A run with a badge renders at every size.
+        pane.manual_running(Some("cargo build".to_string()));
+        for size in [(60, 8), (6, 3), (2, 1), (1, 0)] {
+            render(&mut pane, size);
+        }
+    }
+
+    /// A multi-line command runs verbatim and echoes every line, indented like
+    /// a submitted one.
+    #[test]
+    fn a_multiline_manual_command_echoes_its_lines() {
+        let mut pane = Pane::default();
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        pane.on_paste("cargo build");
+        pane.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        pane.on_paste("cargo test");
+        assert_eq!(pane.prompt.text(), "cargo build\ncargo test");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Command("cargo build\ncargo test".to_string()))
+        );
+
+        pane.manual_running(Some("cargo build\ncargo test".to_string()));
+        assert_eq!(
+            pane.manual_done("done"),
+            Some("cargo build\ncargo test".to_string())
+        );
+        assert_eq!(
+            pane.transcript.message_texts(),
+            ["! cargo build", "  cargo test", "done"]
+        );
+    }
+
+    /// The marker alone runs nothing, and the mode stays on for the command.
+    #[test]
+    fn bang_enter_on_an_empty_command_is_a_noop() {
+        let mut pane = Pane::default();
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(pane.bang, "the mode stays on");
+        assert_eq!(pane.prompt.text(), "");
+        let screen = render(&mut pane, (40, 8));
+        assert!(screen.contains("! alone runs nothing"), "{screen}");
+        // Whitespace-only is just as empty.
+        pane.on_paste("   ");
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(pane.bang);
+    }
+
+    /// A manual command never steers a running turn, and waits for it instead.
+    #[test]
+    fn bang_enter_waits_for_a_running_turn() {
+        let mut pane = Pane::default();
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        pane.on_paste("cargo build");
+        pane.set_generating(true);
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert_eq!(pane.prompt.text(), "cargo build", "the draft is kept");
+        assert_eq!(pane.control.steering(), None, "a command is not a message");
+        let screen = render(&mut pane, (40, 8));
+        assert!(screen.contains("manual commands wait for the turn"), "{screen}");
+
+        // Once the turn is done, the same draft ships as a command.
+        pane.set_generating(false);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Command("cargo build".to_string()))
+        );
+    }
+
+    /// One manual command at a time: a second waits rather than mislabeling the
+    /// first run's echo.
+    #[test]
+    fn a_second_manual_command_waits_for_the_first() {
+        let mut pane = Pane::default();
+        pane.manual_running(Some("first".to_string()));
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        pane.on_paste("second");
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert_eq!(pane.prompt.text(), "second");
+        let screen = render(&mut pane, (40, 8));
+        assert!(screen.contains("a manual command is already running"), "{screen}");
+    }
+
+    /// Esc cancels a manual command.
+    #[test]
+    fn esc_cancels_a_manual_command_without_spilling_the_queue() {
+        let mut pane = Pane::default();
+        pane.manual_running(Some("cargo build".to_string()));
+        assert!(pane.control.steer("meanwhile".to_string()));
+        assert_eq!(
+            pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(PaneEvent::Cancel)
+        );
+        assert_eq!(pane.control.steering(), Some("meanwhile".to_string()));
+        // The run is still in flight; its framed output lands when it does.
+        assert!(render(&mut pane, (40, 8)).contains("[ ! cargo build ]"));
+    }
+
+    /// A paste starting with the marker enters the mode, the marker stripped.
+    #[test]
+    fn a_pasted_bang_command_enters_the_mode() {
+        let mut pane = Pane::default();
+        pane.on_paste("!echo hi");
+        assert!(pane.bang);
+        assert_eq!(pane.prompt.text(), "echo hi");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Command("echo hi".to_string()))
+        );
+
+        // Into a non-empty draft the same paste is ordinary text.
+        let mut literal = Pane::default();
+        literal.on_paste("run this");
+        literal.on_paste("!echo hi");
+        assert!(!literal.bang);
+        assert_eq!(literal.prompt.text(), "run this!echo hi");
+    }
+
+    /// Neither prefix popup opens inside a command: `@` and a leading
+    /// `/resume` stay shell.
+    #[test]
+    fn bang_mode_suppresses_the_prefix_popups() {
+        let mut pane = Pane::default();
+        pane.set_session_dir(PathBuf::from("/tmp/root"), PathBuf::from("/tmp/proj"));
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        for c in "grep @pattern file".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(pane.popup.is_none(), "no mention typeahead");
+
+        pane.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        pane.on_paste("/resume fix");
+        assert!(pane.popup.is_none(), "no session chooser");
+        // The whole thing is a command, not a resumed session.
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Command("grep @pattern file\n/resume fix".to_string()))
+        );
     }
 
     /// The top rule carries the queued-steering snippet, right-aligned.
