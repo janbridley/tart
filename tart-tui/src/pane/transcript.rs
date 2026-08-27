@@ -483,21 +483,6 @@ impl Transcript {
         self.run = Some(ThinkingRun { start: at, end: at });
     }
 
-    /// Roll the log back to `entries` messages, planting a fresh thinking run.
-    pub(crate) fn restore_to(&mut self, entries: usize) {
-        self.messages.truncate(entries);
-        self.rows.clear();
-        self.folds.clear();
-        self.cache.1 = 0;
-        self.run = Some(ThinkingRun { start: entries, end: entries });
-        self.open = false;
-    }
-
-    /// Messages so far; the point a cancelled turn rewinds to.
-    pub(crate) fn message_count(&self) -> usize {
-        self.messages.len()
-    }
-
     /// Whether message `i` belongs to the hidden thinking run.
     fn thinking_hidden(&self, i: usize) -> bool {
         !self.show_thinking && self.run.is_some_and(|run| i >= run.start && i < run.end)
@@ -836,19 +821,6 @@ and the analytics dashboard rewrite.\n\n\
         assert_eq!(t.message_texts(), ["t1", "t2", "a1 a2"]);
         let run = t.run.expect("run");
         assert_eq!((run.start, run.end), (0, 2));
-    }
-
-    #[test]
-    fn restore_truncates_mid_answer() {
-        let mut t = Transcript::default();
-        t.push(Line::from("earlier"));
-        let at = t.message_count();
-        t.append("**partial answer");
-        t.sync(40);
-        t.restore_to(at);
-        t.sync(40);
-        assert_eq!(t.message_texts(), ["earlier"]);
-        t.assert_rows_match_full_rewrap();
     }
 
     /// Blank lines should survive streaming.
