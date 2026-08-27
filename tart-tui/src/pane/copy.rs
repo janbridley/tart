@@ -36,6 +36,9 @@ pub(crate) fn moved(rows: &[Line<'static>], cursor: CopyCursor, key: KeyCode) ->
     }
     let last = rows.len() - 1;
     let mut c = cursor;
+    // Rows can shrink between renders (a restyling append rewinds the
+    // segment), so the cursor clamps before it moves.
+    c.row = c.row.min(last);
     match key {
         KeyCode::Up => c.row = c.row.saturating_sub(1),
         KeyCode::Down => c.row = (c.row + 1).min(last),
