@@ -97,14 +97,6 @@ struct Usage {
     output: u64,
 }
 
-/// The pane state before a submitted turn, restored if the turn is cancelled.
-struct TurnSnapshot {
-    /// Transcript entries before the turn's echo and stream.
-    entries: usize,
-    /// The draft before it was submitted.
-    draft: Editor,
-}
-
 /// The TUI interface.
 #[derive(Default)]
 pub struct Pane {
@@ -128,8 +120,6 @@ pub struct Pane {
     /// Enter keeps the draft while set, and the status rule's spinner runs
     /// off the elapsed time for a steady frame rate.
     spin: Option<Instant>,
-    /// The state before the submitted turn (in case we have to cancel a message).
-    turn: Option<TurnSnapshot>,
 }
 
 impl Pane {
@@ -420,26 +410,11 @@ impl Pane {
         self.spin = generating.then(Instant::now);
     }
 
-    /// Restore the pane to before the cancelled turn, adding a dim cancelled label.
-    pub fn cancel_turn(&mut self) {
-        let Some(turn) = self.turn.take() else {
-            return;
-        };
-        self.transcript.restore_to(turn.entries);
-        self.prompt = turn.draft;
-        self.push(Span::styled("⎋ cancelled", DIM_STYLE));
-    }
-
     /// Echo the draft into the transcript and clear it.
     fn submit(&mut self) -> Option<String> {
         if self.prompt.text().trim().is_empty() {
             return None;
         }
-        // Snapshot the pre-turn state: a cancelled turn restores to here.
-        self.turn = Some(TurnSnapshot {
-            entries: self.transcript.message_count(),
-            draft: self.prompt.clone(),
-        });
         let text = self.prompt.text();
         self.echo(&text);
         self.prompt.clear();
@@ -758,16 +733,16 @@ mod tests {
         assert_eq!(pane.prompt.text(), "");
     }
 
-    /// Cancelling a turn restores the pane to before the message.
+    /// A cancelled turn keeps its partial answer; main adds only the marker.
     #[test]
-    fn cancel_turn_restores_the_pre_turn_state() {
+    fn a_cancelled_turn_keeps_its_partial_answer() {
         let mut pane = Pane::default();
         pane.push(Line::from("earlier"));
         pane.begin_response();
         pane.append_answer("earlier answer");
 
         // The next turn, as main drives it: submit echoes the draft, the
-        // response begins, then the stream and tools arrive.
+        // response begins, then the stream arrives and Esc lands.
         pane.on_paste("write a story");
         assert_eq!(
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
@@ -777,18 +752,14 @@ mod tests {
         pane.set_generating(true);
         pane.append_thinking(&Span::styled("thinking", DIM_STYLE));
         pane.append_answer("Once upon");
-        pane.start_tool("call_0".to_string(), "Bash", "sleep 5".to_string());
-
-        pane.cancel_turn();
+        pane.set_generating(false);
+        pane.note("⎋ cancelled");
 
         let screen = render(&mut pane, (60, 20));
         assert!(screen.contains("earlier answer"), "{screen}");
+        assert!(screen.contains("write a story"), "{screen}");
+        assert!(screen.contains("Once upon"), "{screen}");
         assert!(screen.contains("⎋ cancelled"), "{screen}");
-        assert!(!screen.contains("Once upon"), "{screen}");
-        assert!(!screen.contains("sleep 5"), "{screen}");
-        assert_eq!(pane.prompt.text(), "write a story");
-        // The restored log folds cleanly.
-        pane.transcript.assert_rows_match_full_rewrap();
     }
 
     #[test]
@@ -877,23 +848,6 @@ mod tests {
         let echo_at = screen.find("❯ run it").unwrap();
         let thinking_at = screen.find("Thinking").unwrap();
         assert!(echo_at < thinking_at, "{screen}");
-
-        // A live turn that gets cancelled rewinds to its own start, never into
-        // the replayed history. (The draft returns to the prompt editor.)
-        pane.on_paste("cancel me");
-        pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        pane.set_generating(true);
-        pane.cancel_turn();
-        let screen = render(&mut pane, (60, 20));
-        assert!(screen.contains("❯ run it"), "{screen}");
-        assert!(screen.contains("done"), "{screen}");
-        assert!(
-            !pane
-                .transcript
-                .message_texts()
-                .iter()
-                .any(|text| text.contains("cancel me"))
-        );
     }
 
     /// Validate copy mode isn't exited prematurely.
