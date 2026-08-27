@@ -273,6 +273,10 @@ impl Agent {
             if let Err(error) = self.record_steer(transcript, on_progress) {
                 return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
+            // The sandboxed trio, plus the web tools when their CLIs are installed.
+            let mut definitions = vec![tools::bash(), tools::read(), tools::edit()];
+            definitions.extend(tools::search());
+            definitions.extend(tools::fetch());
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
                 .stream(true)
@@ -281,7 +285,7 @@ impl Agent {
                     summary: None,
                 })
                 .input(InputParam::Items(transcript.request_items()))
-                .tools(vec![tools::bash(), tools::read(), tools::edit()])
+                .tools(definitions)
                 .build()
             {
                 Ok(request) => request,
