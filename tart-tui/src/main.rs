@@ -145,8 +145,6 @@ fn run(
     let mut quit = false;
     let mut perf_on = false;
     let mut perf = Perf::default();
-    // Whether Esc cancelled the turn in flight; when it ends, the turn is unwound
-    let mut cancelled = false;
     // State-mutation time since the last frame.
     let mut work = Duration::ZERO;
     while !quit {
@@ -161,11 +159,8 @@ fn run(
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
-                // Esc with nothing open and running turn aborts the stream and resets.
-                Some(PaneEvent::Cancel) => {
-                    agent.cancel();
-                    cancelled = true;
-                }
+                // Esc with nothing open aborts the running turn, keeping its partial.
+                Some(PaneEvent::Cancel) => agent.cancel(),
                 // Copy the selected text when we exit copy mode.
                 Some(PaneEvent::Copy(text)) => clipboard::copy(&text)?,
                 Some(PaneEvent::Submit(line)) => match line.trim() {
@@ -242,19 +237,17 @@ fn run(
                 let ping = Instant::now();
                 match &progress {
                     // When the turn ends the worker has already recorded the entire turn
-                    Progress::Done { .. } | Progress::Failed(_) => {
+                    Progress::Done { .. } | Progress::Failed(_) | Progress::Cancelled => {
                         pane.set_generating(false);
-                        if cancelled {
-                            // Reset TUI and context as if the last turn never happened.
-                            transcript.drop_last_turn();
-                            cancelled = false;
-                            pane.cancel_turn();
-                        }
                         // A failure also resolves anything still running, then
                         // shows the error.
                         if let Progress::Failed(error) = &progress {
                             pane.fail_pending(error);
                             pane.append_span(&Span::styled(error.clone(), DIM_STYLE));
+                        }
+                        // A cancelled turn keeps its streamed partial message + notify
+                        if matches!(progress, Progress::Cancelled) {
+                            pane.note("⎋ cancelled");
                         }
                         session.record(&transcript)?;
                     }
@@ -264,11 +257,8 @@ fn run(
             }
         }
     }
-    // A quit mid-generation keeps the partial turn unless it was cancelled. In-flight
-    // requests (if present) are reconstructed or repaired in the transcript.
-    if cancelled {
-        transcript.drop_last_turn();
-    }
+    // A quit mid-generation keeps the partial turn; in-flight requests (if
+    // any) are reconstructed or repaired in the transcript.
     session.record(&transcript)?;
     Ok(())
 }
