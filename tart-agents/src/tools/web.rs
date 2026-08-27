@@ -6,7 +6,7 @@
 //! curl hands it back, so no HTML is ever parsed here.
 
 use std::ffi::OsString;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -369,6 +369,9 @@ fn authority_host(rest: &str) -> &str {
 }
 
 /// Whether a host names this machine or a private network rather than the web.
+///
+/// Names are resolved and every address checked, so a public-looking name that
+/// answers for a private record is refused too.
 #[allow(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "the host is lowercased on the first line, so `.local` is already case-insensitive"
@@ -379,7 +382,25 @@ fn is_private_host(host: &str) -> bool {
         || host.ends_with(".localhost")
         || host.ends_with(".local")
         || host.ends_with(".internal")
+        // A zone ID names a link-local interface address (`[fe80::1%en0]`); it
+        // never parses as one, and curl would still understand it, so refuse
+        // it lexically before the resolver ever runs.
+        || host.contains('%')
         || host.parse::<IpAddr>().is_ok_and(|ip| !is_global(ip))
+        || resolves_to_private(&host)
+}
+
+/// Whether any address `host` resolves to is not globally routable.
+///
+/// Every record is checked: a rebinder answers with a public and a private
+/// address together, and either may come back first. A name that fails to
+/// resolve stays public: curl shares this resolver, so an unresolvable name
+/// fails there with the better error. Resolution blocks this thread for as
+/// long as the resolver takes, like the curl call it guards.
+fn resolves_to_private(host: &str) -> bool {
+    (host, 0)
+        .to_socket_addrs()
+        .is_ok_and(|mut addrs| addrs.any(|addr| !is_global(addr.ip())))
 }
 
 /// Whether an IP address is globally routable.
@@ -911,6 +932,32 @@ mod tests {
         assert!(private_redirect("http://printer.local/").is_some());
         assert!(private_redirect("https://example.com/final").is_none());
         assert!(private_redirect("https://[::1]/").is_some());
+    }
+
+    #[test]
+    fn check_url_refuses_zone_ids_and_resolver_shorthand_addresses() {
+        // A zone ID names a link-local interface address; it does not parse as
+        // one, and curl would still fetch it, so it is refused lexically.
+        for url in ["https://[fe80::1%25en0]/", "http://[fe80::1%en0]:8080/x"] {
+            assert!(check_url(url).is_err(), "expected refusal: {url}");
+        }
+
+        // Integer and hex shorthands for 127.0.0.1 parse as no IP at all; the
+        // resolver accepts them, so the record check refuses them.
+        for url in ["http://2130706433/", "http://0x7f000001/"] {
+            assert!(check_url(url).is_err(), "expected refusal: {url}");
+        }
+    }
+
+    #[test]
+    fn resolves_to_private_checks_every_record_and_fails_open() {
+        // `localhost` is private through /etc/hosts alone: the resolver finds
+        // it without any network, and every record it lists is loopback.
+        assert!(resolves_to_private("localhost"));
+
+        // A name the resolver rejects outright stays public: curl shares the
+        // resolver, so it reports the failure better than a refusal here could.
+        assert!(!resolves_to_private("not a hostname"));
     }
 
     /// Live: reaches the network, so it needs connectivity.
