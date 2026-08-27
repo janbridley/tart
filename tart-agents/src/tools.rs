@@ -8,6 +8,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 
 use crate::{Progress, sandbox::Policy};
 
@@ -358,24 +360,16 @@ pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
 
 /// Spawn `command` in its own process group with piped output and no input,
 /// returning the child and its group id.
-fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, libc::pid_t)> {
+fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)> {
     command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn()?;
-    let group = child.id() as libc::pid_t;
+    // A pid always fits an i32, and the child leads its own group.
+    let group = Pid::from_raw(child.id().cast_signed());
     Ok((child, group))
-}
-
-/// Kill a process group we spawned, with everything it started.
-///
-/// # Safety
-///
-/// The caller must pass the group id of a child it spawned and still owns.
-unsafe fn kill_group(group: libc::pid_t) {
-    unsafe { libc::killpg(group, libc::SIGKILL) };
 }
 
 /// Run `command` to completion, killing its process group if it outlives `timeout`.
@@ -391,8 +385,7 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Watc
             // Flag before killing, so the caller cannot mistake the death for a
             // natural signal once the wait returns.
             flagged.store(true, Ordering::Release);
-            // SAFETY: one signal to our own child's process group.
-            unsafe { kill_group(group) };
+            let _ = killpg(group, Signal::SIGKILL);
         }
     });
 
@@ -400,8 +393,7 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Watc
     drop(finished);
     // Double check we've killed everything even if the wait errors.
     if output.is_err() {
-        // SAFETY: as above.
-        unsafe { kill_group(group) };
+        let _ = killpg(group, Signal::SIGKILL);
     }
     let _ = watchdog.join();
 
@@ -432,16 +424,14 @@ fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Resul
         // Flag before killing, so the caller cannot mistake the death for a
         // natural signal once the wait returns.
         flagged.store(true, Ordering::Release);
-        // SAFETY: one signal to our own child's process group.
-        unsafe { kill_group(group) };
+        let _ = killpg(group, Signal::SIGKILL);
     });
 
     let output = child.wait_with_output();
     drop(finished);
     // Double check we've killed everything even if the wait errors.
     if output.is_err() {
-        // SAFETY: as above.
-        unsafe { kill_group(group) };
+        let _ = killpg(group, Signal::SIGKILL);
     }
     let _ = watchdog.join();
 
