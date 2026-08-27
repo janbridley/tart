@@ -16,7 +16,7 @@ pub enum Progress {
     ToolStart {
         /// The call's id, pairing the start with its eventual output.
         id: String,
-        /// The tool's display name: one of {`Bash`, `Read`, `Edit`}.
+        /// The tool's display name: one of {`Bash`, `Read`, `Edit`, `Search`}.
         name: &'static str,
         /// An argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
         digest: String,
