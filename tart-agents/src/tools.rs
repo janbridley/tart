@@ -1,9 +1,11 @@
+use std::ffi::OsString;
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -26,6 +28,16 @@ const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The longest timeout a bash call may ask for.
 const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The timeout every search runs under: ddgs's `auto` backend can walk several
+/// engines before one answers, so a search needs more headroom than a command.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Results returned when the model does not ask for a number.
+const DEFAULT_SEARCH_RESULTS: u64 = 8;
+
+/// Most results one search may return; more is noise the model cannot use.
+const MAX_SEARCH_RESULTS: u64 = 25;
 
 /// Cat a (subregion of a) file, numbering the lines in the output.
 fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
@@ -110,6 +122,42 @@ pub(crate) fn edit() -> Tool {
             "required": ["path", "old_string", "new_string"]
         }),
     )
+}
+
+/// The search tool's definition, offered only when a ddgs CLI is installed.
+fn search_definition() -> Tool {
+    tool(
+        "search",
+        "Search the web and return ranked results (title, url, snippet). Runs the \
+        locally installed ddgs CLI outside the sandbox, so it has network access but \
+        cannot read or write files",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to search for"},
+                "max_results": {
+                    "type": "integer",
+                    "description": "Results to return, 1-25; default 8"
+                },
+                "timelimit": {
+                    "type": "string",
+                    "description": "Only results from the past d(ay), w(eek), m(onth), or y(ear)"
+                },
+                "news": {
+                    "type": "boolean",
+                    "description": "Search news articles instead of web pages"
+                }
+            },
+            "required": ["query"]
+        }),
+    )
+}
+
+/// The search tool; `None` when no ddgs CLI is installed, so the model is never
+/// offered a tool that cannot run.
+#[must_use]
+pub(crate) fn search() -> Option<Tool> {
+    search_binary().map(|_| search_definition())
 }
 
 /// Parse a tool call's arguments as JSON.
@@ -203,6 +251,40 @@ fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
     })
 }
 
+/// One parsed search tool call.
+#[derive(Debug)]
+struct Search {
+    /// The query, passed to ddgs as a single argv element.
+    query: String,
+    /// Results to return, clamped to 1-25.
+    max_results: u64,
+    /// Recency window, one of the letters ddgs understands; `None` is any time.
+    timelimit: Option<String>,
+    /// Search news articles rather than web pages.
+    news: bool,
+}
+
+/// Extract the fields from a search tool call's JSON arguments.
+///
+/// Optional fields fall back to ddgs's own defaults, wrong-typed values are
+/// ignored, and `timelimit` is validated against the four letters ddgs accepts
+/// so a nonsense value cannot become a CLI error.
+fn parse_search(arguments: &str) -> anyhow::Result<Search> {
+    let args = parse_arguments(arguments)?;
+    Ok(Search {
+        query: string_field(&args, "query")?,
+        max_results: args["max_results"]
+            .as_u64()
+            .unwrap_or(DEFAULT_SEARCH_RESULTS)
+            .clamp(1, MAX_SEARCH_RESULTS),
+        timelimit: args["timelimit"]
+            .as_str()
+            .filter(|limit| matches!(*limit, "d" | "w" | "m" | "y"))
+            .map(str::to_string),
+        news: args["news"].as_bool().unwrap_or(false),
+    })
+}
+
 /// Run one tool call under `policy`, report each step to `on_progress`, and return
 /// output to the model
 ///
@@ -222,6 +304,8 @@ pub(crate) fn execute<F: Fn(Progress)>(
         "bash" => run_bash(call, policy, on_progress),
         "read" => run_read(call, policy, on_progress),
         "edit" => run_edit(call, policy, on_progress),
+        // The one unsandboxed tool: it needs the network the sandbox denies.
+        "search" => run_search(call, on_progress),
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -278,6 +362,16 @@ pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
             parse_read(&call.arguments).ok().map(|read| read_digest(&read)),
         ),
         "edit" => ("Edit", parse_edit(&call.arguments).ok().map(|edit| edit.path)),
+        "search" => (
+            "Search",
+            parse_search(&call.arguments).ok().map(|search| {
+                if search.news {
+                    format!("{} [news]", search.query)
+                } else {
+                    search.query
+                }
+            }),
+        ),
         _ => ("Tool", None),
     };
     (name, digest.unwrap_or_else(|| call.arguments.clone()))
@@ -435,6 +529,174 @@ fn run_edit<F: Fn(Progress)>(
         let (result, exit) = apply_edit(&edit, policy);
         (result.clone(), result, exit)
     }))
+}
+
+/// Locate the search CLI: `TART_SEARCH_BIN`, then `~/.local/bin/ddgs`, then `PATH`
+fn search_binary() -> Option<PathBuf> {
+    let pinned = std::env::var_os("TART_SEARCH_BIN").map(PathBuf::from);
+    let installed = std::env::var_os("HOME").map(|home| {
+        let mut path = PathBuf::from(home);
+        path.push(".local/bin/ddgs");
+        path
+    });
+    pinned
+        .into_iter()
+        .chain(installed)
+        .find(|path| is_executable(path))
+        .or_else(|| find_on_path("ddgs"))
+}
+
+/// The first executable `name` on `PATH`, if any.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Whether `path` is a file any user may execute.
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && (meta.permissions().mode() & 0o111) != 0)
+}
+
+/// A fresh path under the system temp directory for one search's results.
+///
+/// ddgs writes structured results only to a file, never to stdout; the counter
+/// keeps concurrent searches apart without adding a dependency.
+fn results_path() -> PathBuf {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("tart-search-{}-{call}.json", std::process::id()))
+}
+
+/// The ddgs argv for one search: the subcommand, the query as a single argv
+/// element, the result count, any recency window, and the results file.
+fn ddgs_args(search: &Search, results: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        if search.news { "news" } else { "text" }.into(),
+        "-q".into(),
+        search.query.clone().into(),
+        "-m".into(),
+        search.max_results.to_string().into(),
+    ];
+    if let Some(timelimit) = &search.timelimit {
+        args.push("-t".into());
+        args.push(timelimit.clone().into());
+    }
+    args.push("-o".into());
+    args.push(results.as_os_str().to_owned());
+    args
+}
+
+/// Run one search tool call, reporting its steps to `on_progress`.
+fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> anyhow::Result<String> {
+    let search = parse_search(&call.arguments)?;
+    let digest = if search.news {
+        format!("{} [news]", search.query)
+    } else {
+        search.query.clone()
+    };
+    Ok(traced(call, "Search", digest, on_progress, || {
+        let Some(binary) = search_binary() else {
+            let text = "search: no ddgs CLI found; install one with `uv tool install ddgs` \
+                        or point TART_SEARCH_BIN at it"
+                .to_string();
+            return (text.clone(), text, None);
+        };
+        let results = results_path();
+        let mut ddgs = Command::new(binary);
+        ddgs.args(ddgs_args(&search, &results))
+            // Cleared like the sandboxed tools, so nothing in our environment can
+            // reach the child; re-added are only the variables a CLI needs to run.
+            .env_clear();
+        if let Some(home) = std::env::var_os("HOME") {
+            ddgs.env("HOME", home);
+        }
+        if let Some(temp) = std::env::var_os("TMPDIR") {
+            ddgs.env("TMPDIR", temp);
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            ddgs.env("PATH", path);
+        }
+        let outcome = run_with_timeout(&mut ddgs, SEARCH_TIMEOUT);
+        // The results file is ours whatever happened: read it, then drop it.
+        let json = std::fs::read_to_string(&results).ok();
+        let _ = std::fs::remove_file(&results);
+        match json.as_deref().and_then(|json| render_results(&search, json)) {
+            Some(rendered) => (rendered.clone(), rendered, Some(0)),
+            None => match outcome {
+                Ok(run) => {
+                    let TimedRun { output, timed_out } = run;
+                    let text = combined_output(&output);
+                    let exit = output.status.code();
+                    if timed_out {
+                        let marked = timeout_text(&text, SEARCH_TIMEOUT);
+                        (marked.clone(), marked, exit)
+                    } else {
+                        (command_text(&text, output.status), text, exit)
+                    }
+                }
+                Err(error) => {
+                    let text = format!("error: {error}");
+                    (text.clone(), text, None)
+                }
+            },
+        }
+    }))
+}
+
+/// A non-empty, trimmed string field of a results record.
+///
+/// Looked up with `get` rather than indexing: a missing key in a `Map` panics,
+/// and news records carry no `href` for the url lookup to find.
+fn field<'a>(
+    record: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a str> {
+    record
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Turn ddgs's results file into the numbered list the model reads, or `None` when it
+/// is not the JSON array we asked for.
+fn render_results(search: &Search, json: &str) -> Option<String> {
+    let Ok(serde_json::Value::Array(records)) = serde_json::from_str(json) else {
+        return None;
+    };
+    if records.is_empty() {
+        return Some(format!("no results for {:?}", search.query));
+    }
+    let mut rendered = format!(
+        "{} results for {:?} (ddgs {})\n",
+        records.len(),
+        search.query,
+        if search.news { "news" } else { "text" }
+    );
+    for (index, record) in records.iter().enumerate() {
+        rendered.push_str(&render_result(index + 1, record.as_object()?));
+    }
+    Some(rendered)
+}
+
+/// One result: the title, an indented url, an indented date for news records,
+/// and the snippet. Text records carry their address as `href`, news ones as `url`
+fn render_result(index: usize, record: &serde_json::Map<String, serde_json::Value>) -> String {
+    let url = field(record, "href").or_else(|| field(record, "url"));
+    let mut lines = vec![format!(
+        "{index}. {}",
+        field(record, "title").unwrap_or("(untitled)")
+    )];
+    for line in [url, field(record, "date"), field(record, "body")]
+        .into_iter()
+        .flatten()
+    {
+        lines.push(format!("   {line}"));
+    }
+    lines.join("\n") + "\n"
 }
 
 /// Apply one parsed edit under `policy`, returning outcome message and the exit code.
@@ -1032,5 +1294,167 @@ mod tests {
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
         let absent = execute(&read_call(&missing, None, None), &policy, &|_| {}).unwrap();
         assert!(absent.contains("No such file or directory"), "{absent}");
+    }
+
+    /// A `search` tool call with raw JSON `arguments`.
+    fn search_call(arguments: &str) -> FunctionToolCall {
+        FunctionToolCall {
+            namespace: None,
+            name: "search".to_string(),
+            arguments: arguments.to_string(),
+            call_id: "call_0".to_string(),
+            id: Some("item_0".to_string()),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn search_definition_requires_query() {
+        let tool = serde_json::to_value(search_definition()).unwrap();
+
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "search");
+        assert_eq!(tool["parameters"]["required"][0], "query");
+    }
+
+    #[test]
+    fn search_is_offered_exactly_when_the_cli_is_installed() {
+        assert_eq!(search().is_some(), search_binary().is_some());
+    }
+
+    #[test]
+    fn parse_search_reads_the_query_and_defaults_the_rest() {
+        let search = parse_search(r#"{"query":"rust regex crate"}"#).unwrap();
+
+        assert_eq!(search.query, "rust regex crate");
+        assert_eq!(search.max_results, DEFAULT_SEARCH_RESULTS);
+        assert_eq!(search.timelimit, None);
+        assert!(!search.news);
+    }
+
+    #[test]
+    fn parse_search_clamps_results_and_drops_unknown_timelimits() {
+        let clamped =
+            parse_search(r#"{"query":"q","max_results":9000,"timelimit":"century","news":true}"#)
+                .unwrap();
+        assert_eq!(clamped.max_results, MAX_SEARCH_RESULTS);
+        assert_eq!(clamped.timelimit, None);
+        assert!(clamped.news);
+
+        let window = parse_search(r#"{"query":"q","timelimit":"w"}"#).unwrap();
+        assert_eq!(window.timelimit.as_deref(), Some("w"));
+    }
+
+    #[test]
+    fn parse_search_rejects_a_missing_query() {
+        let error = parse_search(r#"{"timelimit":"d"}"#).unwrap_err().to_string();
+
+        assert!(error.contains("missing 'query'"), "{error}");
+    }
+
+    #[test]
+    fn ddgs_args_pass_the_subcommand_query_bounds_and_results_file() {
+        let search = parse_search(r#"{"query":"rust web","max_results":5}"#).unwrap();
+        let results = PathBuf::from("/tmp/tart-search.json");
+        let text: Vec<OsString> = vec![
+            "text".into(),
+            "-q".into(),
+            "rust web".into(),
+            "-m".into(),
+            "5".into(),
+            "-o".into(),
+            "/tmp/tart-search.json".into(),
+        ];
+
+        assert_eq!(ddgs_args(&search, &results), text);
+
+        let news = parse_search(r#"{"query":"q","news":true,"timelimit":"d"}"#).unwrap();
+        let news_args: Vec<OsString> = vec![
+            "news".into(),
+            "-q".into(),
+            "q".into(),
+            "-m".into(),
+            "8".into(),
+            "-t".into(),
+            "d".into(),
+            "-o".into(),
+            "/tmp/tart-search.json".into(),
+        ];
+
+        assert_eq!(ddgs_args(&news, &results), news_args);
+    }
+
+    #[test]
+    fn render_results_formats_text_and_news_records() {
+        let search = parse_search(r#"{"query":"rust"}"#).unwrap();
+        let json = r#"[
+            {"title":"Rust","href":"https://www.rust-lang.org","body":"  A systems language  "},
+            {"title":"News","url":"https://example.com/n","date":"2026-08-01","body":"Today"}
+        ]"#;
+
+        let rendered = render_results(&search, json).unwrap();
+
+        assert!(
+            rendered.starts_with("2 results for \"rust\" (ddgs text)\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("1. Rust\n   https://www.rust-lang.org\n   A systems language\n")
+        );
+        assert!(rendered.contains("2. News\n   https://example.com/n\n   2026-08-01\n   Today\n"));
+    }
+
+    #[test]
+    fn render_results_reports_no_results_and_rejects_non_json() {
+        let search = parse_search(r#"{"query":"q"}"#).unwrap();
+
+        assert!(render_results(&search, "[]").unwrap().contains("no results"));
+        // ddgs's own failure mode: nothing written, its error on stdout.
+        assert!(render_results(&search, "RatelimitException: ...").is_none());
+        // The contract is an array; anything else is not ours to interpret.
+        assert!(render_results(&search, r#"{"results":[]}"#).is_none());
+    }
+
+    #[test]
+    fn results_paths_are_fresh_and_under_the_temporary_directory() {
+        let first = results_path();
+        let second = results_path();
+
+        assert!(first.starts_with(std::env::temp_dir()));
+        assert!(first.extension().is_some_and(|extension| extension == "json"));
+        assert_ne!(first, second);
+    }
+
+    /// Live: reaches the network through ddgs, so it needs connectivity.
+    #[test]
+    fn run_search_returns_rendered_results() {
+        let Some(_) = search_binary() else {
+            return;
+        };
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let call = search_call(r#"{"query":"rust programming language","max_results":3}"#);
+
+        let output = execute(&call, &policy, &|progress| {
+            events.borrow_mut().push(progress);
+        })
+        .unwrap();
+
+        assert!(
+            output.contains("results for \"rust programming language\""),
+            "{output}"
+        );
+        assert!(output.contains("1. "), "{output}");
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                Progress::ToolStart {
+                    name: "Search",
+                    digest,
+                    ..
+                },
+                Progress::ToolOutput { exit: Some(0), .. }
+            ] if digest == "rust programming language"
+        ));
     }
 }
