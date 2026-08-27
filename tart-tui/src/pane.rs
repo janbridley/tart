@@ -318,9 +318,7 @@ impl Pane {
                 self.echo(text);
                 self.begin_response();
             }
-            Progress::Thinking(text) => {
-                self.append_thinking(&Span::styled(text.clone(), DIM_STYLE));
-            }
+            Progress::Thinking(text) => self.append_thinking(text),
             Progress::Answer(text) => self.append_answer(text),
             Progress::ToolStart { id, name, digest } => {
                 self.start_tool(id.clone(), name, digest.clone());
@@ -361,9 +359,9 @@ impl Pane {
         self.transcript.append_span(span);
     }
 
-    /// Append a streaming chain-of-thought fragment to the current thinking block.
-    pub fn append_thinking(&mut self, span: &Span<'static>) {
-        self.transcript.append_thinking(span);
+    /// Append a streaming chain-of-thought fragment to the current thinking block
+    pub fn append_thinking(&mut self, fragment: &str) {
+        self.transcript.append_thinking(fragment);
     }
 
     /// Retire the previous response's thinking; see [`Transcript::begin_response`].
@@ -904,7 +902,7 @@ mod tests {
     fn steered_messages_echo_into_the_transcript() {
         let mut pane = Pane::default();
         pane.begin_response();
-        pane.append_thinking(&Span::styled("doomed reasoning", DIM_STYLE));
+        pane.append_thinking("doomed reasoning");
         pane.append_answer("partial");
         pane.transcript.toggle_thinking(); // reveal the run
         assert!(render(&mut pane, (60, 10)).contains("doomed"));
@@ -989,7 +987,7 @@ mod tests {
         );
         pane.begin_response();
         pane.set_generating(true);
-        pane.append_thinking(&Span::styled("thinking", DIM_STYLE));
+        pane.append_thinking("thinking");
         pane.append_answer("Once upon");
         pane.set_generating(false);
         pane.note("⎋ cancelled");
@@ -1255,7 +1253,7 @@ mod tests {
         let mut pane = Pane::default();
         pane.push(Line::from("❯ hi"));
         pane.begin_response();
-        pane.append_thinking(&Span::styled("visible reasoning", DIM_STYLE));
+        pane.append_thinking("visible reasoning");
         pane.append_answer("answer");
 
         // Hidden by default: the placeholder shows, the reasoning does not.
