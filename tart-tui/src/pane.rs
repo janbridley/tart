@@ -2,6 +2,7 @@
 
 mod copy;
 mod editor;
+mod markdown;
 mod transcript;
 mod wrap;
 
@@ -305,7 +306,7 @@ impl Pane {
             Progress::Thinking(text) => {
                 self.append_thinking(&Span::styled(text.clone(), DIM_STYLE));
             }
-            Progress::Answer(text) => self.append(&Span::raw(text.clone())),
+            Progress::Answer(text) => self.append_answer(text),
             Progress::ToolStart { id, name, digest } => {
                 self.start_tool(id.clone(), name, digest.clone());
             }
@@ -329,9 +330,14 @@ impl Pane {
         self.push(Span::styled(text.into(), DIM_STYLE));
     }
 
-    /// Append a streaming fragment; see [`Transcript::append`].
-    pub fn append(&mut self, span: &Span<'static>) {
-        self.transcript.append(span);
+    /// Append a fragment of the model's streamed answer; see [`Transcript::append`].
+    pub fn append_answer(&mut self, text: &str) {
+        self.transcript.append(text);
+    }
+
+    /// Append a styled streaming fragment outside the answer.
+    pub fn append_span(&mut self, span: &Span<'static>) {
+        self.transcript.append_span(span);
     }
 
     /// Append a streaming chain-of-thought fragment to the current thinking block.
@@ -655,10 +661,10 @@ fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>, spinner: Opti
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test assertions")]
+    #![allow(clippy::panic, clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use crate::testutil::{draw, draw_backgrounds};
+    use crate::testutil::{draw, draw_backgrounds, draw_styles};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -758,7 +764,7 @@ mod tests {
         let mut pane = Pane::default();
         pane.push(Line::from("earlier"));
         pane.begin_response();
-        pane.append(&Span::raw("earlier answer"));
+        pane.append_answer("earlier answer");
 
         // The next turn, as main drives it: submit echoes the draft, the
         // response begins, then the stream and tools arrive.
@@ -770,7 +776,7 @@ mod tests {
         pane.begin_response();
         pane.set_generating(true);
         pane.append_thinking(&Span::styled("thinking", DIM_STYLE));
-        pane.append(&Span::raw("Once upon"));
+        pane.append_answer("Once upon");
         pane.start_tool("call_0".to_string(), "Bash", "sleep 5".to_string());
 
         pane.cancel_turn();
@@ -839,7 +845,7 @@ mod tests {
     }
 
     /// Replaying a session renders the echoes, tool headers, and answers the
-    /// live stream would have shown — and a later cancel cannot rewind into it.
+    /// live stream would have shown.
     #[test]
     fn replayed_turns_render_like_live_ones() {
         let mut pane = Pane::default();
@@ -1052,7 +1058,7 @@ mod tests {
         pane.push(Line::from("❯ hi"));
         pane.begin_response();
         pane.append_thinking(&Span::styled("visible reasoning", DIM_STYLE));
-        pane.append(&Span::raw("answer"));
+        pane.append_answer("answer");
 
         // Hidden by default: the placeholder shows, the reasoning does not.
         let hidden = render(&mut pane, (40, 12));
@@ -1071,5 +1077,40 @@ mod tests {
 
         pane.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert!(render(&mut pane, (40, 12)).contains("Thinking"));
+    }
+
+    #[test]
+    fn answers_render_markdown_end_to_end() {
+        let mut pane = Pane::default();
+        pane.extend([
+            Progress::User("show off".to_string()),
+            Progress::Answer("## Done\n\n- item **one**".to_string()),
+        ]);
+        let screen = render(&mut pane, (40, 12));
+        assert!(screen.contains("Done"), "{screen}");
+        assert!(screen.contains("• item one"), "{screen}");
+        assert!(!screen.contains("**"), "{screen}");
+        assert!(!screen.contains("##"), "{screen}");
+
+        // The emphasized word really is styled on screen.
+        let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
+        assert!(styles.contains("BBB"), "{styles}");
+
+        // Copy mode copies the rendered form: the markers stay gone.
+        render(&mut pane, (40, 12));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // enter at the tail
+        pane.on_key(key(KeyCode::Home, KeyModifiers::NONE)); // the top
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor
+        pane.on_key(key(KeyCode::End, KeyModifiers::NONE)); // the bottom row
+        for _ in 0.."• item one".len() {
+            pane.on_key(key(KeyCode::Right, KeyModifiers::NONE));
+        }
+        let Some(PaneEvent::Copy(text)) = pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("copy mode ships no selection");
+        };
+        assert!(text.contains("Done"), "{text}");
+        assert!(text.contains("• item one"), "{text}");
+        assert!(!text.contains("**"), "{text}");
     }
 }
