@@ -11,6 +11,10 @@ use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 
 use crate::{Progress, sandbox::Policy};
 
+mod web;
+
+pub(crate) use web::{fetch, search};
+
 /// Perform a raw string find-and-replace operation, holding a lock for thread safety..
 ///
 /// This string contains perl source code to perform the required work, dispatching a
@@ -222,6 +226,9 @@ pub(crate) fn execute<F: Fn(Progress)>(
         "bash" => run_bash(call, policy, on_progress),
         "read" => run_read(call, policy, on_progress),
         "edit" => run_edit(call, policy, on_progress),
+        // The unsandboxed pair: they need the network the sandbox denies.
+        "search" => web::run_search(call, on_progress),
+        "fetch" => web::run_fetch(call, on_progress),
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -278,6 +285,20 @@ pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
             parse_read(&call.arguments).ok().map(|read| read_digest(&read)),
         ),
         "edit" => ("Edit", parse_edit(&call.arguments).ok().map(|edit| edit.path)),
+        "fetch" => (
+            "Fetch",
+            web::parse_fetch(&call.arguments).ok().map(|fetch| fetch.url),
+        ),
+        "search" => (
+            "Search",
+            web::parse_search(&call.arguments).ok().map(|search| {
+                if search.news {
+                    format!("{} [news]", search.query)
+                } else {
+                    search.query
+                }
+            }),
+        ),
         _ => ("Tool", None),
     };
     (name, digest.unwrap_or_else(|| call.arguments.clone()))

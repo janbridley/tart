@@ -10,6 +10,7 @@ crossterm = { version = "0.29", default-features = false, features = ["osc52"] }
 ignore = "0.4"
 itertools = "0.15.0"
 nucleo-matcher = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 serde = { version = "1", features = ["derive"] }
 tart-agents = { path = "../tart-agents" }

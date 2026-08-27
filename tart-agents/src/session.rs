@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn record_flushes_turns_once_and_cancelled_turns_nothing() {
+    fn record_flushes_turns_once() {
         let root = tempfile::tempdir().unwrap();
         let project = Path::new("/tmp/proj");
         let transcript = Transcript::new().unwrap();
@@ -362,13 +362,11 @@ mod tests {
         session.record(&transcript).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 5);
 
-        // A cancelled turn is unwound back to the flushed boundary before
-        // recording, so it flushes nothing.
+        // A cancelled turn keeps its partial answer, so it flushes like any other.
         transcript.push_user("cancel me".to_string()).unwrap();
         transcript.push_assistant("partial".to_string()).unwrap();
-        transcript.drop_last_turn();
         session.record(&transcript).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 5);
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 7);
 
         let (resumed, _) = Session::open(root.path(), project, &file).unwrap();
         assert_eq!(
@@ -500,13 +498,8 @@ mod tests {
         let transcript = Transcript::new().unwrap();
         let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
 
-        // Quitting before the first message records nothing: no file appears.
+        // Recording before any message exists writes nothing: no file appears.
         session.record(&transcript).unwrap();
-        assert!(session.path.is_none());
-
-        // A cancelled first turn is the same: unwound before recording.
-        transcript.push_user("cancel me".to_string()).unwrap();
-        transcript.drop_last_turn();
         session.record(&transcript).unwrap();
         assert!(session.path.is_none());
         let empty =
