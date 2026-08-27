@@ -16,6 +16,8 @@ pub use session::{SESSIONS_ROOT, Session};
 
 pub use agent::{Agent, TurnControl};
 
+pub use tools::{CancelToken, manual_command};
+
 /// Most model rounds one generation may take before giving up.
 pub const MAX_TOOL_ROUNDS: usize = 128;
 
