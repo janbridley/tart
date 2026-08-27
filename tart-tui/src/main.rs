@@ -147,11 +147,14 @@ fn run(
     let mut perf = Perf::default();
     // Whether Esc cancelled the turn in flight; when it ends, the turn is unwound
     let mut cancelled = false;
+    // State-mutation time since the last frame.
+    let mut work = Duration::ZERO;
     while !quit {
         let t0 = Instant::now();
         let done = terminal.draw(|frame| pane.render(frame, frame.area()))?;
+        let frame = t0.elapsed() + std::mem::take(&mut work);
         if perf_on {
-            pane.set_perf(Some(perf.frame(t0.elapsed(), done.buffer)));
+            pane.set_perf(Some(perf.frame(frame, done.buffer)));
         } else {
             pane.set_perf(None);
         }
@@ -234,27 +237,31 @@ fn run(
             // timer just loops around and draws again.
             Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
-            // Update the pane as progress arrives.
-            Ok(Wake::Generation(progress)) => match &progress {
-                // When the turn ends the worker has already recorded the entire turn
-                Progress::Done { .. } | Progress::Failed(_) => {
-                    pane.set_generating(false);
-                    if cancelled {
-                        // Reset TUI and context as if the last turn never happened.
-                        transcript.drop_last_turn();
-                        cancelled = false;
-                        pane.cancel_turn();
+            // Update the pane as progress arrives and time it into `work`.
+            Ok(Wake::Generation(progress)) => {
+                let ping = Instant::now();
+                match &progress {
+                    // When the turn ends the worker has already recorded the entire turn
+                    Progress::Done { .. } | Progress::Failed(_) => {
+                        pane.set_generating(false);
+                        if cancelled {
+                            // Reset TUI and context as if the last turn never happened.
+                            transcript.drop_last_turn();
+                            cancelled = false;
+                            pane.cancel_turn();
+                        }
+                        // A failure also resolves anything still running, then
+                        // shows the error.
+                        if let Progress::Failed(error) = &progress {
+                            pane.fail_pending(error);
+                            pane.append_span(&Span::styled(error.clone(), DIM_STYLE));
+                        }
+                        session.record(&transcript)?;
                     }
-                    // A failure also resolves anything still running, then
-                    // shows the error.
-                    if let Progress::Failed(error) = &progress {
-                        pane.fail_pending(error);
-                        pane.append(&Span::styled(error.clone(), DIM_STYLE));
-                    }
-                    session.record(&transcript)?;
+                    _ => pane.apply(&progress),
                 }
-                _ => pane.apply(&progress),
-            },
+                work += ping.elapsed();
+            }
         }
     }
     // A quit mid-generation keeps the partial turn unless it was cancelled. In-flight
