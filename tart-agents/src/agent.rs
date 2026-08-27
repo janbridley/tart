@@ -29,8 +29,19 @@ pub struct Agent {
     max_rounds: usize,
     /// The seatbelt policy every bash tool call runs under.
     policy: Policy,
-    /// The running turn's cancel sender, where Esc can reach it.
-    cancel: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    /// The running turn's control slot.
+    cancel: Arc<Mutex<CancelState>>,
+}
+
+/// The running turn's control state, under one lock.
+#[derive(Default)]
+struct CancelState {
+    /// Which turn id owns the slot.
+    generation: u64,
+    /// The running turn's wake sender, where a cancel poke reaches it.
+    sender: Option<mpsc::Sender<()>>,
+    /// Esc was pressed and we should attempt to cancel.
+    cancelled: bool,
 }
 
 impl Agent {
@@ -54,24 +65,33 @@ impl Agent {
             effort: None,
             max_rounds: MAX_TOOL_ROUNDS,
             policy,
-            cancel: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(Mutex::new(CancelState::default())),
         }
     }
 
-    /// The cancel sender under its lock.
-    fn cancel_slot(&self) -> MutexGuard<'_, Option<mpsc::Sender<()>>> {
+    /// The turn control state under its lock.
+    fn cancel_slot(&self) -> MutexGuard<'_, CancelState> {
         self.cancel.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Cancel the turn by dropping the stream.
+    /// Cancel the turn by dropping the stream, keeping any partial answer.
     ///
     /// NOTE: this must wait until tool calls complete, and the provider will likely
     /// take the cancelled turn to completion.
     #[inline]
     pub fn cancel(&self) {
-        if let Some(sender) = &mut *self.cancel_slot() {
+        let mut state = self.cancel_slot();
+        state.cancelled = true;
+        if let Some(sender) = &mut state.sender {
+            // A failed poke means one is already pending
             let _ = sender.try_send(());
         }
+    }
+
+    /// Whether the front end cancelled the turn: pokes only wake a parked wait
+    fn cancelled(&self, cancel_rx: &mut mpsc::Receiver<()>) -> bool {
+        while cancel_rx.try_recv().is_ok() {}
+        self.cancel_slot().cancelled
     }
 
     /// Set how hard the model reasons before answering.
@@ -91,23 +111,35 @@ impl Agent {
     /// Run one generation on its own thread, reporting progress to `on_progress`.
     ///
     /// The worker records its turns (reasoning, tool exchanges, final answer) into the
-    /// shared transcript as it goes. Exactly one terminal event ([`Progress::Done`] or
-    /// [`Progress::Failed`]) is delivered, even if the worker panics.
+    /// shared transcript as it goes. Exactly one terminal event ([`Progress::Done`],
+    /// [`Progress::Failed`], or [`Progress::Cancelled`]) is delivered, even if the
+    /// worker panics.
     #[inline]
     pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
         let agent = self.clone();
         let transcript = transcript.clone();
-        // This turn's cancel channel: the sender waits where Esc can reach it, and the
-        // receiver races the stream inside the worker.
+        // This turn's wake channel: the sender waits where Esc can reach it, and
+        // the receiver races the stream inside the worker.
         let (esc_sender, receiver) = mpsc::channel(1);
-        *self.cancel_slot() = Some(esc_sender);
+        let generation = {
+            let mut state = self.cancel_slot();
+            state.generation += 1;
+            state.cancelled = false;
+            state.sender = Some(esc_sender);
+            state.generation
+        };
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 agent.run(&transcript, receiver, &on_progress);
             }));
-            // The turn is over: Esc can no longer cancel anything.
-            *agent.cancel_slot() = None;
+            // The turn is over: clear the slot only if a newer turn has not
+            // already claimed it.
+            let mut state = agent.cancel_slot();
+            if state.generation == generation {
+                state.sender = None;
+                state.cancelled = false;
+            }
             if outcome.is_err() {
                 terminate_and_log(
                     &on_progress,
@@ -129,7 +161,8 @@ impl Agent {
     /// [`Progress::Done`] with the final answer (`None` if nothing arrived), or
     /// [`Progress::Failed`] on a request error, an explicit error or incomplete event,
     /// or a truncated stream (one that ended mid tool call or delivered nothing),
-    /// or immediately when the front end cancels the turn.
+    /// or [`Progress::Cancelled`] when the front end cancels the turn — keeping
+    /// everything recorded so far, including a partial answer.
     ///
     /// A stream that closes without a terminal event still ends its round with whatever
     /// the model produced.
@@ -150,8 +183,8 @@ impl Agent {
         let mut cancelled = false;
         for _ in 0..self.max_rounds {
             // A cancelled generation stops before spending another request.
-            if cancelled || matches!(cancel_rx.try_recv(), Ok(())) {
-                return terminate_and_log(on_progress, Progress::Done { message: None });
+            if cancelled || self.cancelled(&mut cancel_rx) {
+                return terminate_and_log(on_progress, Progress::Cancelled);
             }
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
@@ -197,9 +230,17 @@ impl Agent {
             // Race the stream against Esc; a won cancel returns and drops the stream
             loop {
                 let item = match block_on(Compat::new(select(stream.next(), cancel_rx.next()))) {
-                    // Esc won: returning drops the stream.
+                    // Esc won: returning drops the stream, keeping what it streamed.
                     Either::Right(_) => {
-                        return terminate_and_log(on_progress, Progress::Done { message: None });
+                        if !answer.is_empty()
+                            && let Err(error) = transcript.push_assistant(answer.clone())
+                        {
+                            return terminate_and_log(
+                                on_progress,
+                                Progress::Failed(error.to_string()),
+                            );
+                        }
+                        return terminate_and_log(on_progress, Progress::Cancelled);
                     }
                     Either::Left((item, _)) => item,
                 };
@@ -336,7 +377,7 @@ impl Agent {
             for call in calls {
                 // A cancelled turn skips its remaining calls; the one in
                 // flight finishes first.
-                if cancelled || matches!(cancel_rx.try_recv(), Ok(())) {
+                if cancelled || self.cancelled(&mut cancel_rx) {
                     cancelled = true;
                     break;
                 }
@@ -349,7 +390,11 @@ impl Agent {
                     }
                 }
             }
-            if let Some(item) = reasoning {
+            // A round cut short before its first executed call records no
+            // reasoning: without its calls the item would dangle in the replay.
+            if !exchanges.is_empty()
+                && let Some(item) = reasoning
+            {
                 transcript.push_reasoning(item);
             }
             if !answer.is_empty()
@@ -358,6 +403,10 @@ impl Agent {
                 return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             transcript.push_tool_round(exchanges);
+            if cancelled {
+                // The turn stops here, keeping the rounds recorded so far.
+                return terminate_and_log(on_progress, Progress::Cancelled);
+            }
             if let Some(reason) = failure {
                 return terminate_and_log(on_progress, Progress::Failed(reason));
             }
@@ -385,6 +434,7 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
             format!("done ({} answer chars)", message.as_deref().map_or(0, str::len))
         }
         Progress::Failed(reason) => format!("failed: {reason}"),
+        Progress::Cancelled => "cancelled".to_string(),
         _ => "not a terminal event".to_string(),
     });
     on_progress(event);
