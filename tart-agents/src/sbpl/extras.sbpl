@@ -9,9 +9,14 @@
 (allow file-read* file-test-existence file-map-executable
   (regex #"^/Users/[^/]+/\.local/share/uv/"))
 
-; Allow the rustup cargo shim (~/.cargo/bin/cargo), the cached registry and git
-; checkouts it builds from, and the ~/.rustup toolchains the shim execs into.
+; Allow reading the cargo home (~/.cargo): the rustup shims in bin/, the user
+; config at the top level, and the cached registry and git checkouts it builds
+; from. The (/|$) anchor also matches the directory itself, so it can be listed.
 (allow file-read* file-test-existence file-map-executable
-  (regex #"^/Users/[^/]+/\.cargo/(bin|registry|git)/"))
+  (regex #"^/Users/[^/]+/\.cargo(/|$)"))
+; Registry tokens in the credentials file stay unreadable, matching the module
+; rule that caller secrets must not be printable into captured output.
+(deny file-read* (regex #"^/Users/[^/]+/\.cargo/\.?credentials(\.toml)?$"))
+; Allow the ~/.rustup toolchains the cargo shim execs into.
 (allow file-read* file-test-existence file-map-executable
   (regex #"^/Users/[^/]+/\.rustup/"))
