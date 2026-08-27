@@ -834,7 +834,7 @@ mod tests {
         assert_eq!(pane.prompt.text(), "another");
         assert_eq!(pane.control.steering(), Some("hi".to_string()));
         let screen = render(&mut pane, (60, 10));
-        assert!(screen.contains("one message queued"), "{screen}");
+        assert!(screen.contains("message queued: Option+Up to edit"), "{screen}");
         pane.prompt.clear();
 
         // Alt+Enter still edits the fresh draft.
