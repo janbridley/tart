@@ -658,7 +658,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use crate::testutil::{draw, draw_backgrounds, draw_highlights};
+    use crate::testutil::{draw, draw_backgrounds};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)

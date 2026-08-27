@@ -11,8 +11,10 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Selection background is lighter than the terminal black level.
-const SELECT_STYLE: Style = Style::new().bg(Color::DarkGray);
+/// The selection band's background.
+const SELECT_BG: Color = Color::DarkGray;
+/// The style painted across a selection: the band, foreground untouched.
+const SELECT_STYLE: Style = Style::new().bg(SELECT_BG);
 
 /// A copy-mode selection, indexing two points in the output transcript.
 ///
@@ -73,10 +75,16 @@ impl Selection {
             }
             let a = if row == self.start.0 { self.start.1.min(w - 1) } else { 0 };
             let b = if row == self.end.0 { (self.end.1 + 1).min(w) } else { w };
-            buf.set_style(
-                Rect::new(area.x + a as u16, area.y + (row - top) as u16, (b - a) as u16, 1),
-                SELECT_STYLE,
-            );
+            let rect = Rect::new(area.x + a as u16, area.y + (row - top) as u16, (b - a) as u16, 1);
+            buf.set_style(rect, SELECT_STYLE);
+            // A glyph the same color as the band should be recolored to show up.
+            for x in rect.x..rect.right() {
+                if let Some(cell) = buf.cell_mut((x, rect.y))
+                    && cell.fg == SELECT_BG
+                {
+                    cell.set_fg(Color::Reset);
+                }
+            }
         }
     }
 }

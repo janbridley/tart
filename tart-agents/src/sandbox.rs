@@ -227,6 +227,23 @@ impl Policy {
         Ok(self)
     }
 
+    /// Drop every write grant, leaving the reads as they are.
+    ///
+    /// Plan mode runs under a policy like this: the model can still inspect everything
+    /// its grants covered, but no path is writable — not even the temp directory,
+    /// which stays bound as `TMPDIR`. Exclusions go with the writes they guarded.
+    #[must_use]
+    #[inline]
+    pub fn read_only(mut self) -> Self {
+        for root in std::mem::take(&mut self.writable) {
+            if !self.read_only.contains(&root) {
+                self.read_only.push(root);
+            }
+        }
+        self.excluded.clear();
+        self
+    }
+
     /// Convenience for [`Policy::exclude`] with `.git`.
     #[must_use]
     #[inline]
