@@ -75,6 +75,7 @@ fn main() -> anyhow::Result<()> {
     let _tmux = override_shift_up();
     let mut pane = Pane::default();
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
+    pane.set_control(agent.control());
     pane.note(format!("tart · {label}"));
     if let Some(tokens) = agent_config.context_tokens {
         pane.set_context_tokens(tokens);
@@ -145,6 +146,7 @@ fn run(
     let mut quit = false;
     let mut perf_on = false;
     let mut perf = Perf::default();
+    let control = agent.control();
     // State-mutation time since the last frame.
     let mut work = Duration::ZERO;
     while !quit {
@@ -160,7 +162,7 @@ fn run(
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
                 // Esc with nothing open aborts the running turn, keeping its partial.
-                Some(PaneEvent::Cancel) => agent.cancel(),
+                Some(PaneEvent::Cancel) => control.cancel(),
                 // Copy the selected text when we exit copy mode.
                 Some(PaneEvent::Copy(text)) => clipboard::copy(&text)?,
                 Some(PaneEvent::Submit(line)) => match line.trim() {
@@ -195,6 +197,11 @@ fn run(
                         }
                     }
                     _ => {
+                        // Steering message is emptied on the same iteration it sends.
+                        if let Some(text) = control.take_steer() {
+                            pane.echo(&text);
+                            transcript.push_user(text)?;
+                        }
                         // New response clears the thinking box for the previous one
                         pane.begin_response();
                         transcript.push_user(line)?;
@@ -245,9 +252,26 @@ fn run(
                             pane.fail_pending(error);
                             pane.append_span(&Span::styled(error.clone(), DIM_STYLE));
                         }
-                        // A cancelled turn keeps its streamed partial message + notify
+                        // A cancelled turn keeps its streamed partial message + notify.
+                        // (The pane already spilled any queued steering when
+                        // Esc landed — a cancel is a take-back.)
                         if matches!(progress, Progress::Cancelled) {
                             pane.note("⎋ cancelled");
+                        } else if control.steering().is_some() {
+                            // A steer that outlived its turn starts a fresh one
+                            if matches!(progress, Progress::Done { .. }) {
+                                let text = control.take_steer().expect("checked above");
+                                pane.echo(&text);
+                                transcript.push_user(text)?;
+                                pane.begin_response();
+                                pane.set_generating(true);
+                                let sender = wake.clone();
+                                agent.spawn(&transcript, move |progress| {
+                                    let _ = sender.send(Wake::Generation(progress));
+                                });
+                            } else {
+                                pane.spill_steer();
+                            }
                         }
                         session.record(&transcript)?;
                     }
