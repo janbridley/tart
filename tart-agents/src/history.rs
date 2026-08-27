@@ -236,6 +236,22 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_user_messages_replay_in_order() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        transcript.push_assistant("partial".to_string()).unwrap();
+        transcript.push_user("actually, go faster".to_string()).unwrap();
+
+        // A steered round's user/partial/user shape replays as recorded.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"], "partial");
+        assert_eq!(items[3]["role"], "user");
+        assert_eq!(items[3]["content"], "actually, go faster");
+    }
+
+    #[test]
     fn tool_rounds_replay_calls_grouped_before_outputs() {
         let transcript = Transcript::new().unwrap();
         let mut second = bash_call();
