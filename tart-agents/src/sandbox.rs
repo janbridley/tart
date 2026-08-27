@@ -30,9 +30,10 @@
 //!
 //! - Network access is denied (the base profile is `(deny default)`).
 //! - The child environment is cleared except for a minimal `PATH` (the system
-//!   directories, plus the rustup shims in `~/.cargo/bin` when present) and the granted
-//!   temp directory, so secrets held by the caller cannot be printed into captured
-//!   output. Re-add variables with the usual `std` methods.
+//!   directories, plus the rustup shims in `~/.cargo/bin` when present), the
+//!   granted temp directory, and `HOME`, so paths like `~/.cargo` resolve.
+//!   With the environment cleared, secrets held by the caller cannot be printed
+//!   into captured output. Re-add variables with the usual `std` methods.
 //! - Standard input is [`Stdio::null`](std::process::Stdio::null) by default, and the
 //!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices.
 //! - Binaries outside the platform read baseline (for example `/opt/homebrew/bin`)
@@ -227,6 +228,23 @@ impl Policy {
         Ok(self)
     }
 
+    /// Drop every write grant, leaving the reads as they are.
+    ///
+    /// Plan mode runs under a policy like this: the model can still inspect everything
+    /// its grants covered, but no path is writable — not even the temp directory,
+    /// which stays bound as `TMPDIR`. Exclusions go with the writes they guarded.
+    #[must_use]
+    #[inline]
+    pub fn read_only(mut self) -> Self {
+        for root in std::mem::take(&mut self.writable) {
+            if !self.read_only.contains(&root) {
+                self.read_only.push(root);
+            }
+        }
+        self.excluded.clear();
+        self
+    }
+
     /// Convenience for [`Policy::exclude`] with `.git`.
     #[must_use]
     #[inline]
@@ -251,9 +269,10 @@ impl Policy {
     /// A [`Command`] for `program` that runs under this policy:
     /// `sandbox-exec -p <render()> -DNAME=value ... -- <program>`.
     ///
-    /// The command starts from a cleared environment (a minimal `PATH`, plus `TMPDIR`
-    /// for the granted temp directory) and null standard input. The command and all of
-    /// its children inherit the sandbox.
+    /// The command starts from a cleared environment (a minimal `PATH`, plus
+    /// `TMPDIR` for the granted temp directory and `HOME` so `~` paths resolve)
+    /// and null standard input. The command and all of its children inherit the
+    /// sandbox.
     ///
     /// ```
     /// use tart_agents::sandbox::Policy;
@@ -277,8 +296,13 @@ impl Policy {
         }
         cmd.arg("--").arg(program.as_ref());
 
-        // Clear the environment
+        // Clear the environment. HOME passes through so `~/xyz` paths expand correctly.
+        //
+        // HOME is *not* readable or writable!
         cmd.env_clear().env("PATH", sandboxed_path()).stdin(Stdio::null());
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            cmd.env("HOME", home);
+        }
         if let Some(temp) = &self.temp {
             cmd.env("TMPDIR", temp);
         }
@@ -539,14 +563,16 @@ mod tests {
 
     /// Extras also grant the user-local interpreter and toolchain trees, so
     /// `.venv/bin/python` (a symlink into uv's `CPython` install) and the rustup
-    /// `cargo` shim execute under every policy.
+    /// `cargo` shim execute under every policy. The cargo grant covers the whole
+    /// `~/.cargo` tree excluding the credentials file.
     #[test]
     fn render_includes_user_toolchain_grants() {
         let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
 
         assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.local/share/uv/""#));
-        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo/(bin|registry|git)/""#));
+        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo(/|$)""#));
+        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo/\.?credentials(\.toml)?$""#));
         assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.rustup/""#));
     }
 
@@ -715,8 +741,15 @@ mod tests {
             .get_envs()
             .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect();
-        assert_eq!(vars.len(), 1 + usize::from(policy.temp.is_some()));
+        let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+        assert_eq!(
+            vars.len(),
+            1 + usize::from(home.is_some()) + usize::from(policy.temp.is_some())
+        );
         assert!(vars.contains(&(OsStr::new("PATH"), sandboxed_path().as_os_str())));
+        if let Some(home) = &home {
+            assert!(vars.contains(&(OsStr::new("HOME"), home.as_os_str())));
+        }
         if let Some(temp) = &policy.temp {
             assert!(vars.contains(&(OsStr::new("TMPDIR"), temp.as_os_str())));
         }
@@ -906,5 +939,68 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
+
+    /// `~/.cargo` is listable under the default grants, and its top-level
+    /// files (for example `config.toml`) are readable. Registry tokens in the
+    /// credentials file stay denied when that file exists.
+    ///
+    /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[test]
+    fn cargo_home_is_readable_but_credentials_are_not() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let cargo = PathBuf::from(home).join(".cargo");
+        if !cargo.is_dir() {
+            return;
+        }
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+
+        let list = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(format!("ls {}", cargo.display()))
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+
+        let config = cargo.join("config.toml");
+        if config.is_file() {
+            let read = policy
+                .command("/bin/sh")
+                .arg("-c")
+                .arg(format!("cat {}", config.display()))
+                .output()
+                .unwrap();
+            assert!(
+                read.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&read.stderr)
+            );
+        }
+
+        for credentials in ["credentials", "credentials.toml"] {
+            let credentials = cargo.join(credentials);
+            if !credentials.is_file() {
+                continue;
+            }
+            let denied = policy
+                .command("/bin/sh")
+                .arg("-c")
+                .arg(format!("cat {}", credentials.display()))
+                .output()
+                .unwrap();
+            assert!(!denied.status.success());
+            assert!(
+                String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"),
+                "stderr: {}",
+                String::from_utf8_lossy(&denied.stderr)
+            );
+        }
     }
 }
