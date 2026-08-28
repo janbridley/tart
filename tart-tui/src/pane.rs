@@ -922,6 +922,31 @@ impl Extend<Progress> for Pane {
     }
 }
 
+/// Span-vector operations shared by the markdown and wrap renderers.
+trait SpansExt {
+    /// Append styled text, gluing onto the last span when the style matches;
+    /// the owned string is allocated once per run.
+    fn push_merged(&mut self, text: &str, style: Style);
+    /// The line these spans render as: an empty line still needs one span.
+    fn into_line(self) -> Line<'static>;
+}
+
+impl SpansExt for Vec<Span<'static>> {
+    fn push_merged(&mut self, text: &str, style: Style) {
+        match self.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push_str(text),
+            _ => self.push(Span::styled(text.to_owned(), style)),
+        }
+    }
+
+    fn into_line(mut self) -> Line<'static> {
+        if self.is_empty() {
+            self.push(Span::raw(""));
+        }
+        Line::from(self)
+    }
+}
+
 /// A full-width dim rule row, drawn cell by cell.
 fn rule(buf: &mut Buffer, area: Rect) {
     for col in area.columns() {
