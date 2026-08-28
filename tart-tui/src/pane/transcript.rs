@@ -565,6 +565,8 @@ impl Transcript {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
@@ -1259,7 +1261,10 @@ and the analytics dashboard rewrite.\n\n\
 
         // A long output collapses to head + count + tail; Ctrl+O expands it.
         start_bash(&mut t, "call_1");
-        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let mut long = String::new();
+        for i in 0..20 {
+            let _ = writeln!(long, "line {i}");
+        }
         t.finish_tool("call_1", long, Some(0));
         t.sync(40);
         let collapsed = texts(&t.rows);
