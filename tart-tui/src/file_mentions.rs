@@ -1,7 +1,8 @@
-//! The `@file` mention popup.
+//! The file-completion popup.
 //!
-//! Typing a word-start `@` in the prompt opens a typeahead file selector over
-//! the working directory (gitignored and hidden entries skipped).
+//! Two front ends share one typeahead over the working directory (gitignored
+//! and hidden entries skipped): typing a word-start `@` in the prompt mentions
+//! a file, and an argument in a `!` shell command completes as a file.
 
 use ignore::WalkBuilder;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -29,6 +30,14 @@ pub(crate) fn derive_query(editor: &Editor) -> Option<(String, usize)> {
     // Whitespace between the `@` and the caret (usually) means the caret left the word.
     let inside = !prefix[at + 1..].contains(char::is_whitespace);
     (word_start && inside).then(|| (prefix[at + 1..].to_string(), at))
+}
+
+/// The argument under the caret, as a file to complete.
+pub(crate) fn derive_argument(editor: &Editor) -> Option<(String, usize)> {
+    let line = &editor.lines[editor.line];
+    let prefix = &line[..g_to_byte(line, editor.g)];
+    let start = prefix.rfind(char::is_whitespace)? + 1;
+    (!prefix[start..].is_empty()).then(|| (prefix[start..].to_string(), start))
 }
 
 /// All non-ignored files under the current directory, as sorted relative paths.
@@ -103,9 +112,21 @@ impl FilePopup {
             .and_then(|i| self.matches.get(i).map(String::as_str))
     }
 
-    /// Replace the word after the `@` with the selection, quoting paths w/ whitespace
+    /// Replace the `@` word with the selection, quoting paths with whitespace.
     pub(crate) fn accept(&self, editor: &mut Editor) {
-        let (Some((_, at)), Some(path)) = (derive_query(editor), self.selected()) else {
+        self.insert(editor, derive_query(editor).map(|(query, at)| (query, at + 1)));
+    }
+
+    /// Replace the argument under the caret with the selection, the bang-mode
+    /// twin of [`FilePopup::accept`].
+    pub(crate) fn accept_argument(&self, editor: &mut Editor) {
+        self.insert(editor, derive_argument(editor));
+    }
+
+    /// Overwrite the word starting at byte `start` with the chosen path,
+    /// quoting paths with whitespace and parking the caret after it.
+    fn insert(&self, editor: &mut Editor, word: Option<(String, usize)>) {
+        let (Some((_, start)), Some(path)) = (word, self.selected()) else {
             return;
         };
         let text = if path.contains(char::is_whitespace) {
@@ -115,13 +136,12 @@ impl FilePopup {
         };
 
         let line = &mut editor.lines[editor.line];
-        // Replace the whole word after the `@`
-        let start = at + 1;
+        // Replace the whole word, to its end.
         let end = line[start..]
             .find(char::is_whitespace)
             .map_or(line.len(), |i| start + i);
         line.replace_range(start..end, &text);
-        editor.g = graphemes(&line[..=at]) + graphemes(&text);
+        editor.g = graphemes(&line[..start]) + graphemes(&text);
     }
 
     /// Draw the popup anchored above `anchor` (the top rule), overlaying the transcript.
@@ -192,16 +212,16 @@ pub(crate) fn rearm(key: &KeyEvent) -> bool {
     }
 }
 
-/// Derive an `@query` from the draft and decide the typeahead's fate.
+/// Derive a query from the draft and decide the typeahead's fate.
 ///
 /// - A changed query refilters the list
 /// - A vanished query closes any popup.
-pub(crate) fn update(editor: &Editor, popup: &mut Option<Popup>, rearm: bool) {
+pub(crate) fn update(popup: &mut Option<Popup>, query: Option<(String, usize)>, rearm: bool) {
     // Closed and not re-arming -> skip the update.
     if popup.is_none() && !rearm {
         return;
     }
-    let Some((query, _)) = derive_query(editor) else {
+    let Some((query, _)) = query else {
         *popup = None;
         return;
     };
@@ -248,6 +268,57 @@ mod tests {
     }
 
     #[test]
+    fn arguments_derive_after_whitespace() {
+        let mut editor = Editor::default();
+        editor.insert_str("cat src/main.rs");
+        assert_eq!(derive_argument(&editor), Some(("src/main.rs".into(), 4)));
+        // The caret ends the query, so completing mid-word sees its prefix.
+        for _ in 0..3 {
+            editor.left();
+        }
+        assert_eq!(derive_argument(&editor), Some(("src/main".into(), 4)));
+
+        editor.clear();
+        editor.insert_str("cargo");
+        assert_eq!(
+            derive_argument(&editor),
+            None,
+            "the command word is not an argument"
+        );
+
+        editor.clear();
+        editor.insert_str("cat ");
+        assert_eq!(derive_argument(&editor), None, "an ended word is no word");
+
+        editor.clear();
+        editor.insert_str("one  two");
+        assert_eq!(derive_argument(&editor), Some(("two".into(), 5)));
+    }
+
+    /// A completion overwrites the whole argument word, tail and all, quoting
+    /// paths with whitespace.
+    #[test]
+    fn accept_argument_replaces_the_word() {
+        let mut editor = Editor::default();
+        editor.insert_str("cat src/ma");
+        let popup = FilePopup::from_files(vec!["src/main.rs".to_string()], "ma".into());
+        popup.accept_argument(&mut editor);
+        assert_eq!(editor.lines, ["cat src/main.rs"]);
+        assert_eq!(editor.g, 15); // parked after the inserted path
+
+        // Mid-word: the word's tail beyond the caret goes with it.
+        let mut editor = Editor::default();
+        editor.insert_str("echo one two three");
+        for _ in 0..6 {
+            editor.left();
+        }
+        let popup = FilePopup::from_files(vec!["two words.txt".to_string()], "tw".into());
+        popup.accept_argument(&mut editor);
+        assert_eq!(editor.lines, ["echo one \"two words.txt\" three"]);
+        assert_eq!(editor.g, 24);
+    }
+
+    #[test]
     fn accept_keeps_the_at_and_rearm_reopens() {
         let mut editor = Editor::default();
         editor.insert_str("read @ma");
@@ -260,18 +331,34 @@ mod tests {
         // keys stay closed too while the caret is outside the mention word.
         let mut slot = None;
         editor.insert_str(" more");
-        update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Char('x'))));
+        update(
+            &mut slot,
+            derive_query(&editor),
+            rearm(&KeyEvent::from(KeyCode::Char('x'))),
+        );
         assert!(slot.is_none());
         editor.backspace();
-        update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Backspace)));
+        update(
+            &mut slot,
+            derive_query(&editor),
+            rearm(&KeyEvent::from(KeyCode::Backspace)),
+        );
         assert!(slot.is_none());
         slot = None;
         editor.left();
-        update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Left)));
+        update(
+            &mut slot,
+            derive_query(&editor),
+            rearm(&KeyEvent::from(KeyCode::Left)),
+        );
         assert!(slot.is_none());
         slot = None;
         editor.insert_str(" @ne");
-        update(&editor, &mut slot, rearm(&KeyEvent::from(KeyCode::Char('@'))));
+        update(
+            &mut slot,
+            derive_query(&editor),
+            rearm(&KeyEvent::from(KeyCode::Char('@'))),
+        );
         assert!(slot.is_some());
     }
 }
