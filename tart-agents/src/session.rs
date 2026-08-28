@@ -494,8 +494,6 @@ mod tests {
 
         let listed = list(root.path(), project).unwrap();
 
-        // Newest first, each labelled with its stamp and opening request — the
-        // first line only, capped with an ellipsis.
         assert_eq!(listed.len(), 4);
         assert!(listed[0].0.ends_with("20260102-000002.jsonl"));
         assert_eq!(listed[0].1, format!("20260102-000002  {}…", "x".repeat(60)));

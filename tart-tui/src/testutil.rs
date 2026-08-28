@@ -59,8 +59,7 @@ fn grid(
 }
 
 /// Render two frames (see [`frames`]) and map each cell: `#` where its
-/// background is `Color::DarkGray` — the selection band — and `.` elsewhere,
-/// one output line per terminal row.
+/// background is `Color::DarkGray` and `.` elsewhere.
 pub(crate) fn draw_backgrounds(render: impl FnMut(&mut Frame, Rect), size: (u16, u16)) -> String {
     grid(
         render,
