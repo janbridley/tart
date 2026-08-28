@@ -121,6 +121,16 @@ impl Session {
         self.path = None;
         self.written = 0;
     }
+
+    /// `items` as JSONL text: one line each, each newline-terminated.
+    fn jsonl(items: impl IntoIterator<Item = &InputItem>) -> anyhow::Result<String> {
+        let mut text = String::new();
+        for item in items {
+            text.push_str(&serde_json::to_string(item)?);
+            text.push('\n');
+        }
+        Ok(text)
+    }
 }
 
 /// The per-project directory name for `path`: separators become `-`.
@@ -235,12 +245,8 @@ fn load(path: &Path) -> anyhow::Result<Vec<InputItem>> {
 
 /// Rewrite `path` with exactly `items`, one JSON line each.
 fn save(path: &Path, items: &[InputItem]) -> anyhow::Result<()> {
-    let mut text = String::new();
-    for item in items {
-        text.push_str(&serde_json::to_string(item)?);
-        text.push('\n');
-    }
-    fs::write(path, text).with_context(|| format!("trimming session {}", path.display()))
+    fs::write(path, Session::jsonl(items)?)
+        .with_context(|| format!("trimming session {}", path.display()))
 }
 
 /// Drop trailing calls whose outputs never arrived.
@@ -312,12 +318,7 @@ mod tests {
 
     /// Write `transcript`'s items to `path`, one JSON line each.
     fn write_session(path: &Path, transcript: &Transcript) {
-        let mut text = String::new();
-        for item in &transcript.request_items() {
-            text.push_str(&serde_json::to_string(item).unwrap());
-            text.push('\n');
-        }
-        std::fs::write(path, text).unwrap();
+        std::fs::write(path, Session::jsonl(&transcript.request_items()).unwrap()).unwrap();
     }
 
     #[test]
