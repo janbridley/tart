@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
 use std::path::PathBuf;
 use std::time::Instant;
-use tart_agents::{Progress, TurnControl};
+use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnControl, prompts};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
@@ -601,6 +601,28 @@ impl Pane {
     /// Offer (or retire) plan approval: Enter on an empty draft approves.
     pub fn set_plan_ready(&mut self, ready: bool) {
         self.plan_ready = ready && matches!(self.mode, Mode::Plan);
+    }
+
+    /// Switch plan mode on or off, updating the sandbox and the transcript's reminder.
+    pub fn set_plan(
+        &mut self,
+        agent: &mut Agent,
+        conversation: &mut Conversation,
+        on: bool,
+    ) -> anyhow::Result<()> {
+        if self.is_generating() {
+            self.note("plan mode will be enabled next turn: Esc to cancel");
+            return Ok(());
+        }
+        self.set_mode(if on { Mode::Plan } else { Mode::Default });
+        agent.set_mode(if on { ChatMode::Plan } else { ChatMode::Default });
+        conversation.set_reminder(on.then_some(prompts::PLAN_REMINDER))?;
+        self.note(if on {
+            "plan mode on · read-only · Shift+Tab to leave"
+        } else {
+            "plan mode off"
+        });
+        Ok(())
     }
 
     /// Wire the pane to the agent's turn control.

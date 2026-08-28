@@ -124,29 +124,6 @@ fn effort_of(name: &str) -> Option<ReasoningEffort> {
     }
 }
 
-/// Switch plan mode on or off, moving the agent's sandbox and tool list with the mode.
-/// Running turns keep their current mode, so the switch waits for the turn end.
-fn set_plan(
-    agent: &mut Agent,
-    pane: &mut Pane,
-    transcript: &mut Transcript,
-    on: bool,
-) -> anyhow::Result<()> {
-    if pane.is_generating() {
-        pane.note("plan mode will be enabled next turn: Esc to cancel");
-        return Ok(());
-    }
-    pane.set_mode(if on { Mode::Plan } else { Mode::Default });
-    agent.set_mode(if on { ChatMode::Plan } else { ChatMode::Default });
-    transcript.set_reminder(on.then_some(prompts::PLAN_REMINDER))?;
-    pane.note(if on {
-        "plan mode on · read-only · Shift+Tab to leave"
-    } else {
-        "plan mode off"
-    });
-    Ok(())
-}
-
 /// The user message recording one manual command and its framed output, so the
 /// model reads the run like pasted text rather than a tool result.
 ///
@@ -232,7 +209,7 @@ fn run(
                 // Shift+Tab: toggle plan mode, exactly as `/plan` does.
                 Some(PaneEvent::Plan) => {
                     let on = !pane.is_plan();
-                    set_plan(agent, pane, &mut transcript, on)?;
+                    pane.set_plan(agent, &mut transcript, on)?;
                 }
                 // Enter approved the drafted plan: leave plan mode and start
                 // the implementing turn, which may now write.
@@ -284,7 +261,7 @@ fn run(
                     // Toggle plan mode: read-only research and planning.
                     "/plan" => {
                         let on = !pane.is_plan();
-                        set_plan(agent, pane, &mut transcript, on)?;
+                        pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ => {
                         // Steering message is emptied on the same iteration it sends.
