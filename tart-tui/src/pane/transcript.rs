@@ -1,5 +1,6 @@
 //! The transcript: the message log, its entries, and the wrap cache.
 
+use itertools::Itertools;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use tart_agents::merge_digests;
@@ -60,20 +61,17 @@ fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
         format!("({})", merge_digests(tool.name, &tool.digests)),
         DIM_STYLE,
     );
-    let mut header = vec![
+    // An exit code shows only on a finished, failed call.
+    let exit = tool.exit.filter(|&c| c != 0).filter(|_| !tool.running);
+    let header = [
         Span::styled("● ", status),
         Span::styled(tool.name, status),
         digest,
-    ];
-
-    if tool.running {
-        header.push(Span::styled(" …", DIM_STYLE));
-    }
-    if !tool.running
-        && let Some(c) = tool.exit.filter(|&c| c != 0)
-    {
-        header.push(Span::styled(format!(" exit {c}"), TOOL_ERR));
-    }
+    ]
+    .into_iter()
+    .chain(tool.running.then(|| Span::styled(" …", DIM_STYLE)))
+    .chain(exit.map(|c| Span::styled(format!(" exit {c}"), TOOL_ERR)))
+    .collect::<Vec<_>>();
 
     // A superseded box stays folded down to its header; Ctrl+O governs only
     // the boxes still standing. A merged box that reopens keeps its previous
@@ -104,7 +102,7 @@ fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
         _ => lines.into_iter().map(tool_row).collect(),
     };
 
-    [vec![Line::from(header)], body].concat()
+    std::iter::once(Line::from(header)).chain(body).collect()
 }
 
 impl Entry {
@@ -127,35 +125,21 @@ impl Entry {
 
 /// The lines a thinking block renders: dim when shown or a placeholder otherwise.
 fn thinking_lines(raw: &str, shown: bool) -> Vec<Line<'static>> {
-    let dim = |text: &str| {
-        let mut line = Line::from(text.to_owned());
-        line.style = DIM_STYLE;
-        line
-    };
     if !shown {
         return raw
             .is_empty()
             .then(Vec::new)
             .unwrap_or_else(|| vec![thinking_placeholder()]);
     }
-    let mut parts = raw.split('\n').collect::<Vec<_>>();
-    while parts.last() == Some(&"") {
-        parts.pop();
+    // Trailing empties are trailing '\n's; a run of interior ones renders once.
+    let body = raw.trim_end_matches('\n');
+    if body.is_empty() {
+        return Vec::new();
     }
-    let mut lines = Vec::with_capacity(parts.len());
-    let mut blank = false;
-    for part in parts {
-        if part.is_empty() {
-            if !blank {
-                lines.push(dim(""));
-            }
-            blank = true;
-        } else {
-            lines.push(dim(part));
-            blank = false;
-        }
-    }
-    lines
+    body.split('\n')
+        .dedup_by(|a, b| a.is_empty() && b.is_empty())
+        .map(|text| Line::styled(text.to_owned(), DIM_STYLE))
+        .collect()
 }
 
 /// One tool invocation, updated in place when its output arrives.
@@ -505,12 +489,10 @@ impl Transcript {
     /// Whether a blank row leads `messages[index]` and we should emit a newline.
     fn separated(&self, index: usize) -> bool {
         // true for an answer, false for a tool box, `None` for anything else.
-        let kind = |entry: &Entry| {
-            matches!(entry, Entry::Answer { .. }).then_some(true).or(matches!(
-                entry,
-                Entry::Tool(_)
-            )
-            .then_some(false))
+        let kind = |entry: &Entry| match entry {
+            Entry::Answer { .. } => Some(true),
+            Entry::Tool(_) => Some(false),
+            _ => None,
         };
         let Some(current) = kind(&self.messages[index]) else {
             return false;
