@@ -43,9 +43,11 @@ const BULLET: &str = "• ";
 /// Should be short, as [`render`] may wrap it.
 const HR_WIDTH: usize = 24;
 
-/// Render answer text to styled transcript lines.
-pub(crate) fn render(raw: &str) -> Vec<Line<'static>> {
-    let mut blocks = Blocks::default();
+/// Render answer text to styled transcript lines, wrapping each line to
+/// `width` cells with its block's hanging indent carried onto every wrapped
+/// row; a `width` of 0 leaves each line on one row.
+pub(crate) fn render(raw: &str, width: usize) -> Vec<Line<'static>> {
+    let mut blocks = Blocks::new(width);
     for event in Parser::new_ext(raw, options()) {
         blocks.event(event);
     }
@@ -61,6 +63,8 @@ fn options() -> Options {
 /// under construction, and the buffered blocks.
 #[derive(Default)]
 struct Blocks {
+    /// The cell width rows wrap at; 0 leaves lines unwrapped.
+    width: usize,
     /// The rendered rows.
     out: Vec<Line<'static>>,
     /// The inline row under construction; breaks and block ends flush it.
@@ -211,6 +215,11 @@ struct Table {
 }
 
 impl Blocks {
+    /// Start a walk whose rows wrap to `width` cells, or to none when 0.
+    fn new(width: usize) -> Self {
+        Self { width, ..Blocks::default() }
+    }
+
     /// Fold one parser event into the state.
     fn event(&mut self, event: Event<'_>) {
         match event {
@@ -300,7 +309,7 @@ impl Blocks {
                     list.next = list.next.wrapping_add(1);
                     list.cont.clone_from(&pad);
                 }
-                let style = if self.quote > 0 { QUIET } else { Style::new() };
+                let style = if self.quote > 0 { QUOTE } else { Style::new() };
                 let mut first = self.rail();
                 first.push(Span::raw(format!("{column}{bullet}")));
                 let mut rest = self.rail();
@@ -351,7 +360,7 @@ impl Blocks {
         self.gap();
         let style = match style {
             Some(style) => style,
-            None if self.quote > 0 => QUIET,
+            None if self.quote > 0 => QUOTE,
             None => Style::new(),
         };
         if self.lists.is_empty() {
@@ -471,10 +480,11 @@ impl Blocks {
 
     /// Push each line of `text` as a quiet row, carrying the context prefix.
     fn quiet_rows(&mut self, text: &str) {
+        let lead = self.indents();
         for line in text.lines() {
-            let mut spans = self.indents();
-            spans.push(Span::styled(line.to_owned(), QUIET));
-            self.push_row(Line::from(spans));
+            for row in self.wrap(&lead, vec![Span::styled(line.to_owned(), QUIET)]) {
+                self.push_row(Line::from([lead.as_slice(), &row].concat()));
+            }
         }
     }
 
@@ -490,10 +500,29 @@ impl Blocks {
         }
     }
 
-    /// Flush the inline row as a line.
+    /// Flush the inline row as a line, or as several wrapped to the width.
     fn flush_line(&mut self) {
-        let line = self.prefix.line(self.inline.take());
-        self.push_row(line);
+        let spans = self.inline.take();
+        let rows = self.wrap(&self.prefix.rest, spans);
+        for spans in rows {
+            let line = self.prefix.line(spans);
+            self.push_row(line);
+        }
+    }
+
+    /// Wrap one block line's spans into rows that fit the cells left of `lead`
+    fn wrap(&self, lead: &[Span<'static>], spans: Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {
+        if self.width == 0 {
+            return vec![spans];
+        }
+        let budget = self
+            .width
+            .saturating_sub(lead.iter().map(Span::width).sum())
+            .max(1);
+        wrap_lines(&[Line::from(spans)], budget)
+            .into_iter()
+            .map(|row| row.spans)
+            .collect()
     }
 
     /// Flush a block's last line when text is pending.
@@ -641,7 +670,7 @@ mod tests {
 
     /// The rendered rows as plain text.
     fn rows(raw: &str) -> Vec<String> {
-        texts(&render(raw))
+        texts(&render(raw, 0))
     }
 
     /// Plain text renders as paragraph blocks.
@@ -670,7 +699,7 @@ mod tests {
     /// Emphasis styles its text and strips its markers
     #[test]
     fn emphasis_styles_and_strips() {
-        let spans = &segments(&render("**bold** and *italic* and ~~gone~~"))[0];
+        let spans = &segments(&render("**bold** and *italic* and ~~gone~~", 0))[0];
         assert_eq!(spans[0], ("bold".into(), HEADING));
         assert_eq!(spans[1], (" and ".into(), Style::new()));
         assert_eq!(
@@ -690,7 +719,7 @@ mod tests {
     /// Inline code renders verbatim in its own color.
     #[test]
     fn inline_code_colors() {
-        let spans = &segments(&render("run `cargo test` now"))[0];
+        let spans = &segments(&render("run `cargo test` now", 0))[0];
         assert_eq!(spans[1], ("cargo test".into(), INLINE_CODE));
         assert_eq!(spans[2], (" now".into(), Style::new()));
         // A break's trim never eats code's leading space: verbatim.
@@ -700,27 +729,27 @@ mod tests {
     /// Headings strip their markers and scale by level.
     #[test]
     fn headings_strip_and_scale() {
-        let spans = segments(&render("# One\n## Two\n### Three\n###### Six"));
+        let spans = segments(&render("# One\n## Two\n### Three\n###### Six", 0));
         assert_eq!(spans[0][0], ("One".into(), HEADING1));
         assert_eq!(spans[2][0], ("Two".into(), HEADING2));
-        assert_eq!(spans[4][0], ("Three".into(), HEADING));
+        assert_eq!(spans[4][0], ("Three".into(), HEADING3));
         assert_eq!(spans[6][0], ("Six".into(), HEADING));
         // A heading still streaming renders with its partial text.
-        assert_eq!(segments(&render("# Hea"))[0][0], ("Hea".into(), HEADING1));
+        assert_eq!(segments(&render("# Hea", 0))[0][0], ("Hea".into(), HEADING1));
     }
 
     /// Fenced and indented code render verbatim and dim.
     #[test]
     fn code_blocks_render_verbatim_dim() {
         assert_eq!(
-            segments(&render("```rust\nlet x = **1**;\n    indented\n```")),
+            segments(&render("```rust\nlet x = **1**;\n    indented\n```", 0)),
             [
                 vec![("let x = **1**;".into(), QUIET)],
                 vec![("    indented".into(), QUIET)],
             ]
         );
         assert_eq!(
-            segments(&render("`x`\n\n    four spaces are code")),
+            segments(&render("`x`\n\n    four spaces are code", 0)),
             [
                 vec![("x".to_string(), INLINE_CODE)],
                 vec![(String::new(), Style::new())],
@@ -728,7 +757,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            segments(&render("```\nunclosed")),
+            segments(&render("```\nunclosed", 0)),
             [vec![("unclosed".into(), QUIET)]]
         );
     }
@@ -754,6 +783,45 @@ mod tests {
         assert_eq!(rows("- a\n  - b\n    wrapped"), ["• a", "  • b", "    wrapped"]);
     }
 
+    /// Wrapped rows keep the hanging indent so a continuation aligns under its item's
+    /// text by the marker's width.
+    #[test]
+    fn wrapped_rows_keep_the_hanging_indent() {
+        // `4. ` is three cells; `10. ` is four, a wider marker a wider indent.
+        let wrap = |raw: &str, width: usize| texts(&render(raw, width));
+        assert_eq!(
+            wrap("4. a long numbered line that wraps at a narrow width", 30),
+            ["4. a long numbered line that ", "   wraps at a narrow width"]
+        );
+        assert_eq!(
+            wrap("10. ten is two digits wide so the marker is four cells", 30),
+            ["10. ten is two digits wide so ", "    the marker is four cells"]
+        );
+        assert_eq!(
+            wrap("- bullet items keep their two space continuation", 20),
+            ["• bullet items keep ", "  their two space ", "  continuation"]
+        );
+        assert_eq!(
+            wrap("> a quoted line that is long enough to wrap here", 20),
+            ["│ a quoted line that", "│ is long enough to ", "│ wrap here"]
+        );
+        // A nested item's continuation aligns under the nested text alone.
+        assert_eq!(
+            wrap("1. outer\n   1. nested item with a long wrapping text line", 26),
+            [
+                "1. outer",
+                "   1. nested item with a ",
+                "      long wrapping text ",
+                "      line"
+            ]
+        );
+        // Verbatim rows wrap to the indent they sit at.
+        assert_eq!(
+            wrap("- item\n\n  ```\n  code line long enough to wrap yes\n  ```", 24),
+            ["• item", "  code line long enough ", "  to wrap yes"]
+        );
+    }
+
     #[test]
     fn item_continuations_and_buffered_blocks_keep_prefixes() {
         assert_eq!(rows("- a\n\n  b"), ["• a", "  b"]);
@@ -774,14 +842,16 @@ mod tests {
         assert_eq!(rows("a\n\n```\n```\n\nb"), ["a", "", "b"]);
     }
 
-    /// Blockquotes render dim behind a rail on every line, nested by depth.
+    /// Blockquotes render dim and italic behind a rail on every line, nested
+    /// by depth; the line's quote style italicizes the rail along with the
+    /// text, so a quotation reads apart from verbatim, quiet blocks.
     #[test]
     fn blockquotes_render_a_rail() {
-        let lines = segments(&render("> quoted\n> more\n\nafter"));
-        assert_eq!(lines[0][0], ("│ ".into(), QUIET));
-        assert_eq!(lines[0][1], ("quoted".into(), QUIET));
-        assert_eq!(lines[1][0], ("│ ".into(), QUIET));
-        assert_eq!(lines[1][1], ("more".into(), QUIET));
+        let lines = segments(&render("> quoted\n> more\n\nafter", 0));
+        assert_eq!(lines[0][0], ("│ ".into(), QUOTE));
+        assert_eq!(lines[0][1], ("quoted".into(), QUOTE));
+        assert_eq!(lines[1][0], ("│ ".into(), QUOTE));
+        assert_eq!(lines[1][1], ("more".into(), QUOTE));
         // The separating blank carries no rail: the quote has closed.
         assert_eq!(lines[2], vec![(String::new(), Style::new())]);
         assert_eq!(lines[3][0], ("after".into(), Style::new()));
@@ -791,7 +861,7 @@ mod tests {
     /// A horizontal rule renders as a dim rule row.
     #[test]
     fn rules_render_dim() {
-        let lines = segments(&render("above\n\n---\n\nbelow"));
+        let lines = segments(&render("above\n\n---\n\nbelow", 0));
         assert_eq!(lines[2][0], ("─".repeat(HR_WIDTH), QUIET));
     }
 
@@ -813,7 +883,7 @@ mod tests {
 
     #[test]
     fn links_style_labels() {
-        let spans = &segments(&render("see [the docs](https://example.com) now"))[0];
+        let spans = &segments(&render("see [the docs](https://example.com) now", 0))[0];
         assert_eq!(spans[1], ("the docs".into(), LINK));
         assert_eq!(spans[2], (" (https://example.com)".into(), QUIET));
         assert_eq!(spans[3], (" now".into(), Style::new()));
@@ -828,7 +898,7 @@ mod tests {
 
     #[test]
     fn tables_render_aligned() {
-        let lines = segments(&render("| left | mid | right |\n|---|:-:|--:|\n| a | b | c |"));
+        let lines = segments(&render("| left | mid | right |\n|---|:-:|--:|\n| a | b | c |", 0));
         assert_eq!(lines[0][0], ("left".into(), HEADING));
         assert_eq!(lines[0][1], (" │ ".into(), QUIET));
         assert_eq!(lines[0][2], ("mid".into(), HEADING));
