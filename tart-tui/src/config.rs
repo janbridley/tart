@@ -120,10 +120,9 @@ impl Config {
     pub(crate) fn default_agent(&self) -> anyhow::Result<ResolvedAgent> {
         let key = &self.default_agent.provider;
         let provider = self.providers.get(key).ok_or_else(|| {
-            let defined: Vec<&str> = self.providers.keys().map(String::as_str).collect();
+            let defined = self.providers.keys().map(String::as_str).join(", ");
             anyhow::anyhow!(
-                "default_agent names provider '{key}', which is not defined (defined: {})",
-                defined.join(", ")
+                "default_agent names provider '{key}', which is not defined (defined: {defined})"
             )
         })?;
         let target = &self.default_agent.name;
