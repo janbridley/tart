@@ -493,6 +493,38 @@ mod tests {
         assert!(!rendered.contains(r#"file-write* (subpath (param "READABLE_ROOT_0")"#));
     }
 
+    /// Plan mode runs under [`Policy::read_only`], with all writes blocked by the OS.
+    #[test]
+    fn read_only_converts_writes_to_reads_only() {
+        let root = tempfile::tempdir().unwrap();
+        // No `.git` exclusion, so the write rule renders in its plain form;
+        // the conversion is what is under test, not the exclusion guards.
+        let base = Policy::new(root.path()).unwrap();
+        assert!(
+            base.render()
+                .contains(r#"(allow file-write* (subpath (param "WRITABLE_ROOT_0")))"#)
+        );
+
+        let rendered = base.clone().read_only().render();
+        // The former writable root is now named as a read-only root instead.
+        assert!(
+            rendered.contains(r#"(allow file-read* (subpath (param "READABLE_ROOT_0")))"#),
+            "the workspace stays readable: {rendered}"
+        );
+        assert!(
+            !rendered.contains("file-write* (subpath (param \"WRITABLE_ROOT_"),
+            "no write rule survives the conversion: {rendered}"
+        );
+        // Every granted root, temp included, loses its write access.
+        assert!(
+            Policy::new(root.path())
+                .unwrap()
+                .read_only()
+                .writable_roots()
+                .is_empty()
+        );
+    }
+
     /// Roots are canonicalized, so a symlinked root grants the real path.
     #[test]
     fn roots_are_canonicalized_through_symlinks() {
