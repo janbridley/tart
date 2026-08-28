@@ -2,6 +2,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use tart_agents::merge_digests;
 
 #[cfg(test)]
 use crate::testutil::texts;
@@ -49,16 +50,17 @@ fn tool_hint_row(hidden: usize) -> Line<'static> {
 /// lines around a count of the hidden middle unless `expanded`. A call a later
 /// one superseded only renders its header.
 fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
-    let status = match (&tool.output, tool.exit) {
-        (None, _) => TOOL_RUNNING,
+    let status = match (tool.running, tool.exit) {
+        (true, _) => TOOL_RUNNING,
         (_, Some(0)) => TOOL_OK,
         _ => TOOL_ERR,
     };
 
+    let joined = merge_digests(tool.name, &tool.digests);
     let digest = if tool.name == "Bash" {
-        Span::raw(format!("({})", tool.digest))
+        Span::raw(format!("({joined})"))
     } else {
-        Span::styled(format!("({})", tool.digest), DIM_STYLE)
+        Span::styled(format!("({joined})"), DIM_STYLE)
     };
     let mut header = vec![
         Span::styled("● ", status),
@@ -66,20 +68,25 @@ fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
         digest,
     ];
 
-    let Some(output) = &tool.output else {
+    if tool.running {
         header.push(Span::styled(" …", DIM_STYLE));
-        return vec![Line::from(header)];
-    };
-
-    if let Some(c) = tool.exit.filter(|&c| c != 0) {
+    }
+    if !tool.running
+        && let Some(c) = tool.exit.filter(|&c| c != 0)
+    {
         header.push(Span::styled(format!(" exit {c}"), TOOL_ERR));
     }
 
     // A superseded box stays folded down to its header; Ctrl+O governs only
-    // the boxes still standing.
+    // the boxes still standing. A merged box that reopens keeps its previous
+    // output under the running header, so edits can be drawn in place.
     if tool.superseded {
         return vec![Line::from(header)];
     }
+
+    let Some(output) = &tool.output else {
+        return vec![Line::from(header)];
+    };
 
     let lines: Vec<_> = output.lines().collect();
     let limit = TOOL_HEAD + TOOL_TAIL;
@@ -160,9 +167,11 @@ struct ToolCall {
     id: String,
     /// Display name: `Bash`, `Read`, or `Edit`.
     name: &'static str,
-    /// Argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
-    digest: String,
-    /// Combined output; `None` while the call is still running.
+    /// The argument digest of each call in the run, e.g. `ls -la` or `main.rs:10-50`
+    digests: Vec<String>,
+    /// Whether a call is in flight.
+    running: bool,
+    /// Combined output; `None` until the first call of the run finishes.
     output: Option<String>,
     /// The process exit code, for the status color.
     exit: Option<i32>,
@@ -218,12 +227,33 @@ impl Transcript {
     }
 
     /// Record a tool invocation's start; it renders as a running header until
-    /// finished. The call supersedes every finished box before it, folding each
-    /// down to its header line, and moves the thinking block below itself so
-    /// the chain-of-thought always renders under the tool boxes.
+    /// finished. A `Read` or `Edit` following its own kind merges into that
+    /// trailing finished box instead of stacking a fresh one. Otherwise the
+    /// call supersedes every finished box before it, folding each down to its
+    /// header line, and moves the thinking block below itself so the
+    /// chain-of-thought always renders under the tool boxes.
     pub(crate) fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
+        // A trailing finished box of the same kind combines with following
+        if matches!(name, "Read" | "Edit")
+            && let Some(index) = self
+                .messages
+                .iter()
+                .rposition(|entry| !matches!(entry, Entry::Thinking { .. }))
+            && let Some(Entry::Tool(tool)) = self.messages.get(index)
+            && tool.name == name
+            && !tool.running
+            && tool.output.is_some()
+        {
+            self.rewind(index);
+            if let Some(Entry::Tool(tool)) = self.messages.get_mut(index) {
+                tool.digests.push(digest);
+                tool.id = id;
+                tool.running = true;
+                return;
+            }
+        }
         let fold = self.messages.iter().position(
-            |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_some() && !tool.superseded),
+            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && tool.output.is_some() && !tool.superseded),
         );
         let think = self
             .messages
@@ -236,6 +266,7 @@ impl Transcript {
         }
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
+                && !tool.running
                 && tool.output.is_some()
             {
                 tool.superseded = true;
@@ -244,7 +275,8 @@ impl Transcript {
         self.messages.push(Entry::Tool(ToolCall {
             id,
             name,
-            digest,
+            digests: vec![digest],
+            running: true,
             output: None,
             exit: None,
             superseded: false,
@@ -258,9 +290,11 @@ impl Transcript {
 
     /// Fill in the pending invocation with `id`, then refold from its box.
     pub(crate) fn finish_tool(&mut self, id: &str, output: String, exit: Option<i32>) {
-        let Some(index) = self.messages.iter().rposition(
-            |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_none() && tool.id == id),
-        ) else {
+        let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::Tool(tool) if tool.running && tool.id == id))
+        else {
             return;
         };
         // The box folds differently once tools finished, so the rows `sync` folded
@@ -272,6 +306,7 @@ impl Transcript {
         };
         tool.output = Some(output);
         tool.exit = exit;
+        tool.running = false;
     }
 
     /// Drop the cached rows of `messages[index..]` so the next `sync` refolds
@@ -291,10 +326,11 @@ impl Transcript {
         let mut failed = false;
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
-                && tool.output.is_none()
+                && tool.running
             {
                 tool.output = Some(reason.to_string());
                 tool.exit = None;
+                tool.running = false;
                 failed = true;
             }
         }
