@@ -200,21 +200,22 @@ impl FilePopup {
     }
 
     /// Replace the `@` word with the selection, quoting paths with whitespace.
-    pub(crate) fn accept(&self, editor: &mut Editor) {
-        self.insert(editor, derive_query(editor).map(|(query, at)| (query, at + 1)));
+    /// Returns whether it named a directory, so completing can keep going.
+    pub(crate) fn accept(&self, editor: &mut Editor) -> bool {
+        self.insert(editor, derive_query(editor).map(|(query, at)| (query, at + 1)))
     }
 
     /// Replace the argument under the caret with the selection, the bang-mode
     /// twin of [`FilePopup::accept`].
-    pub(crate) fn accept_argument(&self, editor: &mut Editor) {
-        self.insert(editor, derive_argument(editor));
+    pub(crate) fn accept_argument(&self, editor: &mut Editor) -> bool {
+        self.insert(editor, derive_argument(editor))
     }
 
     /// Overwrite the word starting at byte `start` with the chosen path,
     /// quoting paths with whitespace and parking the caret after it.
-    fn insert(&self, editor: &mut Editor, word: Option<(String, usize)>) {
+    fn insert(&self, editor: &mut Editor, word: Option<(String, usize)>) -> bool {
         let (Some((_, start)), Some(path)) = (word, self.selected()) else {
-            return;
+            return false;
         };
         let text = if path.contains(char::is_whitespace) {
             format!("\"{path}\"")
@@ -229,6 +230,8 @@ impl FilePopup {
             .map_or(line.len(), |i| start + i);
         line.replace_range(start..end, &text);
         editor.g = graphemes(&line[..start]) + graphemes(&text);
+        // Directories complete with a trailing slash, for continuing into them.
+        path.ends_with('/')
     }
 
     /// Draw the popup anchored above `anchor` (the top rule), overlaying the transcript.
