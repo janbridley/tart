@@ -196,7 +196,7 @@ fn first_user_text(line: &str) -> Option<String> {
 pub(crate) fn one_line(text: &str) -> String {
     let line = text.split('\n').next().unwrap_or_default();
     let mut capped = line.chars().take(60).collect::<String>();
-    if line.chars().count() > 60 {
+    if line.chars().nth(60).is_some() {
         capped.push('…');
     }
     capped
