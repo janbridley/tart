@@ -123,7 +123,7 @@ impl Session {
     }
 
     /// `items` as JSONL text: one line each, each newline-terminated.
-    fn jsonl(items: impl IntoIterator<Item = &InputItem>) -> anyhow::Result<String> {
+    fn jsonl<'a>(items: impl IntoIterator<Item = &'a InputItem>) -> anyhow::Result<String> {
         let mut text = String::new();
         for item in items {
             text.push_str(&serde_json::to_string(item)?);
