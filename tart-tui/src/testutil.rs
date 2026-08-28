@@ -62,7 +62,11 @@ fn grid(
 /// background is `Color::DarkGray` — the selection band — and `.` elsewhere,
 /// one output line per terminal row.
 pub(crate) fn draw_backgrounds(render: impl FnMut(&mut Frame, Rect), size: (u16, u16)) -> String {
-    grid(render, size, |cell| if cell.bg == Color::DarkGray { '#' } else { '.' })
+    grid(
+        render,
+        size,
+        |cell| if cell.bg == Color::DarkGray { '#' } else { '.' },
+    )
 }
 
 /// One line's spans as `(text, style)` pairs with the line style patched in .
@@ -88,38 +92,28 @@ pub(crate) fn segments(lines: &[Line<'static>]) -> Vec<Vec<(String, Style)>> {
 /// - `r` light-red fg · `l` light-blue fg (links) · `y` light-yellow fg
 ///   (inline code) · `p` light-magenta fg
 /// - `.` anything else
-pub(crate) fn draw_styles(render: impl FnMut(&mut Frame, Rect), (w, h): (u16, u16)) -> String {
-    let terminal = frames(render, (w, h));
-    let buf = terminal.backend().buffer();
-    (0..h)
-        .map(|y| {
-            (0..w)
-                .map(|x| {
-                    let cell = &buf[(x, y)];
-                    let add = cell.modifier;
-                    if add.contains(Modifier::BOLD) {
-                        'B'
-                    } else if add.contains(Modifier::ITALIC) {
-                        'I'
-                    } else if add.contains(Modifier::CROSSED_OUT) {
-                        'S'
-                    } else {
-                        match cell.fg {
-                            Color::Yellow => 'c',
-                            Color::DarkGray => 'd',
-                            Color::Blue => 'b',
-                            Color::Cyan => 'C',
-                            Color::Magenta => 'm',
-                            Color::LightRed => 'r',
-                            Color::LightBlue => 'l',
-                            Color::LightYellow => 'y',
-                            Color::LightMagenta => 'p',
-                            _ => '.',
-                        }
-                    }
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+pub(crate) fn draw_styles(render: impl FnMut(&mut Frame, Rect), size: (u16, u16)) -> String {
+    grid(render, size, |cell| {
+        let add = cell.modifier;
+        if add.contains(Modifier::BOLD) {
+            'B'
+        } else if add.contains(Modifier::ITALIC) {
+            'I'
+        } else if add.contains(Modifier::CROSSED_OUT) {
+            'S'
+        } else {
+            match cell.fg {
+                Color::Yellow => 'c',
+                Color::DarkGray => 'd',
+                Color::Blue => 'b',
+                Color::Cyan => 'C',
+                Color::Magenta => 'm',
+                Color::LightRed => 'r',
+                Color::LightBlue => 'l',
+                Color::LightYellow => 'y',
+                Color::LightMagenta => 'p',
+                _ => '.',
+            }
+        }
+    })
 }

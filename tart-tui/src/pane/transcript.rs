@@ -540,7 +540,10 @@ impl Transcript {
     /// The cached rows equal a full re-wrap of every message at the wrapped width
     #[cfg(test)]
     pub(crate) fn assert_rows_match_full_rewrap(&self) {
-        assert_eq!(texts(&self.rows), texts(&wrap_lines(&self.visible_lines(), self.cache.0)));
+        assert_eq!(
+            texts(&self.rows),
+            texts(&wrap_lines(&self.visible_lines(), self.cache.0))
+        );
     }
 
     /// The lines the transcript renders: each entry's display lines,
