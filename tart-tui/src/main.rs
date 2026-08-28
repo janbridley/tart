@@ -34,7 +34,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
-use pane::{DIM_STYLE, Mode, Pane, PaneEvent};
+use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use tart_agents::{
     Agent, CancelToken, ChatMode, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript,
@@ -99,16 +99,6 @@ fn install_panic_hook() {
         let _ = execute!(stdout(), DisableBracketedPaste);
         hook(info);
     }));
-}
-
-/// One wake source for the event loop.
-enum Wake {
-    /// Terminal input, read on its own thread.
-    Input(Event),
-    /// Progress from the background generation.
-    Generation(Progress),
-    /// A finished manual command's framed output.
-    Command(String),
 }
 
 /// Parse a `/effort` argument.
@@ -220,12 +210,7 @@ fn run(
                     pane.note("plan approved · implementing");
                     pane.echo(prompts::PLAN_APPROVAL);
                     transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
-                    pane.begin_response();
-                    pane.set_generating(true);
-                    let sender = wake.clone();
-                    agent.spawn(&transcript, move |progress| {
-                        let _ = sender.send(Wake::Generation(progress));
-                    });
+                    pane.start_turn(agent, &transcript, &wake);
                 }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     // Clear the display and the model's memory of the session
@@ -267,25 +252,10 @@ fn run(
                         // Steering message is emptied on the same iteration it sends.
                         if let Some(text) = control.take_steer() {
                             pane.echo(&text);
-                            let (message, notes) = attachments::attach_mentions(&text, &cwd);
-                            for note in notes {
-                                pane.note(note);
-                            }
-                            transcript.push_user(message)?;
+                            pane.submit_text(&transcript, &text, &cwd)?;
                         }
-                        // New response clears the thinking box for the previous one
-                        pane.begin_response();
-                        let (message, notes) = attachments::attach_mentions(&line, &cwd);
-                        for note in notes {
-                            pane.note(note);
-                        }
-                        transcript.push_user(message)?;
-                        pane.set_generating(true);
-                        let sender = wake.clone();
-                        // The agent loop runs on its own thread
-                        agent.spawn(&transcript, move |progress| {
-                            let _ = sender.send(Wake::Generation(progress));
-                        });
+                        pane.submit_text(&transcript, &line, &cwd)?;
+                        pane.start_turn(agent, &transcript, &wake);
                     }
                 },
                 // A session picked in the `/resume` chooser swaps the conversation
@@ -351,17 +321,8 @@ fn run(
                             if matches!(progress, Progress::Done { .. }) {
                                 let text = control.take_steer().expect("checked above");
                                 pane.echo(&text);
-                                let (message, notes) = attachments::attach_mentions(&text, &cwd);
-                                for note in notes {
-                                    pane.note(note);
-                                }
-                                transcript.push_user(message)?;
-                                pane.begin_response();
-                                pane.set_generating(true);
-                                let sender = wake.clone();
-                                agent.spawn(&transcript, move |progress| {
-                                    let _ = sender.send(Wake::Generation(progress));
-                                });
+                                pane.submit_text(&transcript, &text, &cwd)?;
+                                pane.start_turn(agent, &transcript, &wake);
                             } else {
                                 pane.spill_steer();
                             }
