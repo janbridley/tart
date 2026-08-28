@@ -7,18 +7,20 @@ mod transcript;
 mod wrap;
 
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::time::Instant;
 use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnControl, prompts};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
 
+use crate::attachments;
 use crate::clipboard::Selection;
 use crate::file_mentions::{self, FilePopup};
 use crate::session_picker::{SessionPopup, derive_query as session_query};
@@ -74,6 +76,16 @@ pub enum PaneEvent {
     /// Enter on an empty draft approved the drafted plan.
     Approve,
     Quit,
+}
+
+/// One wake source for the event loop.
+pub enum Wake {
+    /// Terminal input, read on its own thread.
+    Input(Event),
+    /// Progress from the background generation.
+    Generation(Progress),
+    /// A finished manual command's framed output.
+    Command(String),
 }
 
 /// The composer's mode: exactly one at a time.
@@ -577,6 +589,31 @@ impl Pane {
         self.spin = generating.then(Instant::now);
     }
 
+    /// Take a submitted line into the conversation: attach outside-sandbox
+    /// mentions, surface their notes, and record the user message.
+    pub fn submit_text(
+        &mut self,
+        transcript: &Conversation,
+        line: &str,
+        cwd: &Path,
+    ) -> anyhow::Result<()> {
+        let (message, notes) = attachments::attach_mentions(line, cwd);
+        for note in notes {
+            self.note(note);
+        }
+        transcript.push_user(message)
+    }
+
+    /// Begin a response, retiring the previous turn's thinking box, and run the turn
+    pub fn start_turn(&mut self, agent: &Agent, transcript: &Conversation, wake: &Sender<Wake>) {
+        self.begin_response();
+        self.set_generating(true);
+        let sender = wake.clone();
+        agent.spawn(transcript, move |progress| {
+            let _ = sender.send(Wake::Generation(progress));
+        });
+    }
+
     /// Whether a turn is generating, so a mode switch must wait.
     #[inline]
     pub fn is_generating(&self) -> bool {
@@ -1055,6 +1092,8 @@ fn queued_rule(buf: &mut Buffer, area: Rect, text: Option<&str>) {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, reason = "test assertions")]
+
+    use std::fmt::Write as _;
 
     use super::*;
     use crate::testutil::{draw, draw_backgrounds, draw_styles};
@@ -2028,7 +2067,10 @@ mod tests {
     fn ctrl_o_expands_tool_output_in_live_mode_only() {
         let mut pane = Pane::default();
         pane.start_tool("call_0".to_string(), "Bash", "seq 20".to_string());
-        let output: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let mut output = String::new();
+        for i in 0..20 {
+            let _ = writeln!(output, "line {i}");
+        }
         pane.finish_tool("call_0", output, Some(0));
         let collapsed = render(&mut pane, (60, 30));
         assert!(collapsed.contains("ctrl+o to expand"));
