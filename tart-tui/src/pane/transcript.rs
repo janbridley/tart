@@ -555,7 +555,7 @@ impl Transcript {
             .enumerate()
             .flat_map(|(index, entry)| {
                 self.separated(index)
-                    .then(Line::from(""))
+                    .then_some(Line::from(""))
                     .into_iter()
                     .chain(entry.lines(self.show_tool_output, self.show_thinking))
             })
