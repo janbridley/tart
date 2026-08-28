@@ -11,8 +11,8 @@ use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::DIM_STYLE;
 use super::wrap::wrap_lines;
+use super::{DIM_STYLE, SpansExt};
 
 /// H1: blue and bold.
 const HEADING1: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
@@ -129,10 +129,7 @@ impl Inline {
             return;
         }
         self.trim = false;
-        match self.spans.last_mut() {
-            Some(last) if last.style == style => last.content.to_mut().push_str(text),
-            _ => self.spans.push(Span::styled(text.to_owned(), style)),
-        }
+        self.spans.push_merged(text, style);
         if let Some((_, label)) = self.scopes.iter_mut().rev().find_map(|scope| scope.link.as_mut())
         {
             label.push_str(text);
@@ -173,17 +170,14 @@ impl Prefix {
     /// Build the block's next line: its first or rest prefix, then the
     /// spans, stamped with the block's style.
     fn line(&mut self, mut spans: Vec<Span<'static>>) -> Line<'static> {
-        let lead = if self.fresh {
+        let mut lead = if self.fresh {
             std::mem::take(&mut self.first)
         } else {
             self.rest.clone()
         };
         self.fresh = false;
-        let mut line = Line::from(lead);
-        line.spans.append(&mut spans);
-        if line.spans.is_empty() {
-            line.spans.push(Span::raw(""));
-        }
+        lead.append(&mut spans);
+        let mut line = lead.into_line();
         line.style = self.style;
         line
     }
@@ -299,10 +293,7 @@ impl Blocks {
                 // Each level stores only its own bullet's width in cells, so
                 // the levels sum to the true indent.
                 let pad = " ".repeat(bullet.chars().count());
-                let column = self.lists[..self.lists.len() - 1]
-                    .iter()
-                    .map(|list| list.cont.as_str())
-                    .collect::<String>();
+                let column = self.continuations(self.lists.len() - 1);
                 if let Some(list) = self.lists.last_mut() {
                     list.next = list.next.wrapping_add(1);
                     list.cont.clone_from(&pad);
@@ -469,15 +460,16 @@ impl Blocks {
     /// Block text instead uses the `Prefix` frozen at its block's open.
     fn indents(&self) -> Vec<Span<'static>> {
         let mut spans = self.rail();
-        let indent = self
-            .lists
-            .iter()
-            .map(|list| list.cont.as_str())
-            .collect::<String>();
+        let indent = self.continuations(self.lists.len());
         if !indent.is_empty() {
             spans.push(Span::raw(indent));
         }
         spans
+    }
+
+    /// The joined continuation indents of the `n` outermost open lists.
+    fn continuations(&self, n: usize) -> String {
+        self.lists[..n].iter().map(|list| list.cont.as_str()).collect()
     }
 
     /// Push each line of `text` as a quiet row, carrying the context prefix.
@@ -546,10 +538,7 @@ impl Blocks {
         self.in_html = false;
         if self.pending_gap && !self.out.is_empty() {
             self.pending_gap = false;
-            let mut blank = Line::from(self.rail());
-            if blank.spans.is_empty() {
-                blank.spans.push(Span::raw(""));
-            }
+            let blank = self.rail().into_line();
             self.out.push(blank);
         }
         self.out.push(line);
@@ -636,12 +625,7 @@ fn pad_cell(mut cell: Vec<Span<'static>>, width: usize, align: Alignment) -> Vec
     }
     let tail = " ".repeat(right);
     if !tail.is_empty() {
-        match cell.last_mut() {
-            Some(last) if last.style == Style::new() => {
-                last.content.to_mut().push_str(&tail);
-            }
-            _ => cell.push(Span::raw(tail)),
-        }
+        cell.push_merged(&tail, Style::new());
     }
     cell
 }
