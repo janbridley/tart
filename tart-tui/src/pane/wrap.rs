@@ -4,6 +4,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::SpansExt;
+
 /// Spaces a tab renders as.
 const TAB_WIDTH: usize = 4;
 
@@ -92,11 +94,7 @@ impl<'a> Wrapper<'a> {
     fn emit_row(&mut self) {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (sym, style, _) in std::mem::take(&mut self.row) {
-            match spans.last_mut() {
-                Some(last) if last.style == style => last.content.to_mut().push_str(sym),
-                // Allocate an owned string once per run
-                _ => spans.push(Span::styled(sym.to_owned(), style)),
-            }
+            spans.push_merged(sym, style);
         }
         self.rows.push(Line::from(spans));
         self.row_width = 0;
