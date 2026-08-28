@@ -44,73 +44,12 @@ fn tool_hint_row(hidden: usize) -> Line<'static> {
     ])
 }
 
-/// A status header and then the output rendered for a running tool call
-///
-/// Running calls show just the header with a dim ellipsis; finished ones add
-/// their output rows, collapsed to [`TOOL_HEAD`] head and [`TOOL_TAIL`] tail
-/// lines around a count of the hidden middle unless `expanded`. A call a later
-/// one superseded only renders its header.
-fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
-    let status = match (tool.running, tool.exit) {
-        (true, _) => TOOL_RUNNING,
-        (_, Some(0)) => TOOL_OK,
-        _ => TOOL_ERR,
-    };
-
-    let digest = Span::styled(
-        format!("({})", merge_digests(tool.name, &tool.digests)),
-        DIM_STYLE,
-    );
-    // An exit code shows only on a finished, failed call.
-    let exit = tool.exit.filter(|&c| c != 0).filter(|_| !tool.running);
-    let header = [
-        Span::styled("● ", status),
-        Span::styled(tool.name, status),
-        digest,
-    ]
-    .into_iter()
-    .chain(tool.running.then(|| Span::styled(" …", DIM_STYLE)))
-    .chain(exit.map(|c| Span::styled(format!(" exit {c}"), TOOL_ERR)))
-    .collect::<Vec<_>>();
-
-    // A superseded box stays folded down to its header; Ctrl+O governs only
-    // the boxes still standing. A merged box that reopens keeps its previous
-    // output under the running header, so edits can be drawn in place.
-    if tool.superseded {
-        return vec![Line::from(header)];
-    }
-
-    let Some(output) = &tool.output else {
-        return vec![Line::from(header)];
-    };
-
-    let lines: Vec<_> = output.lines().collect();
-    let limit = TOOL_HEAD + TOOL_TAIL;
-
-    let body: Vec<Line<'static>> = match lines.as_slice() {
-        [] => vec![tool_row(TOOL_NO_OUTPUT)],
-        _ if !expanded && lines.len() > limit => {
-            let hidden = lines.len() - limit;
-            lines[..TOOL_HEAD]
-                .iter()
-                .copied()
-                .map(tool_row)
-                .chain(std::iter::once(tool_hint_row(hidden)))
-                .chain(lines[lines.len() - TOOL_TAIL..].iter().copied().map(tool_row))
-                .collect()
-        }
-        _ => lines.into_iter().map(tool_row).collect(),
-    };
-
-    std::iter::once(Line::from(header)).chain(body).collect()
-}
-
 impl Entry {
     /// The display lines the entry renders as. Stale entries render immediately
     fn lines(&self, expanded: bool, thinking: bool) -> Vec<Line<'static>> {
         match self {
             Entry::Text(line) => vec![line.clone()],
-            Entry::Tool(tool) => tool_lines(tool, expanded),
+            Entry::Tool(tool) => tool.lines(expanded),
             Entry::Answer { raw, width, lines } => {
                 if *width == 0 {
                     markdown::render(raw, 0)
@@ -159,6 +98,69 @@ struct ToolCall {
     exit: Option<i32>,
     /// A later invocation folded this box down to its header line.
     superseded: bool,
+}
+
+impl ToolCall {
+    /// The box's rows: a status header and then the rendered output
+    ///
+    /// Running calls show just the header with a dim ellipsis; finished ones add
+    /// their output rows, collapsed to [`TOOL_HEAD`] head and [`TOOL_TAIL`] tail
+    /// lines around a count of the hidden middle unless `expanded`. A call a later
+    /// one superseded only renders its header.
+    fn lines(&self, expanded: bool) -> Vec<Line<'static>> {
+        let status = match (self.running, self.exit) {
+            (true, _) => TOOL_RUNNING,
+            (_, Some(0)) => TOOL_OK,
+            _ => TOOL_ERR,
+        };
+
+        let digest = Span::styled(
+            format!("({})", merge_digests(self.name, &self.digests)),
+            DIM_STYLE,
+        );
+        // An exit code shows only on a finished, failed call.
+        let exit = self.exit.filter(|&c| c != 0).filter(|_| !self.running);
+        let header = [
+            Span::styled("● ", status),
+            Span::styled(self.name, status),
+            digest,
+        ]
+        .into_iter()
+        .chain(self.running.then(|| Span::styled(" …", DIM_STYLE)))
+        .chain(exit.map(|c| Span::styled(format!(" exit {c}"), TOOL_ERR)))
+        .collect::<Vec<_>>();
+
+        // A superseded box stays folded down to its header; Ctrl+O governs only
+        // the boxes still standing. A merged box that reopens keeps its previous
+        // output under the running header, so edits can be drawn in place.
+        if self.superseded {
+            return vec![Line::from(header)];
+        }
+
+        let Some(output) = &self.output else {
+            return vec![Line::from(header)];
+        };
+
+        let lines: Vec<_> = output.lines().collect();
+        let limit = TOOL_HEAD + TOOL_TAIL;
+
+        let body: Vec<Line<'static>> = match lines.as_slice() {
+            [] => vec![tool_row(TOOL_NO_OUTPUT)],
+            _ if !expanded && lines.len() > limit => {
+                let hidden = lines.len() - limit;
+                lines[..TOOL_HEAD]
+                    .iter()
+                    .copied()
+                    .map(tool_row)
+                    .chain(std::iter::once(tool_hint_row(hidden)))
+                    .chain(lines[lines.len() - TOOL_TAIL..].iter().copied().map(tool_row))
+                    .collect()
+            }
+            _ => lines.into_iter().map(tool_row).collect(),
+        };
+
+        std::iter::once(Line::from(header)).chain(body).collect()
+    }
 }
 
 /// One transcript message: a text line, a live tool invocation, a streamed
