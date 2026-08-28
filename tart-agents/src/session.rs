@@ -192,8 +192,8 @@ fn first_user_text(line: &str) -> Option<String> {
     (item["role"] == "user").then(|| item["content"].as_str().map(str::to_string))?
 }
 
-/// The first line of `text`, capped with an ellipsis for a picker row.
-fn one_line(text: &str) -> String {
+/// The first line of `text`, capped with an ellipsis.
+pub(crate) fn one_line(text: &str) -> String {
     let line = text.split('\n').next().unwrap_or_default();
     let mut capped = line.chars().take(60).collect::<String>();
     if line.chars().count() > 60 {
