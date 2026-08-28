@@ -44,7 +44,12 @@ fn inside_grant(mention: &str, cwd: &Path) -> bool {
 
 /// A fence longer than any run of backticks in `text`, so a file can't close its block
 fn fence_len(text: &str) -> usize {
-    text.split(|c: char| c != '`').map(str::len).max().unwrap_or(0).max(3) + 1
+    text.split(|c: char| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+        .max(3)
+        + 1
 }
 
 /// One outside-the-sandbox mention's attachment block and its note for the pane.

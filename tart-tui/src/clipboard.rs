@@ -4,8 +4,8 @@
 use std::io;
 
 use crossterm::clipboard::CopyToClipboard;
-use itertools::Itertools;
 use crossterm::execute;
+use itertools::Itertools;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
