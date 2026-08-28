@@ -158,6 +158,8 @@ fn run(
     let control = agent.control();
     // A manual command's cancel lever, held while one runs; Esc and quit set it.
     let mut manual_cancel: Option<(CancelToken, std::thread::JoinHandle<()>)> = None;
+    // A plan switch deferred by a running turn, applied when the turn ends.
+    let mut pending_plan: Option<bool> = None;
     // State-mutation time since the last frame.
     let mut work = Duration::ZERO;
     while !quit {
@@ -176,6 +178,8 @@ fn run(
                 // (a no-op when idle) and any manual command.
                 Some(PaneEvent::Cancel) => {
                     control.cancel();
+                    // Esc also cancels a plan switch still waiting for the turn.
+                    pending_plan = None;
                     if let Some((token, _)) = &manual_cancel {
                         token.cancel();
                     }
@@ -199,7 +203,7 @@ fn run(
                 // Shift+Tab: toggle plan mode, exactly as `/plan` does.
                 Some(PaneEvent::Plan) => {
                     let on = !pane.is_plan();
-                    pane.set_plan(agent, &mut transcript, on)?;
+                    pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                 }
                 // Enter approved the drafted plan: leave plan mode and start
                 // the implementing turn, which may now write.
@@ -246,7 +250,7 @@ fn run(
                     // Toggle plan mode: read-only research and planning.
                     "/plan" => {
                         let on = !pane.is_plan();
-                        pane.set_plan(agent, &mut transcript, on)?;
+                        pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ => {
                         // Steering message is emptied on the same iteration it sends.
@@ -305,6 +309,11 @@ fn run(
                         pane.set_generating(false);
                         // A finished plan in plan mode is ready for Enter to approve
                         pane.set_plan_ready(matches!(&progress, Progress::Done { .. }));
+                        // A plan switch queued mid-turn takes effect now, ahead of
+                        // any steer that starts the next turn.
+                        if let Some(on) = pending_plan.take() {
+                            pane.set_plan(agent, &mut transcript, on)?;
+                        }
                         // A failure also resolves anything still running, then
                         // shows the error.
                         if let Progress::Failed(error) = &progress {

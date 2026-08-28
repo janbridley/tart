@@ -640,16 +640,22 @@ impl Pane {
         self.plan_ready = ready && matches!(self.mode, Mode::Plan);
     }
 
-    /// Switch plan mode on or off, updating the sandbox and the transcript's reminder.
+    /// Switch plan mode on or off, updating the sandbox and the transcript's
+    /// reminder. A turn in the way defers: the switch comes back as `Some(on)`
+    /// for the caller to apply when the turn ends.
     pub fn set_plan(
         &mut self,
         agent: &mut Agent,
         conversation: &mut Conversation,
         on: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<bool>> {
         if self.is_generating() {
-            self.note("plan mode will be enabled next turn: Esc to cancel");
-            return Ok(());
+            self.note(if on {
+                "plan mode will be enabled next turn: Esc to cancel"
+            } else {
+                "plan mode will be disabled next turn: Esc to cancel"
+            });
+            return Ok(Some(on));
         }
         self.set_mode(if on { Mode::Plan } else { Mode::Default });
         agent.set_mode(if on { ChatMode::Plan } else { ChatMode::Default });
@@ -659,7 +665,7 @@ impl Pane {
         } else {
             "plan mode off"
         });
-        Ok(())
+        Ok(None)
     }
 
     /// Wire the pane to the agent's turn control.
@@ -1097,6 +1103,7 @@ mod tests {
 
     use super::*;
     use crate::testutil::{draw, draw_backgrounds, draw_styles};
+    use tart_agents::sandbox::Policy;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1421,6 +1428,29 @@ mod tests {
         pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
         assert!(pane.is_plan(), "Esc keeps plan mode on");
+    }
+
+    /// A plan switch asked for mid-turn waits: `set_plan` hands it back for the
+    /// front end to apply when the turn ends.
+    #[test]
+    fn mid_turn_plan_switches_wait_for_the_turn() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let mut agent = Agent::new("http://127.0.0.1:1", "key", "model", policy);
+        let mut conversation = Conversation::new().unwrap();
+        let mut pane = Pane::default();
+        pane.set_generating(true);
+
+        let deferred = pane.set_plan(&mut agent, &mut conversation, true).unwrap();
+        assert_eq!(deferred, Some(true), "the switch waits for the turn to end");
+        assert!(!pane.is_plan());
+
+        // Applied at turn end: the mode moves, and an idle switch defers nothing.
+        pane.set_generating(false);
+        let applied = pane
+            .set_plan(&mut agent, &mut conversation, deferred.unwrap())
+            .unwrap();
+        assert_eq!(applied, None);
+        assert!(pane.is_plan());
     }
 
     /// The composer holds exactly one mode: `!` leaves plan mode and returns
