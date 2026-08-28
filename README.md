@@ -1,10 +1,10 @@
 # *tart*
 
 *tart*: like a pi you can see inside! *tart* is a lightweight, auditable agent harness
-implemented in a few thousand lines of code. Though minimal, *tart* implements a variety
-of nice-to-have features including native tmux scrollback, manual tool calls via
-`@filename`, inline bash commands via `!script.sh`, and subagents. Tool calls are
-sandboxed by default, so tools can run without approval.
+implemented in less than 10K lines of code. Though minimal, *tart* implements a variety
+of nice-to-have features including native tmux scrollback, OS-level sandboxing,
+`@filename-mentions`, inline bash commands via `!script.sh`, a read-only plan mode, and
+subagents. Tool calls are sandboxed by default, so tools can run without approval.
 
 ## Architecture
 
@@ -47,6 +47,32 @@ plain-text endpoints. Results are refused for non-public hosts. Each is offered 
 model only when its binary is installed. `TART_SEARCH_BIN` and `TART_FETCH_BIN` override
 the binary lookups, and `TART_JINA_KEY` adds a bearer token if your reader account needs
 one.
+
+### Plan Mode
+
+The keyboard combination `Shift+Tab` or `/plan` enter a read-only plan mode, allowing
+the model to iterate on a design before applying any changes to the working directory.
+To ensure the model has a scratch workspace for test commands, build scripts, and
+similar, `/tmp` is still writable in plan mode. *These filesystem requirements are
+enforced at the OS level by the sandbox!* The model is also provided a helpful temporary
+[message](/tart-agents/src/data/PLAN.md) informing them of the plan mode restrictions
+and how they should proceed. This message is stripped from context when plan mode is
+exited to ensure future messages or compaction do not accidentally misinterpret the
+planning state.
+
+### User Conveniences
+
+Files outside the sandbox can be natively added to the model's context with
+`@file-mentions`, which supports a native file picker at arbitrary relative or absolute
+paths(e.g. `@../other-repo/README.md` or `/Users/jenna/file.txt`). If the requested file
+would be otherwise blocked by the sandbox, *tart* adds the file directly into context of
+the containing user turn. Similarly `!bash` commands, which can only be initiated by the
+user, place their output above the next turn's user message.
+
+We use [`pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark/) to render
+model responses with coloring and proper markdown styling, including nice table formats.
+The style for this is kept in [`markdown.rs`](./tart-tui/src/pane/markdown.rs), and can
+be extended or restyled as desired.
 
 ## Package Structure
 

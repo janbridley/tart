@@ -4,6 +4,7 @@ mod agent;
 mod debug;
 mod history;
 mod progress;
+pub mod prompts;
 pub mod session;
 mod tools;
 
@@ -14,7 +15,7 @@ pub use history::Transcript;
 pub use progress::Progress;
 pub use session::{SESSIONS_ROOT, Session};
 
-pub use agent::{Agent, TurnControl};
+pub use agent::{Agent, ChatMode, TurnControl};
 
 pub use tools::{CONTENT_CAP, CancelToken, head_cap, manual_command, merge_digests};
 

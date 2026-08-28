@@ -82,7 +82,7 @@ impl Session {
     /// Append the transcript's items past `written`, creating the file if needed.
     #[inline]
     pub fn record(&mut self, transcript: &Transcript) -> anyhow::Result<()> {
-        let items = transcript.request_items();
+        let items = transcript.stored_items();
         // A cleared record can end before the flushed prefix; flush from there.
         self.written = self.written.min(items.len());
         // If the session is empty (no user input), we don't need to save a record.
@@ -372,6 +372,35 @@ mod tests {
         assert_eq!(
             serde_json::to_value(resumed.request_items()).unwrap(),
             serde_json::to_value(transcript.request_items()).unwrap()
+        );
+    }
+
+    #[test]
+    fn record_never_writes_the_reminder() {
+        let root = tempfile::tempdir().unwrap();
+        let project = Path::new("/tmp/proj");
+        let mut transcript = Transcript::new().unwrap();
+        let mut session = Session::start(root.path(), project);
+
+        transcript.set_reminder(Some("plan mode is on")).unwrap();
+        transcript.push_user("look at the auth flow".to_string()).unwrap();
+        transcript.push_assistant("here is the plan".to_string()).unwrap();
+        session.record(&transcript).unwrap();
+
+        let file = std::fs::read_to_string(session.path.clone().unwrap()).unwrap();
+        assert_eq!(file.lines().count(), 3, "system, user, assistant: {file}");
+        assert!(
+            !file.contains("plan mode is on"),
+            "the file holds history only: {file}"
+        );
+
+        let (resumed, _) =
+            Session::open(root.path(), project, &session.path.clone().unwrap()).unwrap();
+        assert!(
+            !serde_json::to_string(&resumed.request_items())
+                .unwrap()
+                .contains("plan mode is on"),
+            "a resumed transcript starts with no reminder"
         );
     }
 

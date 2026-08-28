@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
 use std::path::PathBuf;
 use std::time::Instant;
-use tart_agents::{Progress, TurnControl};
+use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnControl, prompts};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
@@ -34,14 +34,24 @@ pub const DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
 /// The highlight for the transcript's actionable hints.
 pub(crate) const HIGHLIGHT_STYLE: Style = Style::new().fg(Color::Blue);
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
 /// The prompt glyph while the `!` manual-command mode is on: also 2 cells.
 const BANG_PROMPT: &str = "! ";
 /// The bang glyph's color, matching the frame it announces.
 const BANG_STYLE: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
 /// The rules' color while the mode is on or a run is in flight; see [`reframe`].
 const BANG_RULE: Color = Color::Magenta;
+
+/// The prompt glyph while plan mode is on: also 2 cells.
+const PLAN_PROMPT: &str = "◇ ";
+/// The plan glyph's color, matching the frame it announces.
+const PLAN_STYLE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+/// The rules' color while plan mode is on; see [`reframe`].
+const PLAN_RULE: Color = Color::Yellow;
+
 /// The copy cursor and the editor caret are the cell under them, inverted.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
+
 /// Frames for the statusline spinner.
 const SPINNER_FRAMES: [&str; 6] = ["·  ", "·· ", "···", " ··", "  ·", "   "];
 /// Milliseconds per spinner frame.
@@ -59,7 +69,28 @@ pub enum PaneEvent {
     Resume(PathBuf),
     /// Esc with nothing open, with a turn or a manual command in flight.
     Cancel,
+    /// Shift+Tab or `/plan`: toggle plan mode, moving the agent's mode with it.
+    Plan,
+    /// Enter on an empty draft approved the drafted plan.
+    Approve,
     Quit,
+}
+
+/// The composer's mode: exactly one at a time.
+///
+/// `Bang` and `Plan` cannot both be on, and the glyph and frame each show the current
+/// mode. Changes to or from [`Mode::Plan`] always travel through the front end
+/// (via [`PaneEvent::Plan`] or [`PaneEvent::Approve`]) so the agent's chat mode moves
+/// with them; `Bang` is only triggered on the TUI side, as it doesn't impact the model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Ordinary chat with the agent.
+    #[default]
+    Default,
+    /// The `!` manual-command mode, allowing user-triggered shell commands.
+    Bang,
+    /// Plan mode: read-only research, with Enter approving a drafted plan.
+    Plan,
 }
 
 /// The popup over the prompt, when one is open.
@@ -137,8 +168,10 @@ pub struct Pane {
     /// Enter keeps the draft while set, and the status rule's spinner runs
     /// off the elapsed time for a steady frame rate.
     spin: Option<Instant>,
-    /// Whether the `!` manual-command mode is enabled
-    bang: bool,
+    /// The composer's mode: ordinary chat, `!` commands, or plan mode.
+    mode: Mode,
+    /// A plan has landed in plan mode, so Enter would approve it.
+    plan_ready: bool,
     /// A manual command in flight, holding the purple frame until its output lands.
     manual: Option<ManualCommand>,
     /// Control parameters for steering or interrupting the model.
@@ -164,7 +197,7 @@ impl Pane {
         // Bang mode completes the argument under the caret as a file, bash's
         // default for arguments, so neither prefix popup applies: an `@` or a
         // leading `/resume` is just text in a command.
-        if self.bang {
+        if matches!(self.mode, Mode::Bang) {
             self.sync_completion(false);
             return;
         }
@@ -214,7 +247,7 @@ impl Pane {
             }
             Some(Popup::Files(popup)) => {
                 // A mention replaces its `@` word, or a completion its argument.
-                let into_directory = if self.bang {
+                let into_directory = if matches!(self.mode, Mode::Bang) {
                     popup.accept_argument(&mut self.prompt)
                 } else {
                     popup.accept(&mut self.prompt)
@@ -229,6 +262,7 @@ impl Pane {
     }
 
     /// Key routing without the popup bookkeeping.
+    #[allow(clippy::too_many_lines, reason = "This control should be in one place")]
     fn route(&mut self, key: KeyEvent) -> Option<PaneEvent> {
         // Copy mode takes every key first, so the draft is immutable while scrolling
         if let Some(cursor) = self.copy {
@@ -279,7 +313,7 @@ impl Pane {
         // Popups take the arrow keys, Tab, and Enter before the events hit the pane
         let claimed = match key.code {
             KeyCode::Up | KeyCode::Down | KeyCode::Tab => true,
-            KeyCode::Enter => !self.bang,
+            KeyCode::Enter => !matches!(self.mode, Mode::Bang),
             _ => false,
         };
         if self.popup.is_some() && !key.modifiers.contains(KeyModifiers::ALT) && claimed {
@@ -297,7 +331,7 @@ impl Pane {
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
             // Classify manual commands BEFORE steering
-            KeyCode::Enter if self.bang => return self.submit_bang(),
+            KeyCode::Enter if matches!(self.mode, Mode::Bang) => return self.submit_bang(),
             // A draft mid-generation must steer the running turn, but slash commands
             // still have to wait. Only one message can be queued at once
             KeyCode::Enter if self.spin.is_some() => {
@@ -311,8 +345,10 @@ impl Pane {
                 }
             }
             KeyCode::Enter => return self.submit(),
-            // Esc with nothing to close cancels the turn or a manual command.
+            // Esc with nothing to close cancels the turn or a manual command,
+            // and dismisses an offered plan approval without leaving plan mode.
             KeyCode::Esc => {
+                self.plan_ready = false;
                 if !self.escape() && (self.spin.is_some() || self.manual.is_some()) {
                     if self.spin.is_some() {
                         self.spill_steer();
@@ -323,15 +359,28 @@ impl Pane {
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
             }
+            // Shift+Tab toggles plan mode. Plain terminals send BackTab; a
+            // kitty-enhanced one sends Tab with SHIFT, so both are valid.
+            KeyCode::BackTab if !matches!(self.mode, Mode::Bang) => return Some(PaneEvent::Plan),
+            KeyCode::Tab
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !matches!(self.mode, Mode::Bang) =>
+            {
+                return Some(PaneEvent::Plan);
+            }
             // Tab completes the argument under the caret as a file
-            KeyCode::Tab if self.bang => self.sync_completion(true),
+            KeyCode::Tab if matches!(self.mode, Mode::Bang) => self.sync_completion(true),
             // `!` on an empty draft enters the manual-command mode; anywhere
             // else (or with the mode already on) it is an ordinary character.
-            KeyCode::Char('!') if !self.bang && self.draft_is_empty() => self.bang = true,
+            KeyCode::Char('!') if !matches!(self.mode, Mode::Bang) && self.draft_is_empty() => {
+                self.mode = Mode::Bang;
+            }
             KeyCode::Char(c) => self.prompt.insert_char(c),
             KeyCode::Tab => self.prompt.insert_char('\t'),
             // An empty draft's backspace leaves the mode instead of deleting.
-            KeyCode::Backspace if self.bang && self.draft_is_empty() => self.bang = false,
+            KeyCode::Backspace if matches!(self.mode, Mode::Bang) && self.draft_is_empty() => {
+                self.mode = Mode::Default;
+            }
             KeyCode::Backspace => self.prompt.backspace(),
             KeyCode::Left => self.prompt.left(),
             KeyCode::Right => self.prompt.right(),
@@ -348,11 +397,11 @@ impl Pane {
     pub fn on_paste(&mut self, text: &str) {
         if self.copy.is_none() {
             // A pasted command starting with the marker enters the mode.
-            if !self.bang
+            if !matches!(self.mode, Mode::Bang)
                 && self.draft_is_empty()
                 && let Some(command) = text.strip_prefix('!')
             {
-                self.bang = true;
+                self.mode = Mode::Bang;
                 self.prompt.insert_str(command);
             } else {
                 self.prompt.insert_str(text);
@@ -493,6 +542,20 @@ impl Pane {
         })
     }
 
+    /// The bottom rule's badge while plan mode is on, replacing the token gauge.
+    fn plan_badge(&self, width: u16) -> Option<String> {
+        if !matches!(self.mode, Mode::Plan) {
+            return None;
+        }
+        let text = if self.plan_ready {
+            "plan · ⏎ approve · esc revise"
+        } else {
+            "plan · read-only"
+        };
+        // The badge reads `[ <text> ]` after the spinner's three cells.
+        Some(ellipsize(text, width.saturating_sub(8) as usize))
+    }
+
     /// The top rule's queued-steering snippet, if a message waits.
     fn queued_text(&self, width: u16) -> Option<String> {
         queued_rule_text(&self.control.steering()?, width as usize)
@@ -512,6 +575,54 @@ impl Pane {
     /// Mark the model busy; Enter keeps the draft instead of submitting it.
     pub fn set_generating(&mut self, generating: bool) {
         self.spin = generating.then(Instant::now);
+    }
+
+    /// Whether a turn is generating, so a mode switch must wait.
+    #[inline]
+    pub fn is_generating(&self) -> bool {
+        self.spin.is_some()
+    }
+
+    /// Set the composer's mode. Leaving plan mode retires any approval on
+    /// offer; entering `Bang` from plan mode is the front end's call to undo.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        if mode != Mode::Plan {
+            self.plan_ready = false;
+        }
+    }
+
+    /// Whether plan mode is on.
+    #[inline]
+    pub fn is_plan(&self) -> bool {
+        matches!(self.mode, Mode::Plan)
+    }
+
+    /// Offer (or retire) plan approval: Enter on an empty draft approves.
+    pub fn set_plan_ready(&mut self, ready: bool) {
+        self.plan_ready = ready && matches!(self.mode, Mode::Plan);
+    }
+
+    /// Switch plan mode on or off, updating the sandbox and the transcript's reminder.
+    pub fn set_plan(
+        &mut self,
+        agent: &mut Agent,
+        conversation: &mut Conversation,
+        on: bool,
+    ) -> anyhow::Result<()> {
+        if self.is_generating() {
+            self.note("plan mode will be enabled next turn: Esc to cancel");
+            return Ok(());
+        }
+        self.set_mode(if on { Mode::Plan } else { Mode::Default });
+        agent.set_mode(if on { ChatMode::Plan } else { ChatMode::Default });
+        conversation.set_reminder(on.then_some(prompts::PLAN_REMINDER))?;
+        self.note(if on {
+            "plan mode on · read-only · Shift+Tab to leave"
+        } else {
+            "plan mode off"
+        });
+        Ok(())
     }
 
     /// Wire the pane to the agent's turn control.
@@ -560,10 +671,18 @@ impl Pane {
     fn submit(&mut self) -> Option<PaneEvent> {
         let text = self.prompt.text();
         if text.trim().is_empty() {
+            // An empty draft in plan mode approves the plan that just landed.
+            if matches!(self.mode, Mode::Plan) && self.plan_ready {
+                return Some(PaneEvent::Approve);
+            }
             return None;
         }
-        let bang = self.bang;
-        self.bang = false;
+        let bang = matches!(self.mode, Mode::Bang);
+        // A submitted command leaves `!` mode; a planning message keeps planning.
+        if bang {
+            self.mode = Mode::Default;
+        }
+        self.plan_ready = false;
         self.prompt.clear();
         if bang {
             // A command's echo waits for its run: what the transcript shows
@@ -617,7 +736,9 @@ impl Pane {
     /// Empty the draft, leaving the manual-command mode with it.
     fn clear_prompt(&mut self) {
         self.prompt.clear();
-        self.bang = false;
+        if matches!(self.mode, Mode::Bang) {
+            self.mode = Mode::Default;
+        }
     }
 
     /// Render into the granted area: transcript, rule, prompt, rule.
@@ -663,10 +784,10 @@ impl Pane {
         // the terminal cursor stays hidden and the prompt viewport can never
         // misplace it.
         let width = prompt_area.width - GUTTER;
-        let (glyph, glyph_style) = if self.bang {
-            (BANG_PROMPT, BANG_STYLE)
-        } else {
-            (PROMPT, PROMPT_STYLE)
+        let (glyph, glyph_style) = match self.mode {
+            Mode::Bang => (BANG_PROMPT, BANG_STYLE),
+            Mode::Plan => (PLAN_PROMPT, PLAN_STYLE),
+            Mode::Default => (PROMPT, PROMPT_STYLE),
         };
         buf.set_span(
             prompt_area.x,
@@ -699,7 +820,7 @@ impl Pane {
             cell.set_style(CURSOR_STYLE);
         }
         // The popup overlays the transcript, anchored above the top rule..
-        let hint = if self.bang {
+        let hint = if matches!(self.mode, Mode::Bang) {
             "↑↓ select · Tab insert · Esc close"
         } else {
             "↑↓ select · Tab/Enter insert · Esc close"
@@ -759,13 +880,18 @@ impl Pane {
         } else {
             let status = self
                 .manual_command_badge(bar_bottom.width)
+                .or_else(|| self.plan_badge(bar_bottom.width))
                 .or_else(|| self.status_text());
             status_rule(buf, bar_bottom, status.as_deref(), self.spinner());
         }
-        // The manual-command mode colors the frame around the composer.
-        if self.bang || self.manual.is_some() {
+        // A manual command in flight or the `!` mode colors the frame around
+        // the composer magenta; plan mode colors it yellow.
+        if self.manual.is_some() || matches!(self.mode, Mode::Bang) {
             reframe(buf, bar_top, BANG_RULE);
             reframe(buf, bar_bottom, BANG_RULE);
+        } else if matches!(self.mode, Mode::Plan) {
+            reframe(buf, bar_top, PLAN_RULE);
+            reframe(buf, bar_bottom, PLAN_RULE);
         }
     }
 
@@ -1090,7 +1216,7 @@ mod tests {
         assert_eq!(idle[7], "d".repeat(40), "{idle_styles}");
 
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        assert!(pane.bang, "the mode is on");
+        assert!(matches!(pane.mode, Mode::Bang), "the mode is on");
         assert_eq!(pane.prompt.text(), "", "the marker is swallowed");
         let screen = render(&mut pane, (40, 8));
         assert!(screen.contains("! "), "{screen}");
@@ -1104,7 +1230,7 @@ mod tests {
         // Backspace on the still-empty draft leaves the mode; typing first
         // would make the backspace an ordinary deletion.
         pane.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert!(!pane.bang);
+        assert!(matches!(pane.mode, Mode::Default));
         let screen = render(&mut pane, (40, 8));
         assert!(screen.contains("❯ "), "{screen}");
         let left = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
@@ -1119,20 +1245,122 @@ mod tests {
         let mut pane = Pane::default();
         pane.on_paste("hi");
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        assert!(!pane.bang);
+        assert!(matches!(pane.mode, Mode::Default));
         assert_eq!(pane.prompt.text(), "hi!");
 
         let mut literal = Pane::default();
         literal.on_paste(" !ls");
-        assert!(!literal.bang);
+        assert!(matches!(literal.mode, Mode::Default));
         assert_eq!(literal.prompt.text(), " !ls");
 
         let mut cleared = Pane::default();
         cleared.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
         cleared.on_paste("ls");
         cleared.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert!(!cleared.bang);
+        assert!(matches!(cleared.mode, Mode::Default));
         assert_eq!(cleared.prompt.text(), "");
+    }
+
+    /// Plan mode swaps the glyph, colors the frame yellow, and takes the
+    /// status badge; the approve hint appears only once a plan has landed.
+    #[test]
+    fn plan_mode_swaps_the_glyph_the_rules_and_the_badge() {
+        let mut pane = Pane::default();
+        pane.set_mode(Mode::Plan);
+        assert!(pane.is_plan());
+        let screen = render(&mut pane, (40, 8));
+        assert!(screen.contains("◇ "), "{screen}");
+        assert!(!screen.contains("❯"), "{screen}");
+        assert!(screen.contains("[ plan · read-only ]"), "{screen}");
+        let plan = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
+        let rows: Vec<&str> = plan.lines().collect();
+        // The rules sit around the composer, yellow where the `!` mode is magenta.
+        assert_eq!(rows[5], "c".repeat(40), "the top rule is yellow: {plan}");
+        assert_eq!(rows[7], "c".repeat(40), "the bottom rule is yellow: {plan}");
+        assert!(rows[6].starts_with('B'), "the glyph is bold: {plan}");
+
+        // A landed plan offers Enter; leaving the mode retires the offer.
+        pane.set_plan_ready(true);
+        assert!(render(&mut pane, (40, 8)).contains("⏎ approve"), "offers Enter");
+        pane.set_mode(Mode::Default);
+        assert!(!pane.is_plan());
+        let screen = render(&mut pane, (40, 8));
+        assert!(screen.contains("❯ "), "{screen}");
+        assert!(!screen.contains("plan ·"), "{screen}");
+    }
+
+    /// Shift+Tab asks the front end to toggle plan mode, as a plain terminal
+    /// (`BackTab`) and an enhanced one (Tab with SHIFT) both report it; the `!`
+    /// mode keeps its own Tab.
+    #[test]
+    fn shift_tab_asks_to_toggle_plan_mode() {
+        let mut pane = Pane::default();
+        assert_eq!(
+            pane.on_key(key(KeyCode::BackTab, KeyModifiers::NONE)),
+            Some(PaneEvent::Plan)
+        );
+        assert_eq!(
+            pane.on_key(key(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Some(PaneEvent::Plan)
+        );
+        // The pane does not change its own mode: the front end owns the switch.
+        assert!(!pane.is_plan());
+
+        // In `!` mode the Tab family stays with completion.
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(pane.on_key(key(KeyCode::BackTab, KeyModifiers::NONE)), None);
+    }
+
+    /// Enter on an empty draft approves a landed plan; a draft submits as an
+    /// ordinary planning message, and Esc dismisses the offer without leaving
+    /// plan mode.
+    #[test]
+    fn enter_approves_a_ready_plan() {
+        let mut pane = Pane::default();
+        pane.set_mode(Mode::Plan);
+
+        // Nothing to approve yet, and never outside plan mode.
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        pane.set_mode(Mode::Default);
+        pane.set_plan_ready(true);
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+
+        pane.set_mode(Mode::Plan);
+        pane.set_plan_ready(true);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Approve)
+        );
+
+        // A follow-up question submits normally and keeps the mode.
+        pane.set_plan_ready(true);
+        pane.on_paste("what about the tests?");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Submit("what about the tests?".to_string()))
+        );
+        assert!(pane.is_plan(), "a planning message keeps planning");
+
+        // Esc dismisses the offer, so Enter has nothing to approve.
+        pane.set_plan_ready(true);
+        pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(pane.is_plan(), "Esc keeps plan mode on");
+    }
+
+    /// The composer holds exactly one mode: `!` leaves plan mode and returns
+    /// to the default chat, never back to planning.
+    #[test]
+    fn the_composer_has_exactly_one_mode() {
+        let mut pane = Pane::default();
+        pane.set_mode(Mode::Plan);
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(matches!(pane.mode, Mode::Bang), "`!` displaces plan mode");
+        pane.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(
+            matches!(pane.mode, Mode::Default),
+            "leaving `!` returns to the default chat"
+        );
     }
 
     /// Enter ships the command as its own event
@@ -1147,7 +1375,7 @@ mod tests {
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(PaneEvent::Command("ls -la".to_string()))
         );
-        assert!(!pane.bang, "submit leaves the mode");
+        assert!(matches!(pane.mode, Mode::Default), "submit leaves the mode");
         assert_eq!(pane.prompt.text(), "", "submit clears the draft");
         assert!(pane.transcript.message_texts().is_empty(), "nothing echoed yet");
 
@@ -1218,14 +1446,14 @@ mod tests {
         let mut pane = Pane::default();
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
-        assert!(pane.bang, "the mode stays on");
+        assert!(matches!(pane.mode, Mode::Bang), "the mode stays on");
         assert_eq!(pane.prompt.text(), "");
         let screen = render(&mut pane, (40, 8));
         assert!(screen.contains("! alone runs nothing"), "{screen}");
         // Whitespace-only is just as empty.
         pane.on_paste("   ");
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
-        assert!(pane.bang);
+        assert!(matches!(pane.mode, Mode::Bang));
     }
 
     /// A manual command never steers a running turn, and waits for it instead.
@@ -1283,7 +1511,7 @@ mod tests {
     fn a_pasted_bang_command_enters_the_mode() {
         let mut pane = Pane::default();
         pane.on_paste("!echo hi");
-        assert!(pane.bang);
+        assert!(matches!(pane.mode, Mode::Bang));
         assert_eq!(pane.prompt.text(), "echo hi");
         assert_eq!(
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1294,7 +1522,7 @@ mod tests {
         let mut literal = Pane::default();
         literal.on_paste("run this");
         literal.on_paste("!echo hi");
-        assert!(!literal.bang);
+        assert!(matches!(literal.mode, Mode::Default));
         assert_eq!(literal.prompt.text(), "run this!echo hi");
     }
     /// Inside a command, Tab completes the argument under the caret as a file

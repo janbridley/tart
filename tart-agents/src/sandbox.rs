@@ -4,7 +4,11 @@
 //! efficient sandboxing. [`Policy::command`] returns a [`std::process::Command`] that
 //! runs the program under that policy:
 //!
-//! ```
+//! The examples are `no_run`: they reach `sandbox-exec`, which cannot nest
+//! inside an existing sandbox, so their runtime behavior is covered by the
+//! guarded live tests in this module instead of here.
+//!
+//! ```no_run
 //! use tart_agents::sandbox::Policy;
 //! # fn main() -> anyhow::Result<()> {
 //! let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
@@ -34,6 +38,9 @@
 //!   granted temp directory, and `HOME`, so paths like `~/.cargo` resolve.
 //!   With the environment cleared, secrets held by the caller cannot be printed
 //!   into captured output. Re-add variables with the usual `std` methods.
+//! - Git's global and system configuration are voided
+//!   (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`), providing what is
+//!   effectively a read-only git tool.
 //! - Standard input is [`Stdio::null`](std::process::Stdio::null) by default, and the
 //!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices.
 //! - Binaries outside the platform read baseline (for example `/opt/homebrew/bin`)
@@ -228,19 +235,23 @@ impl Policy {
         Ok(self)
     }
 
-    /// Drop every write grant, leaving the reads as they are.
+    /// Drop every write grant but the temp directory, leaving reads as they are.
     ///
-    /// Plan mode runs under a policy like this: the model can still inspect everything
-    /// its grants covered, but no path is writable — not even the temp directory,
-    /// which stays bound as `TMPDIR`. Exclusions go with the writes they guarded.
+    /// Plan mode allows reads to all paths normal mode can edit, but the workspace is
+    /// not writable. `/tmp` is writable as scratch space for compiler outputs/tests.
     #[must_use]
     #[inline]
     pub fn read_only(mut self) -> Self {
+        let temp = self.temp.clone();
+        let mut writable = Vec::new();
         for root in std::mem::take(&mut self.writable) {
-            if !self.read_only.contains(&root) {
+            if Some(&root) == temp.as_ref() {
+                writable.push(root);
+            } else if !self.read_only.contains(&root) {
                 self.read_only.push(root);
             }
         }
+        self.writable = writable;
         self.excluded.clear();
         self
     }
@@ -270,11 +281,12 @@ impl Policy {
     /// `sandbox-exec -p <render()> -DNAME=value ... -- <program>`.
     ///
     /// The command starts from a cleared environment (a minimal `PATH`, plus
-    /// `TMPDIR` for the granted temp directory and `HOME` so `~` paths resolve)
+    /// `TMPDIR` for the granted temp directory, `HOME` so `~` paths resolve,
+    /// and git's global and system configuration voided; see the module docs)
     /// and null standard input. The command and all of its children inherit the
     /// sandbox.
     ///
-    /// ```
+    /// ```no_run
     /// use tart_agents::sandbox::Policy;
     /// # fn main() -> anyhow::Result<()> {
     /// let policy = Policy::new(std::env::temp_dir())?.exclude_git();
@@ -300,6 +312,12 @@ impl Policy {
         //
         // HOME is *not* readable or writable!
         cmd.env_clear().env("PATH", sandboxed_path()).stdin(Stdio::null());
+        // Git would fails trying to read `~/.gitconfig` (HOME is unreadable)
+        // so we void its global and system configuration.
+        // Repository-local configuration still applies, and with `.git`
+        // write-excluded the model's git is read-only.
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
             cmd.env("HOME", home);
         }
@@ -410,13 +428,123 @@ fn canonicalize_root(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to canonicalize sandbox root: {}", path.display()))
 }
 
+/// Test support for the live tests, which reach `sandbox-exec` through
+/// [`Policy::command`](super::Policy::command).
+///
+/// macOS refuses to nest seatbelt sandboxes, so those tests fail with
+/// `sandbox-exec: sandbox_apply: Operation not permitted` whenever the suite
+/// itself runs inside one: for example, when the agent runs `cargo test`
+/// through the bash tool. Rather than parse that out of each failure, the
+/// [`skip_unless_live!`] guard probes once, up front, with the exact capability
+/// the tests need: applying a trivial allow-all profile.
+#[cfg(test)]
+pub(crate) mod live {
+    use std::process::Command;
+    use std::sync::OnceLock;
+
+    /// Whether this process can still apply a sandbox profile, probed once and
+    /// shared by every [`skip_unless_live!`] guard.
+    ///
+    /// The `Err` message is written for a model reading test output: it says
+    /// the environment cannot run the test, not that the code is broken.
+    pub(crate) fn probe() -> Result<(), String> {
+        static NESTING: OnceLock<Result<(), String>> = OnceLock::new();
+        NESTING.get_or_init(probe_once).clone()
+    }
+
+    /// Run `/usr/bin/true` under a fresh allow-all profile.
+    ///
+    /// Unsandboxed, this succeeds; inside any seatbelt sandbox, applying the
+    /// profile fails with `Operation not permitted` before anything executes,
+    /// so the probe has no side effects in either case.
+    fn probe_once() -> Result<(), String> {
+        let output = Command::new(super::SANDBOX_EXEC)
+            .arg("-p")
+            .arg("(version 1)(allow default)")
+            .arg("--")
+            .arg("/usr/bin/true")
+            .output()
+            .map_err(|error| format!("sandbox-exec unavailable: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.contains("sandbox_apply") {
+            Err(format!(
+                "the enclosing sandbox denies nesting ({stderr}); \
+                 rerun the suite outside the sandbox"
+            ))
+        } else {
+            Err(format!("sandbox-exec failed: {stderr}"))
+        }
+    }
+
+    /// Skip the decorated test when [`probe`] fails, for tests that reach
+    /// `sandbox-exec` through [`Policy::command`](super::Policy::command).
+    ///
+    /// Written for `#[apply(skip_unless_live!)]` above `#[test]`: the macro
+    /// consumes the function, injects the guard as its first statement, and
+    /// re-emits everything else (documents, `#[test]`, the body) untouched.
+    macro_rules! skip_unless_live {
+        (
+            $(#[$meta:meta])*
+            $vis:vis fn $name:ident () { $($body:tt)* }
+        ) => {
+            $(#[$meta])*
+            $vis fn $name() {
+                if let Err(why) = $crate::sandbox::live::probe() {
+                    use std::io::Write as _;
+                    let current = std::thread::current();
+                    let name = current.name().unwrap_or("<unnamed>");
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(
+                        stderr,
+                        "note: skipping live test {name} (reaches sandbox-exec): {why}"
+                    );
+                    return;
+                }
+                $($body)*
+            }
+        };
+    }
+    pub(crate) use skip_unless_live;
+
+    /// The [`skip_unless_live!`] guard, for the one live test whose need is the
+    /// network the sandbox denies rather than `sandbox-exec` itself.
+    macro_rules! skip_unless_networked {
+        (
+            $(#[$meta:meta])*
+            $vis:vis fn $name:ident () { $($body:tt)* }
+        ) => {
+            $(#[$meta])*
+            $vis fn $name() {
+                if let Err(why) = $crate::sandbox::live::probe() {
+                    use std::io::Write as _;
+                    let current = std::thread::current();
+                    let name = current.name().unwrap_or("<unnamed>");
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(
+                        stderr,
+                        "note: skipping live test {name} (needs network the sandbox denies): {why}"
+                    );
+                    return;
+                }
+                $($body)*
+            }
+        };
+    }
+    pub(crate) use skip_unless_networked;
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use std::ffi::OsStr;
 
+    use super::live::skip_unless_live;
     use super::*;
+    use macro_rules_attribute::apply;
 
     /// The rendered profile opens with the base policy and ends with the sbpl defaults.
     #[test]
@@ -479,6 +607,7 @@ mod tests {
     }
 
     /// A read-only root gets a read allow and no write rule of its own.
+    #[apply(skip_unless_live!)]
     #[test]
     fn read_only_root_emits_read_allow_only() {
         let writable = tempfile::tempdir().unwrap();
@@ -491,6 +620,107 @@ mod tests {
             .render();
         assert!(rendered.contains(r#"(allow file-read* (subpath (param "READABLE_ROOT_0")))"#));
         assert!(!rendered.contains(r#"file-write* (subpath (param "READABLE_ROOT_0")"#));
+    }
+
+    /// Plan mode runs under [`Policy::read_only`]: every granted root but the
+    /// temp directory demotes to a read rule, and the temp root alone keeps a
+    /// write rule.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn read_only_keeps_only_the_temp_scratch() {
+        // A workspace outside the scratch tree, as in `read_only_root_denies_writes`:
+        // `tempdir()` would land inside `$TMPDIR`, which is the one root this policy
+        // keeps writable.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = tempfile::tempdir_in(&home).unwrap();
+        // No `.git` exclusion, so the write rule renders in its plain form;
+        // the demotion is what is under test, not the exclusion guards.
+        let base = Policy::new(root.path()).unwrap();
+        assert!(
+            base.render()
+                .contains(r#"(allow file-write* (subpath (param "WRITABLE_ROOT_0")))"#)
+        );
+
+        let plan = base.clone().read_only();
+        // The former workspace root is now named as a read-only root instead,
+        // and exactly one write rule survives in the whole profile: scratch.
+        let rendered = plan.render();
+        assert!(
+            rendered.contains(r#"(allow file-read* (subpath (param "READABLE_ROOT_0")))"#),
+            "the workspace stays readable: {rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("(allow file-write* (subpath (param \"WRITABLE_ROOT_")
+                .count(),
+            1,
+            "one generated write grant, the scratch root alone (the vendored layers \
+             add /dev/fd and the temp trees, which are theirs): {rendered}"
+        );
+        // The writable set is the granted temp directory, nothing else.
+        let writable = plan.writable_roots();
+        assert_eq!(writable.len(), 1, "exactly the scratch root: {writable:?}");
+        assert_eq!(writable[0], plan.temp.as_deref().expect("a granted temp root"));
+        assert!(
+            writable[0] != root.path(),
+            "the workspace is not writable: {writable:?}"
+        );
+    }
+
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn read_only_denies_the_repo_but_not_the_scratch() {
+        // The workspace must live *outside* the scratch tree: `tempfile::
+        // tempdir()` creates under `$TMPDIR`, which this policy keeps
+        // writable, so a write there would rightly succeed. Under `$HOME`,
+        // as `read_only_root_denies_writes` arranges it.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = tempfile::tempdir_in(&home).unwrap();
+        let policy = Policy::new(root.path()).unwrap().read_only();
+
+        let denied = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(format!("echo x > {}", root.path().join("x").display()))
+            .output()
+            .unwrap();
+        assert!(!denied.status.success(), "the workspace must not take writes");
+        assert!(
+            String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"),
+            "stderr: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+
+        // The granted scratch, and the system tree the platform defaults
+        // cover, both take writes.
+        let scratch = policy.temp.as_ref().unwrap().join("tart_plan_mode_probe");
+        let allowed = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(format!("echo x > {}", scratch.display()))
+            .output()
+            .unwrap();
+        assert!(
+            allowed.status.success(),
+            "the scratch root must take writes: {}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        let system = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg("echo x > /tmp/tart_plan_mode_probe")
+            .output()
+            .unwrap();
+        assert!(
+            system.status.success(),
+            "/tmp must take writes: {}",
+            String::from_utf8_lossy(&system.stderr)
+        );
+        let _ = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg("rm -f /tmp/tart_plan_mode_probe")
+            .output();
     }
 
     /// Roots are canonicalized, so a symlinked root grants the real path.
@@ -744,9 +974,11 @@ mod tests {
         let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
         assert_eq!(
             vars.len(),
-            1 + usize::from(home.is_some()) + usize::from(policy.temp.is_some())
+            3 + usize::from(home.is_some()) + usize::from(policy.temp.is_some())
         );
         assert!(vars.contains(&(OsStr::new("PATH"), sandboxed_path().as_os_str())));
+        assert!(vars.contains(&(OsStr::new("GIT_CONFIG_GLOBAL"), OsStr::new("/dev/null"))));
+        assert!(vars.contains(&(OsStr::new("GIT_CONFIG_NOSYSTEM"), OsStr::new("1"))));
         if let Some(home) = &home {
             assert!(vars.contains(&(OsStr::new("HOME"), home.as_os_str())));
         }
@@ -786,6 +1018,7 @@ mod tests {
 
     /// Writing inside the granted root succeeds. Paths in these live tests
     /// contain no spaces, so sh string interpolation is safe.
+    #[apply(skip_unless_live!)]
     #[test]
     fn write_inside_writable_root_succeeds() {
         let dir = tempfile::tempdir().unwrap();
@@ -828,6 +1061,7 @@ mod tests {
     }
 
     /// An excluded `.git` stays readable but rejects writes.
+    #[apply(skip_unless_live!)]
     #[test]
     fn excluded_git_is_read_only_but_readable() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
@@ -864,7 +1098,89 @@ mod tests {
         );
     }
 
+    /// Live: reaches `sandbox-exec` and `git`, so it only passes outside a nested
+    /// sandbox or a machine without git.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn git_reads_the_repository_but_cannot_write_it() {
+        // Skip when no git is available at all (for example, no Xcode CLT).
+        let probe = std::process::Command::new("git")
+            .arg("--version")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        if !probe.status.success() {
+            return;
+        }
+
+        // A fixture repository, built with the caller's own git.
+        let repo = tempfile::tempdir().unwrap();
+        let fixture = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "tart")
+                .env("GIT_AUTHOR_EMAIL", "tart@localhost")
+                .env("GIT_COMMITTER_NAME", "tart")
+                .env("GIT_COMMITTER_EMAIL", "tart@localhost")
+                .output()
+                .unwrap()
+        };
+        std::fs::write(repo.path().join("file"), "contents\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["add", "file"][..],
+            &["commit", "-q", "-m", "fixture"][..],
+        ] {
+            let out = fixture(args);
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let policy = Policy::new(repo.path()).unwrap().exclude_git();
+
+        // The sandboxed child must run inside the granted root: it inherits
+        // this process's working directory otherwise, which no grant covers.
+        let read = policy
+            .command("git")
+            .current_dir(repo.path())
+            .args(["log", "--oneline", "-1"])
+            .output()
+            .unwrap();
+        assert!(
+            read.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&read.stdout).contains("fixture"),
+            "stdout: {}",
+            String::from_utf8_lossy(&read.stdout)
+        );
+
+        let write = policy
+            .command("git")
+            .current_dir(repo.path())
+            .args(["branch", "denied"])
+            .output()
+            .unwrap();
+        assert!(!write.status.success());
+        assert!(
+            String::from_utf8_lossy(&write.stderr).contains("Operation not permitted"),
+            "stderr: {}",
+            String::from_utf8_lossy(&write.stderr)
+        );
+    }
+
     /// A read-only root outside the temp tree reads but rejects writes.
+    #[apply(skip_unless_live!)]
     #[test]
     fn read_only_root_denies_writes() {
         let writable = tempfile::tempdir().unwrap();
@@ -922,6 +1238,7 @@ mod tests {
     /// read baseline; the extras grant lets it run under every policy.
     ///
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[apply(skip_unless_live!)]
     #[test]
     fn perl_runs_under_the_default_grant() {
         let dir = tempfile::tempdir().unwrap();
@@ -946,6 +1263,7 @@ mod tests {
     /// credentials file stay denied when that file exists.
     ///
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[apply(skip_unless_live!)]
     #[test]
     fn cargo_home_is_readable_but_credentials_are_not() {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {

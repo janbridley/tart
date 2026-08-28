@@ -7,7 +7,7 @@ use async_openai::{
     config::OpenAIConfig,
     types::responses::{
         CreateResponseArgs, FunctionToolCall, InputParam, OutputItem, Reasoning, ReasoningEffort,
-        ReasoningItem, ResponseStreamEvent,
+        ReasoningItem, ResponseStreamEvent, Tool,
     },
 };
 use futures::channel::mpsc;
@@ -15,6 +15,21 @@ use futures::future::{Either, select};
 use futures::{StreamExt, executor::block_on};
 
 use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
+
+/// The session's collaboration mode, mirroring Codex's `ModeKind`.
+///
+/// Plan mode is a property of the *session*, not of the composer: it selects which
+/// policy tool calls run under and which tools are offered. The front end's own
+/// input modes (`!` manual commands) never reach the model and are not represented here
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChatMode {
+    /// Ordinary chat: the granted roots are writable and `edit` is offered.
+    #[default]
+    Default,
+    /// Plan mode: research and plan, blocking writes to the working directory.
+    Plan,
+}
 
 /// A Responses-API model configured to run the tart tool loop.
 #[derive(Clone)]
@@ -27,8 +42,12 @@ pub struct Agent {
     effort: Option<ReasoningEffort>,
     /// Most tool rounds one generation may take.
     max_rounds: usize,
-    /// The seatbelt policy every bash tool call runs under.
-    policy: Policy,
+    /// The session's mode; picks the active policy and tool list.
+    mode: ChatMode,
+    /// The Default-mode policy: the granted roots stay writable.
+    writable: Policy,
+    /// The Plan-mode policy: the same grants, but most paths are read-only.
+    planning: Policy,
     /// The front end's lever on the running turn (cancel + steer).
     control: TurnControl,
 }
@@ -155,14 +174,52 @@ impl Agent {
         let config = OpenAIConfig::new()
             .with_api_base(base_url.into())
             .with_api_key(api_key.into());
+        let planning = policy.clone().read_only();
         Self {
             client: Client::with_config(config),
             model: model.into(),
             effort: None,
             max_rounds: MAX_TOOL_ROUNDS,
-            policy,
+            mode: ChatMode::Default,
+            writable: policy,
+            planning,
             control: TurnControl::default(),
         }
+    }
+
+    /// The session's collaboration mode.
+    #[inline]
+    pub fn mode(&self) -> ChatMode {
+        self.mode
+    }
+
+    /// Switch the session's collaboration mode for subsequent turns.
+    ///
+    /// A turn already in flight keeps the policy it started with, since
+    /// [`Agent::spawn`] copied the agent before it began, so this cannot change the
+    /// sandbox under a running command.
+    #[inline]
+    pub fn set_mode(&mut self, mode: ChatMode) {
+        self.mode = mode;
+    }
+
+    /// The policy the current mode runs tool calls under.
+    fn policy(&self) -> &Policy {
+        match self.mode {
+            ChatMode::Default => &self.writable,
+            ChatMode::Plan => &self.planning,
+        }
+    }
+
+    /// The tools `mode` offers to the model. Plan mode withholds the `edit` tool.
+    fn tools_for(mode: ChatMode) -> Vec<Tool> {
+        let mut definitions = vec![tools::bash(), tools::read()];
+        if mode == ChatMode::Default {
+            definitions.push(tools::edit());
+        }
+        definitions.extend(tools::search());
+        definitions.extend(tools::fetch());
+        definitions
     }
 
     /// The front end's lever on the running turn, for the pane to hold.
@@ -273,10 +330,8 @@ impl Agent {
             if let Err(error) = self.record_steer(transcript, on_progress) {
                 return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
-            // The sandboxed trio, plus the web tools when their CLIs are installed.
-            let mut definitions = vec![tools::bash(), tools::read(), tools::edit()];
-            definitions.extend(tools::search());
-            definitions.extend(tools::fetch());
+            // The sandboxed trio less `edit` in plan mode, plus web tools if available
+            let definitions = Self::tools_for(self.mode);
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
                 .stream(true)
@@ -510,7 +565,7 @@ impl Agent {
                     steered = true;
                     break;
                 }
-                match tools::execute(&call, &self.policy, on_progress) {
+                match tools::execute(&call, self.policy(), on_progress) {
                     Ok(output) => exchanges.push((call, output)),
                     Err(error) => {
                         exchanges.push((call, format!("error: {error}")));
@@ -589,6 +644,42 @@ mod tests {
         // Reaching here means the client constructed without the provider panic.
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
         let _ = agent.model;
+    }
+
+    /// Plan mode runs under the read-only twin of the Default policy and witholds
+    /// the `edit` tool.
+    #[test]
+    fn plan_mode_is_read_only_and_drops_edit() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
+
+        // Default: the granted roots are writable, and `edit` is offered.
+        assert_eq!(agent.mode(), ChatMode::Default);
+        assert!(!agent.policy().writable_roots().is_empty());
+        assert!(names(&Agent::tools_for(ChatMode::Default)).contains(&"edit"));
+
+        // Plan: the workspace is not writable, the temp scratch alone is, and not edit
+        agent.set_mode(ChatMode::Plan);
+        let writable = agent.policy().writable_roots();
+        assert_eq!(writable.len(), 1, "exactly the scratch root: {writable:?}");
+        let scratch =
+            std::fs::canonicalize(std::env::temp_dir()).expect("the temp dir canonicalizes");
+        assert_eq!(writable[0], scratch);
+        let plan_tools = Agent::tools_for(ChatMode::Plan);
+        let offered = names(&plan_tools);
+        assert!(!offered.contains(&"edit"));
+        assert!(offered.contains(&"read") && offered.contains(&"bash"));
+    }
+
+    /// The names of the function tools among `definitions`.
+    fn names(definitions: &[Tool]) -> Vec<&str> {
+        definitions
+            .iter()
+            .filter_map(|tool| match tool {
+                Tool::Function(function) => Some(function.name.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

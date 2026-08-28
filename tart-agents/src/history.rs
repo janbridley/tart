@@ -19,6 +19,13 @@ const SYSTEM: &str = include_str!("data/SYSTEM.md");
 pub struct Transcript {
     /// Every item, oldest first, starting with the system prompt.
     items: Arc<Mutex<Vec<InputItem>>>,
+    /// A mode reminder appended to the end of the input at request time.
+    ///
+    /// This is designed to mirror Codex's instruction handling, as we can't
+    /// guarantee that arbitrary endpoints support a dedicated instructions
+    /// channel. Trailing the record keeps the cached prefix up to the turn on which
+    /// plan mode was triggered intact.
+    reminder: Option<InputItem>,
 }
 
 impl Transcript {
@@ -35,6 +42,7 @@ impl Transcript {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             items: Arc::new(Mutex::new(vec![input_message(Role::System, SYSTEM.to_string())?])),
+            reminder: None,
         })
     }
 
@@ -52,7 +60,10 @@ impl Transcript {
     /// A transcript over `items`, as a session file restored them.
     #[inline]
     pub(crate) fn from_items(items: Vec<InputItem>) -> Self {
-        Self { items: Arc::new(Mutex::new(items)) }
+        Self {
+            items: Arc::new(Mutex::new(items)),
+            reminder: None,
+        }
     }
 
     /// Drop the conversation, keeping the leading system items.
@@ -106,11 +117,35 @@ impl Transcript {
         }
     }
 
-    /// The input items for the next request, cloned from the record.
+    /// Append `text` to the end of the input on every subsequent request, or clear with `None`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the API's argument validation, which a non-empty `text` can't fail
+    #[inline]
+    pub fn set_reminder(&mut self, text: Option<&str>) -> anyhow::Result<()> {
+        self.reminder = match text {
+            Some(text) => Some(input_message(Role::System, text.to_string())?),
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// The stored record, oldest first, as `Session` persists and replays
+    #[inline]
+    #[must_use]
+    pub(crate) fn stored_items(&self) -> Vec<InputItem> {
+        self.items().clone()
+    }
+
+    /// The input items for the next request: the stored record with the
+    /// reminder, when one is set, appended after it.
     #[inline]
     #[must_use]
     pub(crate) fn request_items(&self) -> Vec<InputItem> {
-        self.items().clone()
+        let mut items = self.items().clone();
+        items.extend(self.reminder.clone());
+        items
     }
 
     /// The progress stream that renders this record, in live order, for replay.
@@ -218,6 +253,85 @@ mod tests {
 
         assert_eq!(items[1]["role"], "system");
         assert_eq!(items[1]["content"], "be terse");
+    }
+
+    /// A reminder trails the record on every request, once, and doesn't hit record.
+    #[test]
+    fn a_reminder_trails_the_record_once() {
+        let mut transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
+        transcript.push_user("look at the auth flow".to_string()).unwrap();
+
+        // Without a reminder the request is exactly the stored record.
+        assert_eq!(transcript.request_items().len(), transcript.stored_items().len());
+
+        transcript.set_reminder(Some("plan mode is on")).unwrap();
+        let request = serde_json::to_value(transcript.request_items()).unwrap();
+        let request = request.as_array().unwrap();
+        // After the whole record: the last thing the model reads, and the turn
+        // it answers, sit just before it.
+        let last = request.len() - 1;
+        assert_eq!(request[last]["role"], "system");
+        assert_eq!(request[last]["content"], "plan mode is on");
+        assert_eq!(request[last - 1]["role"], "user");
+
+        // The stored record is an exact prefix of the request, so neither
+        // arming nor clearing the reminder invalidates it.
+        let stored = serde_json::to_value(transcript.stored_items()).unwrap();
+        for (sent, kept) in request.iter().zip(stored.as_array().unwrap()) {
+            assert_eq!(sent, kept, "the record leads the request unchanged");
+        }
+
+        // It stays one copy as turns accrue, and never reaches the record.
+        let record = serde_json::to_string(&transcript.stored_items()).unwrap();
+        assert!(!record.contains("plan mode is on"), "never stored: {record}");
+        transcript.push_user("and the tests?".to_string()).unwrap();
+        let with_two_turns = serde_json::to_string(&transcript.request_items()).unwrap();
+        assert_eq!(
+            with_two_turns.matches("plan mode is on").count(),
+            1,
+            "one copy however long the session: {with_two_turns}"
+        );
+
+        // Clearing it restores the record exactly, and still moves nothing.
+        transcript.set_reminder(None).unwrap();
+        assert_eq!(
+            serde_json::to_value(transcript.request_items()).unwrap(),
+            serde_json::to_value(transcript.stored_items()).unwrap()
+        );
+    }
+
+    /// The approval handover should leave no reminders.
+    #[test]
+    fn approval_leaves_no_reminder_behind() {
+        let mut transcript = Transcript::new().unwrap();
+        transcript
+            .push_user("plan the auth refactor".to_string())
+            .unwrap();
+        // What the last planning request sent as its prefix: the record alone.
+        let sent = serde_json::to_value(transcript.stored_items()).unwrap();
+        transcript.set_reminder(Some("plan mode is on")).unwrap();
+
+        // The plan lands, the mode leaves, the approval turn is recorded.
+        transcript
+            .push_assistant("1. add a session table".to_string())
+            .unwrap();
+        transcript.set_reminder(None).unwrap();
+        transcript
+            .push_user("The plan above is approved: implement it now.".to_string())
+            .unwrap();
+
+        let request = serde_json::to_value(transcript.request_items()).unwrap();
+        assert!(
+            !request.to_string().contains("plan mode is on"),
+            "no residue: {request}"
+        );
+        // The implementing request ends in the approval turn, and everything
+        // the planning request sent sits in front of it unchanged.
+        let request = request.as_array().unwrap();
+        assert_eq!(request.last().unwrap()["role"], "user");
+        for (item, cached) in request.iter().zip(sent.as_array().unwrap()) {
+            assert_eq!(item, cached, "the cached prefix survives the handover");
+        }
     }
 
     #[test]
