@@ -3,8 +3,8 @@
 *tart*: like a pi you can see inside! *tart* is a lightweight, auditable agent harness
 implemented in a few thousand lines of code. Though minimal, *tart* implements a variety
 of nice-to-have features including native tmux scrollback, manual tool calls via
-`@filename`, inline bash commands via `!script.sh`, and subagents. Tool calls are
-sandboxed by default, so tools can run without approval.
+`@filename`, inline bash commands via `!script.sh`, a read-only plan mode, and
+subagents. Tool calls are sandboxed by default, so tools can run without approval.
 
 ## Architecture
 
