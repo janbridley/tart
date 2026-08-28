@@ -772,6 +772,60 @@ mod tests {
         }
     }
 
+    /// Validate our merged-digest grammar
+    #[test]
+    fn merge_digests_coalesces_counts_and_caps() {
+        let digests = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        // The four-line gap stays split; the overlap unions; ascending order.
+        assert_eq!(
+            merge_digests(
+                "Read",
+                &digests(&["a.rs:485-560", "a.rs:420-480", "a.rs:555-600"])
+            ),
+            "a.rs:420-480,485-600"
+        );
+        // A single line renders as its bare number.
+        assert_eq!(
+            merge_digests("Read", &digests(&["a.rs:590-590", "a.rs:400-400"])),
+            "a.rs:400,590"
+        );
+        // An open tail absorbs whatever it covers.
+        assert_eq!(
+            merge_digests("Read", &digests(&["a.rs:5-", "a.rs:10-20"])),
+            "a.rs:5-"
+        );
+        // A whole-file read subsumes the bounded ones; files sort by path.
+        assert_eq!(
+            merge_digests("Read", &digests(&["b.rs:1-2", "a.rs", "a.rs:10-20"])),
+            "a.rs, b.rs:1-2"
+        );
+        // A lone digest renders verbatim.
+        assert_eq!(merge_digests("Read", &digests(&["a.rs:1-9"])), "a.rs:1-9");
+
+        // Edits count repeats beyond the first; other files ride along.
+        assert_eq!(
+            merge_digests("Edit", &digests(&["x.py", "x.py", "x.py"])),
+            "x.py +2 edits"
+        );
+        assert_eq!(
+            merge_digests("Edit", &digests(&["b.rs", "a.rs", "a.rs"])),
+            "a.rs +1 edit, b.rs"
+        );
+
+        // Bash caps to its first line: 60 kept chars plus the ellipsis.
+        let multiline = vec![format!("{}\nsecond line", "x".repeat(70))];
+        let capped = merge_digests("Bash", &multiline);
+        assert_eq!(capped.chars().count(), 61);
+        assert!(capped.ends_with('…'), "{capped}");
+
+        // Reversed bounds would panic the range set; they degrade to a join.
+        assert_eq!(
+            merge_digests("Read", &digests(&["a.rs:30-10", "a.rs:1-5"])),
+            "a.rs:30-10, a.rs:1-5"
+        );
+    }
+
     #[test]
     fn bash_definition_has_one_required_command_parameter() {
         let tool = serde_json::to_value(bash()).unwrap();
