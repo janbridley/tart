@@ -115,7 +115,7 @@ impl Entry {
             Entry::Tool(tool) => tool_lines(tool, expanded),
             Entry::Answer { raw, width, lines } => {
                 if *width == 0 {
-                    markdown::render(raw)
+                    markdown::render(raw, 0)
                 } else {
                     lines.clone()
                 }
@@ -471,7 +471,7 @@ impl Transcript {
             if let Entry::Answer { raw, width: at, lines } = entry
                 && *at != width
             {
-                *lines = markdown::render(raw);
+                *lines = markdown::render(raw, width);
                 *at = width;
             }
         }
@@ -542,7 +542,9 @@ impl Transcript {
             .iter()
             .flat_map(|entry| match entry {
                 Entry::Text(line) => vec![line_text(line)],
-                Entry::Answer { raw, .. } => markdown::render(raw).iter().map(line_text).collect(),
+                Entry::Answer { raw, .. } => {
+                    markdown::render(raw, 0).iter().map(line_text).collect()
+                }
                 Entry::Thinking { raw } => {
                     thinking_lines(raw, true).iter().map(line_text).collect()
                 }
@@ -794,6 +796,29 @@ mod tests {
         t.append(" now **bold**");
         t.sync(40);
         assert_eq!(t.message_texts(), ["plain so far now bold"]);
+        t.assert_rows_match_full_rewrap();
+    }
+
+    /// A wrapped numbered item keeps its hanging indent through the wrap
+    /// cache: the answer pre-wraps at the pane's width, each continuation
+    /// aligned under its item's text, and the cache's re-wrap passes the
+    /// rows through untouched.
+    #[test]
+    fn wrapped_list_items_keep_their_indent_through_sync() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ list"));
+        t.begin_response();
+        t.append("1. one two three four five six seven eight nine ten");
+        t.sync(24);
+        assert_eq!(
+            texts(t.rows()),
+            [
+                "❯ list",
+                "1. one two three four ",
+                "   five six seven eight ",
+                "   nine ten",
+            ]
+        );
         t.assert_rows_match_full_rewrap();
     }
 
