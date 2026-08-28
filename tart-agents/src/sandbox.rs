@@ -34,6 +34,9 @@
 //!   granted temp directory, and `HOME`, so paths like `~/.cargo` resolve.
 //!   With the environment cleared, secrets held by the caller cannot be printed
 //!   into captured output. Re-add variables with the usual `std` methods.
+//! - Git's global and system configuration are voided
+//!   (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`), providing what is
+//!   effectively a read-only git tool.
 //! - Standard input is [`Stdio::null`](std::process::Stdio::null) by default, and the
 //!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices.
 //! - Binaries outside the platform read baseline (for example `/opt/homebrew/bin`)
@@ -274,7 +277,8 @@ impl Policy {
     /// `sandbox-exec -p <render()> -DNAME=value ... -- <program>`.
     ///
     /// The command starts from a cleared environment (a minimal `PATH`, plus
-    /// `TMPDIR` for the granted temp directory and `HOME` so `~` paths resolve)
+    /// `TMPDIR` for the granted temp directory, `HOME` so `~` paths resolve,
+    /// and git's global and system configuration voided; see the module docs)
     /// and null standard input. The command and all of its children inherit the
     /// sandbox.
     ///
@@ -304,6 +308,12 @@ impl Policy {
         //
         // HOME is *not* readable or writable!
         cmd.env_clear().env("PATH", sandboxed_path()).stdin(Stdio::null());
+        // Git would fails trying to read `~/.gitconfig` (HOME is unreadable)
+        // so we void its global and system configuration.
+        // Repository-local configuration still applies, and with `.git`
+        // write-excluded the model's git is read-only.
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
             cmd.env("HOME", home);
         }
@@ -847,9 +857,11 @@ mod tests {
         let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
         assert_eq!(
             vars.len(),
-            1 + usize::from(home.is_some()) + usize::from(policy.temp.is_some())
+            3 + usize::from(home.is_some()) + usize::from(policy.temp.is_some())
         );
         assert!(vars.contains(&(OsStr::new("PATH"), sandboxed_path().as_os_str())));
+        assert!(vars.contains(&(OsStr::new("GIT_CONFIG_GLOBAL"), OsStr::new("/dev/null"))));
+        assert!(vars.contains(&(OsStr::new("GIT_CONFIG_NOSYSTEM"), OsStr::new("1"))));
         if let Some(home) = &home {
             assert!(vars.contains(&(OsStr::new("HOME"), home.as_os_str())));
         }
@@ -957,6 +969,86 @@ mod tests {
             .command("/bin/sh")
             .arg("-c")
             .arg(format!("echo x > {}", dir.path().join(".git/config").display()))
+            .output()
+            .unwrap();
+        assert!(!write.status.success());
+        assert!(
+            String::from_utf8_lossy(&write.stderr).contains("Operation not permitted"),
+            "stderr: {}",
+            String::from_utf8_lossy(&write.stderr)
+        );
+    }
+
+    /// Live: reaches `sandbox-exec` and `git`, so it only passes outside a nested
+    /// sandbox or a machine without git.
+    #[test]
+    fn git_reads_the_repository_but_cannot_write_it() {
+        // Skip when no git is available at all (for example, no Xcode CLT).
+        let probe = std::process::Command::new("git")
+            .arg("--version")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        if !probe.status.success() {
+            return;
+        }
+
+        // A fixture repository, built with the caller's own git.
+        let repo = tempfile::tempdir().unwrap();
+        let fixture = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "tart")
+                .env("GIT_AUTHOR_EMAIL", "tart@localhost")
+                .env("GIT_COMMITTER_NAME", "tart")
+                .env("GIT_COMMITTER_EMAIL", "tart@localhost")
+                .output()
+                .unwrap()
+        };
+        std::fs::write(repo.path().join("file"), "contents\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["add", "file"][..],
+            &["commit", "-q", "-m", "fixture"][..],
+        ] {
+            let out = fixture(args);
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let policy = Policy::new(repo.path()).unwrap().exclude_git();
+
+        // The sandboxed child must run inside the granted root: it inherits
+        // this process's working directory otherwise, which no grant covers.
+        let read = policy
+            .command("git")
+            .current_dir(repo.path())
+            .args(["log", "--oneline", "-1"])
+            .output()
+            .unwrap();
+        assert!(
+            read.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&read.stdout).contains("fixture"),
+            "stdout: {}",
+            String::from_utf8_lossy(&read.stdout)
+        );
+
+        let write = policy
+            .command("git")
+            .current_dir(repo.path())
+            .args(["branch", "denied"])
             .output()
             .unwrap();
         assert!(!write.status.success());
