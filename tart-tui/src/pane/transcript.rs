@@ -169,7 +169,7 @@ struct ToolCall {
     name: &'static str,
     /// The argument digest of each call in the run, e.g. `ls -la` or `main.rs:10-50`
     digests: Vec<String>,
-    /// Whether a call is in flight.
+    /// Whether a call is in flight; `false` once finished, which always fills `output`
     running: bool,
     /// Combined output; `None` until the first call of the run finishes.
     output: Option<String>,
@@ -233,27 +233,11 @@ impl Transcript {
     /// header line, and moves the thinking block below itself so the
     /// chain-of-thought always renders under the tool boxes.
     pub(crate) fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
-        // A trailing finished box of the same kind combines with following
-        if matches!(name, "Read" | "Edit")
-            && let Some(index) = self
-                .messages
-                .iter()
-                .rposition(|entry| !matches!(entry, Entry::Thinking { .. }))
-            && let Some(Entry::Tool(tool)) = self.messages.get(index)
-            && tool.name == name
-            && !tool.running
-            && tool.output.is_some()
-        {
-            self.rewind(index);
-            if let Some(Entry::Tool(tool)) = self.messages.get_mut(index) {
-                tool.digests.push(digest);
-                tool.id = id;
-                tool.running = true;
-                return;
-            }
+        if self.merge_into_tail(&id, name, &digest) {
+            return;
         }
         let fold = self.messages.iter().position(
-            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && tool.output.is_some() && !tool.superseded),
+            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && !tool.superseded),
         );
         let think = self
             .messages
@@ -267,7 +251,6 @@ impl Transcript {
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
                 && !tool.running
-                && tool.output.is_some()
             {
                 tool.superseded = true;
             }
@@ -286,6 +269,32 @@ impl Transcript {
             let entry = self.messages.remove(at);
             self.messages.push(entry);
         }
+    }
+
+    /// Fold a same-kind call into a trailing finished box.
+    fn merge_into_tail(&mut self, id: &str, name: &'static str, digest: &str) -> bool {
+        // The thinking block rides below the boxes, so step past it to the fresh entry
+        let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|entry| !matches!(entry, Entry::Thinking { .. }))
+        else {
+            return false;
+        };
+        if !matches!(name, "Read" | "Edit")
+            || !matches!(&self.messages[index],
+                Entry::Tool(tool) if tool.name == name && !tool.running)
+        {
+            return false;
+        }
+        self.rewind(index);
+        if let Entry::Tool(tool) = &mut self.messages[index] {
+            tool.digests.push(digest.to_owned());
+            id.clone_into(&mut tool.id);
+            tool.running = true;
+            return true;
+        }
+        false
     }
 
     /// Fill in the pending invocation with `id`, then refold from its box.
