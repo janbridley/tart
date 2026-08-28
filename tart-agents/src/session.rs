@@ -1,5 +1,6 @@
 //! Serialize transcripts as jsonl files to allow resumable tart sessions.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -251,20 +252,17 @@ fn save(path: &Path, items: &[InputItem]) -> anyhow::Result<()> {
 
 /// Drop trailing calls whose outputs never arrived.
 fn trim_unpaired(items: &mut Vec<InputItem>) {
-    let unanswered = |items: &[InputItem], item: &InputItem| {
-        let InputItem::Item(Item::FunctionCall(call)) = item else {
-            return false;
-        };
-        !items.iter().any(|other| {
-            matches!(
-                other,
-                InputItem::Item(Item::FunctionCallOutput(output)) if output.call_id == call.call_id
-            )
+    let answered: HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            InputItem::Item(Item::FunctionCallOutput(output)) => Some(output.call_id.as_str()),
+            _ => None,
         })
-    };
-    while items.last().is_some_and(|item| unanswered(items, item)) {
-        items.pop();
-    }
+        .collect();
+    let trailing = items.iter().rev().take_while(|item| {
+        matches!(item, InputItem::Item(Item::FunctionCall(call)) if !answered.contains(call.call_id.as_str()))
+    }).count();
+    items.truncate(items.len() - trailing);
 }
 
 /// The moment as `YYYYMMDD-HHMMSS` UTC.
