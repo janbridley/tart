@@ -802,14 +802,12 @@ impl Pane {
         );
         let top = self.prompt.top;
         let shown = (prompt_area.height as usize).min(layout.rows.len().saturating_sub(top));
-        for i in 0..shown {
-            buf.set_line(
-                prompt_area.x + GUTTER,
-                prompt_area.y + i as u16,
-                &layout.rows[top + i],
-                width,
-            );
-        }
+        buf.set_rows(
+            prompt_area.x + GUTTER,
+            prompt_area.y,
+            &layout.rows[top..top + shown],
+            width,
+        );
         // A caret at the end of a full row inverts the row's last cell.
         let col = layout.caret_col.min(width.saturating_sub(1) as usize) as u16;
         let pos = (
@@ -857,9 +855,7 @@ impl Pane {
         }
         let buf = frame.buffer_mut();
         let shown = visible.min(rows.len().saturating_sub(top));
-        rows[top..top + shown].iter().zip(area.y..).for_each(|(row, y)| {
-            buf.set_line(area.x, y, row, area.width);
-        });
+        buf.set_rows(area.x, area.y, &rows[top..top + shown], area.width);
         if let Some(cursor) = self.copy {
             if let Some(selection) = Selection::between(cursor.anchor, (cursor.row, cursor.col)) {
                 selection.paint(buf, rows, area, top, shown);
@@ -924,10 +920,9 @@ impl Extend<Progress> for Pane {
 
 /// Span-vector operations shared by the markdown and wrap renderers.
 trait SpansExt {
-    /// Append styled text, gluing onto the last span when the style matches;
-    /// the owned string is allocated once per run.
+    /// Append styled text, gluing onto the last span when the style matches.
     fn push_merged(&mut self, text: &str, style: Style);
-    /// The line these spans render as: an empty line still needs one span.
+    /// Render the implementing struct as a `Line`
     fn into_line(self) -> Line<'static>;
 }
 
@@ -944,6 +939,19 @@ impl SpansExt for Vec<Span<'static>> {
             self.push(Span::raw(""));
         }
         Line::from(self)
+    }
+}
+
+/// Painting whole rows at once, the multi-row sibling of `set_line`.
+trait BufRows {
+    fn set_rows(&mut self, x: u16, y: u16, rows: &[Line<'static>], width: u16);
+}
+
+impl BufRows for Buffer {
+    fn set_rows(&mut self, x: u16, y: u16, rows: &[Line<'static>], width: u16) {
+        for (row, y) in rows.iter().zip(y..) {
+            self.set_line(x, y, row, width);
+        }
     }
 }
 
