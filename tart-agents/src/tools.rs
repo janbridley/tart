@@ -1240,12 +1240,7 @@ mod tests {
     #[apply(skip_unless_live!)]
     #[test]
     fn read_returns_numbered_contents_and_ranges() {
-        let mut contents = String::new();
-        for line in 1..=30 {
-            contents.push_str("line ");
-            contents.push_str(&line.to_string());
-            contents.push('\n');
-        }
+        let contents: String = (1..=30).map(|line| format!("line {line}\n")).collect();
         let file = scratch(&contents);
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
