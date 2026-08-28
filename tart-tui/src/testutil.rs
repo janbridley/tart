@@ -76,8 +76,10 @@ pub(crate) fn segments(lines: &[Line<'static>]) -> Vec<Vec<(String, Style)>> {
 /// legend char:
 ///
 /// - `B` bold · `I` italic · `S` crossed-out
-/// - `c` yellow fg (inline code) · `d` dark-gray fg (dim)
+/// - `d` dark-gray fg (dim) · `c` yellow fg (plan mode's rules)
 /// - `b` blue fg · `C` cyan fg · `m` magenta fg (the `!` mode's frame)
+/// - `r` light-red fg · `l` light-blue fg (links) · `y` light-yellow fg
+///   (inline code) · `p` light-magenta fg
 /// - `.` anything else
 pub(crate) fn draw_styles(render: impl FnMut(&mut Frame, Rect), (w, h): (u16, u16)) -> String {
     let terminal = frames(render, (w, h));
@@ -101,6 +103,10 @@ pub(crate) fn draw_styles(render: impl FnMut(&mut Frame, Rect), (w, h): (u16, u1
                             Color::Blue => 'b',
                             Color::Cyan => 'C',
                             Color::Magenta => 'm',
+                            Color::LightRed => 'r',
+                            Color::LightBlue => 'l',
+                            Color::LightYellow => 'y',
+                            Color::LightMagenta => 'p',
                             _ => '.',
                         }
                     }

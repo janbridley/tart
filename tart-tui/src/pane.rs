@@ -2062,6 +2062,34 @@ mod tests {
         assert!(render(&mut pane, (40, 12)).contains("Thinking"));
     }
 
+    /// The answer's markdown palette lands on screen: an H3 bold, inline code
+    /// light yellow, a link's label light blue, its destination dim.
+    #[test]
+    fn markdown_colors_render_end_to_end() {
+        let mut pane = Pane::default();
+        pane.extend([
+            Progress::User("colors".to_string()),
+            Progress::Answer(
+                "### Head\n\nrun `cargo test` and see [the docs](https://example.com)".to_string(),
+            ),
+        ]);
+        let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
+        let rows: Vec<&str> = styles.lines().collect();
+        assert!(rows[1].starts_with("BBBB"), "the H3 is bold: {styles}");
+        assert!(
+            styles.contains("yyyyyyyyyy"),
+            "inline code is light yellow: {styles}"
+        );
+        assert!(
+            styles.contains("llllllll"),
+            "the link label is light blue: {styles}"
+        );
+        assert!(
+            styles.contains("dddddddddddddddddd"),
+            "the destination is dim: {styles}"
+        );
+    }
+
     #[test]
     fn answers_render_markdown_end_to_end() {
         let mut pane = Pane::default();
