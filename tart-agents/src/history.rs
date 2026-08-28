@@ -156,47 +156,55 @@ impl Transcript {
     /// Tool exchanges replay headers only, with coloring skipped for simplicity.
     #[inline]
     pub fn replay(&self) -> Vec<Progress> {
-        let mut events = Vec::new();
-        for item in &self.request_items() {
-            match item {
-                InputItem::EasyMessage(message) => match (&message.role, &message.content) {
-                    (Role::User, EasyInputContent::Text(text)) => {
-                        events.push(Progress::User(text.clone()));
-                    }
-                    (Role::Assistant, EasyInputContent::Text(text)) => {
-                        events.push(Progress::Answer(text.clone()));
-                    }
-                    _ => {}
-                },
-                InputItem::Item(Item::Reasoning(reasoning)) => {
-                    let text: String = reasoning
-                        .content
-                        .iter()
-                        .flatten()
-                        .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
-                        .collect();
-                    if !text.is_empty() {
-                        events.push(Progress::Thinking(text));
-                    }
+        let items = self.items();
+        items
+            .iter()
+            .chain(self.reminder.as_ref())
+            .flat_map(Self::replay_events)
+            .collect()
+    }
+
+    /// The events one recorded item replays as, in live order.
+    fn replay_events(item: &InputItem) -> Vec<Progress> {
+        match item {
+            InputItem::EasyMessage(message) => match (&message.role, &message.content) {
+                (Role::User, EasyInputContent::Text(text)) => vec![Progress::User(text.clone())],
+                (Role::Assistant, EasyInputContent::Text(text)) => {
+                    vec![Progress::Answer(text.clone())]
                 }
-                InputItem::Item(Item::FunctionCall(call)) => {
-                    // Just show the header, exits/output are not super necessary
-                    let (name, digest) = tools::describe(call);
-                    events.push(Progress::ToolStart {
+                _ => Vec::new(),
+            },
+            InputItem::Item(Item::Reasoning(reasoning)) => {
+                let text: String = reasoning
+                    .content
+                    .iter()
+                    .flatten()
+                    .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
+                    .collect();
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Progress::Thinking(text)]
+                }
+            }
+            InputItem::Item(Item::FunctionCall(call)) => {
+                // Just show the header, exits/output are not super necessary
+                let (name, digest) = tools::describe(call);
+                vec![
+                    Progress::ToolStart {
                         id: call.call_id.clone(),
                         name,
                         digest,
-                    });
-                    events.push(Progress::ToolOutput {
+                    },
+                    Progress::ToolOutput {
                         id: call.call_id.clone(),
                         output: String::new(),
                         exit: Some(0),
-                    });
-                }
-                _ => {}
+                    },
+                ]
             }
+            _ => Vec::new(),
         }
-        events
     }
 }
 
