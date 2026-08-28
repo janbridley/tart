@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_openai::types::responses::{FunctionToolCall, Tool};
 
 use super::{
-    TimedRun, combined_output, command_text, parse_arguments, run_with_timeout, string_field,
+    WatchedRun, combined_output, command_text, parse_arguments, run_with_timeout, string_field,
     timeout_text, tool, traced,
 };
 use crate::Progress;
@@ -300,10 +300,10 @@ pub(super) fn run_search<F: Fn(Progress)>(
             Some(rendered) => (rendered.clone(), rendered, Some(0)),
             None => match outcome {
                 Ok(run) => {
-                    let TimedRun { output, timed_out } = run;
+                    let WatchedRun { output, killed } = run;
                     let text = combined_output(&output);
                     let exit = output.status.code();
-                    if timed_out {
+                    if killed {
                         let marked = timeout_text(&text, SEARCH_TIMEOUT);
                         (marked.clone(), marked, exit)
                     } else {
@@ -507,11 +507,11 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
                 let text = format!("error: {error}");
                 (text.clone(), text, None)
             }
-            Ok(TimedRun { output, timed_out: true }) => {
+            Ok(WatchedRun { output, killed: true }) => {
                 let marked = timeout_text(&combined_output(&output), FETCH_TIMEOUT);
                 (marked.clone(), marked, output.status.code())
             }
-            Ok(TimedRun { output, .. }) => {
+            Ok(WatchedRun { output, .. }) => {
                 let exit = output.status.code();
                 let text = combined_output(&output);
                 if !output.status.success() {

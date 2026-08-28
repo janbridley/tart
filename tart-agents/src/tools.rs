@@ -8,6 +8,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 
 use crate::{Progress, sandbox::Policy};
 
@@ -30,6 +32,39 @@ const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The longest timeout a bash call may ask for.
 const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The most manual-command output kept, taking the tail if triggered.
+const MANUAL_OUTPUT_CAP: usize = 50 * 1024; // bytes
+
+/// How often a manual command's watchdog wakes to check its cancel token.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// The front end's control for a running manual command.
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    /// Set by `cancel`, watched by the runner's watchdog.
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// A token for a command nobody has cancelled yet.
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel the run this token fronts, if it is still going.
+    #[inline]
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Whether [`CancelToken::cancel`] was called.
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
 
 /// Cat a (subregion of a) file, numbering the lines in the output.
 fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
@@ -259,18 +294,37 @@ fn command_text(text: &str, status: ExitStatus) -> String {
     format!("[exit {status}]{separator}{text}")
 }
 
-/// One bash command run under a deadline.
-struct TimedRun {
+/// One finished command run under a watchdog: a deadline or a cancel.
+struct WatchedRun {
     /// The command's streams and exit status, as `output()` returns them.
     output: Output,
-    /// The deadline elapsed and the process group was killed.
-    timed_out: bool,
+    /// The watchdog killed the process group: a deadline or a cancel.
+    killed: bool,
 }
 
 /// Model-facing explanation for a command the timeout killed.
 fn timeout_text(text: &str, timeout: Duration) -> String {
     let separator = if text.is_empty() { "" } else { "\n" };
     format!("[timed out after {}s]{separator}{text}", timeout.as_secs())
+}
+
+/// Model-facing explanation for a command the user cancelled with Esc.
+fn cancel_text(text: &str) -> String {
+    let separator = if text.is_empty() { "" } else { "\n" };
+    format!("[cancelled]{separator}{text}")
+}
+
+/// Keep the last `cap` bytes of `text`, prefixing a marker when it cut.
+fn tail_cap(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    // Slicing must land on a char boundary; lossy decoding made `text` valid.
+    let mut start = text.len() - cap;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[truncated; last {} KB shown]\n{}", cap / 1024, &text[start..])
 }
 
 /// The display name and digest for a recorded call, to be replayed as a tool header.
@@ -304,28 +358,34 @@ pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
     (name, digest.unwrap_or_else(|| call.arguments.clone()))
 }
 
-/// Run `command` to completion, killing its process group if it outlives `timeout`.
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<TimedRun> {
+/// Spawn `command` in its own process group with piped output and no input,
+/// returning the child and its group id.
+fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)> {
     command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn()?;
-    // // The child leads its own group, so the group id is its pid.
-    let group = child.id() as libc::pid_t;
+    // A pid always fits an i32, and the child leads its own group.
+    let group = Pid::from_raw(child.id().cast_signed());
+    Ok((child, group))
+}
 
-    let timed_out = Arc::new(AtomicBool::new(false));
+/// Run `command` to completion, killing its process group if it outlives `timeout`.
+fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<WatchedRun> {
+    let (child, group) = spawn_grouped(command)?;
+
+    let killed = Arc::new(AtomicBool::new(false));
     // The sender drops once the command is reaped, waking the watchdog immediatedly
     let (finished, slept) = mpsc::channel::<()>();
-    let flagged = Arc::clone(&timed_out);
+    let flagged = Arc::clone(&killed);
     let watchdog = std::thread::spawn(move || {
         if matches!(slept.recv_timeout(timeout), Err(RecvTimeoutError::Timeout)) {
             // Flag before killing, so the caller cannot mistake the death for a
             // natural signal once the wait returns.
             flagged.store(true, Ordering::Release);
-            // SAFETY: one signal to our own child's process group.
-            unsafe { libc::killpg(group, libc::SIGKILL) };
+            let _ = killpg(group, Signal::SIGKILL);
         }
     });
 
@@ -333,14 +393,51 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Time
     drop(finished);
     // Double check we've killed everything even if the wait errors.
     if output.is_err() {
-        // SAFETY: as above.
-        unsafe { libc::killpg(group, libc::SIGKILL) };
+        let _ = killpg(group, Signal::SIGKILL);
     }
     let _ = watchdog.join();
 
-    Ok(TimedRun {
+    Ok(WatchedRun {
         output: output?,
-        timed_out: timed_out.load(Ordering::Acquire),
+        killed: killed.load(Ordering::Acquire),
+    })
+}
+
+/// Run `command` to completion, killing its process group the moment `cancel` enters.
+fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Result<WatchedRun> {
+    let (child, group) = spawn_grouped(command)?;
+
+    let killed = Arc::new(AtomicBool::new(false));
+    // The sender drops once the command is reaped, waking the watchdog at once.
+    let (finished, slept) = mpsc::channel::<()>();
+    let flagged = Arc::clone(&killed);
+    let token = cancel.clone();
+    let watchdog = std::thread::spawn(move || {
+        while !token.cancelled() {
+            if matches!(
+                slept.recv_timeout(CANCEL_POLL),
+                Err(RecvTimeoutError::Disconnected)
+            ) {
+                return;
+            }
+        }
+        // Flag before killing, so the caller cannot mistake the death for a
+        // natural signal once the wait returns.
+        flagged.store(true, Ordering::Release);
+        let _ = killpg(group, Signal::SIGKILL);
+    });
+
+    let output = child.wait_with_output();
+    drop(finished);
+    // Double check we've killed everything even if the wait errors.
+    if output.is_err() {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+    let _ = watchdog.join();
+
+    Ok(WatchedRun {
+        output: output?,
+        killed: killed.load(Ordering::Acquire),
     })
 }
 
@@ -384,10 +481,10 @@ fn run_bash<F: Fn(Progress)>(
         // Decode the stream into output for the front and backends.
         match run_with_timeout(&mut sandboxed, bash.timeout) {
             Ok(run) => {
-                let TimedRun { output, timed_out } = run;
+                let WatchedRun { output, killed } = run;
                 let text = combined_output(&output);
                 let exit = output.status.code();
-                if timed_out {
+                if killed {
                     // A timeout has no exit code for the header, so we mark up the body.
                     let marked = timeout_text(&text, bash.timeout);
                     (marked.clone(), marked, exit)
@@ -401,6 +498,24 @@ fn run_bash<F: Fn(Progress)>(
             }
         }
     }))
+}
+
+/// Run one command the user typed, with their privileges.
+#[inline]
+pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
+    let mut shell = Command::new("/bin/bash");
+    shell.arg("-c").arg(command);
+    match run_until_cancelled(&mut shell, cancel) {
+        Ok(WatchedRun { output, killed }) => {
+            let text = tail_cap(&combined_output(&output), MANUAL_OUTPUT_CAP);
+            if killed {
+                cancel_text(&text)
+            } else {
+                command_text(&text, output.status)
+            }
+        }
+        Err(error) => format!("error: {error}"),
+    }
 }
 
 /// The digest for a read call: the path, with any bounds as `path:start-end`.
@@ -462,9 +577,6 @@ fn run_edit<F: Fn(Progress)>(
 ///
 /// We pre-check that the edit is valid in rust for performance, though the perl script
 /// verifies to ensure we don't run into TOCTOU issues between here and the lock.
-///
-/// The exit is `None` whenever no process ran: pre-check refusals join spawn
-/// errors in reporting "nothing exited" — the box still colors red.
 fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
     let path = Path::new(&edit.path);
     if edit.old_string.is_empty() {
@@ -682,6 +794,93 @@ mod tests {
         assert_eq!(timeout_text("", DEFAULT_BASH_TIMEOUT), "[timed out after 120s]");
     }
 
+    #[test]
+    fn tail_cap_keeps_the_tail_and_marks_the_cut() {
+        assert_eq!(tail_cap("hi\n", 10), "hi\n");
+
+        let text = "abcdef".repeat(1024); // 6 KB
+        let capped = tail_cap(&text, 1024);
+        let (marker, tail) = capped.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; last 1 KB shown]");
+        assert_eq!(tail, &text[text.len() - 1024..]);
+
+        // A multi-byte tail must not split a character at the cut.
+        let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
+        let capped = tail_cap(&wide, 1024);
+        let (marker, tail) = capped.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; last 1 KB shown]");
+        assert!(tail.chars().all(|c| c == '語'), "cut inside a character");
+    }
+
+    /// Manual runs reuse the bash tool's framing; these run unsandboxed
+    #[test]
+    fn manual_command_frames_success_and_failure() {
+        assert_eq!(manual_command("echo hi", &CancelToken::new()), "hi\n");
+        assert_eq!(manual_command("true", &CancelToken::new()), "done");
+        assert_eq!(manual_command("false", &CancelToken::new()), "[exit 1]");
+        assert_eq!(
+            manual_command("echo boom >&2; exit 3", &CancelToken::new()),
+            "[exit 3]\nboom\n"
+        );
+    }
+
+    /// A token cancelled before the run kills the command at once; one cancelled
+    /// mid-run keeps the output the command had already written.
+    #[test]
+    fn a_cancelled_manual_command_dies_with_its_group() {
+        let ahead = CancelToken::new();
+        ahead.cancel();
+        let started = Instant::now();
+        assert_eq!(
+            manual_command("sleep 9871 & sleep 9871 & wait", &ahead),
+            "[cancelled]"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let live = CancelToken::new();
+        let token = live.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            token.cancel();
+        });
+        let started = Instant::now();
+        // The sleeps hold the output pipe, so returning promptly proves the
+        // whole group died and not just bash.
+        let framed = manual_command("echo started; sleep 9871 & sleep 9871 & wait", &live);
+        assert_eq!(framed, "[cancelled]\nstarted\n");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// An untouched token leaves the command to finish on its own.
+    #[test]
+    fn manual_command_runs_to_completion_without_a_cancel() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("hi");
+
+        let run = run_until_cancelled(&mut command, &CancelToken::new()).unwrap();
+
+        assert!(!run.killed);
+        assert_eq!(combined_output(&run.output), "hi\n");
+    }
+
+    /// The user's shell context is inherited: same working directory, same
+    /// environment, unlike the web tools' cleared environment. `pwd -P`, not
+    /// `$PWD`, since bash re-derives that from its own cwd at startup.
+    #[test]
+    fn manual_command_inherits_the_parents_directory_and_environment() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            manual_command("pwd -P", &CancelToken::new()),
+            format!("{}\n", cwd.display())
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(
+                manual_command("printenv HOME", &CancelToken::new()),
+                format!("{home}\n")
+            );
+        }
+    }
+
     /// These drive `run_with_timeout` with plain commands, so they run without
     /// the sandbox; their deadlines are milliseconds to stay fast.
     #[test]
@@ -691,7 +890,7 @@ mod tests {
 
         let run = run_with_timeout(&mut command, Duration::from_secs(10)).unwrap();
 
-        assert!(!run.timed_out);
+        assert!(!run.killed);
         assert_eq!(combined_output(&run.output), "hi\n");
         assert!(run.output.status.success());
     }
@@ -704,7 +903,7 @@ mod tests {
 
         let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
 
-        assert!(run.timed_out);
+        assert!(run.killed);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!run.output.status.success());
     }
@@ -719,7 +918,7 @@ mod tests {
 
         let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
 
-        assert!(run.timed_out);
+        assert!(run.killed);
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -731,7 +930,7 @@ mod tests {
 
         let run = run_with_timeout(&mut command, DEFAULT_BASH_TIMEOUT).unwrap();
 
-        assert!(!run.timed_out);
+        assert!(!run.killed);
         // The sender's drop joins the watchdog at once rather than letting it
         // sleep out the full timeout.
         assert!(started.elapsed() < Duration::from_secs(5));
