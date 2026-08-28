@@ -482,16 +482,45 @@ impl Transcript {
         &self.rows
     }
 
-    /// Wrap one message into the row cache, recording its row count.
+    /// Wrap one message into the row cache, recording its row count. A
+    /// separated entry's blank row counts among its own, keeping `folds`
+    /// aligned with `messages` through rewinds.
     fn fold_entry(&mut self, index: usize, width: usize, expanded: bool) {
+        let separated = self.separated(index);
         let wrapped = match &self.messages[index] {
             // An answer wraps its rendering without cloning
             Entry::Answer { lines, .. } => wrap_lines(lines, width),
             Entry::Thinking { raw } => wrap_lines(&thinking_lines(raw, self.show_thinking), width),
             entry => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
         };
-        self.folds.push(wrapped.len());
+        if separated {
+            self.folds.push(wrapped.len() + 1);
+            self.rows.push(Line::from(""));
+        } else {
+            self.folds.push(wrapped.len());
+        }
         self.rows.extend(wrapped);
+    }
+
+    /// Whether a blank row leads `messages[index]` and we should emit a newline.
+    fn separated(&self, index: usize) -> bool {
+        // true for an answer, false for a tool box, `None` for anything else.
+        let kind = |entry: &Entry| {
+            matches!(entry, Entry::Answer { .. }).then_some(true).or(matches!(
+                entry,
+                Entry::Tool(_)
+            )
+            .then_some(false))
+        };
+        let Some(current) = kind(&self.messages[index]) else {
+            return false;
+        };
+        self.messages[..index]
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry, Entry::Thinking { .. }))
+            .and_then(kind)
+            .is_some_and(|before| before != current)
     }
 
     /// The wrapped rows; current as of the last `sync`.
@@ -522,14 +551,16 @@ impl Transcript {
             .collect()
     }
 
-    /// The cached rows equal a full re-wrap of every message at the wrapped width.
+    /// The cached rows equal a full re-wrap of every message at the wrapped width
     #[cfg(test)]
     pub(crate) fn assert_rows_match_full_rewrap(&self) {
-        let full = self
-            .messages
-            .iter()
-            .flat_map(|entry| entry.lines(self.show_tool_output, self.show_thinking))
-            .collect::<Vec<_>>();
+        let mut full = Vec::new();
+        for index in 0..self.messages.len() {
+            if self.separated(index) {
+                full.push(Line::from(""));
+            }
+            full.extend(self.messages[index].lines(self.show_tool_output, self.show_thinking));
+        }
         assert_eq!(texts(&self.rows), texts(&wrap_lines(&full, self.cache.0)));
     }
 }
@@ -538,12 +569,16 @@ impl Transcript {
 mod tests {
     use super::*;
 
-    /// The messages the transcript renders, each entry's display lines.
+    /// The messages the transcript renders: each entry's display lines, including separators
     fn visible(t: &Transcript) -> Vec<Line<'static>> {
-        t.messages
-            .iter()
-            .flat_map(|entry| entry.lines(t.show_tool_output, t.show_thinking))
-            .collect()
+        let mut lines = Vec::new();
+        for (index, entry) in t.messages.iter().enumerate() {
+            if t.separated(index) {
+                lines.push(Line::from(""));
+            }
+            lines.extend(entry.lines(t.show_tool_output, t.show_thinking));
+        }
+        lines
     }
 
     /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
@@ -554,6 +589,52 @@ mod tests {
     /// Start a pending `Read(digest)` invocation, as the pane would on a `ToolStart`
     fn start_read(t: &mut Transcript, id: &str, digest: &str) {
         t.start_tool(id.to_string(), "Read", digest.to_string());
+    }
+
+    /// A blank row separates an answer from an adjacent tool box, in either order
+    #[test]
+    fn answers_and_tool_boxes_get_a_blank_between() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        t.append("the answer");
+        t.sync(40);
+        assert_eq!(texts(t.rows()), ["❯ go", "the answer"]);
+
+        // A tool following the answer leads with air.
+        start_bash(&mut t, "call_0");
+        t.sync(40);
+        assert_eq!(texts(t.rows()), ["❯ go", "the answer", "", "● Bash(echo hi) …"]);
+
+        // An answer following the box does too, the riding thinking aside.
+        t.finish_tool("call_0", "hi\n".to_string(), Some(0));
+        t.append_thinking("why");
+        t.append("more");
+        t.sync(40);
+        assert_eq!(
+            texts(t.rows()),
+            [
+                "❯ go",
+                "the answer",
+                "",
+                "● Bash(echo hi)",
+                "  ⎿ hi",
+                THINKING_HIDDEN,
+                "",
+                "more",
+            ]
+        );
+        t.assert_rows_match_full_rewrap();
+
+        // Consecutive boxes and plain lines stack without air.
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        start_bash(&mut t, "call_0");
+        t.finish_tool("call_0", "hi\n".to_string(), Some(0));
+        start_bash(&mut t, "call_1");
+        t.sync(40);
+        assert_eq!(texts(t.rows()), ["❯ go", "● Bash(echo hi)", "● Bash(echo hi) …"]);
     }
 
     #[test]
@@ -885,17 +966,7 @@ and the analytics dashboard rewrite.\n\n\
             transcript.push(Line::from(format!("message {i} aaaa bbbb cccc dddd")));
         }
         let assert_fresh = |transcript: &Transcript| {
-            let full = transcript
-                .messages
-                .iter()
-                .flat_map(|entry| {
-                    entry.lines(transcript.show_tool_output, transcript.show_thinking)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                texts(&transcript.rows),
-                texts(&wrap_lines(&full, transcript.cache.0))
-            );
+            transcript.assert_rows_match_full_rewrap();
         };
         transcript.sync(20);
         assert_eq!(transcript.cache, (20, 5));
@@ -1220,12 +1291,7 @@ and the analytics dashboard rewrite.\n\n\
     fn new_calls_fold_finished_boxes_to_their_headers() {
         let mut t = Transcript::default();
         let assert_fresh = |t: &Transcript| {
-            let full = t
-                .messages
-                .iter()
-                .flat_map(|entry| entry.lines(t.show_tool_output, t.show_thinking))
-                .collect::<Vec<_>>();
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&full, t.cache.0)));
+            t.assert_rows_match_full_rewrap();
         };
         t.push(Line::from("❯ run it"));
         t.begin_response();
