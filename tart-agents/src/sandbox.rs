@@ -228,19 +228,23 @@ impl Policy {
         Ok(self)
     }
 
-    /// Drop every write grant, leaving the reads as they are.
+    /// Drop every write grant but the temp directory, leaving reads as they are.
     ///
-    /// Plan mode runs under a policy like this: the model can still inspect everything
-    /// its grants covered, but no path is writable — not even the temp directory,
-    /// which stays bound as `TMPDIR`. Exclusions go with the writes they guarded.
+    /// Plan mode allows reads to all paths normal mode can edit, but the workspace is
+    /// not writable. `/tmp` is writable as scratch space for compiler outputs/tests.
     #[must_use]
     #[inline]
     pub fn read_only(mut self) -> Self {
+        let temp = self.temp.clone();
+        let mut writable = Vec::new();
         for root in std::mem::take(&mut self.writable) {
-            if !self.read_only.contains(&root) {
+            if Some(&root) == temp.as_ref() {
+                writable.push(root);
+            } else if !self.read_only.contains(&root) {
                 self.read_only.push(root);
             }
         }
+        self.writable = writable;
         self.excluded.clear();
         self
     }
@@ -493,36 +497,103 @@ mod tests {
         assert!(!rendered.contains(r#"file-write* (subpath (param "READABLE_ROOT_0")"#));
     }
 
-    /// Plan mode runs under [`Policy::read_only`], with all writes blocked by the OS.
+    /// Plan mode runs under [`Policy::read_only`]: every granted root but the
+    /// temp directory demotes to a read rule, and the temp root alone keeps a
+    /// write rule.
     #[test]
-    fn read_only_converts_writes_to_reads_only() {
-        let root = tempfile::tempdir().unwrap();
+    fn read_only_keeps_only_the_temp_scratch() {
+        // A workspace outside the scratch tree, as in `read_only_root_denies_writes`:
+        // `tempdir()` would land inside `$TMPDIR`, which is the one root this policy
+        // keeps writable.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = tempfile::tempdir_in(&home).unwrap();
         // No `.git` exclusion, so the write rule renders in its plain form;
-        // the conversion is what is under test, not the exclusion guards.
+        // the demotion is what is under test, not the exclusion guards.
         let base = Policy::new(root.path()).unwrap();
         assert!(
             base.render()
                 .contains(r#"(allow file-write* (subpath (param "WRITABLE_ROOT_0")))"#)
         );
 
-        let rendered = base.clone().read_only().render();
-        // The former writable root is now named as a read-only root instead.
+        let plan = base.clone().read_only();
+        // The former workspace root is now named as a read-only root instead,
+        // and exactly one write rule survives in the whole profile: scratch.
+        let rendered = plan.render();
         assert!(
             rendered.contains(r#"(allow file-read* (subpath (param "READABLE_ROOT_0")))"#),
             "the workspace stays readable: {rendered}"
         );
-        assert!(
-            !rendered.contains("file-write* (subpath (param \"WRITABLE_ROOT_"),
-            "no write rule survives the conversion: {rendered}"
+        assert_eq!(
+            rendered
+                .matches("(allow file-write* (subpath (param \"WRITABLE_ROOT_")
+                .count(),
+            1,
+            "one generated write grant, the scratch root alone (the vendored layers \
+             add /dev/fd and the temp trees, which are theirs): {rendered}"
         );
-        // Every granted root, temp included, loses its write access.
+        // The writable set is the granted temp directory, nothing else.
+        let writable = plan.writable_roots();
+        assert_eq!(writable.len(), 1, "exactly the scratch root: {writable:?}");
+        assert_eq!(writable[0], plan.temp.as_deref().expect("a granted temp root"));
         assert!(
-            Policy::new(root.path())
-                .unwrap()
-                .read_only()
-                .writable_roots()
-                .is_empty()
+            writable[0] != root.path(),
+            "the workspace is not writable: {writable:?}"
         );
+    }
+
+    #[test]
+    fn read_only_denies_the_repo_but_not_the_scratch() {
+        // The workspace must live *outside* the scratch tree: `tempfile::
+        // tempdir()` creates under `$TMPDIR`, which this policy keeps
+        // writable, so a write there would rightly succeed. Under `$HOME`,
+        // as `read_only_root_denies_writes` arranges it.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = tempfile::tempdir_in(&home).unwrap();
+        let policy = Policy::new(root.path()).unwrap().read_only();
+
+        let denied = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(format!("echo x > {}", root.path().join("x").display()))
+            .output()
+            .unwrap();
+        assert!(!denied.status.success(), "the workspace must not take writes");
+        assert!(
+            String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"),
+            "stderr: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+
+        // The granted scratch, and the system tree the platform defaults
+        // cover, both take writes.
+        let scratch = policy.temp.as_ref().unwrap().join("tart_plan_mode_probe");
+        let allowed = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(format!("echo x > {}", scratch.display()))
+            .output()
+            .unwrap();
+        assert!(
+            allowed.status.success(),
+            "the scratch root must take writes: {}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        let system = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg("echo x > /tmp/tart_plan_mode_probe")
+            .output()
+            .unwrap();
+        assert!(
+            system.status.success(),
+            "/tmp must take writes: {}",
+            String::from_utf8_lossy(&system.stderr)
+        );
+        let _ = policy
+            .command("/bin/sh")
+            .arg("-c")
+            .arg("rm -f /tmp/tart_plan_mode_probe")
+            .output();
     }
 
     /// Roots are canonicalized, so a symlinked root grants the real path.
