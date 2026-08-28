@@ -622,7 +622,9 @@ mod tests {
 
     use super::*;
     use crate::sandbox::Policy;
+    use crate::sandbox::live::skip_unless_networked;
     use crate::tools::execute;
+    use macro_rules_attribute::apply;
 
     /// A tool call for `name` with raw JSON `arguments`.
     fn call(name: &str, arguments: &str) -> FunctionToolCall {
@@ -998,6 +1000,7 @@ mod tests {
 
     /// Live: reaches the network, so it needs connectivity. Raw mode, so it
     /// stands on example.com alone and not on the reader service.
+    #[apply(skip_unless_networked!)]
     #[test]
     fn run_fetch_returns_the_page() {
         let Some(_) = fetch_binary() else {

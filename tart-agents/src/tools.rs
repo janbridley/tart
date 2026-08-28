@@ -679,6 +679,8 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use crate::sandbox::live::skip_unless_live;
+    use macro_rules_attribute::apply;
     use std::time::Instant;
 
     /// A `bash` tool call requesting `command`.
@@ -974,6 +976,7 @@ mod tests {
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[apply(skip_unless_live!)]
     #[test]
     fn execute_reports_command_then_output() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
@@ -1138,6 +1141,7 @@ mod tests {
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[apply(skip_unless_live!)]
     #[test]
     fn concurrent_edits_to_one_file_both_apply() {
         let file = scratch("one UNO alpha\ntwo DOS beta\n");
@@ -1233,6 +1237,7 @@ mod tests {
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
+    #[apply(skip_unless_live!)]
     #[test]
     fn read_returns_numbered_contents_and_ranges() {
         let mut contents = String::new();
