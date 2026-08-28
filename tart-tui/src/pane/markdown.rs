@@ -6,6 +6,7 @@
 //! display width with their block's hanging indent, so a wrapped list item or
 //! quotation keeps its marker column on every row.
 
+use itertools::Itertools;
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -128,12 +129,9 @@ impl Inline {
             return;
         }
         self.trim = false;
-        if self.spans.last().is_some_and(|last| last.style == style) {
-            if let Some(last) = self.spans.last_mut() {
-                last.content.to_mut().push_str(text);
-            }
-        } else {
-            self.spans.push(Span::styled(text.to_owned(), style));
+        match self.spans.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push_str(text),
+            _ => self.spans.push(Span::styled(text.to_owned(), style)),
         }
         if let Some((_, label)) = self.scopes.iter_mut().rev().find_map(|scope| scope.link.as_mut())
         {
@@ -333,18 +331,10 @@ impl Blocks {
             Tag::Strikethrough => {
                 self.inline.open(Style::new().add_modifier(Modifier::CROSSED_OUT));
             }
-            Tag::Link { dest_url, .. } => {
-                self.inline.open(LINK);
-                if let Some(scope) = self.inline.scopes.last_mut() {
-                    scope.link = Some((dest_url.to_string(), String::new()));
-                }
-            }
+            Tag::Link { dest_url, .. } => self.open_link(&dest_url),
             // An image renders its alt text as the label in brackets.
             Tag::Image { dest_url, .. } => {
-                self.inline.open(LINK);
-                if let Some(scope) = self.inline.scopes.last_mut() {
-                    scope.link = Some((dest_url.to_string(), String::new()));
-                }
+                self.open_link(&dest_url);
                 let style = self.inline.style();
                 self.inline.push("[", style);
             }
@@ -425,13 +415,12 @@ impl Blocks {
             }
             TagEnd::Link => {
                 if let Some(scope) = self.inline.scopes.pop()
-                    // The destination rides along dimly unless the label finishes
+                    // The destination rides along dimly unless the label finishes it.
                     && let Some((dest, label)) = scope.link
                     && !dest.is_empty()
                     && dest != label
                 {
-                    self.inline.trim = false;
-                    self.inline.push(&format!(" ({dest})"), QUIET);
+                    self.show_dest(&dest);
                 }
             }
             TagEnd::Image => {
@@ -442,13 +431,26 @@ impl Blocks {
                     && let Some((dest, _)) = scope.link
                     && !dest.is_empty()
                 {
-                    self.inline.trim = false;
-                    self.inline.push(&format!(" ({dest})"), QUIET);
+                    self.show_dest(&dest);
                 }
             }
             // An unknown end changing nothing stays safest.
             _ => {}
         }
+    }
+
+    /// Open a link-like scope capturing its destination and streamed label.
+    fn open_link(&mut self, dest: &str) {
+        self.inline.open(LINK);
+        if let Some(scope) = self.inline.scopes.last_mut() {
+            scope.link = Some((dest.to_string(), String::new()));
+        }
+    }
+
+    /// Echo the destination dimly after the label.
+    fn show_dest(&mut self, dest: &str) {
+        self.inline.trim = false;
+        self.inline.push(&format!(" ({dest})"), QUIET);
     }
 
     /// The blockquote rail for the current depth, on every line of a quote.
@@ -554,6 +556,10 @@ impl Blocks {
     }
 
     /// Render the buffered table with padding, a bold header, and a dim rule.
+    #[allow(
+        unstable_name_collisions,
+        reason = "std's Iterator::intersperse is unstable"
+    )]
     fn flush_table(&mut self) {
         let Some(table) = self.table.take() else {
             return;
@@ -582,13 +588,12 @@ impl Blocks {
                 .collect::<Vec<_>>()
         };
         // One dash run per column, joined where the cell separators sit.
-        let mut rule = Vec::with_capacity(columns * 2);
-        for (i, w) in widths.iter().enumerate() {
-            if i > 0 {
-                rule.push(Span::styled("─┼─", QUIET));
-            }
-            rule.push(Span::styled("─".repeat(*w), QUIET));
-        }
+        let rule: Vec<Span<'static>> = widths
+            .iter()
+            .copied()
+            .map(|w| Span::styled("─".repeat(w), QUIET))
+            .intersperse(Span::styled("─┼─", QUIET))
+            .collect();
         let surround = self.indents();
         self.push_row(row_line(surround.clone(), cells(&head), true));
         self.push_row(row_line(surround.clone(), vec![rule], false));
@@ -642,25 +647,34 @@ fn pad_cell(mut cell: Vec<Span<'static>>, width: usize, align: Alignment) -> Vec
 }
 
 /// Assemble one table row: the context prefix, then dim cells, then bold header
+#[allow(
+    unstable_name_collisions,
+    reason = "std's Iterator::intersperse is unstable"
+)]
 fn row_line(
     prefix: Vec<Span<'static>>,
     cells: Vec<Vec<Span<'static>>>,
     header: bool,
 ) -> Line<'static> {
-    let mut spans = prefix;
-    for (i, cell) in cells.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", QUIET));
-        }
-        spans.extend(cell.into_iter().map(|span| {
-            if header {
-                Span::styled(span.content, HEADING.patch(span.style))
-            } else {
-                span
-            }
-        }));
-    }
-    Line::from(spans)
+    let mut line = Line::from(prefix);
+    line.extend(
+        cells
+            .into_iter()
+            .map(|cell| {
+                cell.into_iter()
+                    .map(|span| {
+                        if header {
+                            Span::styled(span.content, HEADING.patch(span.style))
+                        } else {
+                            span
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .intersperse_with(|| vec![Span::styled(" │ ", QUIET)])
+            .flatten(),
+    );
+    line
 }
 
 #[cfg(test)]
