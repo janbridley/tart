@@ -115,12 +115,11 @@ fn feed<'a>(wrapper: &mut Wrapper<'a>, grapheme: &'a str, style: Style) {
 pub(crate) fn wrap_lines(messages: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
     let mut wrapper = Wrapper::new(width);
     for line in messages {
-        for (grapheme, style) in line.spans.iter().flat_map(|span| {
-            span.content
-                .graphemes(true)
-                .map(|g| (g, line.style.patch(span.style)))
-        }) {
-            feed(&mut wrapper, grapheme, style);
+        for span in &line.spans {
+            let style = line.style.patch(span.style);
+            for grapheme in span.content.graphemes(true) {
+                feed(&mut wrapper, grapheme, style);
+            }
         }
         wrapper.hard_break();
     }
