@@ -2,6 +2,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use tart_agents::merge_digests;
 
 #[cfg(test)]
 use crate::testutil::texts;
@@ -49,37 +50,41 @@ fn tool_hint_row(hidden: usize) -> Line<'static> {
 /// lines around a count of the hidden middle unless `expanded`. A call a later
 /// one superseded only renders its header.
 fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
-    let status = match (&tool.output, tool.exit) {
-        (None, _) => TOOL_RUNNING,
+    let status = match (tool.running, tool.exit) {
+        (true, _) => TOOL_RUNNING,
         (_, Some(0)) => TOOL_OK,
         _ => TOOL_ERR,
     };
 
-    let digest = if tool.name == "Bash" {
-        Span::raw(format!("({})", tool.digest))
-    } else {
-        Span::styled(format!("({})", tool.digest), DIM_STYLE)
-    };
+    let digest = Span::styled(
+        format!("({})", merge_digests(tool.name, &tool.digests)),
+        DIM_STYLE,
+    );
     let mut header = vec![
         Span::styled("● ", status),
         Span::styled(tool.name, status),
         digest,
     ];
 
-    let Some(output) = &tool.output else {
+    if tool.running {
         header.push(Span::styled(" …", DIM_STYLE));
-        return vec![Line::from(header)];
-    };
-
-    if let Some(c) = tool.exit.filter(|&c| c != 0) {
+    }
+    if !tool.running
+        && let Some(c) = tool.exit.filter(|&c| c != 0)
+    {
         header.push(Span::styled(format!(" exit {c}"), TOOL_ERR));
     }
 
     // A superseded box stays folded down to its header; Ctrl+O governs only
-    // the boxes still standing.
+    // the boxes still standing. A merged box that reopens keeps its previous
+    // output under the running header, so edits can be drawn in place.
     if tool.superseded {
         return vec![Line::from(header)];
     }
+
+    let Some(output) = &tool.output else {
+        return vec![Line::from(header)];
+    };
 
     let lines: Vec<_> = output.lines().collect();
     let limit = TOOL_HEAD + TOOL_TAIL;
@@ -160,9 +165,11 @@ struct ToolCall {
     id: String,
     /// Display name: `Bash`, `Read`, or `Edit`.
     name: &'static str,
-    /// Argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
-    digest: String,
-    /// Combined output; `None` while the call is still running.
+    /// The argument digest of each call in the run, e.g. `ls -la` or `main.rs:10-50`
+    digests: Vec<String>,
+    /// Whether a call is in flight; `false` once finished, which always fills `output`
+    running: bool,
+    /// Combined output; `None` until the first call of the run finishes.
     output: Option<String>,
     /// The process exit code, for the status color.
     exit: Option<i32>,
@@ -218,12 +225,17 @@ impl Transcript {
     }
 
     /// Record a tool invocation's start; it renders as a running header until
-    /// finished. The call supersedes every finished box before it, folding each
-    /// down to its header line, and moves the thinking block below itself so
-    /// the chain-of-thought always renders under the tool boxes.
+    /// finished. A `Read` or `Edit` following its own kind merges into that
+    /// trailing finished box instead of stacking a fresh one. Otherwise the
+    /// call supersedes every finished box before it, folding each down to its
+    /// header line, and moves the thinking block below itself so the
+    /// chain-of-thought always renders under the tool boxes.
     pub(crate) fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
+        if self.merge_into_tail(&id, name, &digest) {
+            return;
+        }
         let fold = self.messages.iter().position(
-            |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_some() && !tool.superseded),
+            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && !tool.superseded),
         );
         let think = self
             .messages
@@ -236,7 +248,7 @@ impl Transcript {
         }
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
-                && tool.output.is_some()
+                && !tool.running
             {
                 tool.superseded = true;
             }
@@ -244,7 +256,8 @@ impl Transcript {
         self.messages.push(Entry::Tool(ToolCall {
             id,
             name,
-            digest,
+            digests: vec![digest],
+            running: true,
             output: None,
             exit: None,
             superseded: false,
@@ -256,11 +269,39 @@ impl Transcript {
         }
     }
 
+    /// Fold a same-kind call into a trailing finished box.
+    fn merge_into_tail(&mut self, id: &str, name: &'static str, digest: &str) -> bool {
+        // The thinking block rides below the boxes, so step past it to the fresh entry
+        let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|entry| !matches!(entry, Entry::Thinking { .. }))
+        else {
+            return false;
+        };
+        if !matches!(name, "Read" | "Edit")
+            || !matches!(&self.messages[index],
+                Entry::Tool(tool) if tool.name == name && !tool.running)
+        {
+            return false;
+        }
+        self.rewind(index);
+        if let Entry::Tool(tool) = &mut self.messages[index] {
+            tool.digests.push(digest.to_owned());
+            id.clone_into(&mut tool.id);
+            tool.running = true;
+            return true;
+        }
+        false
+    }
+
     /// Fill in the pending invocation with `id`, then refold from its box.
     pub(crate) fn finish_tool(&mut self, id: &str, output: String, exit: Option<i32>) {
-        let Some(index) = self.messages.iter().rposition(
-            |entry| matches!(entry, Entry::Tool(tool) if tool.output.is_none() && tool.id == id),
-        ) else {
+        let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::Tool(tool) if tool.running && tool.id == id))
+        else {
             return;
         };
         // The box folds differently once tools finished, so the rows `sync` folded
@@ -272,6 +313,7 @@ impl Transcript {
         };
         tool.output = Some(output);
         tool.exit = exit;
+        tool.running = false;
     }
 
     /// Drop the cached rows of `messages[index..]` so the next `sync` refolds
@@ -291,10 +333,11 @@ impl Transcript {
         let mut failed = false;
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
-                && tool.output.is_none()
+                && tool.running
             {
                 tool.output = Some(reason.to_string());
                 tool.exit = None;
+                tool.running = false;
                 failed = true;
             }
         }
@@ -439,16 +482,45 @@ impl Transcript {
         &self.rows
     }
 
-    /// Wrap one message into the row cache, recording its row count.
+    /// Wrap one message into the row cache, recording its row count. A
+    /// separated entry's blank row counts among its own, keeping `folds`
+    /// aligned with `messages` through rewinds.
     fn fold_entry(&mut self, index: usize, width: usize, expanded: bool) {
+        let separated = self.separated(index);
         let wrapped = match &self.messages[index] {
             // An answer wraps its rendering without cloning
             Entry::Answer { lines, .. } => wrap_lines(lines, width),
             Entry::Thinking { raw } => wrap_lines(&thinking_lines(raw, self.show_thinking), width),
             entry => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
         };
-        self.folds.push(wrapped.len());
+        if separated {
+            self.folds.push(wrapped.len() + 1);
+            self.rows.push(Line::from(""));
+        } else {
+            self.folds.push(wrapped.len());
+        }
         self.rows.extend(wrapped);
+    }
+
+    /// Whether a blank row leads `messages[index]` and we should emit a newline.
+    fn separated(&self, index: usize) -> bool {
+        // true for an answer, false for a tool box, `None` for anything else.
+        let kind = |entry: &Entry| {
+            matches!(entry, Entry::Answer { .. }).then_some(true).or(matches!(
+                entry,
+                Entry::Tool(_)
+            )
+            .then_some(false))
+        };
+        let Some(current) = kind(&self.messages[index]) else {
+            return false;
+        };
+        self.messages[..index]
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry, Entry::Thinking { .. }))
+            .and_then(kind)
+            .is_some_and(|before| before != current)
     }
 
     /// The wrapped rows; current as of the last `sync`.
@@ -479,14 +551,16 @@ impl Transcript {
             .collect()
     }
 
-    /// The cached rows equal a full re-wrap of every message at the wrapped width.
+    /// The cached rows equal a full re-wrap of every message at the wrapped width
     #[cfg(test)]
     pub(crate) fn assert_rows_match_full_rewrap(&self) {
-        let full = self
-            .messages
-            .iter()
-            .flat_map(|entry| entry.lines(self.show_tool_output, self.show_thinking))
-            .collect::<Vec<_>>();
+        let mut full = Vec::new();
+        for index in 0..self.messages.len() {
+            if self.separated(index) {
+                full.push(Line::from(""));
+            }
+            full.extend(self.messages[index].lines(self.show_tool_output, self.show_thinking));
+        }
         assert_eq!(texts(&self.rows), texts(&wrap_lines(&full, self.cache.0)));
     }
 }
@@ -495,18 +569,150 @@ impl Transcript {
 mod tests {
     use super::*;
 
-    /// The messages the transcript renders, each entry's display lines.
+    /// The messages the transcript renders: each entry's display lines, including separators
     fn visible(t: &Transcript) -> Vec<Line<'static>> {
-        t.messages
-            .iter()
-            .flat_map(|entry| entry.lines(t.show_tool_output, t.show_thinking))
-            .collect()
+        let mut lines = Vec::new();
+        for (index, entry) in t.messages.iter().enumerate() {
+            if t.separated(index) {
+                lines.push(Line::from(""));
+            }
+            lines.extend(entry.lines(t.show_tool_output, t.show_thinking));
+        }
+        lines
     }
 
-    /// Start a pending `Bash(echo hi)` invocation, as the pane would on a
-    /// `ToolStart` event.
+    /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {
         t.start_tool(id.to_string(), "Bash", "echo hi".to_string());
+    }
+
+    /// Start a pending `Read(digest)` invocation, as the pane would on a `ToolStart`
+    fn start_read(t: &mut Transcript, id: &str, digest: &str) {
+        t.start_tool(id.to_string(), "Read", digest.to_string());
+    }
+
+    /// A blank row separates an answer from an adjacent tool box, in either order
+    #[test]
+    fn answers_and_tool_boxes_get_a_blank_between() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        t.append("the answer");
+        t.sync(40);
+        assert_eq!(texts(t.rows()), ["❯ go", "the answer"]);
+
+        // A tool following the answer leads with air.
+        start_bash(&mut t, "call_0");
+        t.sync(40);
+        assert_eq!(texts(t.rows()), ["❯ go", "the answer", "", "● Bash(echo hi) …"]);
+
+        // An answer following the box does too, the riding thinking aside.
+        t.finish_tool("call_0", "hi\n".to_string(), Some(0));
+        t.append_thinking("why");
+        t.append("more");
+        t.sync(40);
+        assert_eq!(
+            texts(t.rows()),
+            [
+                "❯ go",
+                "the answer",
+                "",
+                "● Bash(echo hi)",
+                "  ⎿ hi",
+                THINKING_HIDDEN,
+                "",
+                "more",
+            ]
+        );
+        t.assert_rows_match_full_rewrap();
+
+        // Consecutive boxes and plain lines stack without air.
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        start_bash(&mut t, "call_0");
+        t.finish_tool("call_0", "hi\n".to_string(), Some(0));
+        start_bash(&mut t, "call_1");
+        t.sync(40);
+        assert_eq!(texts(t.rows()), ["❯ go", "● Bash(echo hi)", "● Bash(echo hi) …"]);
+    }
+
+    #[test]
+    fn same_kind_runs_merge_into_one_box() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+
+        start_read(&mut t, "r0", "a.rs:1-10");
+        t.finish_tool("r0", "one\n".to_string(), Some(0));
+        t.append_thinking("mid-run reasoning"); // rides below the boxes
+        start_read(&mut t, "r1", "a.rs:20-30");
+        t.sync(40);
+        let rows = texts(t.rows());
+        assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 1);
+        assert!(rows.iter().any(|row| row.contains("● Read(a.rs:1-10,20-30) …")));
+        t.assert_rows_match_full_rewrap();
+
+        // The newest output lands on the merged box.
+        t.finish_tool("r1", "fresh\n".to_string(), Some(0));
+        t.sync(40);
+        assert!(texts(t.rows()).iter().any(|row| row.contains("⎿ fresh")));
+
+        // An answer between calls breaks the run: a second box.
+        t.append("done reading");
+        start_read(&mut t, "r2", "b.rs:1-5");
+        t.sync(40);
+        assert_eq!(
+            texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
+            2
+        );
+
+        // A box still running never absorbs the next call.
+        start_read(&mut t, "r3", "b.rs:9-9");
+        t.sync(40);
+        assert_eq!(
+            texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
+            3
+        );
+
+        // Bash never merges with the reads.
+        start_bash(&mut t, "b0");
+        t.sync(40);
+        let rows = texts(t.rows());
+        assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 3);
+        assert!(rows.iter().any(|row| row.contains("● Bash(echo hi) …")));
+    }
+
+    #[test]
+    fn merged_boxes_reopen_without_flicker() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        start_read(&mut t, "r0", "a.rs:1-10");
+        t.finish_tool("r0", "one\ntwo\nthree\n".to_string(), Some(0));
+        t.sync(40);
+        let settled = texts(t.rows());
+        assert_eq!(settled.len(), 5, "{settled:?}"); // prompt, header, three rows
+
+        start_read(&mut t, "r1", "a.rs:20-30");
+        t.sync(40);
+        let reopened = texts(t.rows());
+        assert_eq!(reopened.len(), settled.len(), "{reopened:?}");
+        assert!(
+            reopened
+                .iter()
+                .any(|row| row.contains("● Read(a.rs:1-10,20-30) …"))
+        );
+        assert!(
+            reopened.iter().any(|row| row.contains("⎿ three")),
+            "stale output stays"
+        );
+
+        t.finish_tool("r1", "fresh\n".to_string(), Some(0));
+        t.sync(40);
+        let swapped = texts(t.rows());
+        assert!(swapped.iter().any(|row| row.contains("⎿ fresh")));
+        assert!(!swapped.iter().any(|row| row.contains("⎿ three")));
     }
 
     /// Answer fragments join one growing markdown segment; the styled error
@@ -760,17 +966,7 @@ and the analytics dashboard rewrite.\n\n\
             transcript.push(Line::from(format!("message {i} aaaa bbbb cccc dddd")));
         }
         let assert_fresh = |transcript: &Transcript| {
-            let full = transcript
-                .messages
-                .iter()
-                .flat_map(|entry| {
-                    entry.lines(transcript.show_tool_output, transcript.show_thinking)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                texts(&transcript.rows),
-                texts(&wrap_lines(&full, transcript.cache.0))
-            );
+            transcript.assert_rows_match_full_rewrap();
         };
         transcript.sync(20);
         assert_eq!(transcript.cache, (20, 5));
@@ -1095,12 +1291,7 @@ and the analytics dashboard rewrite.\n\n\
     fn new_calls_fold_finished_boxes_to_their_headers() {
         let mut t = Transcript::default();
         let assert_fresh = |t: &Transcript| {
-            let full = t
-                .messages
-                .iter()
-                .flat_map(|entry| entry.lines(t.show_tool_output, t.show_thinking))
-                .collect::<Vec<_>>();
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&full, t.cache.0)));
+            t.assert_rows_match_full_rewrap();
         };
         t.push(Line::from("❯ run it"));
         t.begin_response();

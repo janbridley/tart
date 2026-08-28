@@ -13,8 +13,10 @@ use nix::unistd::Pid;
 
 use crate::{Progress, sandbox::Policy};
 
+mod render_tool;
 mod web;
 
+pub use render_tool::merge_digests;
 pub(crate) use web::{fetch, search};
 
 /// Perform a raw string find-and-replace operation, holding a lock for thread safety..

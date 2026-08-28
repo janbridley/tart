@@ -16,6 +16,8 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # Just `killpg` and the `Pid` it takes, so the harness itself stays free of
 # `unsafe`: signalling a group cannot violate memory safety, which nix encodes.
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
+rangemap = "1.8.0"
+itertools = "0.15.0"
 
 [dev-dependencies]
 # Test scratch files and directories; tempfile removes them on drop.
