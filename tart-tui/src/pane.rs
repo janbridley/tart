@@ -161,9 +161,15 @@ impl Pane {
 
     /// Update a popup based on input keystrokes (e.g. `@` opens, `Esc` closes).
     fn sync_popup(&mut self, key: Option<&KeyEvent>) {
-        // Bang mode is a shell command: neither prefix popup applies, so an
-        // `@` or a leading `/resume` in a command stays literal.
+        // Bang mode completes the argument under the caret as a file, bash's
+        // default for arguments, so neither prefix popup applies: an `@` or a
+        // leading `/resume` is just text in a command.
         if self.bang {
+            // An open list tracks the word as it changes and closes when the
+            // word ends; only Tab opens one (see the Tab arm in `route`).
+            let query =
+                file_mentions::derive_argument(&self.prompt).filter(|(query, _)| !query.is_empty());
+            file_mentions::update(&mut self.popup, query, false);
             return;
         }
         match session_query(&self.prompt) {
@@ -178,8 +184,8 @@ impl Pane {
             }
             None => {
                 file_mentions::update(
-                    &self.prompt,
                     &mut self.popup,
+                    file_mentions::derive_query(&self.prompt),
                     key.is_some_and(file_mentions::rearm),
                 );
             }
@@ -201,7 +207,14 @@ impl Pane {
     /// Close the open popup and apply its highlighted row.
     fn accept_popup(&mut self) -> Option<PaneEvent> {
         match self.popup.take() {
-            Some(Popup::Files(popup)) => popup.accept(&mut self.prompt),
+            Some(Popup::Files(popup)) => {
+                // A mention replaces its `@` word, or a completion its argument.
+                if self.bang {
+                    popup.accept_argument(&mut self.prompt);
+                } else {
+                    popup.accept(&mut self.prompt);
+                }
+            }
             Some(Popup::Sessions(sessions)) => {
                 if self.spin.is_none()
                     && let Some(path) = sessions.selected_path()
@@ -263,14 +276,13 @@ impl Pane {
         if crate::keybinds::mac_modifiers(&mut self.prompt, &key) {
             return None;
         }
-        // All popups take arrow keys, Tab, & Enter before the events hit the main pane
-        if self.popup.is_some()
-            && !key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(
-                key.code,
-                KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter
-            )
-        {
+        // Popups take the arrow keys, Tab, and Enter before the events hit the pane
+        let claimed = match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab => true,
+            KeyCode::Enter => !self.bang,
+            _ => false,
+        };
+        if self.popup.is_some() && !key.modifiers.contains(KeyModifiers::ALT) && claimed {
             return self.popup_key(key);
         }
         // Option+Up moves the queued steering into the composer for editing.
@@ -311,6 +323,8 @@ impl Pane {
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
             }
+            // Tab completes the argument under the caret as a file
+            KeyCode::Tab if self.bang => self.open_completion(),
             // `!` on an empty draft enters the manual-command mode; anywhere
             // else (or with the mode already on) it is an ordinary character.
             KeyCode::Char('!') if !self.bang && self.draft_is_empty() => self.bang = true,
@@ -515,6 +529,12 @@ impl Pane {
         }
     }
 
+    /// Open the file completion for the argument under the caret.
+    fn open_completion(&mut self) {
+        let query = file_mentions::derive_argument(&self.prompt);
+        file_mentions::update(&mut self.popup, query, true);
+    }
+
     /// Submit the manual-command draft, or explain why now is not the time.
     fn submit_bang(&mut self) -> Option<PaneEvent> {
         let refusal = if self.manual.is_some() {
@@ -672,14 +692,14 @@ impl Pane {
         if let Some(cell) = buf.cell_mut(pos) {
             cell.set_style(CURSOR_STYLE);
         }
-        // The popup overlays the transcript, anchored above the top rule.
+        // The popup overlays the transcript, anchored above the top rule..
+        let hint = if self.bang {
+            "↑↓ select · Tab insert · Esc close"
+        } else {
+            "↑↓ select · Tab/Enter insert · Esc close"
+        };
         match self.popup.as_mut() {
-            Some(Popup::Files(popup)) => popup.render(
-                frame,
-                bar_top,
-                "files",
-                "↑↓ select · Tab/Enter insert · Esc close",
-            ),
+            Some(Popup::Files(popup)) => popup.render(frame, bar_top, "files", hint),
             Some(Popup::Sessions(sessions)) => sessions.render(frame, bar_top),
             None => {}
         }
@@ -1271,27 +1291,99 @@ mod tests {
         assert!(!literal.bang);
         assert_eq!(literal.prompt.text(), "run this!echo hi");
     }
-
-    /// Neither prefix popup opens inside a command: `@` and a leading
-    /// `/resume` stay shell.
+    /// Inside a command, Tab completes the argument under the caret as a file
+    /// (bash's default) while neither prefix popup applies: an `@` is just
+    /// text, and a leading `/resume` is a path, not the session chooser.
     #[test]
-    fn bang_mode_suppresses_the_prefix_popups() {
+    fn bang_mode_completes_arguments_not_prefixes() {
         let mut pane = Pane::default();
         pane.set_session_dir(PathBuf::from("/tmp/root"), PathBuf::from("/tmp/proj"));
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        for c in "grep @pattern file".chars() {
+
+        // The command's own word never completes, not even on Tab.
+        for c in "cat".chars() {
             pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        assert!(pane.popup.is_none(), "no mention typeahead");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(pane.popup.is_none(), "the command word is not a file");
 
-        pane.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
-        pane.on_paste("/resume fix");
-        assert!(pane.popup.is_none(), "no session chooser");
-        // The whole thing is a command, not a resumed session.
+        // Tab completes the argument over this package; the hint offers Tab
+        // alone, since Enter here runs the command.
+        for c in " Cargo".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(pane.popup, Some(Popup::Files(_))));
+        let screen = render(&mut pane, (60, 14));
+        assert!(screen.contains("Cargo.toml"), "{screen}");
+        assert!(screen.contains("Tab insert · Esc close"), "{screen}");
+        assert!(!screen.contains("Tab/Enter"), "{screen}");
+
+        // Tab again accepts the highlighted path and closes the list.
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "cat Cargo.toml");
+        assert!(pane.popup.is_none(), "accepting closes the list");
+
+        // Enter runs the command even while a list is open: only Tab accepts.
+        for c in " src/pane".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(pane.popup, Some(Popup::Files(_))), "the list reopened");
         assert_eq!(
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(PaneEvent::Command("grep @pattern file\n/resume fix".to_string()))
+            Some(PaneEvent::Command("cat Cargo.toml src/pane".to_string()))
         );
+        assert!(pane.popup.is_none(), "submitting clears the draft and the list");
+
+        // A leading `/resume` is a path in a command, never the chooser.
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        pane.on_paste("/resume fix");
+        assert!(!matches!(pane.popup, Some(Popup::Sessions(_))));
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Command("/resume fix".to_string()))
+        );
+    }
+
+    /// The list opens only on Tab and follows the word: typing never opens
+    /// it, an ended word closes it, and Tab there opens nothing.
+    #[test]
+    fn completions_open_only_on_tab() {
+        let mut pane = Pane::default();
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        for c in "cat Cargo".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(pane.popup.is_none(), "typing never opens the list");
+
+        // Tab opens it, typing refilters it, Esc closes it.
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(pane.popup, Some(Popup::Files(_))));
+        pane.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            matches!(pane.popup, Some(Popup::Files(_))),
+            "an open list refilters"
+        );
+        pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(pane.popup.is_none(), "Esc closes the list");
+
+        // Tab re-opens it on the same word; ending the word closes it, and a
+        // Tab there has nothing to open.
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(pane.popup, Some(Popup::Files(_))));
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(pane.popup.is_none(), "an ended word closes it");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(pane.popup.is_none(), "an ended word has nothing to complete");
+
+        // The command's own word opens nothing — and inserts no tab either.
+        let mut bare = Pane::default();
+        bare.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        bare.on_paste("cargo");
+        bare.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(bare.popup.is_none());
+        assert_eq!(bare.prompt.text(), "cargo");
     }
 
     /// The top rule carries the queued-steering snippet, right-aligned.
