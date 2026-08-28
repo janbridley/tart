@@ -1,11 +1,8 @@
-//! Canned prompts the front end submits on the user's behalf.
+//! The plan-mode reminder the front end frames around user turns.
 //!
-//! [`INIT_PROMPT`] backs `/init` and [`PLAN_REMINDER`] rides along on every user turn
-//! while plan mode is on. The reminder is wrapped in tags and stripped again for
-//! display, so a session record replays as the user wrote it.
-
-/// The `/init` prompt: analyze the codebase and write the project's memory file.
-pub const INIT_PROMPT: &str = include_str!("data/INIT.md");
+//! [`PLAN_REMINDER`] rides along on every user turn while plan mode is on. It is
+//! wrapped in tags and stripped again for display, so a session record replays as
+//! the user wrote it.
 
 /// The reminder prefixed to every user turn while plan mode is on.
 pub const PLAN_REMINDER: &str = include_str!("data/PLAN.md");
@@ -17,19 +14,6 @@ pub const PLAN_APPROVAL: &str = "The plan above is approved: implement it now. E
 /// The tags wrapping a reminder inside a user turn.
 const REMINDER_OPEN: &str = "<system-reminder>";
 const REMINDER_CLOSE: &str = "</system-reminder>";
-
-/// The `/init` prompt, with any focus the user added after the command.
-#[inline]
-#[must_use]
-pub fn init_prompt(focus: &str) -> String {
-    let base = INIT_PROMPT.trim_end();
-    let focus = focus.trim();
-    if focus.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}\n\nThe user asked you to focus on: {focus}")
-    }
-}
 
 /// `text` with the plan-mode reminder in front of it, as it is sent to the model.
 #[inline]
@@ -70,7 +54,10 @@ mod tests {
     fn a_reminder_round_trips_to_the_text_it_wrapped() {
         let sent = with_reminder("fix the login flow");
 
-        assert_eq!(reminder_span(&sent).unwrap(), reminder_span(&with_reminder("x")).unwrap());
+        assert_eq!(
+            reminder_span(&sent).unwrap(),
+            reminder_span(&with_reminder("x")).unwrap()
+        );
         assert_eq!(without_reminder(&sent), "fix the login flow");
         // And back the other way: re-wrapping the visible text reproduces it.
         assert_eq!(with_reminder(without_reminder(&sent)), sent);
@@ -98,18 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn the_init_prompt_carries_optional_focus() {
-        assert_eq!(init_prompt(""), INIT_PROMPT.trim_end());
-        assert_eq!(init_prompt("  "), INIT_PROMPT.trim_end());
-        assert_eq!(
-            init_prompt(" the tests "),
-            format!("{}\n\nThe user asked you to focus on: the tests", INIT_PROMPT.trim_end())
-        );
-    }
-
-    #[test]
     fn the_canned_prompts_read_as_written() {
-        assert!(INIT_PROMPT.contains("INIT.md"));
         assert!(PLAN_REMINDER.contains("Plan mode is on"));
         assert!(PLAN_APPROVAL.contains("approved"));
         // The frame wraps the whole reminder, tags included.
