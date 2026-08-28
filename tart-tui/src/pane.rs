@@ -1067,6 +1067,15 @@ mod tests {
         draw(|frame, area| pane.render(frame, area), size)
     }
 
+    /// Type `text` into the pane, one plain keypress per character.
+    impl Pane {
+        fn type_keys(&mut self, text: &str) {
+            for c in text.chars() {
+                self.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+        }
+    }
+
     #[test]
     fn token_count_formats_compactly() {
         assert_eq!(token_count(0), "0");
@@ -1133,9 +1142,7 @@ mod tests {
     #[test]
     fn enter_while_generating_queues_steering() {
         let mut pane = Pane::default();
-        for c in ['h', 'i'] {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("hi");
         pane.set_generating(true);
         // Enter steers and clears; nothing echoes into the transcript.
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
@@ -1397,9 +1404,7 @@ mod tests {
     fn bang_enter_ships_the_command_and_waits_to_echo() {
         let mut pane = Pane::default();
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        for c in "ls -la".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("ls -la");
         assert_eq!(
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(PaneEvent::Command("ls -la".to_string()))
@@ -1564,17 +1569,13 @@ mod tests {
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
 
         // The command's own word never completes, not even on Tab.
-        for c in "cat".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("cat");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(pane.popup.is_none(), "the command word is not a file");
 
         // Tab completes the argument over this package; the hint offers Tab
         // alone, since Enter here runs the command.
-        for c in " Cargo".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys(" Cargo");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(pane.popup, Some(Popup::Files(_))));
         let screen = render(&mut pane, (60, 14));
@@ -1588,9 +1589,7 @@ mod tests {
         assert!(pane.popup.is_none(), "accepting closes the list");
 
         // Enter runs the command even while a list is open: only Tab accepts.
-        for c in " src/pane".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys(" src/pane");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(pane.popup, Some(Popup::Files(_))), "the list reopened");
         assert_eq!(
@@ -1636,9 +1635,7 @@ mod tests {
     #[test]
     fn mentions_complete_paths_outside_the_working_directory() {
         let mut pane = Pane::default();
-        for c in "see @../tart-ag".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("see @../tart-ag");
         assert!(matches!(pane.popup, Some(Popup::Files(_))));
         let screen = render(&mut pane, (70, 14));
         assert!(screen.contains("../tart-agents/"), "{screen}");
@@ -1653,9 +1650,7 @@ mod tests {
     fn accepting_a_directory_keeps_completing() {
         let mut pane = Pane::default();
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        for c in "cat ../tart-ag".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("cat ../tart-ag");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // open
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // accept the directory
         assert_eq!(pane.prompt.text(), "cat ../tart-agents/");
@@ -1679,9 +1674,7 @@ mod tests {
     #[test]
     fn mention_accepts_walk_into_directories() {
         let mut pane = Pane::default();
-        for c in "see @../tart-ag".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("see @../tart-ag");
         assert!(matches!(pane.popup, Some(Popup::Files(_))), "the @ opened it");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(pane.prompt.text(), "see @../tart-agents/");
@@ -1697,9 +1690,7 @@ mod tests {
     fn completions_open_only_on_tab() {
         let mut pane = Pane::default();
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        for c in "cat Cargo".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("cat Cargo");
         assert!(pane.popup.is_none(), "typing never opens the list");
 
         // Tab opens it, typing refilters it, Esc closes it.
@@ -1842,9 +1833,7 @@ mod tests {
         let mut pane = Pane::default();
         pane.set_session_dir(root.path().to_path_buf(), project);
 
-        for c in "/resume fix".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("/resume fix");
         assert!(matches!(pane.popup, Some(Popup::Sessions(_))));
 
         // Enter picks the highlighted session and clears the draft.
@@ -1856,9 +1845,7 @@ mod tests {
 
         // Esc closes the chooser; the draft survives. Reopened, a generating
         // turn keeps the chooser from swapping.
-        for c in "/resume fix".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("/resume fix");
         pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(pane.popup.is_none());
         assert_eq!(pane.prompt.text(), "/resume fix");
@@ -2041,12 +2028,7 @@ mod tests {
     fn ctrl_o_expands_tool_output_in_live_mode_only() {
         let mut pane = Pane::default();
         pane.start_tool("call_0".to_string(), "Bash", "seq 20".to_string());
-        let mut output = String::new();
-        for i in 0..20 {
-            output.push_str("line ");
-            output.push_str(&i.to_string());
-            output.push('\n');
-        }
+        let output: String = (0..20).map(|i| format!("line {i}\n")).collect();
         pane.finish_tool("call_0", output, Some(0));
         let collapsed = render(&mut pane, (60, 30));
         assert!(collapsed.contains("ctrl+o to expand"));

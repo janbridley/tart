@@ -540,32 +540,29 @@ impl Transcript {
     /// The cached rows equal a full re-wrap of every message at the wrapped width
     #[cfg(test)]
     pub(crate) fn assert_rows_match_full_rewrap(&self) {
-        let mut full = Vec::new();
-        for index in 0..self.messages.len() {
-            if self.separated(index) {
-                full.push(Line::from(""));
-            }
-            full.extend(self.messages[index].lines(self.show_tool_output, self.show_thinking));
-        }
-        assert_eq!(texts(&self.rows), texts(&wrap_lines(&full, self.cache.0)));
+        assert_eq!(texts(&self.rows), texts(&wrap_lines(&self.visible_lines(), self.cache.0)));
+    }
+
+    /// The lines the transcript renders: each entry's display lines,
+    /// separators included.
+    #[cfg(test)]
+    fn visible_lines(&self) -> Vec<Line<'static>> {
+        self.messages
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                self.separated(index)
+                    .then(Line::from(""))
+                    .into_iter()
+                    .chain(entry.lines(self.show_tool_output, self.show_thinking))
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The messages the transcript renders: each entry's display lines, including separators
-    fn visible(t: &Transcript) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        for (index, entry) in t.messages.iter().enumerate() {
-            if t.separated(index) {
-                lines.push(Line::from(""));
-            }
-            lines.extend(entry.lines(t.show_tool_output, t.show_thinking));
-        }
-        lines
-    }
 
     /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {
@@ -1021,7 +1018,7 @@ and the analytics dashboard rewrite.\n\n\
         let mut t = Transcript::default();
         assert!(!t.show_thinking, "thinking starts hidden");
         let assert_fresh = |t: &Transcript| {
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(t), t.cache.0)));
+            assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), t.cache.0)));
         };
 
         t.push(Line::from("❯ echo"));
@@ -1168,7 +1165,7 @@ and the analytics dashboard rewrite.\n\n\
 
         t.toggle_thinking();
         t.sync(40);
-        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), 40)));
 
         t.begin_response();
         assert_eq!(t.message_texts(), ["a1"]);
@@ -1208,13 +1205,13 @@ and the analytics dashboard rewrite.\n\n\
         t.append_thinking("t2\n"); // late, tail folded
         assert_eq!(t.cache, (40, 1), "only the echo stays cached");
         t.sync(40);
-        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), 40)));
 
         // A second late fragment with an unsynced glued answer in between.
         t.append(" a2");
         t.append_thinking("t3\n");
         t.sync(40);
-        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), 40)));
         assert_eq!(t.message_texts(), ["❯ echo", "t1", "t2", "t3", "a1 a2"]);
     }
 
@@ -1259,12 +1256,7 @@ and the analytics dashboard rewrite.\n\n\
 
         // A long output collapses to head + count + tail; Ctrl+O expands it.
         start_bash(&mut t, "call_1");
-        let mut long = String::new();
-        for i in 0..20 {
-            long.push_str("line ");
-            long.push_str(&i.to_string());
-            long.push('\n');
-        }
+        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
         t.finish_tool("call_1", long, Some(0));
         t.sync(40);
         let collapsed = texts(&t.rows);
@@ -1378,7 +1370,7 @@ and the analytics dashboard rewrite.\n\n\
     fn thinking_rides_below_tool_boxes() {
         let mut t = Transcript::default();
         let assert_fresh = |t: &Transcript| {
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(t), t.cache.0)));
+            assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), t.cache.0)));
         };
         t.push(Line::from("❯ go"));
         t.begin_response();
