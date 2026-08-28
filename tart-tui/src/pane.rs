@@ -956,7 +956,7 @@ fn ellipsize(text: &str, budget: usize) -> String {
         return text.to_string();
     }
     // One cell stays free so a cut always shows its ellipsis.
-    let mut cut = text
+    let mut cut: String = text
         .graphemes(true)
         .scan(0, |used, grapheme| {
             let spent = cell_width(grapheme);
