@@ -112,9 +112,12 @@ impl Transcript {
             });
             items.push(InputItem::Item(Item::FunctionCall(call)));
         }
-        for output in outputs {
-            items.push(InputItem::Item(Item::FunctionCallOutput(output)));
-        }
+        items.extend(
+            outputs
+                .into_iter()
+                .map(Item::FunctionCallOutput)
+                .map(InputItem::Item),
+        );
     }
 
     /// Append `text` to the end of the input on every subsequent request, or clear with `None`.
