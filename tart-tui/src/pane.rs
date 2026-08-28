@@ -202,21 +202,25 @@ impl Pane {
 
     /// Close the open popup and apply its highlighted row.
     fn accept_popup(&mut self) -> Option<PaneEvent> {
+        // Completed files close the popup, but completed *folders* may not
         match self.popup.take() {
-            Some(Popup::Files(popup)) => {
-                // A mention replaces its `@` word, or a completion its argument.
-                if self.bang {
-                    popup.accept_argument(&mut self.prompt);
-                } else {
-                    popup.accept(&mut self.prompt);
-                }
-            }
             Some(Popup::Sessions(sessions)) => {
                 if self.spin.is_none()
                     && let Some(path) = sessions.selected_path()
                 {
                     self.clear_prompt();
                     return Some(PaneEvent::Resume(path));
+                }
+            }
+            Some(Popup::Files(popup)) => {
+                // A mention replaces its `@` word, or a completion its argument.
+                let into_directory = if self.bang {
+                    popup.accept_argument(&mut self.prompt)
+                } else {
+                    popup.accept(&mut self.prompt)
+                };
+                if into_directory {
+                    self.popup = Some(Popup::Files(popup));
                 }
             }
             None => {}
@@ -1368,6 +1372,68 @@ mod tests {
         );
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // accept
         assert_eq!(pane.prompt.text(), format!("cat {path}/notes.md"));
+    }
+
+    /// A mention completes paths outside the working directory too: the token
+    /// names the directory to list, and the `@` stays in the inserted text.
+    #[test]
+    fn mentions_complete_paths_outside_the_working_directory() {
+        let mut pane = Pane::default();
+        for c in "see @../tart-ag".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(matches!(pane.popup, Some(Popup::Files(_))));
+        let screen = render(&mut pane, (70, 14));
+        assert!(screen.contains("../tart-agents/"), "{screen}");
+
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "see @../tart-agents/");
+    }
+
+    /// Accepting a directory keeps the list open and following into it, so
+    /// Tab walks down the tree; a completed file closes the list.
+    #[test]
+    fn accepting_a_directory_keeps_completing() {
+        let mut pane = Pane::default();
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        for c in "cat ../tart-ag".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // open
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // accept the directory
+        assert_eq!(pane.prompt.text(), "cat ../tart-agents/");
+        assert!(matches!(pane.popup, Some(Popup::Files(_))), "the list follows in");
+
+        // Typing refilters the new directory; another directory keeps going.
+        pane.on_paste("sr");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "cat ../tart-agents/src/");
+        assert!(matches!(pane.popup, Some(Popup::Files(_))), "still walking");
+
+        // A completed file closes the list.
+        pane.on_paste("lib");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "cat ../tart-agents/src/lib.rs");
+        assert!(pane.popup.is_none(), "a completed file closes the list");
+    }
+
+    /// Mentions walk into directories the same way, `@` and all: the list
+    /// opens on the `@` itself, so the first Tab already accepts.
+    #[test]
+    fn mention_accepts_walk_into_directories() {
+        let mut pane = Pane::default();
+        for c in "see @../tart-ag".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(matches!(pane.popup, Some(Popup::Files(_))), "the @ opened it");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "see @../tart-agents/");
+        assert!(matches!(pane.popup, Some(Popup::Files(_))), "the list follows in");
+
+        pane.on_paste("sr");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "see @../tart-agents/src/");
+        assert!(matches!(pane.popup, Some(Popup::Files(_))), "still walking");
     }
 
     #[test]

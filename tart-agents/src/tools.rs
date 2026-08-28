@@ -35,8 +35,8 @@ const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest timeout a bash call may ask for.
 const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The most manual-command output kept, taking the tail if triggered.
-const MANUAL_OUTPUT_CAP: usize = 50 * 1024; // bytes
+/// The most of any one blob the model is handed, in bytes.
+pub const CONTENT_CAP: usize = 64 * 1024;
 
 /// How often a manual command's watchdog wakes to check its cancel token.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -316,6 +316,21 @@ fn cancel_text(text: &str) -> String {
     format!("[cancelled]{separator}{text}")
 }
 
+/// Keep the first `cap` bytes of `text`, suffixing a marker when it cut: an
+/// attached file reads from the top, where its interesting part usually is.
+#[inline]
+pub fn head_cap(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    // Slicing must land on a char boundary; lossy decoding made `text` valid.
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated; first {} KB shown]", &text[..end], cap / 1024)
+}
+
 /// Keep the last `cap` bytes of `text`, prefixing a marker when it cut.
 fn tail_cap(text: &str, cap: usize) -> String {
     if text.len() <= cap {
@@ -509,7 +524,7 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     shell.arg("-c").arg(command);
     match run_until_cancelled(&mut shell, cancel) {
         Ok(WatchedRun { output, killed }) => {
-            let text = tail_cap(&combined_output(&output), MANUAL_OUTPUT_CAP);
+            let text = tail_cap(&combined_output(&output), CONTENT_CAP);
             if killed {
                 cancel_text(&text)
             } else {
@@ -789,6 +804,26 @@ mod tests {
             timeout_text("still going\n", MAX_BASH_TIMEOUT),
             "[timed out after 600s]\nstill going\n"
         );
+    }
+
+    /// A short text passes through untouched; a long one keeps its head under a
+    /// trailing marker, cut on a char boundary.
+    #[test]
+    fn head_cap_keeps_the_head_and_marks_the_cut() {
+        assert_eq!(head_cap("hi\n", 10), "hi\n");
+
+        let text = "abcdef".repeat(1024); // 6 KB
+        let capped = head_cap(&text, 1024);
+        let (kept, marker) = capped.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; first 1 KB shown]");
+        assert_eq!(kept, &text[..1024]);
+
+        // A multi-byte head must not split a character at the cut.
+        let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
+        let capped = head_cap(&wide, 1024);
+        let (kept, marker) = capped.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; first 1 KB shown]");
+        assert!(kept.chars().all(|c| c == '語'), "cut inside a character");
     }
 
     #[test]

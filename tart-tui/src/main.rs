@@ -8,6 +8,7 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+mod attachments;
 mod cli;
 mod clipboard;
 mod config;
@@ -147,6 +148,8 @@ fn run(
     session: &mut Session,
     pane: &mut Pane,
 ) -> anyhow::Result<()> {
+    // The sandbox's grant root, for deciding which mentions need attaching.
+    let cwd = std::env::current_dir()?;
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
     std::thread::spawn({
@@ -238,11 +241,19 @@ fn run(
                         // Steering message is emptied on the same iteration it sends.
                         if let Some(text) = control.take_steer() {
                             pane.echo(&text);
-                            transcript.push_user(text)?;
+                            let (message, notes) = attachments::attach_mentions(&text, &cwd);
+                            for note in notes {
+                                pane.note(note);
+                            }
+                            transcript.push_user(message)?;
                         }
                         // New response clears the thinking box for the previous one
                         pane.begin_response();
-                        transcript.push_user(line)?;
+                        let (message, notes) = attachments::attach_mentions(&line, &cwd);
+                        for note in notes {
+                            pane.note(note);
+                        }
+                        transcript.push_user(message)?;
                         pane.set_generating(true);
                         let sender = wake.clone();
                         // The agent loop runs on its own thread
@@ -308,7 +319,11 @@ fn run(
                             if matches!(progress, Progress::Done { .. }) {
                                 let text = control.take_steer().expect("checked above");
                                 pane.echo(&text);
-                                transcript.push_user(text)?;
+                                let (message, notes) = attachments::attach_mentions(&text, &cwd);
+                                for note in notes {
+                                    pane.note(note);
+                                }
+                                transcript.push_user(message)?;
                                 pane.begin_response();
                                 pane.set_generating(true);
                                 let sender = wake.clone();

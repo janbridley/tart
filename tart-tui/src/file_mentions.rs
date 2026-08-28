@@ -49,18 +49,23 @@ fn dir_named(token: &str) -> Option<String> {
 
 /// Expand directories to readable paths.
 fn readable_dir(dirpart: &str) -> Option<PathBuf> {
-    if let Some(rest) = dirpart.strip_prefix('~') {
-        // `~user` names another user's home, which we cannot expand.
-        if !rest.is_empty() && !rest.starts_with('/') {
-            return None;
-        }
-        let home = PathBuf::from(std::env::var_os("HOME")?);
-        return Some(home.join(rest.trim_start_matches('/')));
+    if dirpart.starts_with('~') {
+        return expand_tilde(dirpart);
     }
     Some(match dirpart {
         "" => PathBuf::from("/"),
         dir => PathBuf::from(dir),
     })
+}
+
+/// A path with a leading `~` expanded to the home directory, as typed otherwise
+pub(crate) fn expand_tilde(path: &str) -> Option<PathBuf> {
+    let rest = path.strip_prefix('~')?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some(home.join(rest.trim_start_matches('/')))
 }
 
 /// One directory's entries as completion candidates, each prefixed by `dirpart`
@@ -132,10 +137,6 @@ pub struct FilePopup {
 }
 
 impl FilePopup {
-    fn new(query: String) -> Self {
-        Self::from_files(walk_current_directory(), query)
-    }
-
     /// A popup completing shell path `token`, whose named directory is the
     /// candidate source: `../`, `~/…`, and absolute paths all complete.
     fn complete(token: &str) -> Self {
@@ -199,21 +200,22 @@ impl FilePopup {
     }
 
     /// Replace the `@` word with the selection, quoting paths with whitespace.
-    pub(crate) fn accept(&self, editor: &mut Editor) {
-        self.insert(editor, derive_query(editor).map(|(query, at)| (query, at + 1)));
+    /// Returns whether it named a directory, so completing can keep going.
+    pub(crate) fn accept(&self, editor: &mut Editor) -> bool {
+        self.insert(editor, derive_query(editor).map(|(query, at)| (query, at + 1)))
     }
 
     /// Replace the argument under the caret with the selection, the bang-mode
     /// twin of [`FilePopup::accept`].
-    pub(crate) fn accept_argument(&self, editor: &mut Editor) {
-        self.insert(editor, derive_argument(editor));
+    pub(crate) fn accept_argument(&self, editor: &mut Editor) -> bool {
+        self.insert(editor, derive_argument(editor))
     }
 
     /// Overwrite the word starting at byte `start` with the chosen path,
     /// quoting paths with whitespace and parking the caret after it.
-    fn insert(&self, editor: &mut Editor, word: Option<(String, usize)>) {
+    fn insert(&self, editor: &mut Editor, word: Option<(String, usize)>) -> bool {
         let (Some((_, start)), Some(path)) = (word, self.selected()) else {
-            return;
+            return false;
         };
         let text = if path.contains(char::is_whitespace) {
             format!("\"{path}\"")
@@ -228,6 +230,8 @@ impl FilePopup {
             .map_or(line.len(), |i| start + i);
         line.replace_range(start..end, &text);
         editor.g = graphemes(&line[..start]) + graphemes(&text);
+        // Directories complete with a trailing slash, for continuing into them.
+        path.ends_with('/')
     }
 
     /// Draw the popup anchored above `anchor` (the top rule), overlaying the transcript.
@@ -323,7 +327,7 @@ pub(crate) fn update(popup: &mut Option<Popup>, query: Option<(String, usize)>, 
         // An unchanged query refilters nothing: set_query no-ops on it.
         Some(Popup::Files(p)) => p.set_query(query),
         Some(Popup::Sessions(_)) | None if rearm => {
-            *popup = Some(Popup::Files(FilePopup::new(query)));
+            *popup = Some(Popup::Files(FilePopup::complete(&query)));
         }
         _ => {}
     }
