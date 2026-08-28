@@ -56,12 +56,10 @@ fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
         _ => TOOL_ERR,
     };
 
-    let joined = merge_digests(tool.name, &tool.digests);
-    let digest = if tool.name == "Bash" {
-        Span::raw(format!("({joined})"))
-    } else {
-        Span::styled(format!("({joined})"), DIM_STYLE)
-    };
+    let digest = Span::styled(
+        format!("({})", merge_digests(tool.name, &tool.digests)),
+        DIM_STYLE,
+    );
     let mut header = vec![
         Span::styled("● ", status),
         Span::styled(tool.name, status),
