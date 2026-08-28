@@ -417,8 +417,7 @@ mod tests {
 
         let items = serde_json::to_value(transcript.request_items()).unwrap();
 
-        // message, reasoning, call, output, message — each call paired with
-        // its output by `call_id`.
+        // message, reasoning, call, output, message, each call paired with its output
         assert_eq!(items[1]["role"], "user");
         assert_eq!(items[2]["type"], "reasoning");
         assert_eq!(items[3]["type"], "function_call");
