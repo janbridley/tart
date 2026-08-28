@@ -34,7 +34,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
-use pane::{DIM_STYLE, Mode, Pane, PaneEvent};
+use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use tart_agents::{
     Agent, CancelToken, ChatMode, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript,
@@ -101,16 +101,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// One wake source for the event loop.
-enum Wake {
-    /// Terminal input, read on its own thread.
-    Input(Event),
-    /// Progress from the background generation.
-    Generation(Progress),
-    /// A finished manual command's framed output.
-    Command(String),
-}
-
 /// Parse a `/effort` argument.
 fn effort_of(name: &str) -> Option<ReasoningEffort> {
     match name {
@@ -168,6 +158,8 @@ fn run(
     let control = agent.control();
     // A manual command's cancel lever, held while one runs; Esc and quit set it.
     let mut manual_cancel: Option<(CancelToken, std::thread::JoinHandle<()>)> = None;
+    // A plan switch deferred by a running turn, applied when the turn ends.
+    let mut pending_plan: Option<bool> = None;
     // State-mutation time since the last frame.
     let mut work = Duration::ZERO;
     while !quit {
@@ -186,6 +178,8 @@ fn run(
                 // (a no-op when idle) and any manual command.
                 Some(PaneEvent::Cancel) => {
                     control.cancel();
+                    // Esc also cancels a plan switch still waiting for the turn.
+                    pending_plan = None;
                     if let Some((token, _)) = &manual_cancel {
                         token.cancel();
                     }
@@ -209,7 +203,7 @@ fn run(
                 // Shift+Tab: toggle plan mode, exactly as `/plan` does.
                 Some(PaneEvent::Plan) => {
                     let on = !pane.is_plan();
-                    pane.set_plan(agent, &mut transcript, on)?;
+                    pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                 }
                 // Enter approved the drafted plan: leave plan mode and start
                 // the implementing turn, which may now write.
@@ -220,12 +214,7 @@ fn run(
                     pane.note("plan approved · implementing");
                     pane.echo(prompts::PLAN_APPROVAL);
                     transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
-                    pane.begin_response();
-                    pane.set_generating(true);
-                    let sender = wake.clone();
-                    agent.spawn(&transcript, move |progress| {
-                        let _ = sender.send(Wake::Generation(progress));
-                    });
+                    pane.start_turn(agent, &transcript, &wake);
                 }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     // Clear the display and the model's memory of the session
@@ -261,31 +250,16 @@ fn run(
                     // Toggle plan mode: read-only research and planning.
                     "/plan" => {
                         let on = !pane.is_plan();
-                        pane.set_plan(agent, &mut transcript, on)?;
+                        pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ => {
                         // Steering message is emptied on the same iteration it sends.
                         if let Some(text) = control.take_steer() {
                             pane.echo(&text);
-                            let (message, notes) = attachments::attach_mentions(&text, &cwd);
-                            for note in notes {
-                                pane.note(note);
-                            }
-                            transcript.push_user(message)?;
+                            pane.submit_text(&transcript, &text, &cwd)?;
                         }
-                        // New response clears the thinking box for the previous one
-                        pane.begin_response();
-                        let (message, notes) = attachments::attach_mentions(&line, &cwd);
-                        for note in notes {
-                            pane.note(note);
-                        }
-                        transcript.push_user(message)?;
-                        pane.set_generating(true);
-                        let sender = wake.clone();
-                        // The agent loop runs on its own thread
-                        agent.spawn(&transcript, move |progress| {
-                            let _ = sender.send(Wake::Generation(progress));
-                        });
+                        pane.submit_text(&transcript, &line, &cwd)?;
+                        pane.start_turn(agent, &transcript, &wake);
                     }
                 },
                 // A session picked in the `/resume` chooser swaps the conversation
@@ -335,6 +309,11 @@ fn run(
                         pane.set_generating(false);
                         // A finished plan in plan mode is ready for Enter to approve
                         pane.set_plan_ready(matches!(&progress, Progress::Done { .. }));
+                        // A plan switch queued mid-turn takes effect now, ahead of
+                        // any steer that starts the next turn.
+                        if let Some(on) = pending_plan.take() {
+                            pane.set_plan(agent, &mut transcript, on)?;
+                        }
                         // A failure also resolves anything still running, then
                         // shows the error.
                         if let Progress::Failed(error) = &progress {
@@ -351,17 +330,8 @@ fn run(
                             if matches!(progress, Progress::Done { .. }) {
                                 let text = control.take_steer().expect("checked above");
                                 pane.echo(&text);
-                                let (message, notes) = attachments::attach_mentions(&text, &cwd);
-                                for note in notes {
-                                    pane.note(note);
-                                }
-                                transcript.push_user(message)?;
-                                pane.begin_response();
-                                pane.set_generating(true);
-                                let sender = wake.clone();
-                                agent.spawn(&transcript, move |progress| {
-                                    let _ = sender.send(Wake::Generation(progress));
-                                });
+                                pane.submit_text(&transcript, &text, &cwd)?;
+                                pane.start_turn(agent, &transcript, &wake);
                             } else {
                                 pane.spill_steer();
                             }

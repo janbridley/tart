@@ -5,6 +5,7 @@ use std::io;
 
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::execute;
+use itertools::Itertools;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -46,16 +47,15 @@ impl Selection {
         }
         let last = rows.len() - 1;
         let (r0, r1) = (self.start.0.min(last), self.end.0.min(last));
-        let mut out = String::new();
-        for (i, row) in rows[r0..=r1].iter().enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
-            let a = if i == 0 { self.start.1 } else { 0 };
-            let b = if i == r1 - r0 { self.end.1 } else { usize::MAX };
-            out.push_str(&row_slice(row, a, b));
-        }
-        out
+        rows[r0..=r1]
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let a = if i == 0 { self.start.1 } else { 0 };
+                let b = if i == r1 - r0 { self.end.1 } else { usize::MAX };
+                row_slice(row, a, b)
+            })
+            .join("\n")
     }
 
     /// Paint the selection region.

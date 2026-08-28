@@ -5,6 +5,7 @@
 //! a file, and an argument in a `!` shell command completes as a file.
 
 use ignore::WalkBuilder;
+use itertools::Itertools;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 use ratatui::Frame;
@@ -28,9 +29,10 @@ pub(crate) fn derive_query(editor: &Editor) -> Option<(String, usize)> {
     let prefix = &line[..g_to_byte(line, editor.g)];
     let at = prefix.rfind('@')?;
     let word_start = prefix[..at].chars().next_back().is_none_or(char::is_whitespace);
+    let word = &prefix[at + 1..];
     // Whitespace between the `@` and the caret (usually) means the caret left the word.
-    let inside = !prefix[at + 1..].contains(char::is_whitespace);
-    (word_start && inside).then(|| (prefix[at + 1..].to_string(), at))
+    let inside = !word.contains(char::is_whitespace);
+    (word_start && inside).then(|| (word.to_string(), at))
 }
 
 /// The argument under the caret, as a file to complete.
@@ -70,25 +72,21 @@ pub(crate) fn expand_tilde(path: &str) -> Option<PathBuf> {
 
 /// One directory's entries as completion candidates, each prefixed by `dirpart`
 fn list_directory(dirpart: &str, dir: &Path, base: &str) -> Vec<String> {
-    let mut entries: Vec<String> = WalkBuilder::new(dir)
+    WalkBuilder::new(dir)
         .max_depth(Some(1))
         .hidden(false)
         .build()
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.depth() == 1)
         .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let name = entry.file_name().to_string_lossy();
             (name.starts_with('.') == base.starts_with('.')).then(|| {
-                if entry.path().is_dir() {
-                    format!("{dirpart}/{name}/")
-                } else {
-                    format!("{dirpart}/{name}")
-                }
+                let slash = if entry.path().is_dir() { "/" } else { "" };
+                format!("{dirpart}/{name}{slash}")
             })
         })
-        .collect();
-    entries.sort();
-    entries
+        .sorted()
+        .collect_vec()
 }
 
 /// The candidates for completing shell path `token`, and the directory it named
@@ -105,7 +103,7 @@ fn path_source(token: &str) -> (Option<String>, Vec<String>) {
 /// All non-ignored files under the current directory, as sorted relative paths.
 fn walk_current_directory() -> Vec<String> {
     let root = std::env::current_dir().unwrap_or_default();
-    let mut files: Vec<String> = WalkBuilder::new(&root)
+    WalkBuilder::new(&root)
         .build()
         .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
@@ -115,9 +113,8 @@ fn walk_current_directory() -> Vec<String> {
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned())
         })
-        .collect();
-    files.sort();
-    files
+        .sorted()
+        .collect_vec()
 }
 
 pub struct FilePopup {

@@ -46,7 +46,7 @@ impl Editor {
 
     /// Insert one character; controls are ignored except tab.
     pub(crate) fn insert_char(&mut self, c: char) {
-        if !c.is_control() || c == '\t' {
+        if insertable(c) {
             let line = &mut self.lines[self.line];
             line.insert(g_to_byte(line, self.g), c);
             self.g += 1;
@@ -56,15 +56,20 @@ impl Editor {
     /// Insert pasted text: CRLF normalized, controls dropped except tab,
     /// newlines split the draft.
     pub(crate) fn insert_str(&mut self, text: &str) {
-        for (i, part) in text.lines().enumerate() {
-            if i > 0 {
-                self.new_line();
-            }
-            let cleaned: String = part.chars().filter(|c| !c.is_control() || *c == '\t').collect();
-            let line = &mut self.lines[self.line];
-            line.insert_str(g_to_byte(line, self.g), &cleaned);
-            self.g += graphemes(&cleaned);
+        let mut parts = text.lines();
+        self.insert_fragment(parts.next().unwrap_or_default());
+        for part in parts {
+            self.new_line();
+            self.insert_fragment(part);
         }
+    }
+
+    /// Splice one line's worth of pasted text, cleaned, in at the caret.
+    fn insert_fragment(&mut self, part: &str) {
+        let cleaned: String = part.chars().filter(|c| insertable(*c)).collect();
+        let line = &mut self.lines[self.line];
+        line.insert_str(g_to_byte(line, self.g), &cleaned);
+        self.g += graphemes(&cleaned);
     }
 
     /// Split the draft at the caret (Alt+Enter).
@@ -142,6 +147,12 @@ impl Editor {
 
 pub(crate) fn graphemes(s: &str) -> usize {
     s.graphemes(true).count()
+}
+
+/// Whether a character may enter the draft: controls are dropped except tab.
+#[inline]
+fn insertable(c: char) -> bool {
+    !c.is_control() || c == '\t'
 }
 
 /// Byte offset of grapheme boundary `g` (the string end when `g` is the count).

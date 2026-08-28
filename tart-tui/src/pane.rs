@@ -7,18 +7,20 @@ mod transcript;
 mod wrap;
 
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::time::Instant;
 use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnControl, prompts};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
 
+use crate::attachments;
 use crate::clipboard::Selection;
 use crate::file_mentions::{self, FilePopup};
 use crate::session_picker::{SessionPopup, derive_query as session_query};
@@ -74,6 +76,16 @@ pub enum PaneEvent {
     /// Enter on an empty draft approved the drafted plan.
     Approve,
     Quit,
+}
+
+/// One wake source for the event loop.
+pub enum Wake {
+    /// Terminal input, read on its own thread.
+    Input(Event),
+    /// Progress from the background generation.
+    Generation(Progress),
+    /// A finished manual command's framed output.
+    Command(String),
 }
 
 /// The composer's mode: exactly one at a time.
@@ -577,6 +589,31 @@ impl Pane {
         self.spin = generating.then(Instant::now);
     }
 
+    /// Take a submitted line into the conversation: attach outside-sandbox
+    /// mentions, surface their notes, and record the user message.
+    pub fn submit_text(
+        &mut self,
+        transcript: &Conversation,
+        line: &str,
+        cwd: &Path,
+    ) -> anyhow::Result<()> {
+        let (message, notes) = attachments::attach_mentions(line, cwd);
+        for note in notes {
+            self.note(note);
+        }
+        transcript.push_user(message)
+    }
+
+    /// Begin a response, retiring the previous turn's thinking box, and run the turn
+    pub fn start_turn(&mut self, agent: &Agent, transcript: &Conversation, wake: &Sender<Wake>) {
+        self.begin_response();
+        self.set_generating(true);
+        let sender = wake.clone();
+        agent.spawn(transcript, move |progress| {
+            let _ = sender.send(Wake::Generation(progress));
+        });
+    }
+
     /// Whether a turn is generating, so a mode switch must wait.
     #[inline]
     pub fn is_generating(&self) -> bool {
@@ -603,16 +640,22 @@ impl Pane {
         self.plan_ready = ready && matches!(self.mode, Mode::Plan);
     }
 
-    /// Switch plan mode on or off, updating the sandbox and the transcript's reminder.
+    /// Switch plan mode on or off, updating the sandbox and the transcript's
+    /// reminder. A turn in the way defers: the switch comes back as `Some(on)`
+    /// for the caller to apply when the turn ends.
     pub fn set_plan(
         &mut self,
         agent: &mut Agent,
         conversation: &mut Conversation,
         on: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<bool>> {
         if self.is_generating() {
-            self.note("plan mode will be enabled next turn: Esc to cancel");
-            return Ok(());
+            self.note(if on {
+                "plan mode will be enabled next turn: Esc to cancel"
+            } else {
+                "plan mode will be disabled next turn: Esc to cancel"
+            });
+            return Ok(Some(on));
         }
         self.set_mode(if on { Mode::Plan } else { Mode::Default });
         agent.set_mode(if on { ChatMode::Plan } else { ChatMode::Default });
@@ -622,7 +665,7 @@ impl Pane {
         } else {
             "plan mode off"
         });
-        Ok(())
+        Ok(None)
     }
 
     /// Wire the pane to the agent's turn control.
@@ -802,14 +845,12 @@ impl Pane {
         );
         let top = self.prompt.top;
         let shown = (prompt_area.height as usize).min(layout.rows.len().saturating_sub(top));
-        for i in 0..shown {
-            buf.set_line(
-                prompt_area.x + GUTTER,
-                prompt_area.y + i as u16,
-                &layout.rows[top + i],
-                width,
-            );
-        }
+        buf.set_rows(
+            prompt_area.x + GUTTER,
+            prompt_area.y,
+            &layout.rows[top..top + shown],
+            width,
+        );
         // A caret at the end of a full row inverts the row's last cell.
         let col = layout.caret_col.min(width.saturating_sub(1) as usize) as u16;
         let pos = (
@@ -857,9 +898,7 @@ impl Pane {
         }
         let buf = frame.buffer_mut();
         let shown = visible.min(rows.len().saturating_sub(top));
-        rows[top..top + shown].iter().zip(area.y..).for_each(|(row, y)| {
-            buf.set_line(area.x, y, row, area.width);
-        });
+        buf.set_rows(area.x, area.y, &rows[top..top + shown], area.width);
         if let Some(cursor) = self.copy {
             if let Some(selection) = Selection::between(cursor.anchor, (cursor.row, cursor.col)) {
                 selection.paint(buf, rows, area, top, shown);
@@ -922,6 +961,43 @@ impl Extend<Progress> for Pane {
     }
 }
 
+/// Span-vector operations shared by the markdown and wrap renderers.
+trait SpansExt {
+    /// Append styled text, gluing onto the last span when the style matches.
+    fn push_merged(&mut self, text: &str, style: Style);
+    /// Render the implementing struct as a `Line`
+    fn into_line(self) -> Line<'static>;
+}
+
+impl SpansExt for Vec<Span<'static>> {
+    fn push_merged(&mut self, text: &str, style: Style) {
+        match self.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push_str(text),
+            _ => self.push(Span::styled(text.to_owned(), style)),
+        }
+    }
+
+    fn into_line(mut self) -> Line<'static> {
+        if self.is_empty() {
+            self.push(Span::raw(""));
+        }
+        Line::from(self)
+    }
+}
+
+/// Painting whole rows at once, the multi-row sibling of `set_line`.
+trait BufRows {
+    fn set_rows(&mut self, x: u16, y: u16, rows: &[Line<'static>], width: u16);
+}
+
+impl BufRows for Buffer {
+    fn set_rows(&mut self, x: u16, y: u16, rows: &[Line<'static>], width: u16) {
+        for (row, y) in rows.iter().zip(y..) {
+            self.set_line(x, y, row, width);
+        }
+    }
+}
+
 /// A full-width dim rule row, drawn cell by cell.
 fn rule(buf: &mut Buffer, area: Rect) {
     for col in area.columns() {
@@ -933,11 +1009,7 @@ fn rule(buf: &mut Buffer, area: Rect) {
 
 /// Recolor one already-drawn rule row.
 fn reframe(buf: &mut Buffer, area: Rect, color: Color) {
-    for col in area.columns() {
-        if let Some(cell) = buf.cell_mut((col.x, area.y)) {
-            cell.set_fg(color);
-        }
-    }
+    buf.set_style(area, Style::new().fg(color));
 }
 
 /// A token count in the status line's compact style: `843`, `45k`, `1.2 M`.
@@ -949,27 +1021,27 @@ fn token_count(tokens: u64) -> String {
     }
 }
 
+/// One grapheme's width in cells, never zero.
+fn cell_width(grapheme: &str) -> usize {
+    Span::raw(grapheme).width().max(1)
+}
+
 /// `text` as-is when it fits `budget` cells, else its clipped start and an ellipsis
 fn ellipsize(text: &str, budget: usize) -> String {
-    let cells = |text: &str| {
-        text.graphemes(true)
-            .map(|g| Span::raw(g).width().max(1))
-            .sum::<usize>()
-    };
-    if cells(text) <= budget {
+    if text.graphemes(true).map(cell_width).sum::<usize>() <= budget {
         return text.to_string();
     }
     // One cell stays free so a cut always shows its ellipsis.
-    let mut cut = String::new();
-    let mut used = 0;
-    for grapheme in text.graphemes(true) {
-        let spent = Span::raw(grapheme).width().max(1);
-        if used + spent >= budget {
-            break;
-        }
-        cut.push_str(grapheme);
-        used += spent;
-    }
+    let mut cut: String = text
+        .graphemes(true)
+        .scan(0, |used, grapheme| {
+            let spent = cell_width(grapheme);
+            (*used + spent < budget).then(|| {
+                *used += spent;
+                grapheme
+            })
+        })
+        .collect();
     cut.push('…');
     cut
 }
@@ -1027,8 +1099,11 @@ fn queued_rule(buf: &mut Buffer, area: Rect, text: Option<&str>) {
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, reason = "test assertions")]
 
+    use std::fmt::Write as _;
+
     use super::*;
     use crate::testutil::{draw, draw_backgrounds, draw_styles};
+    use tart_agents::sandbox::Policy;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1036,6 +1111,15 @@ mod tests {
 
     fn render(pane: &mut Pane, size: (u16, u16)) -> String {
         draw(|frame, area| pane.render(frame, area), size)
+    }
+
+    /// Type `text` into the pane, one plain keypress per character.
+    impl Pane {
+        fn type_keys(&mut self, text: &str) {
+            for c in text.chars() {
+                self.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+        }
     }
 
     #[test]
@@ -1104,9 +1188,7 @@ mod tests {
     #[test]
     fn enter_while_generating_queues_steering() {
         let mut pane = Pane::default();
-        for c in ['h', 'i'] {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("hi");
         pane.set_generating(true);
         // Enter steers and clears; nothing echoes into the transcript.
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
@@ -1348,6 +1430,29 @@ mod tests {
         assert!(pane.is_plan(), "Esc keeps plan mode on");
     }
 
+    /// A plan switch asked for mid-turn waits: `set_plan` hands it back for the
+    /// front end to apply when the turn ends.
+    #[test]
+    fn mid_turn_plan_switches_wait_for_the_turn() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let mut agent = Agent::new("http://127.0.0.1:1", "key", "model", policy);
+        let mut conversation = Conversation::new().unwrap();
+        let mut pane = Pane::default();
+        pane.set_generating(true);
+
+        let deferred = pane.set_plan(&mut agent, &mut conversation, true).unwrap();
+        assert_eq!(deferred, Some(true), "the switch waits for the turn to end");
+        assert!(!pane.is_plan());
+
+        // Applied at turn end: the mode moves, and an idle switch defers nothing.
+        pane.set_generating(false);
+        let applied = pane
+            .set_plan(&mut agent, &mut conversation, deferred.unwrap())
+            .unwrap();
+        assert_eq!(applied, None);
+        assert!(pane.is_plan());
+    }
+
     /// The composer holds exactly one mode: `!` leaves plan mode and returns
     /// to the default chat, never back to planning.
     #[test]
@@ -1368,9 +1473,7 @@ mod tests {
     fn bang_enter_ships_the_command_and_waits_to_echo() {
         let mut pane = Pane::default();
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        for c in "ls -la".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("ls -la");
         assert_eq!(
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(PaneEvent::Command("ls -la".to_string()))
@@ -1535,17 +1638,13 @@ mod tests {
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
 
         // The command's own word never completes, not even on Tab.
-        for c in "cat".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("cat");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(pane.popup.is_none(), "the command word is not a file");
 
         // Tab completes the argument over this package; the hint offers Tab
         // alone, since Enter here runs the command.
-        for c in " Cargo".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys(" Cargo");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(pane.popup, Some(Popup::Files(_))));
         let screen = render(&mut pane, (60, 14));
@@ -1559,9 +1658,7 @@ mod tests {
         assert!(pane.popup.is_none(), "accepting closes the list");
 
         // Enter runs the command even while a list is open: only Tab accepts.
-        for c in " src/pane".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys(" src/pane");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(pane.popup, Some(Popup::Files(_))), "the list reopened");
         assert_eq!(
@@ -1607,9 +1704,7 @@ mod tests {
     #[test]
     fn mentions_complete_paths_outside_the_working_directory() {
         let mut pane = Pane::default();
-        for c in "see @../tart-ag".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("see @../tart-ag");
         assert!(matches!(pane.popup, Some(Popup::Files(_))));
         let screen = render(&mut pane, (70, 14));
         assert!(screen.contains("../tart-agents/"), "{screen}");
@@ -1624,9 +1719,7 @@ mod tests {
     fn accepting_a_directory_keeps_completing() {
         let mut pane = Pane::default();
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        for c in "cat ../tart-ag".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("cat ../tart-ag");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // open
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // accept the directory
         assert_eq!(pane.prompt.text(), "cat ../tart-agents/");
@@ -1650,9 +1743,7 @@ mod tests {
     #[test]
     fn mention_accepts_walk_into_directories() {
         let mut pane = Pane::default();
-        for c in "see @../tart-ag".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("see @../tart-ag");
         assert!(matches!(pane.popup, Some(Popup::Files(_))), "the @ opened it");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(pane.prompt.text(), "see @../tart-agents/");
@@ -1668,9 +1759,7 @@ mod tests {
     fn completions_open_only_on_tab() {
         let mut pane = Pane::default();
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
-        for c in "cat Cargo".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("cat Cargo");
         assert!(pane.popup.is_none(), "typing never opens the list");
 
         // Tab opens it, typing refilters it, Esc closes it.
@@ -1813,9 +1902,7 @@ mod tests {
         let mut pane = Pane::default();
         pane.set_session_dir(root.path().to_path_buf(), project);
 
-        for c in "/resume fix".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("/resume fix");
         assert!(matches!(pane.popup, Some(Popup::Sessions(_))));
 
         // Enter picks the highlighted session and clears the draft.
@@ -1827,9 +1914,7 @@ mod tests {
 
         // Esc closes the chooser; the draft survives. Reopened, a generating
         // turn keeps the chooser from swapping.
-        for c in "/resume fix".chars() {
-            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        pane.type_keys("/resume fix");
         pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(pane.popup.is_none());
         assert_eq!(pane.prompt.text(), "/resume fix");
@@ -2014,9 +2099,7 @@ mod tests {
         pane.start_tool("call_0".to_string(), "Bash", "seq 20".to_string());
         let mut output = String::new();
         for i in 0..20 {
-            output.push_str("line ");
-            output.push_str(&i.to_string());
-            output.push('\n');
+            let _ = writeln!(output, "line {i}");
         }
         pane.finish_tool("call_0", output, Some(0));
         let collapsed = render(&mut pane, (60, 30));
@@ -2060,6 +2143,34 @@ mod tests {
 
         pane.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert!(render(&mut pane, (40, 12)).contains("Thinking"));
+    }
+
+    /// The answer's markdown palette lands on screen: an H3 bold, inline code
+    /// light yellow, a link's label light blue, its destination dim.
+    #[test]
+    fn markdown_colors_render_end_to_end() {
+        let mut pane = Pane::default();
+        pane.extend([
+            Progress::User("colors".to_string()),
+            Progress::Answer(
+                "### Head\n\nrun `cargo test` and see [the docs](https://example.com)".to_string(),
+            ),
+        ]);
+        let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
+        let rows: Vec<&str> = styles.lines().collect();
+        assert!(rows[1].starts_with("BBBB"), "the H3 is bold: {styles}");
+        assert!(
+            styles.contains("yyyyyyyyyy"),
+            "inline code is light yellow: {styles}"
+        );
+        assert!(
+            styles.contains("llllllll"),
+            "the link label is light blue: {styles}"
+        );
+        assert!(
+            styles.contains("dddddddddddddddddd"),
+            "the destination is dim: {styles}"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Serialize transcripts as jsonl files to allow resumable tart sessions.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -121,6 +122,16 @@ impl Session {
         self.path = None;
         self.written = 0;
     }
+
+    /// `items` as JSONL text: one line each, each newline-terminated.
+    fn jsonl<'a>(items: impl IntoIterator<Item = &'a InputItem>) -> anyhow::Result<String> {
+        let mut text = String::new();
+        for item in items {
+            text.push_str(&serde_json::to_string(item)?);
+            text.push('\n');
+        }
+        Ok(text)
+    }
 }
 
 /// The per-project directory name for `path`: separators become `-`.
@@ -196,7 +207,7 @@ fn first_user_text(line: &str) -> Option<String> {
 pub(crate) fn one_line(text: &str) -> String {
     let line = text.split('\n').next().unwrap_or_default();
     let mut capped = line.chars().take(60).collect::<String>();
-    if line.chars().count() > 60 {
+    if line.chars().nth(60).is_some() {
         capped.push('…');
     }
     capped
@@ -235,30 +246,23 @@ fn load(path: &Path) -> anyhow::Result<Vec<InputItem>> {
 
 /// Rewrite `path` with exactly `items`, one JSON line each.
 fn save(path: &Path, items: &[InputItem]) -> anyhow::Result<()> {
-    let mut text = String::new();
-    for item in items {
-        text.push_str(&serde_json::to_string(item)?);
-        text.push('\n');
-    }
-    fs::write(path, text).with_context(|| format!("trimming session {}", path.display()))
+    fs::write(path, Session::jsonl(items)?)
+        .with_context(|| format!("trimming session {}", path.display()))
 }
 
 /// Drop trailing calls whose outputs never arrived.
 fn trim_unpaired(items: &mut Vec<InputItem>) {
-    let unanswered = |items: &[InputItem], item: &InputItem| {
-        let InputItem::Item(Item::FunctionCall(call)) = item else {
-            return false;
-        };
-        !items.iter().any(|other| {
-            matches!(
-                other,
-                InputItem::Item(Item::FunctionCallOutput(output)) if output.call_id == call.call_id
-            )
+    let answered: HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            InputItem::Item(Item::FunctionCallOutput(output)) => Some(output.call_id.as_str()),
+            _ => None,
         })
-    };
-    while items.last().is_some_and(|item| unanswered(items, item)) {
-        items.pop();
-    }
+        .collect();
+    let trailing = items.iter().rev().take_while(|item| {
+        matches!(item, InputItem::Item(Item::FunctionCall(call)) if !answered.contains(call.call_id.as_str()))
+    }).count();
+    items.truncate(items.len() - trailing);
 }
 
 /// The moment as `YYYYMMDD-HHMMSS` UTC.
@@ -305,14 +309,14 @@ mod tests {
     use super::*;
     use async_openai::types::responses::FunctionToolCall;
 
+    /// A session file's line count.
+    fn line_count(path: &Path) -> usize {
+        std::fs::read_to_string(path).unwrap().lines().count()
+    }
+
     /// Write `transcript`'s items to `path`, one JSON line each.
     fn write_session(path: &Path, transcript: &Transcript) {
-        let mut text = String::new();
-        for item in &transcript.request_items() {
-            text.push_str(&serde_json::to_string(item).unwrap());
-            text.push('\n');
-        }
-        std::fs::write(path, text).unwrap();
+        std::fs::write(path, Session::jsonl(&transcript.request_items()).unwrap()).unwrap();
     }
 
     #[test]
@@ -354,19 +358,19 @@ mod tests {
         session.record(&transcript).unwrap();
         session.record(&transcript).unwrap();
         let file = session.path.clone().unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 3);
+        assert_eq!(line_count(&file), 3);
 
         // A resumed session appends to the same file.
         transcript.push_user("again".to_string()).unwrap();
         transcript.push_assistant("there".to_string()).unwrap();
         session.record(&transcript).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 5);
+        assert_eq!(line_count(&file), 5);
 
         // A cancelled turn keeps its partial answer, so it flushes like any other.
         transcript.push_user("cancel me".to_string()).unwrap();
         transcript.push_assistant("partial".to_string()).unwrap();
         session.record(&transcript).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 7);
+        assert_eq!(line_count(&file), 7);
 
         let (resumed, _) = Session::open(root.path(), project, &file).unwrap();
         assert_eq!(
@@ -488,8 +492,6 @@ mod tests {
 
         let listed = list(root.path(), project).unwrap();
 
-        // Newest first, each labelled with its stamp and opening request — the
-        // first line only, capped with an ellipsis.
         assert_eq!(listed.len(), 4);
         assert!(listed[0].0.ends_with("20260102-000002.jsonl"));
         assert_eq!(listed[0].1, format!("20260102-000002  {}…", "x".repeat(60)));

@@ -2,28 +2,41 @@
 //!
 //! Only [`Progress::Answer`](tart_agents::Progress::Answer) fragments are pretty-
 //! rendered, all others stay base text. Copy mode reads the rendered rows so that a
-//! copied answer carries the styled form, markers stripped.
+//! copied answer carries the styled form, markers stripped. Lines wrap to the
+//! display width with their block's hanging indent, so a wrapped list item or
+//! quotation keeps its marker column on every row.
 
+use itertools::Itertools;
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::DIM_STYLE;
+use super::wrap::wrap_lines;
+use super::{DIM_STYLE, SpansExt};
 
 /// H1: blue and bold.
 const HEADING1: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
 /// H2: cyan and bold.
 const HEADING2: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-/// H3–H6: bold with default color
+/// H3: Same color as H2, but italic as well.
+const HEADING3: Style = Style::new()
+    .fg(Color::Cyan)
+    .add_modifier(Modifier::BOLD)
+    .add_modifier(Modifier::ITALIC);
+/// H4–H6: bold with default color
 const HEADING: Style = Style::new().add_modifier(Modifier::BOLD);
 /// Heading styles by level, H1 first.
-const HEADING_STYLES: [Style; 6] = [HEADING1, HEADING2, HEADING, HEADING, HEADING, HEADING];
+const HEADING_STYLES: [Style; 6] = [HEADING1, HEADING2, HEADING3, HEADING, HEADING, HEADING];
 /// Inline `` `code` ``: set apart by color rather than markers.
-const INLINE_CODE: Style = Style::new().fg(Color::Yellow);
+const INLINE_CODE: Style = Style::new().fg(Color::LightYellow);
 /// Blockquote rails, code-block content, and other quiet chrome.
 const QUIET: Style = DIM_STYLE;
-/// Link text: the same blue as the transcript's actionable hints.
-const LINK: Style = Style::new().fg(Color::Blue);
+/// Blockquote text: quiet like code, but italic.
+const QUOTE: Style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+/// Link text: light blue and underlined.
+const LINK: Style = Style::new()
+    .fg(Color::LightBlue)
+    .add_modifier(Modifier::UNDERLINED);
 /// The bullet an unordered list item renders instead of its marker.
 const BULLET: &str = "• ";
 /// The width of the rule row a horizontal rule renders as
@@ -31,9 +44,11 @@ const BULLET: &str = "• ";
 /// Should be short, as [`render`] may wrap it.
 const HR_WIDTH: usize = 24;
 
-/// Render answer text to styled transcript lines.
-pub(crate) fn render(raw: &str) -> Vec<Line<'static>> {
-    let mut blocks = Blocks::default();
+/// Render answer text to styled transcript lines, wrapping each line to
+/// `width` cells with its block's hanging indent carried onto every wrapped
+/// row; a `width` of 0 leaves each line on one row.
+pub(crate) fn render(raw: &str, width: usize) -> Vec<Line<'static>> {
+    let mut blocks = Blocks::new(width);
     for event in Parser::new_ext(raw, options()) {
         blocks.event(event);
     }
@@ -49,6 +64,8 @@ fn options() -> Options {
 /// under construction, and the buffered blocks.
 #[derive(Default)]
 struct Blocks {
+    /// The cell width rows wrap at; 0 leaves lines unwrapped.
+    width: usize,
     /// The rendered rows.
     out: Vec<Line<'static>>,
     /// The inline row under construction; breaks and block ends flush it.
@@ -112,13 +129,7 @@ impl Inline {
             return;
         }
         self.trim = false;
-        if self.spans.last().is_some_and(|last| last.style == style) {
-            if let Some(last) = self.spans.last_mut() {
-                last.content.to_mut().push_str(text);
-            }
-        } else {
-            self.spans.push(Span::styled(text.to_owned(), style));
-        }
+        self.spans.push_merged(text, style);
         if let Some((_, label)) = self.scopes.iter_mut().rev().find_map(|scope| scope.link.as_mut())
         {
             label.push_str(text);
@@ -159,17 +170,14 @@ impl Prefix {
     /// Build the block's next line: its first or rest prefix, then the
     /// spans, stamped with the block's style.
     fn line(&mut self, mut spans: Vec<Span<'static>>) -> Line<'static> {
-        let lead = if self.fresh {
+        let mut lead = if self.fresh {
             std::mem::take(&mut self.first)
         } else {
             self.rest.clone()
         };
         self.fresh = false;
-        let mut line = Line::from(lead);
-        line.spans.append(&mut spans);
-        if line.spans.is_empty() {
-            line.spans.push(Span::raw(""));
-        }
+        lead.append(&mut spans);
+        let mut line = lead.into_line();
         line.style = self.style;
         line
     }
@@ -199,6 +207,11 @@ struct Table {
 }
 
 impl Blocks {
+    /// Start a walk whose rows wrap to `width` cells, or to none when 0.
+    fn new(width: usize) -> Self {
+        Self { width, ..Blocks::default() }
+    }
+
     /// Fold one parser event into the state.
     fn event(&mut self, event: Event<'_>) {
         match event {
@@ -280,15 +293,12 @@ impl Blocks {
                 // Each level stores only its own bullet's width in cells, so
                 // the levels sum to the true indent.
                 let pad = " ".repeat(bullet.chars().count());
-                let column = self.lists[..self.lists.len() - 1]
-                    .iter()
-                    .map(|list| list.cont.as_str())
-                    .collect::<String>();
+                let column = self.continuations(self.lists.len() - 1);
                 if let Some(list) = self.lists.last_mut() {
                     list.next = list.next.wrapping_add(1);
                     list.cont.clone_from(&pad);
                 }
-                let style = if self.quote > 0 { QUIET } else { Style::new() };
+                let style = if self.quote > 0 { QUOTE } else { Style::new() };
                 let mut first = self.rail();
                 first.push(Span::raw(format!("{column}{bullet}")));
                 let mut rest = self.rail();
@@ -312,18 +322,10 @@ impl Blocks {
             Tag::Strikethrough => {
                 self.inline.open(Style::new().add_modifier(Modifier::CROSSED_OUT));
             }
-            Tag::Link { dest_url, .. } => {
-                self.inline.open(LINK);
-                if let Some(scope) = self.inline.scopes.last_mut() {
-                    scope.link = Some((dest_url.to_string(), String::new()));
-                }
-            }
+            Tag::Link { dest_url, .. } => self.open_link(&dest_url),
             // An image renders its alt text as the label in brackets.
             Tag::Image { dest_url, .. } => {
-                self.inline.open(LINK);
-                if let Some(scope) = self.inline.scopes.last_mut() {
-                    scope.link = Some((dest_url.to_string(), String::new()));
-                }
+                self.open_link(&dest_url);
                 let style = self.inline.style();
                 self.inline.push("[", style);
             }
@@ -339,7 +341,7 @@ impl Blocks {
         self.gap();
         let style = match style {
             Some(style) => style,
-            None if self.quote > 0 => QUIET,
+            None if self.quote > 0 => QUOTE,
             None => Style::new(),
         };
         if self.lists.is_empty() {
@@ -404,13 +406,12 @@ impl Blocks {
             }
             TagEnd::Link => {
                 if let Some(scope) = self.inline.scopes.pop()
-                    // The destination rides along dimly unless the label finishes
+                    // The destination rides along dimly unless the label finishes it.
                     && let Some((dest, label)) = scope.link
                     && !dest.is_empty()
                     && dest != label
                 {
-                    self.inline.trim = false;
-                    self.inline.push(&format!(" ({dest})"), QUIET);
+                    self.show_dest(&dest);
                 }
             }
             TagEnd::Image => {
@@ -421,13 +422,26 @@ impl Blocks {
                     && let Some((dest, _)) = scope.link
                     && !dest.is_empty()
                 {
-                    self.inline.trim = false;
-                    self.inline.push(&format!(" ({dest})"), QUIET);
+                    self.show_dest(&dest);
                 }
             }
             // An unknown end changing nothing stays safest.
             _ => {}
         }
+    }
+
+    /// Open a link-like scope capturing its destination and streamed label.
+    fn open_link(&mut self, dest: &str) {
+        self.inline.open(LINK);
+        if let Some(scope) = self.inline.scopes.last_mut() {
+            scope.link = Some((dest.to_string(), String::new()));
+        }
+    }
+
+    /// Echo the destination dimly after the label.
+    fn show_dest(&mut self, dest: &str) {
+        self.inline.trim = false;
+        self.inline.push(&format!(" ({dest})"), QUIET);
     }
 
     /// The blockquote rail for the current depth, on every line of a quote.
@@ -446,23 +460,25 @@ impl Blocks {
     /// Block text instead uses the `Prefix` frozen at its block's open.
     fn indents(&self) -> Vec<Span<'static>> {
         let mut spans = self.rail();
-        let indent = self
-            .lists
-            .iter()
-            .map(|list| list.cont.as_str())
-            .collect::<String>();
+        let indent = self.continuations(self.lists.len());
         if !indent.is_empty() {
             spans.push(Span::raw(indent));
         }
         spans
     }
 
+    /// The joined continuation indents of the `n` outermost open lists.
+    fn continuations(&self, n: usize) -> String {
+        self.lists[..n].iter().map(|list| list.cont.as_str()).collect()
+    }
+
     /// Push each line of `text` as a quiet row, carrying the context prefix.
     fn quiet_rows(&mut self, text: &str) {
+        let lead = self.indents();
         for line in text.lines() {
-            let mut spans = self.indents();
-            spans.push(Span::styled(line.to_owned(), QUIET));
-            self.push_row(Line::from(spans));
+            for row in self.wrap(&lead, vec![Span::styled(line.to_owned(), QUIET)]) {
+                self.push_row(Line::from([lead.as_slice(), &row].concat()));
+            }
         }
     }
 
@@ -478,10 +494,29 @@ impl Blocks {
         }
     }
 
-    /// Flush the inline row as a line.
+    /// Flush the inline row as a line, or as several wrapped to the width.
     fn flush_line(&mut self) {
-        let line = self.prefix.line(self.inline.take());
-        self.push_row(line);
+        let spans = self.inline.take();
+        let rows = self.wrap(&self.prefix.rest, spans);
+        for spans in rows {
+            let line = self.prefix.line(spans);
+            self.push_row(line);
+        }
+    }
+
+    /// Wrap one block line's spans into rows that fit the cells left of `lead`
+    fn wrap(&self, lead: &[Span<'static>], spans: Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {
+        if self.width == 0 {
+            return vec![spans];
+        }
+        let budget = self
+            .width
+            .saturating_sub(lead.iter().map(Span::width).sum())
+            .max(1);
+        wrap_lines(&[Line::from(spans)], budget)
+            .into_iter()
+            .map(|row| row.spans)
+            .collect()
     }
 
     /// Flush a block's last line when text is pending.
@@ -503,16 +538,17 @@ impl Blocks {
         self.in_html = false;
         if self.pending_gap && !self.out.is_empty() {
             self.pending_gap = false;
-            let mut blank = Line::from(self.rail());
-            if blank.spans.is_empty() {
-                blank.spans.push(Span::raw(""));
-            }
+            let blank = self.rail().into_line();
             self.out.push(blank);
         }
         self.out.push(line);
     }
 
     /// Render the buffered table with padding, a bold header, and a dim rule.
+    #[allow(
+        unstable_name_collisions,
+        reason = "std's Iterator::intersperse is unstable"
+    )]
     fn flush_table(&mut self) {
         let Some(table) = self.table.take() else {
             return;
@@ -541,13 +577,12 @@ impl Blocks {
                 .collect::<Vec<_>>()
         };
         // One dash run per column, joined where the cell separators sit.
-        let mut rule = Vec::with_capacity(columns * 2);
-        for (i, w) in widths.iter().enumerate() {
-            if i > 0 {
-                rule.push(Span::styled("─┼─", QUIET));
-            }
-            rule.push(Span::styled("─".repeat(*w), QUIET));
-        }
+        let rule: Vec<Span<'static>> = widths
+            .iter()
+            .copied()
+            .map(|w| Span::styled("─".repeat(w), QUIET))
+            .intersperse(Span::styled("─┼─", QUIET))
+            .collect();
         let surround = self.indents();
         self.push_row(row_line(surround.clone(), cells(&head), true));
         self.push_row(row_line(surround.clone(), vec![rule], false));
@@ -590,36 +625,40 @@ fn pad_cell(mut cell: Vec<Span<'static>>, width: usize, align: Alignment) -> Vec
     }
     let tail = " ".repeat(right);
     if !tail.is_empty() {
-        match cell.last_mut() {
-            Some(last) if last.style == Style::new() => {
-                last.content.to_mut().push_str(&tail);
-            }
-            _ => cell.push(Span::raw(tail)),
-        }
+        cell.push_merged(&tail, Style::new());
     }
     cell
 }
 
 /// Assemble one table row: the context prefix, then dim cells, then bold header
+#[allow(
+    unstable_name_collisions,
+    reason = "std's Iterator::intersperse is unstable"
+)]
 fn row_line(
     prefix: Vec<Span<'static>>,
     cells: Vec<Vec<Span<'static>>>,
     header: bool,
 ) -> Line<'static> {
-    let mut spans = prefix;
-    for (i, cell) in cells.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", QUIET));
-        }
-        spans.extend(cell.into_iter().map(|span| {
-            if header {
-                Span::styled(span.content, HEADING.patch(span.style))
-            } else {
-                span
-            }
-        }));
-    }
-    Line::from(spans)
+    let mut line = Line::from(prefix);
+    line.extend(
+        cells
+            .into_iter()
+            .map(|cell| {
+                cell.into_iter()
+                    .map(|span| {
+                        if header {
+                            Span::styled(span.content, HEADING.patch(span.style))
+                        } else {
+                            span
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .intersperse_with(|| vec![Span::styled(" │ ", QUIET)])
+            .flatten(),
+    );
+    line
 }
 
 #[cfg(test)]
@@ -629,7 +668,7 @@ mod tests {
 
     /// The rendered rows as plain text.
     fn rows(raw: &str) -> Vec<String> {
-        texts(&render(raw))
+        texts(&render(raw, 0))
     }
 
     /// Plain text renders as paragraph blocks.
@@ -658,7 +697,7 @@ mod tests {
     /// Emphasis styles its text and strips its markers
     #[test]
     fn emphasis_styles_and_strips() {
-        let spans = &segments(&render("**bold** and *italic* and ~~gone~~"))[0];
+        let spans = &segments(&render("**bold** and *italic* and ~~gone~~", 0))[0];
         assert_eq!(spans[0], ("bold".into(), HEADING));
         assert_eq!(spans[1], (" and ".into(), Style::new()));
         assert_eq!(
@@ -678,7 +717,7 @@ mod tests {
     /// Inline code renders verbatim in its own color.
     #[test]
     fn inline_code_colors() {
-        let spans = &segments(&render("run `cargo test` now"))[0];
+        let spans = &segments(&render("run `cargo test` now", 0))[0];
         assert_eq!(spans[1], ("cargo test".into(), INLINE_CODE));
         assert_eq!(spans[2], (" now".into(), Style::new()));
         // A break's trim never eats code's leading space: verbatim.
@@ -688,27 +727,27 @@ mod tests {
     /// Headings strip their markers and scale by level.
     #[test]
     fn headings_strip_and_scale() {
-        let spans = segments(&render("# One\n## Two\n### Three\n###### Six"));
+        let spans = segments(&render("# One\n## Two\n### Three\n###### Six", 0));
         assert_eq!(spans[0][0], ("One".into(), HEADING1));
         assert_eq!(spans[2][0], ("Two".into(), HEADING2));
-        assert_eq!(spans[4][0], ("Three".into(), HEADING));
+        assert_eq!(spans[4][0], ("Three".into(), HEADING3));
         assert_eq!(spans[6][0], ("Six".into(), HEADING));
         // A heading still streaming renders with its partial text.
-        assert_eq!(segments(&render("# Hea"))[0][0], ("Hea".into(), HEADING1));
+        assert_eq!(segments(&render("# Hea", 0))[0][0], ("Hea".into(), HEADING1));
     }
 
     /// Fenced and indented code render verbatim and dim.
     #[test]
     fn code_blocks_render_verbatim_dim() {
         assert_eq!(
-            segments(&render("```rust\nlet x = **1**;\n    indented\n```")),
+            segments(&render("```rust\nlet x = **1**;\n    indented\n```", 0)),
             [
                 vec![("let x = **1**;".into(), QUIET)],
                 vec![("    indented".into(), QUIET)],
             ]
         );
         assert_eq!(
-            segments(&render("`x`\n\n    four spaces are code")),
+            segments(&render("`x`\n\n    four spaces are code", 0)),
             [
                 vec![("x".to_string(), INLINE_CODE)],
                 vec![(String::new(), Style::new())],
@@ -716,7 +755,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            segments(&render("```\nunclosed")),
+            segments(&render("```\nunclosed", 0)),
             [vec![("unclosed".into(), QUIET)]]
         );
     }
@@ -742,6 +781,45 @@ mod tests {
         assert_eq!(rows("- a\n  - b\n    wrapped"), ["• a", "  • b", "    wrapped"]);
     }
 
+    /// Wrapped rows keep the hanging indent so a continuation aligns under its item's
+    /// text by the marker's width.
+    #[test]
+    fn wrapped_rows_keep_the_hanging_indent() {
+        // `4. ` is three cells; `10. ` is four, a wider marker a wider indent.
+        let wrap = |raw: &str, width: usize| texts(&render(raw, width));
+        assert_eq!(
+            wrap("4. a long numbered line that wraps at a narrow width", 30),
+            ["4. a long numbered line that ", "   wraps at a narrow width"]
+        );
+        assert_eq!(
+            wrap("10. ten is two digits wide so the marker is four cells", 30),
+            ["10. ten is two digits wide so ", "    the marker is four cells"]
+        );
+        assert_eq!(
+            wrap("- bullet items keep their two space continuation", 20),
+            ["• bullet items keep ", "  their two space ", "  continuation"]
+        );
+        assert_eq!(
+            wrap("> a quoted line that is long enough to wrap here", 20),
+            ["│ a quoted line that", "│ is long enough to ", "│ wrap here"]
+        );
+        // A nested item's continuation aligns under the nested text alone.
+        assert_eq!(
+            wrap("1. outer\n   1. nested item with a long wrapping text line", 26),
+            [
+                "1. outer",
+                "   1. nested item with a ",
+                "      long wrapping text ",
+                "      line"
+            ]
+        );
+        // Verbatim rows wrap to the indent they sit at.
+        assert_eq!(
+            wrap("- item\n\n  ```\n  code line long enough to wrap yes\n  ```", 24),
+            ["• item", "  code line long enough ", "  to wrap yes"]
+        );
+    }
+
     #[test]
     fn item_continuations_and_buffered_blocks_keep_prefixes() {
         assert_eq!(rows("- a\n\n  b"), ["• a", "  b"]);
@@ -762,14 +840,16 @@ mod tests {
         assert_eq!(rows("a\n\n```\n```\n\nb"), ["a", "", "b"]);
     }
 
-    /// Blockquotes render dim behind a rail on every line, nested by depth.
+    /// Blockquotes render dim and italic behind a rail on every line, nested
+    /// by depth; the line's quote style italicizes the rail along with the
+    /// text, so a quotation reads apart from verbatim, quiet blocks.
     #[test]
     fn blockquotes_render_a_rail() {
-        let lines = segments(&render("> quoted\n> more\n\nafter"));
-        assert_eq!(lines[0][0], ("│ ".into(), QUIET));
-        assert_eq!(lines[0][1], ("quoted".into(), QUIET));
-        assert_eq!(lines[1][0], ("│ ".into(), QUIET));
-        assert_eq!(lines[1][1], ("more".into(), QUIET));
+        let lines = segments(&render("> quoted\n> more\n\nafter", 0));
+        assert_eq!(lines[0][0], ("│ ".into(), QUOTE));
+        assert_eq!(lines[0][1], ("quoted".into(), QUOTE));
+        assert_eq!(lines[1][0], ("│ ".into(), QUOTE));
+        assert_eq!(lines[1][1], ("more".into(), QUOTE));
         // The separating blank carries no rail: the quote has closed.
         assert_eq!(lines[2], vec![(String::new(), Style::new())]);
         assert_eq!(lines[3][0], ("after".into(), Style::new()));
@@ -779,7 +859,7 @@ mod tests {
     /// A horizontal rule renders as a dim rule row.
     #[test]
     fn rules_render_dim() {
-        let lines = segments(&render("above\n\n---\n\nbelow"));
+        let lines = segments(&render("above\n\n---\n\nbelow", 0));
         assert_eq!(lines[2][0], ("─".repeat(HR_WIDTH), QUIET));
     }
 
@@ -801,7 +881,7 @@ mod tests {
 
     #[test]
     fn links_style_labels() {
-        let spans = &segments(&render("see [the docs](https://example.com) now"))[0];
+        let spans = &segments(&render("see [the docs](https://example.com) now", 0))[0];
         assert_eq!(spans[1], ("the docs".into(), LINK));
         assert_eq!(spans[2], (" (https://example.com)".into(), QUIET));
         assert_eq!(spans[3], (" now".into(), Style::new()));
@@ -816,7 +896,7 @@ mod tests {
 
     #[test]
     fn tables_render_aligned() {
-        let lines = segments(&render("| left | mid | right |\n|---|:-:|--:|\n| a | b | c |"));
+        let lines = segments(&render("| left | mid | right |\n|---|:-:|--:|\n| a | b | c |", 0));
         assert_eq!(lines[0][0], ("left".into(), HEADING));
         assert_eq!(lines[0][1], (" │ ".into(), QUIET));
         assert_eq!(lines[0][2], ("mid".into(), HEADING));

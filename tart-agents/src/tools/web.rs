@@ -962,7 +962,9 @@ mod tests {
         assert!(!resolves_to_private("not a hostname"));
     }
 
-    /// Live: reaches the network, so it needs connectivity.
+    /// Live: reaches the network and the system keychain, so it only passes
+    /// outside a nested sandbox.
+    #[apply(skip_unless_networked!)]
     #[test]
     fn run_search_returns_rendered_results() {
         let Some(_) = search_binary() else {

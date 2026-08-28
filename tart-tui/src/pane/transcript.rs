@@ -1,5 +1,6 @@
 //! The transcript: the message log, its entries, and the wrap cache.
 
+use itertools::Itertools;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use tart_agents::merge_digests;
@@ -43,79 +44,15 @@ fn tool_hint_row(hidden: usize) -> Line<'static> {
     ])
 }
 
-/// A status header and then the output rendered for a running tool call
-///
-/// Running calls show just the header with a dim ellipsis; finished ones add
-/// their output rows, collapsed to [`TOOL_HEAD`] head and [`TOOL_TAIL`] tail
-/// lines around a count of the hidden middle unless `expanded`. A call a later
-/// one superseded only renders its header.
-fn tool_lines(tool: &ToolCall, expanded: bool) -> Vec<Line<'static>> {
-    let status = match (tool.running, tool.exit) {
-        (true, _) => TOOL_RUNNING,
-        (_, Some(0)) => TOOL_OK,
-        _ => TOOL_ERR,
-    };
-
-    let digest = Span::styled(
-        format!("({})", merge_digests(tool.name, &tool.digests)),
-        DIM_STYLE,
-    );
-    let mut header = vec![
-        Span::styled("● ", status),
-        Span::styled(tool.name, status),
-        digest,
-    ];
-
-    if tool.running {
-        header.push(Span::styled(" …", DIM_STYLE));
-    }
-    if !tool.running
-        && let Some(c) = tool.exit.filter(|&c| c != 0)
-    {
-        header.push(Span::styled(format!(" exit {c}"), TOOL_ERR));
-    }
-
-    // A superseded box stays folded down to its header; Ctrl+O governs only
-    // the boxes still standing. A merged box that reopens keeps its previous
-    // output under the running header, so edits can be drawn in place.
-    if tool.superseded {
-        return vec![Line::from(header)];
-    }
-
-    let Some(output) = &tool.output else {
-        return vec![Line::from(header)];
-    };
-
-    let lines: Vec<_> = output.lines().collect();
-    let limit = TOOL_HEAD + TOOL_TAIL;
-
-    let body: Vec<Line<'static>> = match lines.as_slice() {
-        [] => vec![tool_row(TOOL_NO_OUTPUT)],
-        _ if !expanded && lines.len() > limit => {
-            let hidden = lines.len() - limit;
-            lines[..TOOL_HEAD]
-                .iter()
-                .copied()
-                .map(tool_row)
-                .chain(std::iter::once(tool_hint_row(hidden)))
-                .chain(lines[lines.len() - TOOL_TAIL..].iter().copied().map(tool_row))
-                .collect()
-        }
-        _ => lines.into_iter().map(tool_row).collect(),
-    };
-
-    [vec![Line::from(header)], body].concat()
-}
-
 impl Entry {
     /// The display lines the entry renders as. Stale entries render immediately
     fn lines(&self, expanded: bool, thinking: bool) -> Vec<Line<'static>> {
         match self {
             Entry::Text(line) => vec![line.clone()],
-            Entry::Tool(tool) => tool_lines(tool, expanded),
+            Entry::Tool(tool) => tool.lines(expanded),
             Entry::Answer { raw, width, lines } => {
                 if *width == 0 {
-                    markdown::render(raw)
+                    markdown::render(raw, 0)
                 } else {
                     lines.clone()
                 }
@@ -127,35 +64,21 @@ impl Entry {
 
 /// The lines a thinking block renders: dim when shown or a placeholder otherwise.
 fn thinking_lines(raw: &str, shown: bool) -> Vec<Line<'static>> {
-    let dim = |text: &str| {
-        let mut line = Line::from(text.to_owned());
-        line.style = DIM_STYLE;
-        line
-    };
     if !shown {
         return raw
             .is_empty()
             .then(Vec::new)
             .unwrap_or_else(|| vec![thinking_placeholder()]);
     }
-    let mut parts = raw.split('\n').collect::<Vec<_>>();
-    while parts.last() == Some(&"") {
-        parts.pop();
+    // Trailing empties are trailing '\n's; a run of interior ones renders once.
+    let body = raw.trim_end_matches('\n');
+    if body.is_empty() {
+        return Vec::new();
     }
-    let mut lines = Vec::with_capacity(parts.len());
-    let mut blank = false;
-    for part in parts {
-        if part.is_empty() {
-            if !blank {
-                lines.push(dim(""));
-            }
-            blank = true;
-        } else {
-            lines.push(dim(part));
-            blank = false;
-        }
-    }
-    lines
+    body.split('\n')
+        .dedup_by(|a, b| a.is_empty() && b.is_empty())
+        .map(|text| Line::styled(text.to_owned(), DIM_STYLE))
+        .collect()
 }
 
 /// One tool invocation, updated in place when its output arrives.
@@ -175,6 +98,69 @@ struct ToolCall {
     exit: Option<i32>,
     /// A later invocation folded this box down to its header line.
     superseded: bool,
+}
+
+impl ToolCall {
+    /// The box's rows: a status header and then the rendered output
+    ///
+    /// Running calls show just the header with a dim ellipsis; finished ones add
+    /// their output rows, collapsed to [`TOOL_HEAD`] head and [`TOOL_TAIL`] tail
+    /// lines around a count of the hidden middle unless `expanded`. A call a later
+    /// one superseded only renders its header.
+    fn lines(&self, expanded: bool) -> Vec<Line<'static>> {
+        let status = match (self.running, self.exit) {
+            (true, _) => TOOL_RUNNING,
+            (_, Some(0)) => TOOL_OK,
+            _ => TOOL_ERR,
+        };
+
+        let digest = Span::styled(
+            format!("({})", merge_digests(self.name, &self.digests)),
+            DIM_STYLE,
+        );
+        // An exit code shows only on a finished, failed call.
+        let exit = self.exit.filter(|&c| c != 0).filter(|_| !self.running);
+        let header = [
+            Span::styled("● ", status),
+            Span::styled(self.name, status),
+            digest,
+        ]
+        .into_iter()
+        .chain(self.running.then(|| Span::styled(" …", DIM_STYLE)))
+        .chain(exit.map(|c| Span::styled(format!(" exit {c}"), TOOL_ERR)))
+        .collect::<Vec<_>>();
+
+        // A superseded box stays folded down to its header; Ctrl+O governs only
+        // the boxes still standing. A merged box that reopens keeps its previous
+        // output under the running header, so edits can be drawn in place.
+        if self.superseded {
+            return vec![Line::from(header)];
+        }
+
+        let Some(output) = &self.output else {
+            return vec![Line::from(header)];
+        };
+
+        let lines: Vec<_> = output.lines().collect();
+        let limit = TOOL_HEAD + TOOL_TAIL;
+
+        let body: Vec<Line<'static>> = match lines.as_slice() {
+            [] => vec![tool_row(TOOL_NO_OUTPUT)],
+            _ if !expanded && lines.len() > limit => {
+                let hidden = lines.len() - limit;
+                lines[..TOOL_HEAD]
+                    .iter()
+                    .copied()
+                    .map(tool_row)
+                    .chain(std::iter::once(tool_hint_row(hidden)))
+                    .chain(lines[lines.len() - TOOL_TAIL..].iter().copied().map(tool_row))
+                    .collect()
+            }
+            _ => lines.into_iter().map(tool_row).collect(),
+        };
+
+        std::iter::once(Line::from(header)).chain(body).collect()
+    }
 }
 
 /// One transcript message: a text line, a live tool invocation, a streamed
@@ -471,7 +457,7 @@ impl Transcript {
             if let Entry::Answer { raw, width: at, lines } = entry
                 && *at != width
             {
-                *lines = markdown::render(raw);
+                *lines = markdown::render(raw, width);
                 *at = width;
             }
         }
@@ -505,12 +491,10 @@ impl Transcript {
     /// Whether a blank row leads `messages[index]` and we should emit a newline.
     fn separated(&self, index: usize) -> bool {
         // true for an answer, false for a tool box, `None` for anything else.
-        let kind = |entry: &Entry| {
-            matches!(entry, Entry::Answer { .. }).then_some(true).or(matches!(
-                entry,
-                Entry::Tool(_)
-            )
-            .then_some(false))
+        let kind = |entry: &Entry| match entry {
+            Entry::Answer { .. } => Some(true),
+            Entry::Tool(_) => Some(false),
+            _ => None,
         };
         let Some(current) = kind(&self.messages[index]) else {
             return false;
@@ -542,7 +526,9 @@ impl Transcript {
             .iter()
             .flat_map(|entry| match entry {
                 Entry::Text(line) => vec![line_text(line)],
-                Entry::Answer { raw, .. } => markdown::render(raw).iter().map(line_text).collect(),
+                Entry::Answer { raw, .. } => {
+                    markdown::render(raw, 0).iter().map(line_text).collect()
+                }
                 Entry::Thinking { raw } => {
                     thinking_lines(raw, true).iter().map(line_text).collect()
                 }
@@ -554,32 +540,34 @@ impl Transcript {
     /// The cached rows equal a full re-wrap of every message at the wrapped width
     #[cfg(test)]
     pub(crate) fn assert_rows_match_full_rewrap(&self) {
-        let mut full = Vec::new();
-        for index in 0..self.messages.len() {
-            if self.separated(index) {
-                full.push(Line::from(""));
-            }
-            full.extend(self.messages[index].lines(self.show_tool_output, self.show_thinking));
-        }
-        assert_eq!(texts(&self.rows), texts(&wrap_lines(&full, self.cache.0)));
+        assert_eq!(
+            texts(&self.rows),
+            texts(&wrap_lines(&self.visible_lines(), self.cache.0))
+        );
+    }
+
+    /// The lines the transcript renders: each entry's display lines,
+    /// separators included.
+    #[cfg(test)]
+    fn visible_lines(&self) -> Vec<Line<'static>> {
+        self.messages
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                self.separated(index)
+                    .then_some(Line::from(""))
+                    .into_iter()
+                    .chain(entry.lines(self.show_tool_output, self.show_thinking))
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fmt::Write as _;
 
-    /// The messages the transcript renders: each entry's display lines, including separators
-    fn visible(t: &Transcript) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        for (index, entry) in t.messages.iter().enumerate() {
-            if t.separated(index) {
-                lines.push(Line::from(""));
-            }
-            lines.extend(entry.lines(t.show_tool_output, t.show_thinking));
-        }
-        lines
-    }
+    use super::*;
 
     /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {
@@ -794,6 +782,29 @@ mod tests {
         t.append(" now **bold**");
         t.sync(40);
         assert_eq!(t.message_texts(), ["plain so far now bold"]);
+        t.assert_rows_match_full_rewrap();
+    }
+
+    /// A wrapped numbered item keeps its hanging indent through the wrap
+    /// cache: the answer pre-wraps at the pane's width, each continuation
+    /// aligned under its item's text, and the cache's re-wrap passes the
+    /// rows through untouched.
+    #[test]
+    fn wrapped_list_items_keep_their_indent_through_sync() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ list"));
+        t.begin_response();
+        t.append("1. one two three four five six seven eight nine ten");
+        t.sync(24);
+        assert_eq!(
+            texts(t.rows()),
+            [
+                "❯ list",
+                "1. one two three four ",
+                "   five six seven eight ",
+                "   nine ten",
+            ]
+        );
         t.assert_rows_match_full_rewrap();
     }
 
@@ -1012,7 +1023,7 @@ and the analytics dashboard rewrite.\n\n\
         let mut t = Transcript::default();
         assert!(!t.show_thinking, "thinking starts hidden");
         let assert_fresh = |t: &Transcript| {
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(t), t.cache.0)));
+            assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), t.cache.0)));
         };
 
         t.push(Line::from("❯ echo"));
@@ -1159,7 +1170,7 @@ and the analytics dashboard rewrite.\n\n\
 
         t.toggle_thinking();
         t.sync(40);
-        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), 40)));
 
         t.begin_response();
         assert_eq!(t.message_texts(), ["a1"]);
@@ -1199,13 +1210,13 @@ and the analytics dashboard rewrite.\n\n\
         t.append_thinking("t2\n"); // late, tail folded
         assert_eq!(t.cache, (40, 1), "only the echo stays cached");
         t.sync(40);
-        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), 40)));
 
         // A second late fragment with an unsynced glued answer in between.
         t.append(" a2");
         t.append_thinking("t3\n");
         t.sync(40);
-        assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(&t), 40)));
+        assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), 40)));
         assert_eq!(t.message_texts(), ["❯ echo", "t1", "t2", "t3", "a1 a2"]);
     }
 
@@ -1252,9 +1263,7 @@ and the analytics dashboard rewrite.\n\n\
         start_bash(&mut t, "call_1");
         let mut long = String::new();
         for i in 0..20 {
-            long.push_str("line ");
-            long.push_str(&i.to_string());
-            long.push('\n');
+            let _ = writeln!(long, "line {i}");
         }
         t.finish_tool("call_1", long, Some(0));
         t.sync(40);
@@ -1369,7 +1378,7 @@ and the analytics dashboard rewrite.\n\n\
     fn thinking_rides_below_tool_boxes() {
         let mut t = Transcript::default();
         let assert_fresh = |t: &Transcript| {
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&visible(t), t.cache.0)));
+            assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), t.cache.0)));
         };
         t.push(Line::from("❯ go"));
         t.begin_response();

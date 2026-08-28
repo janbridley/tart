@@ -4,6 +4,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::SpansExt;
+
 /// Spaces a tab renders as.
 const TAB_WIDTH: usize = 4;
 
@@ -92,11 +94,7 @@ impl<'a> Wrapper<'a> {
     fn emit_row(&mut self) {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (sym, style, _) in std::mem::take(&mut self.row) {
-            match spans.last_mut() {
-                Some(last) if last.style == style => last.content.to_mut().push_str(sym),
-                // Allocate an owned string once per run
-                _ => spans.push(Span::styled(sym.to_owned(), style)),
-            }
+            spans.push_merged(sym, style);
         }
         self.rows.push(Line::from(spans));
         self.row_width = 0;
@@ -117,12 +115,11 @@ fn feed<'a>(wrapper: &mut Wrapper<'a>, grapheme: &'a str, style: Style) {
 pub(crate) fn wrap_lines(messages: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
     let mut wrapper = Wrapper::new(width);
     for line in messages {
-        for (grapheme, style) in line.spans.iter().flat_map(|span| {
-            span.content
-                .graphemes(true)
-                .map(|g| (g, line.style.patch(span.style)))
-        }) {
-            feed(&mut wrapper, grapheme, style);
+        for span in &line.spans {
+            let style = line.style.patch(span.style);
+            for grapheme in span.content.graphemes(true) {
+                feed(&mut wrapper, grapheme, style);
+            }
         }
         wrapper.hard_break();
     }

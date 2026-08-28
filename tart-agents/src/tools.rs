@@ -679,6 +679,8 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use std::fmt::Write as _;
+
     use crate::sandbox::live::skip_unless_live;
     use macro_rules_attribute::apply;
     use std::time::Instant;
@@ -1242,9 +1244,7 @@ mod tests {
     fn read_returns_numbered_contents_and_ranges() {
         let mut contents = String::new();
         for line in 1..=30 {
-            contents.push_str("line ");
-            contents.push_str(&line.to_string());
-            contents.push('\n');
+            let _ = writeln!(contents, "line {line}");
         }
         let file = scratch(&contents);
         let policy = Policy::new(std::env::temp_dir()).unwrap();

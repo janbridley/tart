@@ -3,19 +3,19 @@
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
+use itertools::Itertools;
 use tart_agents::{CONTENT_CAP, head_cap};
 
 use crate::file_mentions;
 
 /// The `@path` tokens in a submitted line, as the typeahead would complete them
 fn mentions(line: &str) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    for mention in line.split_whitespace().filter_map(|word| word.strip_prefix('@')) {
-        if !mention.is_empty() && !found.iter().any(|seen| seen == mention) {
-            found.push(mention.to_string());
-        }
-    }
-    found
+    line.split_whitespace()
+        .filter_map(|word| word.strip_prefix('@'))
+        .filter(|mention| !mention.is_empty())
+        .unique()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Resolve `.` and `..` components lexically, without touching the filesystem.
@@ -44,12 +44,12 @@ fn inside_grant(mention: &str, cwd: &Path) -> bool {
 
 /// A fence longer than any run of backticks in `text`, so a file can't close its block
 fn fence_len(text: &str) -> usize {
-    let (mut longest, mut run) = (0, 0);
-    for c in text.chars() {
-        run = if c == '`' { run + 1 } else { 0 };
-        longest = longest.max(run);
-    }
-    longest.max(3) + 1
+    text.split(|c: char| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+        .max(3)
+        + 1
 }
 
 /// One outside-the-sandbox mention's attachment block and its note for the pane.
@@ -84,15 +84,14 @@ fn attach(mention: &str) -> (String, String) {
 
 /// Expand a submitted line's `@path` mentions outside the sandbox into attached content
 pub(crate) fn attach_mentions(line: &str, cwd: &Path) -> (String, Vec<String>) {
-    let mut blocks = Vec::new();
-    let mut notes = Vec::new();
-    for mention in mentions(line) {
-        if !inside_grant(&mention, cwd) {
+    let (blocks, notes): (Vec<String>, Vec<String>) = mentions(line)
+        .into_iter()
+        .filter(|mention| !inside_grant(mention, cwd))
+        .map(|mention| {
             let (block, note) = attach(&mention);
-            blocks.push(format!("`{mention}`:\n{block}"));
-            notes.push(note);
-        }
-    }
+            (format!("`{mention}`:\n{block}"), note)
+        })
+        .unzip();
     if blocks.is_empty() {
         return (line.to_string(), notes);
     }
