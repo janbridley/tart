@@ -305,6 +305,11 @@ mod tests {
     use super::*;
     use async_openai::types::responses::FunctionToolCall;
 
+    /// A session file's line count.
+    fn line_count(path: &Path) -> usize {
+        std::fs::read_to_string(path).unwrap().lines().count()
+    }
+
     /// Write `transcript`'s items to `path`, one JSON line each.
     fn write_session(path: &Path, transcript: &Transcript) {
         let mut text = String::new();
@@ -354,19 +359,19 @@ mod tests {
         session.record(&transcript).unwrap();
         session.record(&transcript).unwrap();
         let file = session.path.clone().unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 3);
+        assert_eq!(line_count(&file), 3);
 
         // A resumed session appends to the same file.
         transcript.push_user("again".to_string()).unwrap();
         transcript.push_assistant("there".to_string()).unwrap();
         session.record(&transcript).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 5);
+        assert_eq!(line_count(&file), 5);
 
         // A cancelled turn keeps its partial answer, so it flushes like any other.
         transcript.push_user("cancel me".to_string()).unwrap();
         transcript.push_assistant("partial".to_string()).unwrap();
         session.record(&transcript).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 7);
+        assert_eq!(line_count(&file), 7);
 
         let (resumed, _) = Session::open(root.path(), project, &file).unwrap();
         assert_eq!(
