@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState};
+use std::path::{Path, PathBuf};
 
 use crate::pane::{Editor, Popup, g_to_byte, graphemes};
 
@@ -40,6 +41,62 @@ pub(crate) fn derive_argument(editor: &Editor) -> Option<(String, usize)> {
     (!prefix[start..].is_empty()).then(|| (prefix[start..].to_string(), start))
 }
 
+/// The directory a completion token names, as typed
+/// `Some("")` is the root and `Some("~")` the home directory. `None` for bare words
+fn dir_named(token: &str) -> Option<String> {
+    token.rsplit_once('/').map(|(dir, _)| dir.to_string())
+}
+
+/// Expand directories to readable paths.
+fn readable_dir(dirpart: &str) -> Option<PathBuf> {
+    if let Some(rest) = dirpart.strip_prefix('~') {
+        // `~user` names another user's home, which we cannot expand.
+        if !rest.is_empty() && !rest.starts_with('/') {
+            return None;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        return Some(home.join(rest.trim_start_matches('/')));
+    }
+    Some(match dirpart {
+        "" => PathBuf::from("/"),
+        dir => PathBuf::from(dir),
+    })
+}
+
+/// One directory's entries as completion candidates, each prefixed by `dirpart`
+fn list_directory(dirpart: &str, dir: &Path, base: &str) -> Vec<String> {
+    let mut entries: Vec<String> = WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .hidden(false)
+        .build()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.depth() == 1)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with('.') == base.starts_with('.')).then(|| {
+                if entry.path().is_dir() {
+                    format!("{dirpart}/{name}/")
+                } else {
+                    format!("{dirpart}/{name}")
+                }
+            })
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// The candidates for completing shell path `token`, and the directory it named
+fn path_source(token: &str) -> (Option<String>, Vec<String>) {
+    let Some((dir, base)) = token.rsplit_once('/') else {
+        return (None, walk_current_directory());
+    };
+    let dirpart = dir.to_string();
+    let files =
+        readable_dir(&dirpart).map_or_else(Vec::new, |dir| list_directory(&dirpart, &dir, base));
+    (Some(dirpart), files)
+}
+
 /// All non-ignored files under the current directory, as sorted relative paths.
 fn walk_current_directory() -> Vec<String> {
     let root = std::env::current_dir().unwrap_or_default();
@@ -59,9 +116,13 @@ fn walk_current_directory() -> Vec<String> {
 }
 
 pub struct FilePopup {
-    /// Cached directory snapshot from when the popup opened.
+    /// The candidates, as they were sourced.
     files: Vec<String>,
     query: String,
+    /// This popup completes shell paths, re-sourcing when the query's directory moves
+    paths: bool,
+    /// The directory the candidates came from, as the query typed it.
+    dir: Option<String>,
     /// Matched paths, sorted by relevance and capped at `MAX_SHOWN`.
     matches: Vec<String>,
     /// Total hits before the cap (for the title's `+`).
@@ -75,11 +136,23 @@ impl FilePopup {
         Self::from_files(walk_current_directory(), query)
     }
 
+    /// A popup completing shell path `token`, whose named directory is the
+    /// candidate source: `../`, `~/…`, and absolute paths all complete.
+    fn complete(token: &str) -> Self {
+        let mut popup = Self::from_files(Vec::new(), token.to_string());
+        popup.paths = true;
+        popup.refile();
+        popup.refilter();
+        popup
+    }
+
     /// A popup over `files`, filtered by `query`.
     pub(crate) fn from_files(files: Vec<String>, query: String) -> Self {
         let mut popup = Self {
             files,
             query,
+            paths: false,
+            dir: None,
             matches: Vec::new(),
             total: 0,
             state: ListState::default(),
@@ -97,12 +170,25 @@ impl FilePopup {
         self.state.select_next();
     }
 
-    /// Point the popup at a new query, refiltering when it changed.
+    /// Point the popup at a new query, refiltering when it changed. A path
+    /// completion whose query names a new directory re-sources first, so a
+    /// typed `/` lists the directory it just named.
     pub(crate) fn set_query(&mut self, query: String) {
         if self.query != query {
             self.query = query;
+            if self.paths && self.dir != dir_named(&self.query) {
+                self.refile();
+            }
             self.refilter();
         }
+    }
+
+    /// Re-source the candidates for the current query, whose named directory
+    /// changed.
+    fn refile(&mut self) {
+        let (dir, files) = path_source(&self.query);
+        self.dir = dir;
+        self.files = files;
     }
 
     /// The highlighted row, if any.
@@ -212,6 +298,14 @@ pub(crate) fn rearm(key: &KeyEvent) -> bool {
     }
 }
 
+/// Open the path completion for `token`, replacing any open popup. The
+/// command's own word and an ended word open nothing.
+pub(crate) fn open_path(popup: &mut Option<Popup>, token: Option<(String, usize)>) {
+    if let Some((token, _)) = token {
+        *popup = Some(Popup::Files(FilePopup::complete(&token)));
+    }
+}
+
 /// Derive a query from the draft and decide the typeahead's fate.
 ///
 /// - A changed query refilters the list
@@ -237,6 +331,8 @@ pub(crate) fn update(popup: &mut Option<Popup>, query: Option<(String, usize)>, 
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
     use super::*;
 
     /// The query derives from a word-start `@` and matches subsequences;
@@ -267,6 +363,75 @@ mod tests {
         assert_eq!(popup.matches, files);
     }
 
+    /// The directory a token names, and where it reads from.
+    #[test]
+    fn directories_derive_from_tokens() {
+        assert_eq!(dir_named("Cargo"), None, "a bare word names none");
+        assert_eq!(dir_named("src/ma"), Some("src".to_string()));
+        assert_eq!(dir_named("../"), Some("..".to_string()));
+        assert_eq!(dir_named("/Users/jenna"), Some("/Users".to_string()));
+        assert_eq!(dir_named("/Users"), Some(String::new()), "the root names none");
+        assert_eq!(dir_named("~/Downloads"), Some("~".to_string()));
+
+        assert_eq!(readable_dir("src"), Some(PathBuf::from("src")));
+        assert_eq!(readable_dir(""), Some(PathBuf::from("/")));
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(readable_dir("~"), Some(home.clone()));
+        assert_eq!(readable_dir("~/Downloads"), Some(home.join("Downloads")));
+    }
+
+    /// A token naming a directory completes from it: entries keep the prefix
+    /// as typed, directories trail a slash, and dotfiles appear only for a
+    /// prefix that is one itself.
+    #[test]
+    fn tokens_naming_a_directory_list_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), "").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let tmp = tmp.path().display().to_string();
+
+        let popup = FilePopup::complete(&format!("{tmp}/ma"));
+        assert_eq!(popup.matches, [format!("{tmp}/main.rs")]);
+
+        let dot = FilePopup::complete(&format!("{tmp}/."));
+        assert_eq!(dot.matches, [format!("{tmp}/.hidden")], "{:?}", dot.matches);
+
+        let all = FilePopup::complete(&format!("{tmp}/"));
+        assert!(
+            all.matches.contains(&format!("{tmp}/main.rs")),
+            "{:?}",
+            all.matches
+        );
+        assert!(all.matches.contains(&format!("{tmp}/sub/")), "{:?}", all.matches);
+        assert!(
+            !all.matches.iter().any(|m| m.ends_with(".hidden")),
+            "{:?}",
+            all.matches
+        );
+    }
+
+    /// A typed `/` names a new directory, and an open list re-sources, not refilters
+    #[test]
+    fn a_slash_in_the_query_resources_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub").join("inner.rs"), "").unwrap();
+        let tmp = tmp.path().display().to_string();
+
+        let mut popup = FilePopup::complete(&format!("{tmp}/s"));
+        assert_eq!(popup.matches, [format!("{tmp}/sub/")]);
+
+        popup.set_query(format!("{tmp}/sub/"));
+        assert_eq!(
+            popup.matches,
+            [format!("{tmp}/sub/inner.rs")],
+            "{:?}",
+            popup.matches
+        );
+    }
+
+    /// Arguments derive from any word after whitespace, up to the caret.
     #[test]
     fn arguments_derive_after_whitespace() {
         let mut editor = Editor::default();

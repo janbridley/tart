@@ -165,11 +165,7 @@ impl Pane {
         // default for arguments, so neither prefix popup applies: an `@` or a
         // leading `/resume` is just text in a command.
         if self.bang {
-            // An open list tracks the word as it changes and closes when the
-            // word ends; only Tab opens one (see the Tab arm in `route`).
-            let query =
-                file_mentions::derive_argument(&self.prompt).filter(|(query, _)| !query.is_empty());
-            file_mentions::update(&mut self.popup, query, false);
+            self.sync_completion(false);
             return;
         }
         match session_query(&self.prompt) {
@@ -324,7 +320,7 @@ impl Pane {
                 self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
             }
             // Tab completes the argument under the caret as a file
-            KeyCode::Tab if self.bang => self.open_completion(),
+            KeyCode::Tab if self.bang => self.sync_completion(true),
             // `!` on an empty draft enters the manual-command mode; anywhere
             // else (or with the mode already on) it is an ordinary character.
             KeyCode::Char('!') if !self.bang && self.draft_is_empty() => self.bang = true,
@@ -529,10 +525,16 @@ impl Pane {
         }
     }
 
-    /// Open the file completion for the argument under the caret.
-    fn open_completion(&mut self) {
+    /// Sync the bang-mode completion for the argument under the caret: an open
+    /// list tracks the word as it changes and closes when the word ends, and
+    /// `open` (Tab) opens one unless the word is the command's own or ended.
+    fn sync_completion(&mut self, open: bool) {
         let query = file_mentions::derive_argument(&self.prompt);
-        file_mentions::update(&mut self.popup, query, true);
+        if open {
+            file_mentions::open_path(&mut self.popup, query);
+        } else {
+            file_mentions::update(&mut self.popup, query, false);
+        }
     }
 
     /// Submit the manual-command draft, or explain why now is not the time.
@@ -1348,6 +1350,26 @@ mod tests {
 
     /// The list opens only on Tab and follows the word: typing never opens
     /// it, an ended word closes it, and Tab there opens nothing.
+    /// A path argument outside the working directory completes too: the token
+    /// names the directory to list, and the accepted path is inserted as typed.
+    #[test]
+    fn paths_outside_the_working_directory_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.md"), "").unwrap();
+        let path = tmp.path().display().to_string();
+
+        let mut pane = Pane::default();
+        pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        pane.on_paste(&format!("cat {path}/not"));
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(
+            matches!(pane.popup, Some(Popup::Files(_))),
+            "the named directory lists"
+        );
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE)); // accept
+        assert_eq!(pane.prompt.text(), format!("cat {path}/notes.md"));
+    }
+
     #[test]
     fn completions_open_only_on_tab() {
         let mut pane = Pane::default();
@@ -1377,7 +1399,6 @@ mod tests {
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(pane.popup.is_none(), "an ended word has nothing to complete");
 
-        // The command's own word opens nothing — and inserts no tab either.
         let mut bare = Pane::default();
         bare.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
         bare.on_paste("cargo");
