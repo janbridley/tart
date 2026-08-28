@@ -34,11 +34,11 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
-use pane::{DIM_STYLE, Pane, PaneEvent};
+use pane::{DIM_STYLE, Mode, Pane, PaneEvent};
 use perf::Perf;
 use tart_agents::{
-    Agent, CancelToken, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript,
-    manual_command, sandbox::Policy,
+    Agent, CancelToken, ChatMode, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript,
+    manual_command, prompts, sandbox::Policy,
 };
 use tmux_override::{override_shift_up, restore_tmux};
 
@@ -124,6 +124,29 @@ fn effort_of(name: &str) -> Option<ReasoningEffort> {
     }
 }
 
+/// Switch plan mode on or off, moving the agent's sandbox and tool list with the mode.
+/// Running turns keep their current mode, so the switch waits for the turn end.
+fn set_plan(
+    agent: &mut Agent,
+    pane: &mut Pane,
+    transcript: &mut Transcript,
+    on: bool,
+) -> anyhow::Result<()> {
+    if pane.is_generating() {
+        pane.note("plan mode will be enabled next turn: Esc to cancel");
+        return Ok(());
+    }
+    pane.set_mode(if on { Mode::Plan } else { Mode::Default });
+    agent.set_mode(if on { ChatMode::Plan } else { ChatMode::Default });
+    transcript.set_reminder(on.then_some(prompts::PLAN_REMINDER))?;
+    pane.note(if on {
+        "plan mode on · read-only · Shift+Tab to leave"
+    } else {
+        "plan mode off"
+    });
+    Ok(())
+}
+
 /// The user message recording one manual command and its framed output, so the
 /// model reads the run like pasted text rather than a tool result.
 ///
@@ -206,6 +229,27 @@ fn run(
                     };
                     manual_cancel = Some((token, runner));
                 }
+                // Shift+Tab: toggle plan mode, exactly as `/plan` does.
+                Some(PaneEvent::Plan) => {
+                    let on = !pane.is_plan();
+                    set_plan(agent, pane, &mut transcript, on)?;
+                }
+                // Enter approved the drafted plan: leave plan mode and start
+                // the implementing turn, which may now write.
+                Some(PaneEvent::Approve) => {
+                    pane.set_mode(Mode::Default);
+                    agent.set_mode(ChatMode::Default);
+                    transcript.set_reminder(None)?;
+                    pane.note("plan approved · implementing");
+                    pane.echo(prompts::PLAN_APPROVAL);
+                    transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
+                    pane.begin_response();
+                    pane.set_generating(true);
+                    let sender = wake.clone();
+                    agent.spawn(&transcript, move |progress| {
+                        let _ = sender.send(Wake::Generation(progress));
+                    });
+                }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     // Clear the display and the model's memory of the session
                     "/clear" => {
@@ -236,6 +280,11 @@ fn run(
                             // Bare and unknown arguments both show the usage.
                             None => pane.note("usage: /effort none|minimal|low|medium|high|xhigh"),
                         }
+                    }
+                    // Toggle plan mode: read-only research and planning.
+                    "/plan" => {
+                        let on = !pane.is_plan();
+                        set_plan(agent, pane, &mut transcript, on)?;
                     }
                     _ => {
                         // Steering message is emptied on the same iteration it sends.
@@ -270,6 +319,10 @@ fn run(
                         let history = restored.replay();
                         *session = resumed;
                         transcript = restored;
+                        // The restored record carries no reminder; plan mode
+                        // outlives a resume, so re-arm it on the new transcript.
+                        transcript
+                            .set_reminder(pane.is_plan().then_some(prompts::PLAN_REMINDER))?;
                         pane.clear();
                         let name = path.file_stem().map_or_else(
                             || path.display().to_string(),
@@ -303,6 +356,8 @@ fn run(
                     // When the turn ends the worker has already recorded the entire turn
                     Progress::Done { .. } | Progress::Failed(_) | Progress::Cancelled => {
                         pane.set_generating(false);
+                        // A finished plan in plan mode is ready for Enter to approve
+                        pane.set_plan_ready(matches!(&progress, Progress::Done { .. }));
                         // A failure also resolves anything still running, then
                         // shows the error.
                         if let Progress::Failed(error) = &progress {
