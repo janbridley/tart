@@ -546,10 +546,92 @@ mod tests {
             .collect()
     }
 
-    /// Start a pending `Bash(echo hi)` invocation, as the pane would on a
-    /// `ToolStart` event.
+    /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {
         t.start_tool(id.to_string(), "Bash", "echo hi".to_string());
+    }
+
+    /// Start a pending `Read(digest)` invocation, as the pane would on a `ToolStart`
+    fn start_read(t: &mut Transcript, id: &str, digest: &str) {
+        t.start_tool(id.to_string(), "Read", digest.to_string());
+    }
+
+    #[test]
+    fn same_kind_runs_merge_into_one_box() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+
+        start_read(&mut t, "r0", "a.rs:1-10");
+        t.finish_tool("r0", "one\n".to_string(), Some(0));
+        t.append_thinking("mid-run reasoning"); // rides below the boxes
+        start_read(&mut t, "r1", "a.rs:20-30");
+        t.sync(40);
+        let rows = texts(t.rows());
+        assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 1);
+        assert!(rows.iter().any(|row| row.contains("● Read(a.rs:1-10,20-30) …")));
+        t.assert_rows_match_full_rewrap();
+
+        // The newest output lands on the merged box.
+        t.finish_tool("r1", "fresh\n".to_string(), Some(0));
+        t.sync(40);
+        assert!(texts(t.rows()).iter().any(|row| row.contains("⎿ fresh")));
+
+        // An answer between calls breaks the run: a second box.
+        t.append("done reading");
+        start_read(&mut t, "r2", "b.rs:1-5");
+        t.sync(40);
+        assert_eq!(
+            texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
+            2
+        );
+
+        // A box still running never absorbs the next call.
+        start_read(&mut t, "r3", "b.rs:9-9");
+        t.sync(40);
+        assert_eq!(
+            texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
+            3
+        );
+
+        // Bash never merges with the reads.
+        start_bash(&mut t, "b0");
+        t.sync(40);
+        let rows = texts(t.rows());
+        assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 3);
+        assert!(rows.iter().any(|row| row.contains("● Bash(echo hi) …")));
+    }
+
+    #[test]
+    fn merged_boxes_reopen_without_flicker() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        start_read(&mut t, "r0", "a.rs:1-10");
+        t.finish_tool("r0", "one\ntwo\nthree\n".to_string(), Some(0));
+        t.sync(40);
+        let settled = texts(t.rows());
+        assert_eq!(settled.len(), 5, "{settled:?}"); // prompt, header, three rows
+
+        start_read(&mut t, "r1", "a.rs:20-30");
+        t.sync(40);
+        let reopened = texts(t.rows());
+        assert_eq!(reopened.len(), settled.len(), "{reopened:?}");
+        assert!(
+            reopened
+                .iter()
+                .any(|row| row.contains("● Read(a.rs:1-10,20-30) …"))
+        );
+        assert!(
+            reopened.iter().any(|row| row.contains("⎿ three")),
+            "stale output stays"
+        );
+
+        t.finish_tool("r1", "fresh\n".to_string(), Some(0));
+        t.sync(40);
+        let swapped = texts(t.rows());
+        assert!(swapped.iter().any(|row| row.contains("⎿ fresh")));
+        assert!(!swapped.iter().any(|row| row.contains("⎿ three")));
     }
 
     /// Answer fragments join one growing markdown segment; the styled error
