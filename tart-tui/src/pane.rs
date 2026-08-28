@@ -933,11 +933,7 @@ fn rule(buf: &mut Buffer, area: Rect) {
 
 /// Recolor one already-drawn rule row.
 fn reframe(buf: &mut Buffer, area: Rect, color: Color) {
-    for col in area.columns() {
-        if let Some(cell) = buf.cell_mut((col.x, area.y)) {
-            cell.set_fg(color);
-        }
-    }
+    buf.set_style(area, Style::new().fg(color));
 }
 
 /// A token count in the status line's compact style: `843`, `45k`, `1.2 M`.
@@ -949,27 +945,27 @@ fn token_count(tokens: u64) -> String {
     }
 }
 
+/// One grapheme's width in cells, never zero.
+fn cell_width(grapheme: &str) -> usize {
+    Span::raw(grapheme).width().max(1)
+}
+
 /// `text` as-is when it fits `budget` cells, else its clipped start and an ellipsis
 fn ellipsize(text: &str, budget: usize) -> String {
-    let cells = |text: &str| {
-        text.graphemes(true)
-            .map(|g| Span::raw(g).width().max(1))
-            .sum::<usize>()
-    };
-    if cells(text) <= budget {
+    if text.graphemes(true).map(cell_width).sum::<usize>() <= budget {
         return text.to_string();
     }
     // One cell stays free so a cut always shows its ellipsis.
-    let mut cut = String::new();
-    let mut used = 0;
-    for grapheme in text.graphemes(true) {
-        let spent = Span::raw(grapheme).width().max(1);
-        if used + spent >= budget {
-            break;
-        }
-        cut.push_str(grapheme);
-        used += spent;
-    }
+    let mut cut = text
+        .graphemes(true)
+        .scan(0, |used, grapheme| {
+            let spent = cell_width(grapheme);
+            (*used + spent < budget).then(|| {
+                *used += spent;
+                grapheme
+            })
+        })
+        .collect();
     cut.push('…');
     cut
 }
