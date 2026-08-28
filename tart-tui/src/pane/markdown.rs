@@ -2,28 +2,40 @@
 //!
 //! Only [`Progress::Answer`](tart_agents::Progress::Answer) fragments are pretty-
 //! rendered, all others stay base text. Copy mode reads the rendered rows so that a
-//! copied answer carries the styled form, markers stripped.
+//! copied answer carries the styled form, markers stripped. Lines wrap to the
+//! display width with their block's hanging indent, so a wrapped list item or
+//! quotation keeps its marker column on every row.
 
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::DIM_STYLE;
+use super::wrap::wrap_lines;
 
 /// H1: blue and bold.
 const HEADING1: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
 /// H2: cyan and bold.
 const HEADING2: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-/// H3–H6: bold with default color
+/// H3: Same color as H2, but italic as well.
+const HEADING3: Style = Style::new()
+    .fg(Color::Cyan)
+    .add_modifier(Modifier::BOLD)
+    .add_modifier(Modifier::ITALIC);
+/// H4–H6: bold with default color
 const HEADING: Style = Style::new().add_modifier(Modifier::BOLD);
 /// Heading styles by level, H1 first.
-const HEADING_STYLES: [Style; 6] = [HEADING1, HEADING2, HEADING, HEADING, HEADING, HEADING];
+const HEADING_STYLES: [Style; 6] = [HEADING1, HEADING2, HEADING3, HEADING, HEADING, HEADING];
 /// Inline `` `code` ``: set apart by color rather than markers.
-const INLINE_CODE: Style = Style::new().fg(Color::Yellow);
+const INLINE_CODE: Style = Style::new().fg(Color::LightYellow);
 /// Blockquote rails, code-block content, and other quiet chrome.
 const QUIET: Style = DIM_STYLE;
-/// Link text: the same blue as the transcript's actionable hints.
-const LINK: Style = Style::new().fg(Color::Blue);
+/// Blockquote text: quiet like code, but italic.
+const QUOTE: Style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+/// Link text: light blue and underlined.
+const LINK: Style = Style::new()
+    .fg(Color::LightBlue)
+    .add_modifier(Modifier::UNDERLINED);
 /// The bullet an unordered list item renders instead of its marker.
 const BULLET: &str = "• ";
 /// The width of the rule row a horizontal rule renders as
