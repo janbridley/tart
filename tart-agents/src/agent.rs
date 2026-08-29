@@ -1,5 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use async_compat::Compat;
 use async_openai::{
@@ -15,6 +16,12 @@ use futures::future::{Either, select};
 use futures::{StreamExt, executor::block_on};
 
 use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
+
+/// How long one HTTP connection attempt may take before the request fails.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long one socket read may stall, receiving nothing, before the stream fails into `Progress::Failed`.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The session's collaboration mode, mirroring Codex's `ModeKind`.
 ///
@@ -174,9 +181,14 @@ impl Agent {
         let config = OpenAIConfig::new()
             .with_api_base(base_url.into())
             .with_api_key(api_key.into());
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         let planning = policy.clone().read_only();
         Self {
-            client: Client::with_config(config),
+            client: Client::build(http, config),
             model: model.into(),
             effort: None,
             max_rounds: MAX_TOOL_ROUNDS,
