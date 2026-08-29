@@ -480,6 +480,27 @@ fn traced<F: Fn(Progress)>(
     result
 }
 
+/// Run `command` to a `timeout` deadline and frame its streams for the model & pane
+fn run_framed(command: &mut Command, timeout: Duration) -> (String, String, Option<i32>) {
+    match run_with_timeout(command, timeout) {
+        Ok(WatchedRun { output, killed }) => {
+            let text = combined_output(&output);
+            let exit = output.status.code();
+            if killed {
+                // A timeout has no exit code for the header, so we mark up the body.
+                let marked = timeout_text(&text, timeout);
+                (marked.clone(), marked, exit)
+            } else {
+                (command_text(&text, output.status), text, exit)
+            }
+        }
+        Err(error) => {
+            let text = format!("error: {error}");
+            (text.clone(), text, None)
+        }
+    }
+}
+
 /// Run one bash tool call under `policy`, reporting its steps to `on_progress`.
 ///
 /// A command that outlives its timeout is killed with everything it started.
@@ -495,25 +516,7 @@ fn run_bash<F: Fn(Progress)>(
     let mut sandboxed = policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
     Ok(traced(call, "Bash", bash.command.clone(), on_progress, || {
-        // Decode the stream into output for the front and backends.
-        match run_with_timeout(&mut sandboxed, bash.timeout) {
-            Ok(run) => {
-                let WatchedRun { output, killed } = run;
-                let text = combined_output(&output);
-                let exit = output.status.code();
-                if killed {
-                    // A timeout has no exit code for the header, so we mark up the body.
-                    let marked = timeout_text(&text, bash.timeout);
-                    (marked.clone(), marked, exit)
-                } else {
-                    (command_text(&text, output.status), text, exit)
-                }
-            }
-            Err(error) => {
-                let text = format!("error: {error}");
-                (text.clone(), text, None)
-            }
-        }
+        run_framed(&mut sandboxed, bash.timeout)
     }))
 }
 
@@ -559,17 +562,9 @@ fn run_read<F: Fn(Progress)>(
         .arg("--")
         .arg(&read.path);
     Ok(traced(call, "Read", read_digest(&read), on_progress, || {
-        // A failure to launch comes back as an error string for the model to deal with.
-        match &command.output() {
-            Ok(spawned) => {
-                let text = combined_output(spawned);
-                (text.clone(), text, spawned.status.code())
-            }
-            Err(error) => {
-                let text = format!("error: {error}");
-                (text.clone(), text, None)
-            }
-        }
+        // The watchdog bounds the read like bash: a FIFO with no writer dies
+        // at the deadline instead of wedging the generation.
+        run_framed(&mut command, DEFAULT_BASH_TIMEOUT)
     }))
 }
 
@@ -653,12 +648,16 @@ fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i
         .env("TART_OLD", &edit.old_string)
         .env("TART_NEW", &edit.new_string)
         .envs(edit.replace_all.then_some(("TART_ALL", "1")));
-    match cmd.output() {
-        Ok(output) if output.status.success() => (
+    match run_with_timeout(cmd, DEFAULT_BASH_TIMEOUT) {
+        Ok(WatchedRun { output, .. }) if output.status.success() => (
             String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
             Some(0),
         ),
-        Ok(output) => (
+        Ok(WatchedRun { output, killed }) if killed => (
+            timeout_text(&combined_output(&output), DEFAULT_BASH_TIMEOUT),
+            None,
+        ),
+        Ok(WatchedRun { output, .. }) => (
             format!(
                 "edit failed on {}: {}{}",
                 path.display(),
@@ -975,6 +974,39 @@ mod tests {
         // The sender's drop joins the watchdog at once rather than letting it
         // sleep out the full timeout.
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A killed run is framed for the model with the timeout marker, keeping
+    /// whatever partial output the child had already written.
+    #[test]
+    fn run_framed_marks_a_killed_run_with_the_deadline() {
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg("-c")
+            .arg("echo partial; sleep 9871 & sleep 9871 & wait");
+        let started = Instant::now();
+
+        let (result, display, exit) = run_framed(&mut command, Duration::from_millis(300));
+
+        assert!(result.starts_with("[timed out after 0s]\npartial"), "{result}");
+        // The pane carries the marker too, exactly as bash always has.
+        assert_eq!(display, result);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(exit, None);
+    }
+
+    /// A successful run keeps bash's framing: output for the model, plain text
+    /// for the pane, and the child's exit code.
+    #[test]
+    fn run_framed_passes_a_finished_run_through() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("hi");
+
+        let (result, display, exit) = run_framed(&mut command, DEFAULT_BASH_TIMEOUT);
+
+        assert_eq!(result, "hi\n");
+        assert_eq!(display, "hi\n");
+        assert_eq!(exit, Some(0));
     }
 
     /// Live: reaches `sandbox-exec`, so it only passes outside a nested sandbox.
