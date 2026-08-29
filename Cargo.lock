@@ -1949,6 +1949,7 @@ dependencies = [
  "macro_rules_attribute",
  "nix",
  "rangemap",
+ "reqwest",
  "rustls",
  "serde_json",
  "tempfile",

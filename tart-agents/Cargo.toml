@@ -9,6 +9,7 @@ async-compat = "0.2.5"
 # rustls-no-provider keeps aws-lc-rs provider out of our dependency chain and speed up
 # compiles. We directly depend on rustls to get the required components.
 async-openai = { version = "0.41.3", default-features = false, features = ["responses", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures = "0.3.34"
 serde_json = "1"
