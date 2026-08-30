@@ -423,9 +423,7 @@ fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)
 }
 
 /// Run `command` to completion under the one watchdog, killing its process
-/// group at `deadline` (if any) or the moment `kill` sets — whichever comes
-/// first. The group is signalled before the wait is satisfied, so reaping is
-/// prompt; that ordering is an invariant, not an optimization.
+/// group at `deadline` (if any) or the moment `kill` sets.
 fn run_watched_sync(
     command: &mut Command,
     deadline: Option<Duration>,
