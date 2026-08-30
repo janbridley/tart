@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -5,7 +6,7 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 use nix::sys::signal::{Signal, killpg};
@@ -38,10 +39,10 @@ const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
 /// The most of any one blob the model is handed, in bytes.
 pub const CONTENT_CAP: usize = 64 * 1024;
 
-/// How often a manual command's watchdog wakes to check its cancel token.
+/// How often the watchdog wakes to check its deadline and kill lever.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 
-/// The front end's control for a running manual command.
+/// The front end's kill lever for a running process group: one tool call or command
 #[derive(Clone, Default)]
 pub struct CancelToken {
     /// Set by `cancel`, watched by the runner's watchdog.
@@ -254,18 +255,19 @@ fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
 /// Tool *failures* (a non-zero exit, an edit that did not apply, or a command the
 /// sandbox denies) are not errors here: their output is content that the model
 /// should see.
-pub(crate) fn execute<F: Fn(Progress)>(
+pub(crate) async fn execute<F: Fn(Progress)>(
     call: &FunctionToolCall,
     policy: &Policy,
+    kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     match call.name.as_str() {
-        "bash" => run_bash(call, policy, on_progress),
-        "read" => run_read(call, policy, on_progress),
-        "edit" => run_edit(call, policy, on_progress),
+        "bash" => run_bash(call, policy, kill, on_progress).await,
+        "read" => run_read(call, policy, kill, on_progress).await,
+        "edit" => run_edit(call, policy, kill, on_progress).await,
         // The unsandboxed pair: they need the network the sandbox denies.
-        "search" => web::run_search(call, on_progress),
-        "fetch" => web::run_fetch(call, on_progress),
+        "search" => web::run_search(call, kill, on_progress).await,
+        "fetch" => web::run_fetch(call, kill, on_progress).await,
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -296,12 +298,43 @@ fn command_text(text: &str, status: ExitStatus) -> String {
     format!("[exit {status}]{separator}{text}")
 }
 
-/// One finished command run under a watchdog: a deadline or a cancel.
-struct WatchedRun {
+/// How a watched run stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stopped {
+    /// The watchdog killed the group at its deadline.
+    Deadline,
+    /// Esc killed the group mid-run.
+    Esc,
+}
+
+/// One finished process run under the watchdog.
+pub(crate) struct WatchedRun {
     /// The command's streams and exit status, as `output()` returns them.
     output: Output,
-    /// The watchdog killed the process group: a deadline or a cancel.
-    killed: bool,
+    /// What stopped it: `None` when it finished on its own.
+    stopped: Option<Stopped>,
+}
+
+/// Frame one finished (or stopped) run for the model and the pane.
+///
+/// `[timed out after Ns]` for a deadline, `[cancelled]` for Esc, and the
+/// status-prefixed text otherwise.
+fn frame_run(run: WatchedRun, timeout: Duration) -> (String, String, Option<i32>) {
+    let WatchedRun { output, stopped } = run;
+    let text = combined_output(&output);
+    let exit = output.status.code();
+    match stopped {
+        Some(Stopped::Deadline) => {
+            let marked = timeout_text(&text, timeout);
+            (marked.clone(), marked, exit)
+        }
+        // Esc leaves no exit code for the header, so the body is marked up.
+        Some(Stopped::Esc) => {
+            let marked = cancel_text(&text);
+            (marked.clone(), marked, exit)
+        }
+        None => (command_text(&text, output.status), text, exit),
+    }
 }
 
 /// Model-facing explanation for a command the timeout killed.
@@ -310,8 +343,8 @@ fn timeout_text(text: &str, timeout: Duration) -> String {
     format!("[timed out after {}s]{separator}{text}", timeout.as_secs())
 }
 
-/// Model-facing explanation for a command the user cancelled with Esc.
-fn cancel_text(text: &str) -> String {
+/// Model-facing explanation for a command Esc killed.
+pub(crate) fn cancel_text(text: &str) -> String {
     let separator = if text.is_empty() { "" } else { "\n" };
     format!("[cancelled]{separator}{text}")
 }
@@ -389,48 +422,37 @@ fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)
     Ok((child, group))
 }
 
-/// Run `command` to completion, killing its process group if it outlives `timeout`.
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<WatchedRun> {
+/// Run `command` to completion under the one watchdog, killing its process
+/// group at `deadline` (if any) or the moment `kill` sets — whichever comes
+/// first. The group is signalled before the wait is satisfied, so reaping is
+/// prompt; that ordering is an invariant, not an optimization.
+fn run_watched_sync(
+    command: &mut Command,
+    deadline: Option<Duration>,
+    kill: &CancelToken,
+) -> io::Result<WatchedRun> {
     let (child, group) = spawn_grouped(command)?;
+    let started = Instant::now();
 
-    let killed = Arc::new(AtomicBool::new(false));
-    // The sender drops once the command is reaped, waking the watchdog immediatedly
-    let (finished, slept) = mpsc::channel::<()>();
-    let flagged = Arc::clone(&killed);
-    let watchdog = std::thread::spawn(move || {
-        if matches!(slept.recv_timeout(timeout), Err(RecvTimeoutError::Timeout)) {
-            // Flag before killing, so the caller cannot mistake the death for a
-            // natural signal once the wait returns.
-            flagged.store(true, Ordering::Release);
-            let _ = killpg(group, Signal::SIGKILL);
-        }
-    });
-
-    let output = child.wait_with_output();
-    drop(finished);
-    // Double check we've killed everything even if the wait errors.
-    if output.is_err() {
-        let _ = killpg(group, Signal::SIGKILL);
-    }
-    let _ = watchdog.join();
-
-    Ok(WatchedRun {
-        output: output?,
-        killed: killed.load(Ordering::Acquire),
-    })
-}
-
-/// Run `command` to completion, killing its process group the moment `cancel` enters.
-fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command)?;
-
-    let killed = Arc::new(AtomicBool::new(false));
     // The sender drops once the command is reaped, waking the watchdog at once.
     let (finished, slept) = mpsc::channel::<()>();
-    let flagged = Arc::clone(&killed);
-    let token = cancel.clone();
+    // The stop reason, sent only when the watchdog stopped the run.
+    let (reason, verdict) = mpsc::channel::<Stopped>();
+    let token = kill.clone();
     let watchdog = std::thread::spawn(move || {
-        while !token.cancelled() {
+        loop {
+            if token.cancelled() {
+                // Flag by sending before killing, so the caller cannot mistake
+                // the death for a natural signal once the wait returns.
+                let _ = reason.send(Stopped::Esc);
+                break;
+            }
+            if let Some(deadline) = deadline
+                && started.elapsed() >= deadline
+            {
+                let _ = reason.send(Stopped::Deadline);
+                break;
+            }
             if matches!(
                 slept.recv_timeout(CANCEL_POLL),
                 Err(RecvTimeoutError::Disconnected)
@@ -438,9 +460,6 @@ fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Resul
                 return;
             }
         }
-        // Flag before killing, so the caller cannot mistake the death for a
-        // natural signal once the wait returns.
-        flagged.store(true, Ordering::Release);
         let _ = killpg(group, Signal::SIGKILL);
     });
 
@@ -451,27 +470,48 @@ fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Resul
         let _ = killpg(group, Signal::SIGKILL);
     }
     let _ = watchdog.join();
+    let stopped = verdict.try_recv().ok();
 
-    Ok(WatchedRun {
-        output: output?,
-        killed: killed.load(Ordering::Acquire),
-    })
+    Ok(WatchedRun { output: output?, stopped })
+}
+
+/// [`run_watched_sync`] off the calling task, so a caller can send pokes.
+async fn run_watched(
+    command: Command,
+    deadline: Option<Duration>,
+    kill: CancelToken,
+) -> io::Result<WatchedRun> {
+    let (done, done_rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut command = command;
+        let _ = done.send(run_watched_sync(&mut command, deadline, &kill));
+    });
+    done_rx
+        .await
+        .unwrap_or_else(|_| Err(io::Error::other("the watched run's thread died")))
 }
 
 /// Announce a tool call, run it, and report its conclusion.
-fn traced<F: Fn(Progress)>(
+///
+/// The run arrives as a future: it is inert until polled, so the
+/// [`Progress::ToolStart`] pair always opens before any work and closes after
+/// it, whatever the body awaits.
+async fn traced<F: Fn(Progress), Run>(
     call: &FunctionToolCall,
     name: &'static str,
     digest: String,
     on_progress: &F,
-    run: impl FnOnce() -> (String, String, Option<i32>),
-) -> String {
+    run: Run,
+) -> String
+where
+    Run: Future<Output = (String, String, Option<i32>)>,
+{
     on_progress(Progress::ToolStart {
         id: call.call_id.clone(),
         name,
         digest,
     });
-    let (result, output, exit) = run();
+    let (result, output, exit) = run.await;
     on_progress(Progress::ToolOutput {
         id: call.call_id.clone(),
         output,
@@ -481,19 +521,14 @@ fn traced<F: Fn(Progress)>(
 }
 
 /// Run `command` to a `timeout` deadline and frame its streams for the model & pane
-fn run_framed(command: &mut Command, timeout: Duration) -> (String, String, Option<i32>) {
-    match run_with_timeout(command, timeout) {
-        Ok(WatchedRun { output, killed }) => {
-            let text = combined_output(&output);
-            let exit = output.status.code();
-            if killed {
-                // A timeout has no exit code for the header, so we mark up the body.
-                let marked = timeout_text(&text, timeout);
-                (marked.clone(), marked, exit)
-            } else {
-                (command_text(&text, output.status), text, exit)
-            }
-        }
+async fn run_framed(
+    command: Command,
+    timeout: Duration,
+    kill: CancelToken,
+) -> (String, String, Option<i32>) {
+    // All tools run through here, so they can't get stuck forever.
+    match run_watched(command, Some(timeout), kill).await {
+        Ok(run) => frame_run(run, timeout),
         Err(error) => {
             let text = format!("error: {error}");
             (text.clone(), text, None)
@@ -505,9 +540,10 @@ fn run_framed(command: &mut Command, timeout: Duration) -> (String, String, Opti
 ///
 /// A command that outlives its timeout is killed with everything it started.
 /// The model sees `[timed out after Ns]` and any partial output.
-fn run_bash<F: Fn(Progress)>(
+async fn run_bash<F: Fn(Progress)>(
     call: &FunctionToolCall,
     policy: &Policy,
+    kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let bash = parse_bash(&call.arguments)?;
@@ -515,20 +551,25 @@ fn run_bash<F: Fn(Progress)>(
     // so the output can be handed straight back to the model.
     let mut sandboxed = policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
-    Ok(traced(call, "Bash", bash.command.clone(), on_progress, || {
-        run_framed(&mut sandboxed, bash.timeout)
-    }))
+    Ok(traced(
+        call,
+        "Bash",
+        bash.command.clone(),
+        on_progress,
+        run_framed(sandboxed, bash.timeout, kill.clone()),
+    )
+    .await)
 }
 
-/// Run one command the user typed, with their privileges.
+/// Run one command the user typed, with their privileges and *no deadline*.
 #[inline]
 pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     let mut shell = Command::new("/bin/bash");
     shell.arg("-c").arg(command);
-    match run_until_cancelled(&mut shell, cancel) {
-        Ok(WatchedRun { output, killed }) => {
+    match run_watched_sync(&mut shell, None, cancel) {
+        Ok(WatchedRun { output, stopped }) => {
             let text = tail_cap(&combined_output(&output), CONTENT_CAP);
-            if killed {
+            if stopped.is_some() {
                 cancel_text(&text)
             } else {
                 command_text(&text, output.status)
@@ -549,9 +590,10 @@ fn read_digest(read: &Read) -> String {
 }
 
 /// Run one read tool call under `policy`, reporting its steps to `on_progress`.
-fn run_read<F: Fn(Progress)>(
+async fn run_read<F: Fn(Progress)>(
     call: &FunctionToolCall,
     policy: &Policy,
+    kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let read = parse_read(&call.arguments)?;
@@ -561,11 +603,16 @@ fn run_read<F: Fn(Progress)>(
         .arg(numbered_read(read.start_line, read.end_line))
         .arg("--")
         .arg(&read.path);
-    Ok(traced(call, "Read", read_digest(&read), on_progress, || {
+    Ok(traced(
+        call,
+        "Read",
+        read_digest(&read),
+        on_progress,
         // The watchdog bounds the read like bash: a FIFO with no writer dies
-        // at the deadline instead of wedging the generation.
-        run_framed(&mut command, DEFAULT_BASH_TIMEOUT)
-    }))
+        // at the deadline — or on Esc — instead of wedging the generation.
+        run_framed(command, DEFAULT_BASH_TIMEOUT, kill.clone()),
+    )
+    .await)
 }
 
 /// Run one edit tool call: report the target, apply it, and report the outcome.
@@ -573,23 +620,25 @@ fn run_read<F: Fn(Progress)>(
 /// As with bash, edit *failures* (an unreadable file, no or ambiguous match, a
 /// sandbox denial) are not errors: their message is content the model can act
 /// on and retry.
-fn run_edit<F: Fn(Progress)>(
+async fn run_edit<F: Fn(Progress)>(
     call: &FunctionToolCall,
     policy: &Policy,
+    kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
-    Ok(traced(call, "Edit", edit.path.clone(), on_progress, || {
-        let (result, exit) = apply_edit(&edit, policy);
+    Ok(traced(call, "Edit", edit.path.clone(), on_progress, async {
+        let (result, exit) = apply_edit(&edit, policy, kill).await;
         (result.clone(), result, exit)
-    }))
+    })
+    .await)
 }
 
 /// Apply one parsed edit under `policy`, returning outcome message and the exit code.
 ///
 /// We pre-check that the edit is valid in rust for performance, though the perl script
 /// verifies to ensure we don't run into TOCTOU issues between here and the lock.
-fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
+async fn apply_edit(edit: &Edit, policy: &Policy, kill: &CancelToken) -> (String, Option<i32>) {
     let path = Path::new(&edit.path);
     if edit.old_string.is_empty() {
         return (
@@ -630,17 +679,16 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
             None,
         );
     }
-    spawn_perl(edit, &mut policy.command("/usr/bin/perl"))
+    let mut cmd = policy.command("/usr/bin/perl");
+    arm_perl(edit, &mut cmd);
+    frame_perl(
+        run_watched(cmd, Some(DEFAULT_BASH_TIMEOUT), kill.clone()).await,
+        Path::new(&edit.path),
+    )
 }
 
-/// Run [`EDIT_PROGRAM`] through an already-configured `perl` command and map
-/// its exit status to the message the model sees: perl's report on success,
-/// its warning as retryable content otherwise.
-///
-/// Split out so tests can drive the program with a plain command, exercising
-/// its locking and matching semantics without the sandbox.
-fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i32>) {
-    let path = Path::new(&edit.path);
+/// Set [`EDIT_PROGRAM`] and its arguments and environment on `cmd`.
+fn arm_perl(edit: &Edit, cmd: &mut std::process::Command) {
     cmd.arg("-e")
         .arg(EDIT_PROGRAM)
         .arg("--")
@@ -648,13 +696,18 @@ fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i
         .env("TART_OLD", &edit.old_string)
         .env("TART_NEW", &edit.new_string)
         .envs(edit.replace_all.then_some(("TART_ALL", "1")));
-    match run_with_timeout(cmd, DEFAULT_BASH_TIMEOUT) {
+}
+
+/// Map one watched perl run to the message the model sees: perl's report on
+/// success, its warning as retryable content otherwise.
+fn frame_perl(run: io::Result<WatchedRun>, path: &Path) -> (String, Option<i32>) {
+    match run {
         Ok(WatchedRun { output, .. }) if output.status.success() => (
             String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
             Some(0),
         ),
-        Ok(WatchedRun { output, killed }) if killed => (
-            timeout_text(&combined_output(&output), DEFAULT_BASH_TIMEOUT),
+        Ok(WatchedRun { output, stopped }) if stopped.is_some() => (
+            frame_run(WatchedRun { output, stopped }, DEFAULT_BASH_TIMEOUT).0,
             None,
         ),
         Ok(WatchedRun { output, .. }) => (
@@ -671,6 +724,16 @@ fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i
             None,
         ),
     }
+}
+
+/// Run [`EDIT_PROGRAM`] through an already-configured `perl` command.
+#[cfg(test)]
+fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i32>) {
+    arm_perl(edit, cmd);
+    frame_perl(
+        run_watched_sync(cmd, Some(DEFAULT_BASH_TIMEOUT), &CancelToken::new()),
+        Path::new(&edit.path),
+    )
 }
 
 #[cfg(test)]
@@ -891,15 +954,64 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    /// Esc's kill lever stops a run immediately.
+    #[test]
+    fn the_kill_lever_beats_the_deadline() {
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg("-c")
+            .arg("echo started; sleep 9871 & sleep 9871 & wait");
+        let kill = CancelToken::new();
+        let signer = kill.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            signer.cancel();
+        });
+        let started = Instant::now();
+
+        let run =
+            futures::executor::block_on(run_watched(command, Some(Duration::from_secs(600)), kill))
+                .unwrap();
+
+        assert_eq!(run.stopped, Some(Stopped::Esc));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_kill_lever_frees_a_fifo_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("wedge");
+        let made = Command::new("/usr/bin/mkfifo").arg(&fifo).output().unwrap();
+        assert!(made.status.success());
+        let mut command = Command::new("/usr/bin/perl");
+        command.arg("-e").arg(format!(
+            "open(my $f, '<', '{}') or exit 1; print <$f>;",
+            fifo.display()
+        ));
+        let kill = CancelToken::new();
+        let signer = kill.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            signer.cancel();
+        });
+        let started = Instant::now();
+
+        let run = futures::executor::block_on(run_watched(command, None, kill)).unwrap();
+
+        assert_eq!(run.stopped, Some(Stopped::Esc));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     /// An untouched token leaves the command to finish on its own.
     #[test]
     fn manual_command_runs_to_completion_without_a_cancel() {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
 
-        let run = run_until_cancelled(&mut command, &CancelToken::new()).unwrap();
+        let run =
+            futures::executor::block_on(run_watched(command, None, CancelToken::new())).unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.stopped, None);
         assert_eq!(combined_output(&run.output), "hi\n");
     }
 
@@ -921,56 +1033,76 @@ mod tests {
         }
     }
 
-    /// These drive `run_with_timeout` with plain commands, so they run without
+    /// These drive `run_watched` with plain commands, so they run without
     /// the sandbox; their deadlines are milliseconds to stay fast.
     #[test]
-    fn run_with_timeout_returns_a_fast_command_normally() {
+    fn run_watched_returns_a_fast_command_normally() {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
 
-        let run = run_with_timeout(&mut command, Duration::from_secs(10)).unwrap();
+        let run = futures::executor::block_on(run_watched(
+            command,
+            Some(Duration::from_secs(10)),
+            CancelToken::new(),
+        ))
+        .unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.stopped, None);
         assert_eq!(combined_output(&run.output), "hi\n");
         assert!(run.output.status.success());
     }
 
     #[test]
-    fn run_with_timeout_kills_a_command_that_outruns_the_deadline() {
+    fn run_watched_kills_a_command_that_outruns_the_deadline() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+        let run = futures::executor::block_on(run_watched(
+            command,
+            Some(Duration::from_millis(300)),
+            CancelToken::new(),
+        ))
+        .unwrap();
 
-        assert!(run.killed);
+        assert_eq!(run.stopped, Some(Stopped::Deadline));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!run.output.status.success());
     }
 
     #[test]
-    fn run_with_timeout_kills_the_whole_process_group() {
+    fn run_watched_kills_the_whole_process_group() {
         // The backgrounded sleeps outlive bash and hold the output pipe; only a
         // group kill frees the capture, so returning promptly proves they died.
         let mut command = Command::new("/bin/bash");
         command.arg("-c").arg("sleep 9871 & sleep 9871 & wait");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+        let run = futures::executor::block_on(run_watched(
+            command,
+            Some(Duration::from_millis(300)),
+            CancelToken::new(),
+        ))
+        .unwrap();
 
-        assert!(run.killed);
+        assert_eq!(run.stopped, Some(Stopped::Deadline));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
-    fn run_with_timeout_wakes_the_watchdog_when_the_command_finishes_early() {
+    fn run_watched_wakes_the_watchdog_when_the_command_finishes_early() {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, DEFAULT_BASH_TIMEOUT).unwrap();
+        let run = futures::executor::block_on(run_watched(
+            command,
+            Some(DEFAULT_BASH_TIMEOUT),
+            CancelToken::new(),
+        ))
+        .unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.stopped, None);
         // The sender's drop joins the watchdog at once rather than letting it
         // sleep out the full timeout.
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -986,7 +1118,11 @@ mod tests {
             .arg("echo partial; sleep 9871 & sleep 9871 & wait");
         let started = Instant::now();
 
-        let (result, display, exit) = run_framed(&mut command, Duration::from_millis(300));
+        let (result, display, exit) = futures::executor::block_on(run_framed(
+            command,
+            Duration::from_millis(300),
+            CancelToken::new(),
+        ));
 
         assert!(result.starts_with("[timed out after 0s]\npartial"), "{result}");
         // The pane carries the marker too, exactly as bash always has.
@@ -1002,7 +1138,11 @@ mod tests {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
 
-        let (result, display, exit) = run_framed(&mut command, DEFAULT_BASH_TIMEOUT);
+        let (result, display, exit) = futures::executor::block_on(run_framed(
+            command,
+            DEFAULT_BASH_TIMEOUT,
+            CancelToken::new(),
+        ));
 
         assert_eq!(result, "hi\n");
         assert_eq!(display, "hi\n");
@@ -1015,9 +1155,14 @@ mod tests {
     fn execute_reports_command_then_output() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
-        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &policy, &|progress| {
-            events.borrow_mut().push(progress);
-        })
+        let output = futures::executor::block_on(execute(
+            &bash_call(r#"{"command":"echo hi"}"#),
+            &policy,
+            &CancelToken::new(),
+            &|progress| {
+                events.borrow_mut().push(progress);
+            },
+        ))
         .unwrap();
 
         assert_eq!(output, "hi\n");
@@ -1039,11 +1184,23 @@ mod tests {
 
         // The exit status reaches the model verbatim.
         assert_eq!(
-            execute(&bash_call(r#"{"command":"false"}"#), &policy, &|_| {}).unwrap(),
+            futures::executor::block_on(execute(
+                &bash_call(r#"{"command":"false"}"#),
+                &policy,
+                &CancelToken::new(),
+                &|_| {},
+            ))
+            .unwrap(),
             "[exit 1]"
         );
         assert_eq!(
-            execute(&bash_call(r#"{"command":"true"}"#), &policy, &|_| {}).unwrap(),
+            futures::executor::block_on(execute(
+                &bash_call(r#"{"command":"true"}"#),
+                &policy,
+                &CancelToken::new(),
+                &|_| {},
+            ))
+            .unwrap(),
             "done"
         );
     }
@@ -1054,7 +1211,10 @@ mod tests {
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
 
-        let error = execute(&call, &policy, &|_| {}).unwrap_err().to_string();
+        let error =
+            futures::executor::block_on(execute(&call, &policy, &CancelToken::new(), &|_| {}))
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("unknown tool"), "{error}");
     }
@@ -1183,7 +1343,10 @@ mod tests {
         let spawn_edit = |old: &str, new: &str| {
             let call = edit_call(file.path(), old, new);
             let policy = policy.clone();
-            std::thread::spawn(move || execute(&call, &policy, &|_| {}).unwrap())
+            std::thread::spawn(move || {
+                futures::executor::block_on(execute(&call, &policy, &CancelToken::new(), &|_| {}))
+                    .unwrap()
+            })
         };
         let first = spawn_edit("UNO", "uno");
         let second = spawn_edit("DOS", "dos");
@@ -1282,9 +1445,14 @@ mod tests {
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
 
-        let whole = execute(&read_call(file.path(), None, None), &policy, &|progress| {
-            events.borrow_mut().push(progress);
-        })
+        let whole = futures::executor::block_on(execute(
+            &read_call(file.path(), None, None),
+            &policy,
+            &CancelToken::new(),
+            &|progress| {
+                events.borrow_mut().push(progress);
+            },
+        ))
         .unwrap();
 
         assert!(whole.starts_with("     1\tline 1\n"), "{whole}");
@@ -1304,13 +1472,14 @@ mod tests {
 
         // A bounded read digests its range into the box header.
         events.borrow_mut().clear();
-        let range = execute(
+        let range = futures::executor::block_on(execute(
             &read_call(file.path(), Some(10), Some(12)),
             &policy,
+            &CancelToken::new(),
             &|progress| {
                 events.borrow_mut().push(progress);
             },
-        )
+        ))
         .unwrap();
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
         assert!(matches!(
@@ -1319,12 +1488,24 @@ mod tests {
                 if digest == &format!("{}:10-12", file.path().display())
         ));
 
-        let tail = execute(&read_call(file.path(), Some(28), None), &policy, &|_| {}).unwrap();
+        let tail = futures::executor::block_on(execute(
+            &read_call(file.path(), Some(28), None),
+            &policy,
+            &CancelToken::new(),
+            &|_| {},
+        ))
+        .unwrap();
         assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
         assert_eq!(tail.lines().count(), 3);
 
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
-        let absent = execute(&read_call(&missing, None, None), &policy, &|_| {}).unwrap();
+        let absent = futures::executor::block_on(execute(
+            &read_call(&missing, None, None),
+            &policy,
+            &CancelToken::new(),
+            &|_| {},
+        ))
+        .unwrap();
         assert!(absent.contains("No such file or directory"), "{absent}");
     }
 }
