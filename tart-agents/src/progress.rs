@@ -3,7 +3,7 @@
 /// This struct is a compatibility shim to separate `async-openai` generation types from
 /// terminal frontend. As a side benefit, it gives us more control over how we store and
 /// track history/context.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Progress {
     /// A user message from the record; replay only, never live generation.
