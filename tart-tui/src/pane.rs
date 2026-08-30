@@ -7,15 +7,16 @@ mod transcript;
 mod wrap;
 
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, symbols};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::time::Instant;
-use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnControl, prompts};
+use tart_agents::{
+    Agent, ChatMode, Progress, Steering, Transcript as Conversation, TurnTask, prompts,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
@@ -76,16 +77,6 @@ pub enum PaneEvent {
     /// Enter on an empty draft approved the drafted plan.
     Approve,
     Quit,
-}
-
-/// One wake source for the event loop.
-pub enum Wake {
-    /// Terminal input, read on its own thread.
-    Input(Event),
-    /// Progress from the background generation.
-    Generation(Progress),
-    /// A finished manual command's framed output.
-    Command(String),
 }
 
 /// The composer's mode: exactly one at a time.
@@ -186,8 +177,8 @@ pub struct Pane {
     plan_ready: bool,
     /// A manual command in flight, holding the purple frame until its output lands.
     manual: Option<ManualCommand>,
-    /// Control parameters for steering or interrupting the model.
-    control: TurnControl,
+    /// The session's steering surface.
+    steering: Steering,
 }
 
 impl Pane {
@@ -335,7 +326,7 @@ impl Pane {
         // Enter re-queues the edited draft as a bew message.
         if key.code == KeyCode::Up
             && key.modifiers.contains(KeyModifiers::ALT)
-            && self.control.steering().is_some()
+            && self.steering.steering().is_some()
         {
             self.spill_steer();
             return None;
@@ -349,7 +340,7 @@ impl Pane {
             KeyCode::Enter if self.spin.is_some() => {
                 let text = self.prompt.text();
                 if !text.trim().is_empty() && !text.trim().starts_with('/') {
-                    if self.control.steer(text) {
+                    if self.steer_turn(text) {
                         self.clear_prompt();
                     } else {
                         self.note("message queued: Option+Up to edit");
@@ -449,10 +440,8 @@ impl Pane {
             // A steering message aborted that response: retire its thinking
             // run (the record dropped it too), then echo like a submitted one.
             Progress::Steered(text) => {
-                // The worker consumed this steer, so its mirror slot is free again.
-                if self.control.steering().as_deref() == Some(text) {
-                    self.control.take_steer();
-                }
+                // The worker consumed this steer, so the slot is free again
+                self.steering.clear_if(text);
                 self.begin_response();
                 self.echo(text);
             }
@@ -574,7 +563,7 @@ impl Pane {
 
     /// The top rule's queued-steering snippet, if a message waits.
     fn queued_text(&self, width: u16) -> Option<String> {
-        queued_rule_text(&self.control.steering()?, width as usize)
+        queued_rule_text(self.steering.steering()?, width as usize)
     }
 
     pub fn clear(&mut self) {
@@ -588,9 +577,12 @@ impl Pane {
         self.perf = perf;
     }
 
-    /// Mark the model busy; Enter keeps the draft instead of submitting it.
+    /// Mark the model busy so that Enter keeps the draft instead of submitting it.
     pub fn set_generating(&mut self, generating: bool) {
         self.spin = generating.then(Instant::now);
+        if !generating {
+            self.steering.end();
+        }
     }
 
     /// Take a submitted line into the conversation: attach outside-sandbox
@@ -609,13 +601,27 @@ impl Pane {
     }
 
     /// Begin a response, retiring the previous turn's thinking box, and run the turn
-    pub fn start_turn(&mut self, agent: &Agent, transcript: &Conversation, wake: &Sender<Wake>) {
+    /// on the injected executor.
+    pub fn start_turn<D>(
+        &mut self,
+        agent: &Agent,
+        transcript: &Conversation,
+        progress: &futures::channel::mpsc::UnboundedSender<Progress>,
+        drive: &D,
+    ) where
+        D: Fn(TurnTask),
+    {
         self.begin_response();
         self.set_generating(true);
-        let sender = wake.clone();
-        agent.spawn(transcript, move |progress| {
-            let _ = sender.send(Wake::Generation(progress));
-        });
+        let sender = progress.clone();
+        // Begin installs the lever and drops any slot a finished turn left behind
+        self.steering.begin(agent.spawn(
+            transcript,
+            move |event| {
+                let _ = sender.unbounded_send(event);
+            },
+            drive,
+        ));
     }
 
     /// Whether a turn is generating, so a mode switch must wait.
@@ -672,14 +678,30 @@ impl Pane {
         Ok(None)
     }
 
-    /// Wire the pane to the agent's turn control.
-    pub fn set_control(&mut self, control: TurnControl) {
-        self.control = control;
+    /// Esc's lever on the running turn: a no-op when the model is idle.
+    pub fn cancel_turn(&mut self) {
+        self.steering.cancel();
+    }
+
+    /// Queue `text` to interrupt and redirect the running turn.
+    #[must_use]
+    pub fn steer_turn(&mut self, text: String) -> bool {
+        self.steering.steer(text)
+    }
+
+    /// A copy of the waiting steering message, if any.
+    pub fn steering(&self) -> Option<String> {
+        self.steering.steering().map(str::to_string)
+    }
+
+    /// Take the waiting steering message, if any.
+    pub fn take_steer(&mut self) -> Option<String> {
+        self.steering.take()
     }
 
     /// Move the queued steering message into the composer as editable text
     pub fn spill_steer(&mut self) {
-        if let Some(text) = self.control.take_steer() {
+        if let Some(text) = self.take_steer() {
             if !self.prompt.text().is_empty() {
                 self.prompt.new_line();
             }
@@ -1197,7 +1219,7 @@ mod tests {
         // Enter steers and clears; nothing echoes into the transcript.
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
         assert_eq!(pane.prompt.text(), "");
-        assert_eq!(pane.control.steering(), Some("hi".to_string()));
+        assert_eq!(pane.steering(), Some("hi".to_string()));
         assert!(pane.transcript.message_texts().is_empty());
 
         // A second message waits: the queue takes one at a time, and the
@@ -1205,7 +1227,7 @@ mod tests {
         pane.on_paste("another");
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
         assert_eq!(pane.prompt.text(), "another");
-        assert_eq!(pane.control.steering(), Some("hi".to_string()));
+        assert_eq!(pane.steering(), Some("hi".to_string()));
         let screen = render(&mut pane, (60, 10));
         assert!(screen.contains("message queued: Option+Up to edit"), "{screen}");
         pane.prompt.clear();
@@ -1236,14 +1258,14 @@ mod tests {
     fn esc_spills_queued_steering_into_the_composer() {
         let mut pane = Pane::default();
         pane.set_generating(true);
-        assert!(pane.control.steer("one".to_string()));
-        assert!(!pane.control.steer("two".to_string())); // one at a time
+        assert!(pane.steer_turn("one".to_string()));
+        assert!(!pane.steer_turn("two".to_string())); // one at a time
         assert_eq!(
             pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
             Some(PaneEvent::Cancel)
         );
         assert_eq!(pane.prompt.text(), "one");
-        assert_eq!(pane.control.steering(), None);
+        assert_eq!(pane.steering(), None);
     }
 
     /// Option+Up moves the queued steering into the composer for editing;
@@ -1252,15 +1274,15 @@ mod tests {
     fn alt_up_spills_the_queue_into_the_composer() {
         let mut pane = Pane::default();
         pane.set_generating(true);
-        assert!(pane.control.steer("one".to_string()));
+        assert!(pane.steer_turn("one".to_string()));
         pane.on_key(key(KeyCode::Up, KeyModifiers::ALT));
         assert_eq!(pane.prompt.text(), "one");
-        assert_eq!(pane.control.steering(), None);
+        assert_eq!(pane.steering(), None);
 
         // An edit, then Enter: the draft re-queues as the steering message.
         pane.on_paste(" now two");
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
-        assert_eq!(pane.control.steering(), Some("one now two".to_string()));
+        assert_eq!(pane.steering(), Some("one now two".to_string()));
         assert_eq!(pane.prompt.text(), "");
 
         // A spill onto a non-empty draft lands on a fresh line, and the chord
@@ -1275,17 +1297,17 @@ mod tests {
     fn echoing_a_consumed_steer_frees_the_slot() {
         let mut pane = Pane::default();
         pane.set_generating(true);
-        assert!(pane.control.steer("redirect".to_string()));
+        assert!(pane.steer_turn("redirect".to_string()));
 
         // The worker records the steer and reports it; the echo clears the
         // slot, so a second steer queues instead of being refused.
         pane.apply(&Progress::Steered("redirect".to_string()));
-        assert_eq!(pane.control.steering(), None);
-        assert!(pane.control.steer("again".to_string()));
+        assert_eq!(pane.steering(), None);
+        assert!(pane.steer_turn("again".to_string()));
 
         // A different steer echoed (an older turn's, say) leaves the slot be.
         pane.apply(&Progress::Steered("redirect".to_string()));
-        assert_eq!(pane.control.steering(), Some("again".to_string()));
+        assert_eq!(pane.steering(), Some("again".to_string()));
     }
 
     /// A steered message retires the aborted response's thinking run, then
@@ -1589,7 +1611,7 @@ mod tests {
         pane.set_generating(true);
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
         assert_eq!(pane.prompt.text(), "cargo build", "the draft is kept");
-        assert_eq!(pane.control.steering(), None, "a command is not a message");
+        assert_eq!(pane.steering(), None, "a command is not a message");
         let screen = render(&mut pane, (40, 8));
         assert!(screen.contains("manual commands wait for the turn"), "{screen}");
 
@@ -1620,12 +1642,12 @@ mod tests {
     fn esc_cancels_a_manual_command_without_spilling_the_queue() {
         let mut pane = Pane::default();
         pane.manual_running(Some("cargo build".to_string()));
-        assert!(pane.control.steer("meanwhile".to_string()));
+        assert!(pane.steer_turn("meanwhile".to_string()));
         assert_eq!(
             pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
             Some(PaneEvent::Cancel)
         );
-        assert_eq!(pane.control.steering(), Some("meanwhile".to_string()));
+        assert_eq!(pane.steering(), Some("meanwhile".to_string()));
         // The run is still in flight; its framed output lands when it does.
         assert!(render(&mut pane, (40, 8)).contains("[ ! cargo build ]"));
     }
@@ -1819,7 +1841,7 @@ mod tests {
         let idle = render(&mut pane, (60, 8));
         assert!(!idle.contains("queued:"), "{idle}");
 
-        assert!(pane.control.steer("update feature XYZ".to_string()));
+        assert!(pane.steer_turn("update feature XYZ".to_string()));
         let screen = render(&mut pane, (60, 8));
         assert!(screen.contains("queued: 'update feature XYZ'"), "{screen}");
         // The snippet sits in the rule: dashes run right up to it.
@@ -1827,8 +1849,8 @@ mod tests {
         assert!(screen[..at].ends_with('─'), "{screen}");
 
         // A freed slot takes the next message.
-        pane.control.take_steer();
-        assert!(pane.control.steer("actually, stop".to_string()));
+        pane.take_steer();
+        assert!(pane.steer_turn("actually, stop".to_string()));
         let screen = render(&mut pane, (60, 8));
         assert!(screen.contains("queued: 'actually, stop'"), "{screen}");
         assert!(!screen.contains("XYZ"), "{screen}");
@@ -2100,7 +2122,7 @@ mod tests {
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));
         // A queued message renders (or skips) at every size too.
-        assert!(pane.control.steer("queued up".to_string()));
+        assert!(pane.steer_turn("queued up".to_string()));
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));
