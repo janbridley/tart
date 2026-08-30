@@ -911,7 +911,7 @@ mod tests {
             matches!(outcome, Progress::Done { message: Some(text) } if text == "after the steer")
         );
         // The record reads: user, the tool round, the steered input, the final
-        // answer — whichever select arm won, the steer waited for the call.
+        // answer (whichever select arm won).
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         let items = items.as_array().unwrap();
         let position = |probe: &dyn Fn(&serde_json::Value) -> bool| {
