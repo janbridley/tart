@@ -3,11 +3,11 @@
 use itertools::Itertools;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use tart_agents::merge_digests;
 
 #[cfg(test)]
 use crate::testutil::texts;
 
+use super::digest::tool_header;
 use super::markdown;
 use super::wrap::wrap_lines;
 use super::{DIM_STYLE, HIGHLIGHT_STYLE};
@@ -86,10 +86,10 @@ fn thinking_lines(raw: &str, shown: bool) -> Vec<Line<'static>> {
 struct ToolCall {
     /// Pairs the finishing `ToolOutput` with this start.
     id: String,
-    /// Display name: `Bash`, `Read`, or `Edit`.
-    name: &'static str,
-    /// The argument digest of each call in the run, e.g. `ls -la` or `main.rs:10-50`
-    digests: Vec<String>,
+    /// The tool's name on the wire: `bash`, `read`, or `edit`.
+    name: String,
+    /// The raw JSON arguments of each call in the run, as the provider sent them
+    arguments: Vec<String>,
     /// Whether a call is in flight; `false` once finished, which always fills `output`
     running: bool,
     /// Combined output; `None` until the first call of the run finishes.
@@ -114,15 +114,19 @@ impl ToolCall {
             _ => TOOL_ERR,
         };
 
-        let digest = Span::styled(
-            format!("({})", merge_digests(self.name, &self.digests)),
-            DIM_STYLE,
-        );
+        let header_text = tool_header(&self.name, &self.arguments);
+        // The name carries the status color and the arguments render dimly
+        let (name, arguments) = header_text
+            .split_once('(')
+            .map_or((header_text.as_str(), ""), |(name, rest)| {
+                (name, rest.strip_suffix(')').unwrap_or(rest))
+            });
+        let digest = Span::styled(format!("({arguments})"), DIM_STYLE);
         // An exit code shows only on a finished, failed call.
         let exit = self.exit.filter(|&c| c != 0).filter(|_| !self.running);
         let header = [
             Span::styled("● ", status),
-            Span::styled(self.name, status),
+            Span::styled(name.to_owned(), status),
             digest,
         ]
         .into_iter()
@@ -211,13 +215,13 @@ impl Transcript {
     }
 
     /// Record a tool invocation's start; it renders as a running header until
-    /// finished. A `Read` or `Edit` following its own kind merges into that
+    /// finished. A `read` or `edit` following its own kind merges into that
     /// trailing finished box instead of stacking a fresh one. Otherwise the
     /// call supersedes every finished box before it, folding each down to its
     /// header line, and moves the thinking block below itself so the
     /// chain-of-thought always renders under the tool boxes.
-    pub(crate) fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
-        if self.merge_into_tail(&id, name, &digest) {
+    pub(crate) fn start_tool(&mut self, id: String, name: String, arguments: String) {
+        if self.merge_into_tail(&id, &name, &arguments) {
             return;
         }
         let fold = self.messages.iter().position(
@@ -242,7 +246,7 @@ impl Transcript {
         self.messages.push(Entry::Tool(ToolCall {
             id,
             name,
-            digests: vec![digest],
+            arguments: vec![arguments],
             running: true,
             output: None,
             exit: None,
@@ -256,7 +260,7 @@ impl Transcript {
     }
 
     /// Fold a same-kind call into a trailing finished box.
-    fn merge_into_tail(&mut self, id: &str, name: &'static str, digest: &str) -> bool {
+    fn merge_into_tail(&mut self, id: &str, name: &str, arguments: &str) -> bool {
         // The thinking block rides below the boxes, so step past it to the fresh entry
         let Some(index) = self
             .messages
@@ -265,7 +269,7 @@ impl Transcript {
         else {
             return false;
         };
-        if !matches!(name, "Read" | "Edit")
+        if !matches!(name, "read" | "edit")
             || !matches!(&self.messages[index],
                 Entry::Tool(tool) if tool.name == name && !tool.running)
         {
@@ -273,7 +277,7 @@ impl Transcript {
         }
         self.rewind(index);
         if let Entry::Tool(tool) = &mut self.messages[index] {
-            tool.digests.push(digest.to_owned());
+            tool.arguments.push(arguments.to_owned());
             id.clone_into(&mut tool.id);
             tool.running = true;
             return true;
@@ -569,14 +573,18 @@ mod tests {
 
     use super::*;
 
-    /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
+    /// Start a pending `bash` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {
-        t.start_tool(id.to_string(), "Bash", "echo hi".to_string());
+        t.start_tool(
+            id.to_string(),
+            "bash".to_string(),
+            r#"{"command":"echo hi"}"#.to_string(),
+        );
     }
 
-    /// Start a pending `Read(digest)` invocation, as the pane would on a `ToolStart`
-    fn start_read(t: &mut Transcript, id: &str, digest: &str) {
-        t.start_tool(id.to_string(), "Read", digest.to_string());
+    /// Start a pending `read` invocation, as the pane would on a `ToolStart`
+    fn start_read(t: &mut Transcript, id: &str, arguments: &str) {
+        t.start_tool(id.to_string(), "read".to_string(), arguments.to_string());
     }
 
     /// A blank row separates an answer from an adjacent tool box, in either order
@@ -631,14 +639,17 @@ mod tests {
         t.push(Line::from("❯ go"));
         t.begin_response();
 
-        start_read(&mut t, "r0", "a.rs:1-10");
+        start_read(&mut t, "r0", r#"{"path":"a.rs","start_line":1,"end_line":10}"#);
         t.finish_tool("r0", "one\n".to_string(), Some(0));
         t.append_thinking("mid-run reasoning"); // rides below the boxes
-        start_read(&mut t, "r1", "a.rs:20-30");
+        start_read(&mut t, "r1", r#"{"path":"a.rs","start_line":20,"end_line":30}"#);
         t.sync(40);
         let rows = texts(t.rows());
         assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 1);
-        assert!(rows.iter().any(|row| row.contains("● Read(a.rs:1-10,20-30) …")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("● Read(a.rs:1-10, a.rs:20-30) …"))
+        );
         t.assert_rows_match_full_rewrap();
 
         // The newest output lands on the merged box.
@@ -648,7 +659,7 @@ mod tests {
 
         // An answer between calls breaks the run: a second box.
         t.append("done reading");
-        start_read(&mut t, "r2", "b.rs:1-5");
+        start_read(&mut t, "r2", r#"{"path":"b.rs","start_line":1,"end_line":5}"#);
         t.sync(40);
         assert_eq!(
             texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
@@ -656,7 +667,7 @@ mod tests {
         );
 
         // A box still running never absorbs the next call.
-        start_read(&mut t, "r3", "b.rs:9-9");
+        start_read(&mut t, "r3", r#"{"path":"b.rs","start_line":9,"end_line":9}"#);
         t.sync(40);
         assert_eq!(
             texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
@@ -676,20 +687,20 @@ mod tests {
         let mut t = Transcript::default();
         t.push(Line::from("❯ go"));
         t.begin_response();
-        start_read(&mut t, "r0", "a.rs:1-10");
+        start_read(&mut t, "r0", r#"{"path":"a.rs","start_line":1,"end_line":10}"#);
         t.finish_tool("r0", "one\ntwo\nthree\n".to_string(), Some(0));
         t.sync(40);
         let settled = texts(t.rows());
         assert_eq!(settled.len(), 5, "{settled:?}"); // prompt, header, three rows
 
-        start_read(&mut t, "r1", "a.rs:20-30");
+        start_read(&mut t, "r1", r#"{"path":"a.rs","start_line":20,"end_line":30}"#);
         t.sync(40);
         let reopened = texts(t.rows());
         assert_eq!(reopened.len(), settled.len(), "{reopened:?}");
         assert!(
             reopened
                 .iter()
-                .any(|row| row.contains("● Read(a.rs:1-10,20-30) …"))
+                .any(|row| row.contains("● Read(a.rs:1-10, a.rs:20-30) …"))
         );
         assert!(
             reopened.iter().any(|row| row.contains("⎿ three")),
@@ -1311,7 +1322,11 @@ and the analytics dashboard rewrite.\n\n\
         assert!(texts(&t.rows).iter().any(|row| row.contains("⎿ one")));
 
         // The second call folds the first: only the two headers render.
-        t.start_tool("call_1".to_string(), "Bash", "ls -la".to_string());
+        t.start_tool(
+            "call_1".to_string(),
+            "bash".to_string(),
+            r#"{"command":"ls -la"}"#.to_string(),
+        );
         t.sync(40);
         assert_fresh(&t);
         let rows = texts(&t.rows);
