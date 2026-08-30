@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_compat::Compat;
@@ -16,7 +15,7 @@ use async_openai::{
 };
 use futures::FutureExt;
 use futures::channel::mpsc;
-use futures::executor::block_on;
+use futures::future::Either;
 use futures::stream::{Stream, StreamExt};
 
 use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
@@ -51,6 +50,9 @@ type ResponseStream = Pin<Box<dyn Stream<Item = StreamItem> + Send>>;
 /// The future that opens one round's response stream.
 type OpenStreamFuture = Pin<Box<dyn Future<Output = Result<ResponseStream, OpenAIError>> + Send>>;
 
+/// One generation task, boxed for whichever executor drives it.
+pub type TurnTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// A Responses-API model configured to run the tart tool loop.
 #[derive(Clone)]
 pub struct Agent {
@@ -68,8 +70,6 @@ pub struct Agent {
     writable: Policy,
     /// The Plan-mode policy: the same grants, but most paths are read-only.
     planning: Policy,
-    /// The front end's lever on the running turn (cancel + steer).
-    control: TurnControl,
 }
 
 /// One interrupt the front end can send a running turn.
@@ -81,90 +81,96 @@ pub enum Poke {
     Steer(String),
 }
 
-/// The front end's control plane for running turns.
-#[derive(Clone, Default)]
-pub struct TurnControl {
-    state: Arc<Mutex<TurnState>>,
+/// The front end's lever on one running turn.
+pub struct TurnHandle {
+    /// The turn's poke sender, where interrupts reach the round loop.
+    sender: mpsc::Sender<Poke>,
 }
 
-/// The turn control state, under one lock.
-#[derive(Default)]
-struct TurnState {
-    /// Which turn owns the lever; a finishing worker retires only its own.
-    generation: u64,
-    /// The running turn's poke sender, where interrupts reach it. `None` at idle
-    sender: Option<mpsc::Sender<Poke>>,
-    /// Message queue and effective label for the frontend to observe what's waiting.
-    steer: Option<String>,
-}
-
-impl TurnControl {
-    /// The state under its lock.
-    fn state(&self) -> MutexGuard<'_, TurnState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+impl TurnHandle {
+    /// Cancel the turn, keeping any partial answer and every exchange that already ran
+    ///
+    /// Mid-stream the stream is dropped (aborting the request); mid-tool the
+    /// call's process group is killed within one watchdog slice and the call
+    /// is awaited to its `[cancelled]` framing; between rounds no further
+    /// request is spent.
+    #[inline]
+    pub fn cancel(&mut self) {
+        let _ = self.sender.try_send(Poke::Cancel);
     }
 
-    /// Cancel the turn by dropping the stream, keeping any partial answer.
-    ///
-    /// NOTE: this must wait until tool calls complete, and the provider will likely
-    /// take the cancelled turn to completion.
+    /// Deliver `text` as a steering poke. [`Steering`] ensures we go one at a time
     #[inline]
-    pub fn cancel(&self) {
-        let mut state = self.state();
-        if let Some(sender) = state.sender.as_mut() {
-            // A failed send means a poke is already queued; a pending Cancel
-            // says everything a second one would.
-            let _ = sender.try_send(Poke::Cancel);
+    fn steer(&mut self, text: String) {
+        let _ = self.sender.try_send(Poke::Steer(text));
+    }
+}
+
+/// The session's steering surface.
+#[derive(Default)]
+pub struct Steering {
+    /// The running turn's lever; absent while the model is idle.
+    handle: Option<TurnHandle>,
+    /// The queued steering message, or None otherwise.
+    slot: Option<String>,
+}
+
+impl Steering {
+    /// Install a newly spawned turn's lever, dropping any slot a finished turn left.
+    #[inline]
+    pub fn begin(&mut self, handle: TurnHandle) {
+        self.slot = None;
+        self.handle = Some(handle);
+    }
+
+    /// The turn ended; retire its lever.
+    #[inline]
+    pub fn end(&mut self) {
+        self.handle = None;
+    }
+
+    /// Esc's lever on the running turn: a no-op while the model is idle.
+    #[inline]
+    pub fn cancel(&mut self) {
+        if let Some(handle) = &mut self.handle {
+            handle.cancel();
         }
     }
 
-    /// Queue `text` to interrupt and redirect the turn.
+    /// Queue `text` to interrupt and redirect the running turn.
     ///
-    /// One message waits at a time: `false` when one already does, so the
-    /// caller keeps its draft (Option+Up edits the queued message instead).
-    #[must_use = "the caller keeps its draft when the slot is taken"]
+    /// Returns `false` when a message is already queued.
+    #[must_use]
     #[inline]
-    pub fn steer(&self, text: String) -> bool {
-        let mut state = self.state();
-        if state.steer.is_some() {
+    pub fn steer(&mut self, text: String) -> bool {
+        if self.slot.is_some() {
             return false;
         }
-        if let Some(sender) = state.sender.as_mut() {
-            // A failed send means a poke is already queued behind this text.
-            let _ = sender.try_send(Poke::Steer(text.clone()));
+        if let Some(handle) = &mut self.handle {
+            handle.steer(text.clone());
         }
-        state.steer = Some(text);
+        self.slot = Some(text);
         true
     }
 
-    /// A copy of the waiting steering message, if any.
+    /// The waiting steering message, if any.
     #[inline]
-    pub fn steering(&self) -> Option<String> {
-        self.state().steer.clone()
+    pub fn steering(&self) -> Option<&str> {
+        self.slot.as_deref()
     }
 
     /// Take the waiting steering message, if any.
     #[inline]
-    pub fn take_steer(&self) -> Option<String> {
-        self.state().steer.take()
+    pub fn take(&mut self) -> Option<String> {
+        self.slot.take()
     }
 
-    /// Install `sender` as the next turn's lever, forgetting the last turn's
-    /// intents, and report the turn's id.
-    fn claim(&self, sender: mpsc::Sender<Poke>) -> u64 {
-        let mut state = self.state();
-        state.generation += 1;
-        state.steer = None;
-        state.sender = Some(sender);
-        state.generation
-    }
-
-    /// Retire the lever, unless a newer turn already claimed it. A steering
-    /// message survives: the front end reads it when the terminal event lands.
-    fn release(&self, generation: u64) {
-        let mut state = self.state();
-        if state.generation == generation {
-            state.sender = None;
+    /// Clear the slot when `text` is the message the worker just consumed —
+    /// matched, so a different steer queued in the same breath survives.
+    #[inline]
+    pub fn clear_if(&mut self, text: &str) {
+        if self.slot.as_deref() == Some(text) {
+            self.slot = None;
         }
     }
 }
@@ -198,14 +204,7 @@ impl Agent {
             mode: ChatMode::Default,
             writable: policy,
             planning,
-            control: TurnControl::default(),
         }
-    }
-
-    /// The session's collaboration mode.
-    #[inline]
-    pub fn mode(&self) -> ChatMode {
-        self.mode
     }
 
     /// Switch the session's collaboration mode for subsequent turns.
@@ -237,12 +236,6 @@ impl Agent {
         definitions
     }
 
-    /// The front end's lever on the running turn, for the pane to hold.
-    #[inline]
-    pub fn control(&self) -> TurnControl {
-        self.control.clone()
-    }
-
     /// Record one steering message, reporting it so the front end can echo
     fn record_steer<F: Fn(Progress)>(
         transcript: &Transcript,
@@ -268,44 +261,52 @@ impl Agent {
         self.effort = Some(effort);
     }
 
-    /// Run one generation on its own thread, reporting progress to `on_progress`.
+    /// Run one generation as a task on the injected executor, reporting progress.
     ///
-    /// The worker records its turns (reasoning, tool exchanges, final answer) into the
+    /// The task records its turns (reasoning, tool exchanges, final answer) into the
     /// shared transcript as it goes. Exactly one terminal event ([`Progress::Done`],
     /// [`Progress::Failed`], or [`Progress::Cancelled`]) is delivered, even if the
-    /// worker panics.
+    /// task panics. The handle needs no retirement: when the turn ends its
+    /// receiver is gone, and later pokes simply go unread.
+    #[must_use]
     #[inline]
-    pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
+    pub fn spawn<F, D>(&self, transcript: &Transcript, on_progress: F, drive: D) -> TurnHandle
+    where
+        F: Fn(Progress) + Send + Sync + 'static,
+        D: FnOnce(TurnTask),
+    {
         let agent = self.clone();
         let transcript = transcript.clone();
         // This turn's poke channel: the sender waits where Esc and steering
-        // reach it, and the receiver races the stream inside the worker.
+        // reach it, and the receiver races the stream inside the task.
         // Four slots, so a Cancel can queue behind a Steer.
         let (sender, pokes) = mpsc::channel(4);
-        let generation = self.control.claim(sender);
-        std::thread::spawn(move || {
-            // One provider call per round, from the agent's collection pool.
-            let open_client = agent.client.clone();
-            let open = move |request: CreateResponse| -> OpenStreamFuture {
-                let client = open_client.clone();
-                Box::pin(async move { client.responses().create_stream(request).await })
-            };
-            // A panicking worker must still deliver the terminal event to the caller
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                block_on(agent.run(&transcript, pokes, open, &on_progress))
-            }));
-            // The turn is over: retire the lever unless a newer turn claimed it.
-            agent.control.release(generation);
-            if outcome.is_err() {
-                terminate_and_log(
-                    &on_progress,
-                    Progress::Failed("generation panicked".to_string()),
-                );
+        // One provider call per round, from the agent's connection pool.
+        let open_client = agent.client.clone();
+        drive(
+            async move {
+                let open = move |request: CreateResponse| -> OpenStreamFuture {
+                    let client = open_client.clone();
+                    Box::pin(async move { client.responses().create_stream(request).await })
+                };
+                // A panicking task must still deliver the terminal event.
+                let outcome = AssertUnwindSafe(agent.run(&transcript, pokes, open, &on_progress))
+                    .catch_unwind()
+                    .await;
+                if outcome.is_err() {
+                    terminate_and_log(
+                        &on_progress,
+                        Progress::Failed("generation panicked".to_string()),
+                    );
+                }
             }
-        });
+            .boxed(),
+        );
+        TurnHandle { sender }
     }
 
-    /// Drive one generation to completion on the current thread.
+    /// Drive one generation to completion as one task, on whatever executor
+    /// the caller injected.
     ///
     /// Each round streams model output; when the model calls a tool (which
     /// could happen more than once per round) the round's reasoning, any text
@@ -327,7 +328,7 @@ impl Agent {
     /// A stream that closes without a terminal event still ends its round with whatever
     /// the model produced.
     ///
-    /// Blocks the current thread until the generation finishes.
+    /// Resolves with the generation's terminal `Progress`.
     #[allow(
         clippy::too_many_lines,
         reason = "the round loop reads best as one straight-line function"
@@ -340,8 +341,8 @@ impl Agent {
         on_progress: &F,
     ) -> Progress
     where
-        O: Fn(CreateResponse) -> OpenStreamFuture,
-        F: Fn(Progress),
+        O: Fn(CreateResponse) -> OpenStreamFuture + Send,
+        F: Fn(Progress) + Sync,
     {
         // Set once a cancel is consumed, so the rest of the turn's calls and rounds
         // skip without re-reading the channel.
@@ -414,9 +415,9 @@ impl Agent {
                 // The poke future borrows the receiver; scoping it here frees the drain
                 let woke = {
                     let mut poke_fut = if pokes_closed {
-                        futures::future::pending::<Option<Poke>>().boxed_local().fuse()
+                        futures::future::pending::<Option<Poke>>().boxed().fuse()
                     } else {
-                        pokes.next().boxed_local().fuse()
+                        pokes.next().boxed().fuse()
                     };
                     let mut closed = false;
                     let woke = futures::select! {
@@ -607,8 +608,8 @@ impl Agent {
             // The tool loop broke early to consume a steering message.
             let mut steered_text: Option<String> = None;
             for call in calls {
-                // Pokes that arrived mid-tools stop the loop the way Esc
-                // between calls always has; the one in flight finishes first.
+                // Pokes that arrived between calls stop the loop the way
+                // they always have.
                 let (cancel, steer) = drain_pokes(&mut pokes);
                 if cancel || cancelled {
                     cancelled = true;
@@ -618,13 +619,47 @@ impl Agent {
                     steered_text = Some(text);
                     break;
                 }
-                match tools::execute(&call, self.policy(), on_progress) {
-                    Ok(output) => exchanges.push((call, output)),
+                // Interrupt control per call
+                let recorded = call.clone();
+                let kill = tools::CancelToken::new();
+                let raced = futures::future::select(
+                    tools::execute(&call, self.policy(), &kill, on_progress).boxed(),
+                    pokes.next(),
+                )
+                .await;
+                let outcome = match raced {
+                    Either::Left((outcome, _)) => outcome,
+                    Either::Right((poke, in_flight)) => {
+                        // Drain the company, as every other wake point does:
+                        // an Esc queued behind a steer still wins, and the
+                        // steer it retracts is discarded instead of recorded.
+                        let (cancel, steer) = match poke {
+                            Some(Poke::Cancel) => (true, None),
+                            Some(Poke::Steer(text)) => {
+                                let (cancel, more) = drain_pokes(&mut pokes);
+                                (cancel, more.or(Some(text)))
+                            }
+                            None => (false, None),
+                        };
+                        if cancel {
+                            kill.cancel();
+                            cancelled = true;
+                        } else if let Some(text) = steer {
+                            steered_text = Some(text);
+                        }
+                        in_flight.await
+                    }
+                };
+                match outcome {
+                    Ok(output) => exchanges.push((recorded, output)),
                     Err(error) => {
-                        exchanges.push((call, format!("error: {error}")));
+                        exchanges.push((recorded, format!("error: {error}")));
                         failure = Some(error.to_string());
                         break;
                     }
+                }
+                if cancelled || steered_text.is_some() {
+                    break;
                 }
             }
             // A round cut short before its first executed call records no
@@ -704,8 +739,9 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use futures::executor::block_on;
     use serde_json::json;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -726,7 +762,6 @@ mod tests {
         let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
 
         // Default: the granted roots are writable, and `edit` is offered.
-        assert_eq!(agent.mode(), ChatMode::Default);
         assert!(!agent.policy().writable_roots().is_empty());
         assert!(names(&Agent::tools_for(ChatMode::Default)).contains(&"edit"));
 
@@ -755,49 +790,45 @@ mod tests {
     }
 
     #[test]
-    fn turn_control_intents_are_generation_owned() {
-        let control = TurnControl::default();
+    fn steering_gates_matches_and_survives_its_turn() {
+        let mut steering = Steering::default();
 
         // One message waits at a time: a second submission is refused.
-        assert!(control.steer("first".to_string()));
-        assert!(!control.steer("second".to_string()));
-        assert_eq!(control.steering(), Some("first".to_string()));
-        assert_eq!(control.take_steer(), Some("first".to_string()));
+        assert!(steering.steer("first".to_string()));
+        assert!(!steering.steer("second".to_string()));
+        assert_eq!(steering.steering(), Some("first"));
+        assert_eq!(steering.take(), Some("first".to_string()));
 
-        // Claiming resets the slot and installs the poke sender.
+        // A steer with no turn running still waits, for the next one.
+        assert!(steering.steer("queued while idle".to_string()));
+        assert_eq!(steering.steering(), Some("queued while idle"));
+
+        // Begin drops what the finished turn left behind, and installs the lever.
         let (sender, mut pokes) = mpsc::channel(4);
-        let first = control.claim(sender);
-        assert_eq!(control.steering(), None);
+        steering.begin(TurnHandle { sender });
+        assert_eq!(steering.steering(), None);
         assert_eq!(drain_pokes(&mut pokes), (false, None));
 
-        // Cancel sends a typed poke the worker drains.
-        control.cancel();
-        assert_eq!(drain_pokes(&mut pokes), (true, None));
+        // Cancel and steer deliver typed pokes the worker drains; an Esc
+        // queued behind a steer still wins.
+        assert!(steering.steer("redirect".to_string()));
+        steering.cancel();
+        assert_eq!(drain_pokes(&mut pokes), (true, Some("redirect".to_string())));
 
-        // A steer delivers its text in the message; the slot mirrors it.
-        assert!(control.steer("redirect".to_string()));
-        assert_eq!(control.steering(), Some("redirect".to_string()));
-        assert_eq!(drain_pokes(&mut pokes), (false, Some("redirect".to_string())));
-        // The pane clears the mirror when the steer is echoed.
-        assert_eq!(control.take_steer().as_deref(), Some("redirect"));
+        // The matched clear frees the slot the worker just consumed; a
+        // different steer queued in the same breath survives it.
+        steering.clear_if("redirect");
+        assert_eq!(steering.steering(), None);
+        assert!(steering.steer("next".to_string()));
+        steering.clear_if("redirect");
+        assert_eq!(steering.steering(), Some("next"));
 
-        // An Esc queued behind a steer still wins the drain.
-        assert!(control.steer("second thought".to_string()));
-        control.cancel();
-        assert_eq!(
-            drain_pokes(&mut pokes),
-            (true, Some("second thought".to_string()))
-        );
-
-        // A stale release must not retire the newer turn's lever.
-        let (sender, _) = mpsc::channel(4);
-        let second = control.claim(sender);
-        control.release(first);
-
-        // Retiring the right turn clears its intents but not a later steer.
-        control.release(second);
-        assert!(control.steer("survives".to_string()));
-        assert_eq!(control.take_steer(), Some("survives".to_string()));
+        // A retired lever's pokes go into the void harmlessly.
+        let (sender, pokes) = mpsc::channel(4);
+        steering.begin(TurnHandle { sender });
+        steering.end();
+        steering.cancel();
+        drop(pokes);
     }
 
     #[test]
@@ -814,17 +845,17 @@ mod tests {
         transcript.push_user("original".to_string()).unwrap();
         // The poke rides in mid-stream: the first delta queues the redirect,
         // the way a user's message lands during a live generation.
-        let mid_stream = RefCell::new(Some(sender));
-        let events = RefCell::new(Vec::new());
+        let mid_stream = Mutex::new(Some(sender));
+        let events = Mutex::new(Vec::new());
         let outcome = block_on(agent.run(&transcript, pokes, open, &|progress| {
             if matches!(&progress, Progress::Answer(delta) if delta == "partial ")
-                && let Some(mut sender) = mid_stream.borrow_mut().take()
+                && let Some(mut sender) = mid_stream.lock().unwrap().take()
             {
                 sender
                     .try_send(Poke::Steer("redirect".to_string()))
                     .expect("four slots");
             }
-            events.borrow_mut().push(progress);
+            events.lock().unwrap().push(progress);
         }));
 
         assert!(matches!(outcome, Progress::Done { message: Some(text) } if text == "redirected"));
@@ -839,7 +870,108 @@ mod tests {
         assert_eq!(items[4]["role"], "assistant");
         assert_eq!(items[4]["content"], "redirected");
         // The steer was reported so the front end can echo it.
-        assert!(events.borrow().iter().any(|event| matches!(
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            Progress::Steered(text) if text == "redirect"
+        )));
+    }
+
+    #[test]
+    fn a_steer_mid_tool_waits_for_the_call_and_rides_the_next_round() {
+        let agent = test_agent();
+        let open = scripted(vec![
+            ends(vec![item(json!({
+                "type": "response.output_item.done",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call", "id": "fc_1", "call_id": "c1", "name": "bash",
+                    "arguments": "{\"command\":\"echo tool ran\"}", "status": "completed"
+                }
+            }))]),
+            ends(vec![delta("after the steer")]),
+        ]);
+        let (sender, pokes) = mpsc::channel::<Poke>(4);
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        let mid_tool = Mutex::new(Some(sender));
+        let events = Mutex::new(Vec::new());
+        let outcome = block_on(agent.run(&transcript, pokes, open, &|progress| {
+            if matches!(&progress, Progress::ToolStart { name: "Bash", .. })
+                && let Some(mut sender) = mid_tool.lock().unwrap().take()
+            {
+                sender
+                    .try_send(Poke::Steer("redirect".to_string()))
+                    .expect("four slots");
+            }
+            events.lock().unwrap().push(progress);
+        }));
+
+        assert!(
+            matches!(outcome, Progress::Done { message: Some(text) } if text == "after the steer")
+        );
+        // The record reads: user, the tool round, the steered input, the final
+        // answer — whichever select arm won, the steer waited for the call.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().unwrap();
+        let position = |probe: &dyn Fn(&serde_json::Value) -> bool| {
+            items.iter().position(probe).expect("the item recorded")
+        };
+        let tool = position(&|item| item["type"] == "function_call");
+        let steer = position(&|item| item["role"] == "user" && item["content"] == "redirect");
+        let answer = position(&|item| item["role"] == "assistant");
+        assert!(tool < steer && steer < answer);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            Progress::Steered(text) if text == "redirect"
+        )));
+    }
+
+    #[test]
+    fn an_esc_queued_behind_a_mid_tool_steer_still_wins() {
+        let agent = test_agent();
+        let open = scripted(vec![
+            ends(vec![item(json!({
+                "type": "response.output_item.done",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call", "id": "fc_1", "call_id": "c1", "name": "bash",
+                    "arguments": "{\"command\":\"echo tool ran\"}", "status": "completed"
+                }
+            }))]),
+            // Never reached: the cancel wins before another round opens.
+            ends(vec![delta("unreachable")]),
+        ]);
+        let (sender, pokes) = mpsc::channel::<Poke>(4);
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        let mid_tool = Mutex::new(Some(sender));
+        let events = Mutex::new(Vec::new());
+        let outcome = block_on(agent.run(&transcript, pokes, open, &|progress| {
+            if matches!(&progress, Progress::ToolStart { name: "Bash", .. })
+                && let Some(mut sender) = mid_tool.lock().unwrap().take()
+            {
+                sender
+                    .try_send(Poke::Steer("redirect".to_string()))
+                    .expect("four slots");
+                sender.try_send(Poke::Cancel).expect("four slots");
+            }
+            events.lock().unwrap().push(progress);
+        }));
+
+        assert!(matches!(outcome, Progress::Cancelled));
+        // The retracted steer was neither recorded nor echoed; the killed
+        // call is kept, as a cancel always keeps what ran.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().unwrap();
+        assert!(
+            !items
+                .iter()
+                .any(|item| item["role"] == "user" && item["content"] == "redirect")
+        );
+        assert!(items.iter().any(|item| item["type"] == "function_call"));
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(
             event,
             Progress::Steered(text) if text == "redirect"
         )));
@@ -853,10 +985,10 @@ mod tests {
         let (sender, pokes) = mpsc::channel::<Poke>(4);
         let transcript = Transcript::new().unwrap();
         // Esc lands after the first delta: the partial answer is kept.
-        let mid_stream = RefCell::new(Some(sender));
+        let mid_stream = Mutex::new(Some(sender));
         let outcome = block_on(agent.run(&transcript, pokes, open, &|progress| {
             if matches!(&progress, Progress::Answer(delta) if delta == "partial answer")
-                && let Some(mut sender) = mid_stream.borrow_mut().take()
+                && let Some(mut sender) = mid_stream.lock().unwrap().take()
             {
                 sender.try_send(Poke::Cancel).expect("four slots");
             }
