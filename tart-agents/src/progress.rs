@@ -16,10 +16,10 @@ pub enum Progress {
     ToolStart {
         /// The call's id, pairing the start with its eventual output.
         id: String,
-        /// The tool's display name: one of {`Bash`, `Read`, `Edit`, `Search`, `Fetch`}.
-        name: &'static str,
-        /// An argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
-        digest: String,
+        /// The tool's name on the wire: one of {`bash`, `read`, `edit`, `search`, `fetch`}.
+        name: String,
+        /// The call's raw JSON arguments, exactly as the provider sent them.
+        arguments: String,
     },
     /// A finished tool invocation, paired with its start by `id`.
     ToolOutput {
