@@ -48,7 +48,7 @@ pub struct Agent {
     writable: Policy,
     /// The Plan-mode policy: the same grants, but most paths are read-only.
     planning: Policy,
-    /// The front end's lever on the running turn (cancel + steer).
+    /// The front end's lever on the running turn (cancel).
     control: TurnControl,
 }
 
@@ -67,8 +67,6 @@ struct TurnState {
     sender: Option<mpsc::Sender<()>>,
     /// Esc was pressed and we should attempt to cancel.
     cancelled: bool,
-    /// The steering message waiting to interrupt the turn, if any.
-    steer: Option<String>,
 }
 
 impl TurnControl {
@@ -91,49 +89,17 @@ impl TurnControl {
         }
     }
 
-    /// Queue `text` to interrupt and redirect the turn.
-    ///
-    /// One message waits at a time: `false` when one already does, so the
-    /// caller keeps its draft (Option+Up edits the queued message instead).
-    #[must_use = "the caller keeps its draft when the slot is taken"]
-    #[inline]
-    pub fn steer(&self, text: String) -> bool {
-        let mut state = self.state();
-        if state.steer.is_some() {
-            return false;
-        }
-        state.steer = Some(text);
-        if let Some(sender) = &mut state.sender {
-            let _ = sender.try_send(());
-        }
-        true
-    }
-
-    /// A copy of the waiting steering message, if any.
-    #[inline]
-    pub fn steering(&self) -> Option<String> {
-        self.state().steer.clone()
-    }
-
-    /// Take the waiting steering message, if any.
-    #[inline]
-    pub fn take_steer(&self) -> Option<String> {
-        self.state().steer.take()
-    }
-
     /// Install `sender` as the next turn's lever, forgetting the last turn's
-    /// intents, and report the turn's id.
+    /// cancel, and report the turn's id.
     fn claim(&self, sender: mpsc::Sender<()>) -> u64 {
         let mut state = self.state();
         state.generation += 1;
         state.cancelled = false;
-        state.steer = None;
         state.sender = Some(sender);
         state.generation
     }
 
-    /// Retire the lever, unless a newer turn already claimed it. A steering
-    /// message survives: the front end reads it when the terminal event lands.
+    /// Retire the lever, unless a newer turn already claimed it.
     fn release(&self, generation: u64) {
         let mut state = self.state();
         if state.generation == generation {
@@ -146,16 +112,6 @@ impl TurnControl {
     fn cancelled(&self, cancel_rx: &mut mpsc::Receiver<()>) -> bool {
         while cancel_rx.try_recv().is_ok() {}
         self.state().cancelled
-    }
-
-    /// The cancel flag, without draining pokes — the select already woke.
-    fn is_cancelled(&self) -> bool {
-        self.state().cancelled
-    }
-
-    /// Whether a steering message waits.
-    fn has_steer(&self) -> bool {
-        self.state().steer.is_some()
     }
 }
 
@@ -228,19 +184,6 @@ impl Agent {
         self.control.clone()
     }
 
-    /// Record the queued steering message, reporting it so the front end can echo
-    fn record_steer<F: Fn(Progress)>(
-        &self,
-        transcript: &Transcript,
-        on_progress: &F,
-    ) -> anyhow::Result<()> {
-        if let Some(text) = self.control.take_steer() {
-            transcript.push_user(text.clone())?;
-            on_progress(Progress::Steered(text));
-        }
-        Ok(())
-    }
-
     /// Set how hard the model reasons before answering.
     #[must_use]
     #[inline]
@@ -300,9 +243,11 @@ impl Agent {
     /// or [`Progress::Cancelled`] when the front end cancels the turn. *Keeps*
     /// *everything recorded so far, including a partial answer*.
     ///
-    /// A steering message the front end queues mid-turn interrupts the stream
-    /// the same way, is recorded as the next user message, and the round
-    /// continues from it.
+    /// A message the front end queues mid-turn is not the worker's concern:
+    /// queueing cancels the turn, and the front end starts the next turn on
+    /// the queued message when this one ends. The record keeps its shape
+    /// either way: the partial answer and the calls that ran, then the
+    /// queued message as the next user item.
     ///
     /// A stream that closes without a terminal event still ends its round with whatever
     /// the model produced.
@@ -325,10 +270,6 @@ impl Agent {
             // A cancelled generation stops before spending another request.
             if cancelled || self.control.cancelled(&mut cancel_rx) {
                 return terminate_and_log(on_progress, Progress::Cancelled);
-            }
-            // Steering left over from the last round rides on this request.
-            if let Err(error) = self.record_steer(transcript, on_progress) {
-                return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             // The sandboxed trio less `edit` in plan mode, plus web tools if available
             let definitions = Self::tools_for(self.mode);
@@ -372,49 +313,26 @@ impl Agent {
             // The last transport error, skipped so a trailing one cannot discard an
             // otherwise complete answer.
             let mut last_error: Option<String> = None;
-            // The stream was dropped mid-round for a steering message.
-            let mut aborted = false;
 
-            // Race the stream against Esc and steering pokes; a won cancel
-            // returns and drops the stream, a won steer restarts the round
+            // Race the stream against Esc pokes; a won cancel returns and
+            // drops the stream, keeping whatever it streamed
             loop {
                 let item = match block_on(Compat::new(select(stream.next(), cancel_rx.next()))) {
                     Either::Right(_) => {
-                        if self.control.is_cancelled() {
-                            // Esc won: dropping the stream keeps what it streamed.
-                            if !answer.is_empty()
-                                && let Err(error) = transcript.push_assistant(answer.clone())
-                            {
-                                return terminate_and_log(
-                                    on_progress,
-                                    Progress::Failed(error.to_string()),
-                                );
-                            }
-                            return terminate_and_log(on_progress, Progress::Cancelled);
-                        }
-                        if !self.control.has_steer() {
-                            // A stale poke: nothing to do but keep streaming.
+                        // A stale poke only wakes the wait: the flag decides.
+                        if !self.control.cancelled(&mut cancel_rx) {
                             continue;
                         }
-                        // A steer won: record the partial, then the steered input,
-                        // and restart the round from it.
+                        // Esc won: dropping the stream keeps what it streamed.
                         if !answer.is_empty()
-                            && let Err(error) =
-                                transcript.push_assistant(std::mem::take(&mut answer))
+                            && let Err(error) = transcript.push_assistant(answer.clone())
                         {
                             return terminate_and_log(
                                 on_progress,
                                 Progress::Failed(error.to_string()),
                             );
                         }
-                        if let Err(error) = self.record_steer(transcript, on_progress) {
-                            return terminate_and_log(
-                                on_progress,
-                                Progress::Failed(error.to_string()),
-                            );
-                        }
-                        aborted = true;
-                        break;
+                        return terminate_and_log(on_progress, Progress::Cancelled);
                     }
                     Either::Left((item, _)) => item,
                 };
@@ -507,11 +425,6 @@ impl Agent {
                 }
             }
 
-            // The stream was dropped for a steer -> rebuild from truncated output
-            if aborted {
-                continue;
-            }
-
             if call_in_flight {
                 return terminate_and_log(
                     on_progress,
@@ -552,17 +465,11 @@ impl Agent {
             // A call the harness cannot run ends the round, but is recorded with its
             // error so the round's earlier effects stay in the transcript.
             let mut failure: Option<String> = None;
-            // The tool loop broke early to consume a steering message.
-            let mut steered = false;
             for call in calls {
                 // A cancelled turn skips its remaining calls; the one in
                 // flight finishes first.
                 if cancelled || self.control.cancelled(&mut cancel_rx) {
                     cancelled = true;
-                    break;
-                }
-                if self.control.has_steer() {
-                    steered = true;
                     break;
                 }
                 match tools::execute(&call, self.policy(), on_progress) {
@@ -590,13 +497,6 @@ impl Agent {
             if cancelled {
                 // The turn stops here, keeping the rounds recorded so far.
                 return terminate_and_log(on_progress, Progress::Cancelled);
-            }
-            if steered {
-                // The steered input rides on the next round's request.
-                if let Err(error) = self.record_steer(transcript, on_progress) {
-                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-                }
-                continue;
             }
             if let Some(reason) = failure {
                 return terminate_and_log(on_progress, Progress::Failed(reason));
@@ -633,7 +533,11 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
     use super::*;
+    use async_openai::types::responses::ResponseTextDeltaEvent;
+    use std::io::{Read, Write};
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -682,20 +586,15 @@ mod tests {
             .collect()
     }
 
+    /// Claiming installs the wake sender and retires the last turn's cancel;
+    /// a stale release must not retire a newer turn's lever.
     #[test]
-    fn turn_control_intents_are_generation_owned() {
+    fn turn_control_cancel_is_generation_owned() {
         let control = TurnControl::default();
 
-        // One message waits at a time: a second submission is refused.
-        assert!(control.steer("first".to_string()));
-        assert!(!control.steer("second".to_string()));
-        assert_eq!(control.steering(), Some("first".to_string()));
-        assert_eq!(control.take_steer(), Some("first".to_string()));
-
-        // Claiming resets both intents and installs the wake sender.
+        // Claiming resets the cancel and installs the wake sender.
         let (sender, mut rx) = mpsc::channel(1);
         let first = control.claim(sender);
-        assert_eq!(control.steering(), None);
         assert!(!control.cancelled(&mut rx));
 
         // Cancel pokes the claimed sender; the drained flag decides.
@@ -707,12 +606,157 @@ mod tests {
         let second = control.claim(sender);
         control.release(first);
         control.cancel();
-        assert!(control.is_cancelled());
+        assert!(control.cancelled(&mut rx));
 
-        // Retiring the right turn clears its intents but not a later steer —
-        // the front end reads that when the terminal event lands.
+        // Retiring the right turn clears its cancel for the next one.
         control.release(second);
-        assert!(control.steer("survives".to_string()));
-        assert_eq!(control.take_steer(), Some("survives".to_string()));
+        assert!(!control.cancelled(&mut rx));
+    }
+
+    /// A cancel mid-stream keeps the partial answer and ends the turn
+    /// [`Progress::Cancelled`], with nothing recorded after it: what an
+    /// interrupted turn leaves behind for the front end to requeue onto.
+    #[test]
+    fn cancel_mid_stream_keeps_the_partial_answer() {
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("tell me a story".to_string())
+            .expect("the user turn records");
+
+        // One round streams a partial answer, then parks: the stream never
+        // ends on its own, so only a cancel can end the turn.
+        let server = serve(listener, vec![delta("Once upon"), delta(" a time")]);
+
+        // Esc lands once both fragments have streamed, so the cancel wakes
+        // the parked select with the partial already in hand.
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let interrupt = {
+            let log = log.clone();
+            let control = agent.control();
+            std::thread::spawn(move || {
+                while !log.lock().unwrap().iter().any(|entry| entry.contains(" a time")) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                control.cancel();
+            })
+        };
+
+        // Drive the generation as `spawn` would: claim, run, retire.
+        let (sender, receiver) = mpsc::channel(1);
+        let control = agent.control();
+        let generation = control.claim(sender);
+        agent.run(&transcript, receiver, &|progress| {
+            log.lock().unwrap().push(format!("{progress:?}"));
+        });
+        control.release(generation);
+        interrupt.join().expect("the interrupter exits");
+
+        // The turn ends with exactly one terminal event: the cancel.
+        let log = log.lock().unwrap();
+        assert_eq!(log.last().map(String::as_str), Some("Cancelled"));
+        assert_eq!(
+            log.iter().filter(|entry| entry.as_str() == "Cancelled").count(),
+            1
+        );
+
+        // The partial answer is recorded: the user turn, then it, then nothing.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items.as_array().map(Vec::len), Some(3));
+        assert_eq!(items[2]["content"], "Once upon a time");
+
+        server.join().expect("the server exits");
+    }
+
+    /// The loopback listener the worker test streams from, or `None` where the
+    /// enclosing sandbox denies binding one: the test then skips, exactly like
+    /// the live sandbox tests do.
+    fn loopback() -> Option<std::net::TcpListener> {
+        match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                let current = std::thread::current();
+                let name = current.name().unwrap_or("<unnamed>");
+                let mut stderr = std::io::stderr().lock();
+                let _ = writeln!(
+                    stderr,
+                    "note: skipping live test {name} (needs loopback the sandbox denies): {error}"
+                );
+                None
+            }
+        }
+    }
+
+    /// An output-text delta event carrying `text`.
+    fn delta(text: &str) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
+            sequence_number: 0,
+            item_id: "item_0".to_string(),
+            output_index: 0,
+            content_index: 0,
+            delta: text.to_string(),
+            logprobs: None,
+        })
+    }
+
+    /// Answer one `/responses` request with `events` as `text/event-stream`,
+    /// then park until the client drops the connection: the stream never ends
+    /// on its own, so a test decides when the turn ends.
+    fn serve(
+        listener: std::net::TcpListener,
+        events: Vec<ResponseStreamEvent>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            read_request(&mut stream);
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            for event in events {
+                let event = serde_json::to_string(&event).expect("a stream event serializes");
+                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            }
+            let _ = stream.flush();
+            // Park until the client drops the stream: a cancel does.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+            let mut drain = [0; 1024];
+            while !matches!(stream.read(&mut drain), Ok(0) | Err(_)) {}
+        })
+    }
+
+    /// Read one request off `stream`: the head, then the body its
+    /// `content-length` names. Nothing beyond that length is parsed.
+    fn read_request(stream: &mut std::net::TcpStream) {
+        let mut seen = Vec::new();
+        let mut chunk = [0; 1024];
+        let head = loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return; // the client gave up
+            }
+            seen.extend_from_slice(&chunk[..read]);
+            if let Some(at) = seen.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let length = String::from_utf8_lossy(&seen[..head])
+            .to_uppercase()
+            .lines()
+            .find_map(|line| line.strip_prefix("CONTENT-LENGTH:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while seen.len() < head + length {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            seen.extend_from_slice(&chunk[..read]);
+        }
     }
 }

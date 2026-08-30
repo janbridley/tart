@@ -253,11 +253,9 @@ fn run(
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ => {
-                        // Steering message is emptied on the same iteration it sends.
-                        if let Some(text) = control.take_steer() {
-                            pane.echo(&text);
-                            pane.submit_text(&transcript, &text, &cwd)?;
-                        }
+                        // A queued message drains into the record ahead of the
+                        // fresh submit, joining its turn.
+                        pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
                         pane.start_turn(agent, &transcript, &wake);
                     }
@@ -310,7 +308,7 @@ fn run(
                         // A finished plan in plan mode is ready for Enter to approve
                         pane.set_plan_ready(matches!(&progress, Progress::Done { .. }));
                         // A plan switch queued mid-turn takes effect now, ahead of
-                        // any steer that starts the next turn.
+                        // any queued message that starts the next turn.
                         if let Some(on) = pending_plan.take() {
                             pane.set_plan(agent, &mut transcript, on)?;
                         }
@@ -320,21 +318,18 @@ fn run(
                             pane.fail_pending(error);
                             pane.append_span(&Span::styled(error.clone(), DIM_STYLE));
                         }
-                        // A cancelled turn keeps its streamed partial message + notify.
-                        // (The pane already spilled any queued steering when
-                        // Esc landed. A cancel is a take-back.)
-                        if matches!(progress, Progress::Cancelled) {
-                            pane.note("⎋ cancelled");
-                        } else if control.steering().is_some() {
-                            // A steer that outlived its turn starts a fresh one
-                            if matches!(progress, Progress::Done { .. }) {
-                                let text = control.take_steer().expect("checked above");
-                                pane.echo(&text);
-                                pane.submit_text(&transcript, &text, &cwd)?;
-                                pane.start_turn(agent, &transcript, &wake);
+                        let requeued =
+                            if matches!(progress, Progress::Done { .. } | Progress::Cancelled) {
+                                pane.requeue(agent, &transcript, &cwd, &wake)?
                             } else {
-                                pane.spill_steer();
-                            }
+                                pane.spill_queued();
+                                false
+                            };
+                        // A cancelled turn keeps its streamed partial message + notify.
+                        // (The pane already spilled any queued message when
+                        // Esc landed. A cancel is a take-back.)
+                        if matches!(progress, Progress::Cancelled) && !requeued {
+                            pane.note("⎋ cancelled");
                         }
                         session.record(&transcript)?;
                     }

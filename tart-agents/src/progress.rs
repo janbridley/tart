@@ -47,6 +47,4 @@ pub enum Progress {
     Failed(String),
     /// The front end cancelled the turn and any partial answer that arrived is recorded
     Cancelled,
-    /// A steering message the user submitted mid-turn.
-    Steered(String),
 }
