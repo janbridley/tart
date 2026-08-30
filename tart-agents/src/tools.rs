@@ -13,10 +13,8 @@ use nix::unistd::Pid;
 
 use crate::{Progress, sandbox::Policy};
 
-mod render_tool;
 mod web;
 
-pub use render_tool::merge_digests;
 pub(crate) use web::{fetch, search};
 
 /// Perform a raw string find-and-replace operation, holding a lock for thread safety..
@@ -344,37 +342,6 @@ fn tail_cap(text: &str, cap: usize) -> String {
     format!("[truncated; last {} KB shown]\n{}", cap / 1024, &text[start..])
 }
 
-/// The display name and digest for a recorded call, to be replayed as a tool header.
-///
-/// Recorded arguments are re-parsed so the header matches what the front end showed
-/// live. Unparseable arguments and unknown tools degrade to the raw JSON.
-pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
-    let (name, digest) = match call.name.as_str() {
-        "bash" => ("Bash", parse_bash(&call.arguments).ok().map(|bash| bash.command)),
-        "read" => (
-            "Read",
-            parse_read(&call.arguments).ok().map(|read| read_digest(&read)),
-        ),
-        "edit" => ("Edit", parse_edit(&call.arguments).ok().map(|edit| edit.path)),
-        "fetch" => (
-            "Fetch",
-            web::parse_fetch(&call.arguments).ok().map(|fetch| fetch.url),
-        ),
-        "search" => (
-            "Search",
-            web::parse_search(&call.arguments).ok().map(|search| {
-                if search.news {
-                    format!("{} [news]", search.query)
-                } else {
-                    search.query
-                }
-            }),
-        ),
-        _ => ("Tool", None),
-    };
-    (name, digest.unwrap_or_else(|| call.arguments.clone()))
-}
-
 /// Spawn `command` in its own process group with piped output and no input,
 /// returning the child and its group id.
 fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)> {
@@ -459,17 +426,18 @@ fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Resul
 }
 
 /// Announce a tool call, run it, and report its conclusion.
+///
+/// The announcement carries the call's identity as the provider sent it; how
+/// that reads on screen is the front end's business.
 fn traced<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    name: &'static str,
-    digest: String,
     on_progress: &F,
     run: impl FnOnce() -> (String, String, Option<i32>),
 ) -> String {
     on_progress(Progress::ToolStart {
         id: call.call_id.clone(),
-        name,
-        digest,
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
     });
     let (result, output, exit) = run();
     on_progress(Progress::ToolOutput {
@@ -494,7 +462,7 @@ fn run_bash<F: Fn(Progress)>(
     // so the output can be handed straight back to the model.
     let mut sandboxed = policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
-    Ok(traced(call, "Bash", bash.command.clone(), on_progress, || {
+    Ok(traced(call, on_progress, || {
         // Decode the stream into output for the front and backends.
         match run_with_timeout(&mut sandboxed, bash.timeout) {
             Ok(run) => {
@@ -535,16 +503,6 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     }
 }
 
-/// The digest for a read call: the path, with any bounds as `path:start-end`.
-fn read_digest(read: &Read) -> String {
-    match (read.start_line, read.end_line) {
-        (None, None) => read.path.clone(),
-        (Some(start), Some(end)) => format!("{}:{start}-{end}", read.path),
-        (Some(start), None) => format!("{}:{start}-", read.path),
-        (None, Some(end)) => format!("{}:-{end}", read.path),
-    }
-}
-
 /// Run one read tool call under `policy`, reporting its steps to `on_progress`.
 fn run_read<F: Fn(Progress)>(
     call: &FunctionToolCall,
@@ -558,7 +516,7 @@ fn run_read<F: Fn(Progress)>(
         .arg(numbered_read(read.start_line, read.end_line))
         .arg("--")
         .arg(&read.path);
-    Ok(traced(call, "Read", read_digest(&read), on_progress, || {
+    Ok(traced(call, on_progress, || {
         // A failure to launch comes back as an error string for the model to deal with.
         match &command.output() {
             Ok(spawned) => {
@@ -584,7 +542,7 @@ fn run_edit<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
-    Ok(traced(call, "Edit", edit.path.clone(), on_progress, || {
+    Ok(traced(call, on_progress, || {
         let (result, exit) = apply_edit(&edit, policy);
         (result.clone(), result, exit)
     }))
@@ -994,15 +952,18 @@ mod tests {
             [
                 Progress::ToolStart {
                     id,
-                    name: "Bash",
-                    digest
+                    name,
+                    arguments,
                 },
                 Progress::ToolOutput {
                     output,
                     exit: Some(0),
                     ..
                 }
-            ] if id == "call_0" && digest == "echo hi" && output == "hi\n"
+            ] if id == "call_0"
+                && name == "bash"
+                && arguments == r#"{"command":"echo hi"}"#
+                && output == "hi\n"
         ));
 
         // The exit status reaches the model verbatim.
@@ -1261,16 +1222,16 @@ mod tests {
         assert!(matches!(
             events.borrow().as_slice(),
             [
-                Progress::ToolStart {
-                    name: "Read",
-                    digest,
-                    ..
-                },
+                Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { .. }
-            ] if digest == &file.path().display().to_string()
+            ] if name == "read"
+                && arguments
+                    == &serde_json::json!({"path": file.path(), "start_line": null,
+                                           "end_line": null})
+                        .to_string()
         ));
 
-        // A bounded read digests its range into the box header.
+        // A bounded read's arguments ride along untouched.
         events.borrow_mut().clear();
         let range = execute(
             &read_call(file.path(), Some(10), Some(12)),
@@ -1283,8 +1244,15 @@ mod tests {
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
         assert!(matches!(
             events.borrow().as_slice(),
-            [Progress::ToolStart { digest, .. }, _]
-                if digest == &format!("{}:10-12", file.path().display())
+            [Progress::ToolStart { name, arguments, .. }, _]
+                if name == "read"
+                    && arguments
+                        == &serde_json::json!({
+                            "path": file.path(),
+                            "start_line": 10,
+                            "end_line": 12
+                        })
+                        .to_string()
         ));
 
         let tail = execute(&read_call(file.path(), Some(28), None), &policy, &|_| {}).unwrap();

@@ -277,12 +277,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let search = parse_search(&call.arguments)?;
-    let digest = if search.news {
-        format!("{} [news]", search.query)
-    } else {
-        search.query.clone()
-    };
-    Ok(traced(call, "Search", digest, on_progress, || {
+    Ok(traced(call, on_progress, || {
         let Some(binary) = search_binary() else {
             let text = "search: no ddgs CLI found; install one with `uv tool install ddgs` \
                         or point TART_SEARCH_BIN at it"
@@ -489,8 +484,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let fetch = parse_fetch(&call.arguments)?;
-    let digest = fetch.url.clone();
-    Ok(traced(call, "Fetch", digest, on_progress, || {
+    Ok(traced(call, on_progress, || {
         let Some(binary) = fetch_binary() else {
             let text = format!("fetch: no curl found at {FETCH_DEFAULT}; set TART_FETCH_BIN");
             return (text.clone(), text, None);
@@ -990,13 +984,11 @@ mod tests {
         assert!(matches!(
             events.borrow().as_slice(),
             [
-                Progress::ToolStart {
-                    name: "Search",
-                    digest,
-                    ..
-                },
+                Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { exit: Some(0), .. }
-            ] if digest == "rust programming language"
+            ] if name == "search"
+                && arguments
+                    == r#"{"query":"rust programming language","max_results":3}"#
         ));
     }
 
@@ -1021,13 +1013,9 @@ mod tests {
         assert!(matches!(
             events.borrow().as_slice(),
             [
-                Progress::ToolStart {
-                    name: "Fetch",
-                    digest,
-                    ..
-                },
+                Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { exit: Some(0), .. }
-            ] if digest == "https://example.com"
+            ] if name == "fetch" && arguments == r#"{"url":"https://example.com","raw":true}"#
         ));
     }
 }
