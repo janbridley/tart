@@ -1387,12 +1387,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rangemap"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
-
-[[package]]
 name = "ratatui"
 version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1948,7 +1942,6 @@ dependencies = [
  "itertools 0.15.0",
  "macro_rules_attribute",
  "nix",
- "rangemap",
  "rustls",
  "serde_json",
  "tempfile",
@@ -1968,6 +1961,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "serde",
+ "serde_json",
  "tart-agents",
  "tempfile",
  "toml",
