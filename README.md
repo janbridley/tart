@@ -74,6 +74,17 @@ model responses with coloring and proper markdown styling, including nice table 
 The style for this is kept in [`markdown.rs`](./tart-tui/src/pane/markdown.rs), and can
 be extended or restyled as desired.
 
+### Threading and Execution
+
+We keep a thread pool with 3 entries open for the whole session. The **main thread**
+runs the terminal loop, with user input event streaming and frontend rendering. The
+**driver thread** polls agent-driven tasks on an owned `smol` async executor, which acts
+as a work queue for agent activity. The third is **async-compat's runtime thread**,
+effectively a `tokio` backend that handles network text and server-send events. Tool
+calls spawn brief transient threads to ensure they don't block other tasks. Most threads
+spend most of their time waiting for work, so the actual CPU usage is low even while
+streaming.
+
 ## Package Structure
 
 Internally, we use an agent harness package structure similar to the one
