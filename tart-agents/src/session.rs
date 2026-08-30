@@ -193,7 +193,7 @@ fn label(path: &Path) -> String {
         .flatten();
     let opening = opening
         .as_deref()
-        .map_or_else(|| "(no messages)".to_string(), one_line);
+        .map_or_else(|| "(no messages)".to_string(), |text| crate::tools::one_line_capped(text, 60));
     format!("{stamp}  {opening}")
 }
 
@@ -204,15 +204,6 @@ fn first_user_text(line: &str) -> Option<String> {
 }
 
 /// The first line of `text`, capped with an ellipsis.
-pub(crate) fn one_line(text: &str) -> String {
-    let line = text.split('\n').next().unwrap_or_default();
-    let mut capped = line.chars().take(60).collect::<String>();
-    if line.chars().nth(60).is_some() {
-        capped.push('…');
-    }
-    capped
-}
-
 /// The items in a session file, stopping at the first damaged line.
 fn load(path: &Path) -> anyhow::Result<Vec<InputItem>> {
     let text =

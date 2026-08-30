@@ -10,7 +10,7 @@ use rangemap::RangeInclusiveSet;
 ///
 /// - Read digests coalesce per file-line counts for easier reading.
 /// - Edit digests count repeated changes to the same file as `path +N edits`
-/// - Anything past [`crate::session::one_line`]'s cap truncates so commands stay readable
+/// - Anything past [`crate::tools::one_line_capped`]'s cap truncates so commands stay readable
 #[inline]
 pub fn merge_digests(name: &str, digests: &[String]) -> String {
     if let [one] = digests
@@ -23,7 +23,7 @@ pub fn merge_digests(name: &str, digests: &[String]) -> String {
         "Edit" => merge_edits(digests),
         _ => digests.join(", "),
     };
-    crate::session::one_line(&merged)
+    crate::tools::one_line_capped(&merged, 60)
 }
 
 /// Coalesce file reads into a nice set of ranges.
