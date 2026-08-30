@@ -1,6 +1,7 @@
 //! `Pane` object stores data and rendering logic for the terminal interface.
 
 mod copy;
+mod digest;
 mod editor;
 mod markdown;
 mod transcript;
@@ -441,8 +442,8 @@ impl Pane {
             }
             Progress::Thinking(text) => self.append_thinking(text),
             Progress::Answer(text) => self.append_answer(text),
-            Progress::ToolStart { id, name, digest } => {
-                self.start_tool(id.clone(), name, digest.clone());
+            Progress::ToolStart { id, name, arguments } => {
+                self.start_tool(id.clone(), name.clone(), arguments.clone());
             }
             Progress::ToolOutput { id, output, exit } => {
                 self.finish_tool(id, output.clone(), *exit);
@@ -485,8 +486,8 @@ impl Pane {
     }
 
     /// Record a tool invocation's start; see [`Transcript::start_tool`].
-    pub fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
-        self.transcript.start_tool(id, name, digest);
+    pub fn start_tool(&mut self, id: String, name: String, arguments: String) {
+        self.transcript.start_tool(id, name, arguments);
     }
 
     /// Fill in the pending invocation; see [`Transcript::finish_tool`].
@@ -1994,8 +1995,8 @@ mod tests {
             // A replayed tool box: the header, finished empty.
             Progress::ToolStart {
                 id: "call_0".to_string(),
-                name: "Bash",
-                digest: "ls -la".to_string(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"ls -la"}"#.to_string(),
             },
             Progress::ToolOutput {
                 id: "call_0".to_string(),
@@ -2154,7 +2155,11 @@ mod tests {
     #[test]
     fn ctrl_o_expands_tool_output_in_live_mode_only() {
         let mut pane = Pane::default();
-        pane.start_tool("call_0".to_string(), "Bash", "seq 20".to_string());
+        pane.start_tool(
+            "call_0".to_string(),
+            "bash".to_string(),
+            r#"{"command":"seq 20"}"#.to_string(),
+        );
         let mut output = String::new();
         for i in 0..20 {
             let _ = writeln!(output, "line {i}");

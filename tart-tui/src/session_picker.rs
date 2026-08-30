@@ -13,14 +13,21 @@ use tart_agents::session;
 pub(crate) struct SessionPopup {
     /// Fuzzy matcher and file popup over the project's sessions.
     pub(crate) popup: FilePopup,
-    /// Listed sessions, their lines the popup's rows.
+    /// Listed sessions paired with the label the popup's rows show.
     sessions: Vec<(PathBuf, String)>,
 }
 
 impl SessionPopup {
     /// Create a selection menut over `project`'s sessions in `root`, newest first.
     pub(crate) fn new(root: &Path, project: &Path, query: String) -> Self {
-        let sessions = session::list(root, project).unwrap_or_default();
+        let sessions = session::list(root, project)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(path, opening)| {
+                let label = label(&path, &opening);
+                (path, label)
+            })
+            .collect::<Vec<_>>();
         let lines: Vec<String> = sessions.iter().map(|(_, line)| line.clone()).collect();
         Self {
             popup: FilePopup::from_files(lines, query),
@@ -45,6 +52,30 @@ impl SessionPopup {
             "↑↓ select · Enter to resume · Esc to close popup",
         );
     }
+}
+
+/// One picker row: the session's filename stamp, then its opening request
+/// capped with an ellipsis; a session without messages says so.
+fn label(path: &Path, opening: &str) -> String {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let stamp = name.strip_suffix(".jsonl").unwrap_or(&name);
+    let opening = if opening.is_empty() {
+        "(no messages)".to_string()
+    } else {
+        capped(opening)
+    };
+    format!("{stamp}  {opening}")
+}
+
+/// `text` capped at 60 characters, plus an ellipsis when it runs past.
+fn capped(text: &str) -> String {
+    let mut capped = text.chars().take(60).collect::<String>();
+    if text.chars().nth(60).is_some() {
+        capped.push('…');
+    }
+    capped
 }
 
 /// Everything preceeding a `/resume` line, used to filter results.
@@ -77,6 +108,25 @@ mod tests {
         assert_eq!(derive_query(&editor("/resumefoo")), None);
         assert_eq!(derive_query(&editor("fix /resume")), None);
         assert_eq!(derive_query(&editor("hello")), None);
+    }
+
+    /// Labels pair the file's stamp with its opening request, capped.
+    #[test]
+    fn labels_pair_the_stamp_with_a_capped_opening_request() {
+        let path = Path::new("/root/proj/20260102-000000.jsonl");
+        assert_eq!(
+            label(path, "fix the login flow"),
+            "20260102-000000  fix the login flow"
+        );
+        // A long opening keeps 60 characters plus the ellipsis.
+        assert_eq!(
+            label(path, &"x".repeat(80)),
+            format!("20260102-000000  {}…", "x".repeat(60))
+        );
+        // A session without messages says so, and a foreign name keeps its
+        // whole stem.
+        assert_eq!(label(path, ""), "20260102-000000  (no messages)");
+        assert_eq!(label(Path::new("notes.txt"), "hi"), "notes.txt  hi");
     }
 
     #[test]
