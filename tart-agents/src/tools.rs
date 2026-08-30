@@ -177,23 +177,25 @@ struct Bash {
     timeout: Duration,
 }
 
-/// Extract the fields from a bash tool call's JSON arguments.
-fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
-    let args = parse_arguments(arguments)?;
-    // `as_i64` so negatives join the clamp instead of falling to the default.
-    #[allow(
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss,
-        reason = "the clamp bounds the value to 1-600 seconds before either cast"
-    )]
-    let seconds = args["timeout"]
-        .as_i64()
-        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs() as i64)
-        .clamp(1, MAX_BASH_TIMEOUT.as_secs() as i64) as u64;
-    Ok(Bash {
-        command: string_field(&args, "command")?,
-        timeout: Duration::from_secs(seconds),
-    })
+impl Bash {
+    /// Extract the fields from a bash tool call's JSON arguments.
+    fn parse(arguments: &str) -> anyhow::Result<Self> {
+        let args = parse_arguments(arguments)?;
+        // `as_i64` so negatives join the clamp instead of falling to the default.
+        #[allow(
+            clippy::cast_possible_wrap,
+            clippy::cast_sign_loss,
+            reason = "the clamp bounds the value to 1-600 seconds before either cast"
+        )]
+        let seconds = args["timeout"]
+            .as_i64()
+            .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs() as i64)
+            .clamp(1, MAX_BASH_TIMEOUT.as_secs() as i64) as u64;
+        Ok(Bash {
+            command: string_field(&args, "command")?,
+            timeout: Duration::from_secs(seconds),
+        })
+    }
 }
 
 /// One parsed read tool call.
@@ -207,16 +209,28 @@ struct Read {
     end_line: Option<u64>,
 }
 
-/// Extract the fields from a read tool call's JSON arguments.
-///
-/// The line bounds are optional; wrong-typed bounds are ignored.
-fn parse_read(arguments: &str) -> anyhow::Result<Read> {
-    let args = parse_arguments(arguments)?;
-    Ok(Read {
-        path: string_field(&args, "path")?,
-        start_line: args["start_line"].as_u64(),
-        end_line: args["end_line"].as_u64(),
-    })
+impl Read {
+    /// Extract the fields from a read tool call's JSON arguments.
+    ///
+    /// The line bounds are optional; wrong-typed bounds are ignored.
+    fn parse(arguments: &str) -> anyhow::Result<Self> {
+        let args = parse_arguments(arguments)?;
+        Ok(Read {
+            path: string_field(&args, "path")?,
+            start_line: args["start_line"].as_u64(),
+            end_line: args["end_line"].as_u64(),
+        })
+    }
+
+    /// The digest for a read call: the path, with any bounds as `path:start-end`.
+    fn digest(&self) -> String {
+        match (self.start_line, self.end_line) {
+            (None, None) => self.path.clone(),
+            (Some(start), Some(end)) => format!("{}:{start}-{end}", self.path),
+            (Some(start), None) => format!("{}:{start}-", self.path),
+            (None, Some(end)) => format!("{}:-{end}", self.path),
+        }
+    }
 }
 
 /// One parsed edit tool call.
@@ -232,17 +246,19 @@ struct Edit {
     replace_all: bool,
 }
 
-/// Extract the fields from an edit tool call's JSON arguments.
-///
-/// `replace_all` is optional and defaults to false.
-fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
-    let args = parse_arguments(arguments)?;
-    Ok(Edit {
-        path: string_field(&args, "path")?,
-        old_string: string_field(&args, "old_string")?,
-        new_string: string_field(&args, "new_string")?,
-        replace_all: args["replace_all"].as_bool().unwrap_or(false),
-    })
+impl Edit {
+    /// Extract the fields from an edit tool call's JSON arguments.
+    ///
+    /// `replace_all` is optional and defaults to false.
+    fn parse(arguments: &str) -> anyhow::Result<Self> {
+        let args = parse_arguments(arguments)?;
+        Ok(Edit {
+            path: string_field(&args, "path")?,
+            old_string: string_field(&args, "old_string")?,
+            new_string: string_field(&args, "new_string")?,
+            replace_all: args["replace_all"].as_bool().unwrap_or(false),
+        })
+    }
 }
 
 /// Run one tool call under `policy`, report each step to `on_progress`, and return
@@ -315,25 +331,27 @@ pub(crate) struct WatchedRun {
     stopped: Option<Stopped>,
 }
 
-/// Frame one finished (or stopped) run for the model and the pane.
-///
-/// `[timed out after Ns]` for a deadline, `[cancelled]` for Esc, and the
-/// status-prefixed text otherwise.
-fn frame_run(run: WatchedRun, timeout: Duration) -> (String, String, Option<i32>) {
-    let WatchedRun { output, stopped } = run;
-    let text = combined_output(&output);
-    let exit = output.status.code();
-    match stopped {
-        Some(Stopped::Deadline) => {
-            let marked = timeout_text(&text, timeout);
-            (marked.clone(), marked, exit)
+impl WatchedRun {
+    /// Frame one finished (or stopped) run for the model and the pane.
+    ///
+    /// `[timed out after Ns]` for a deadline, `[cancelled]` for Esc, and the
+    /// status-prefixed text otherwise.
+    pub(crate) fn frame(self, timeout: Duration) -> (String, String, Option<i32>) {
+        let WatchedRun { output, stopped } = self;
+        let text = combined_output(&output);
+        let exit = output.status.code();
+        match stopped {
+            Some(Stopped::Deadline) => {
+                let marked = timeout_text(&text, timeout);
+                (marked.clone(), marked, exit)
+            }
+            // Esc leaves no exit code for the header, so the body is marked up.
+            Some(Stopped::Esc) => {
+                let marked = cancel_text(&text);
+                (marked.clone(), marked, exit)
+            }
+            None => (command_text(&text, output.status), text, exit),
         }
-        // Esc leaves no exit code for the header, so the body is marked up.
-        Some(Stopped::Esc) => {
-            let marked = cancel_text(&text);
-            (marked.clone(), marked, exit)
-        }
-        None => (command_text(&text, output.status), text, exit),
     }
 }
 
@@ -393,12 +411,12 @@ fn tail_cap(text: &str, cap: usize) -> String {
 /// live. Unparseable arguments and unknown tools degrade to the raw JSON.
 pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
     let (name, digest) = match call.name.as_str() {
-        "bash" => ("Bash", parse_bash(&call.arguments).ok().map(|bash| bash.command)),
+        "bash" => ("Bash", Bash::parse(&call.arguments).ok().map(|bash| bash.command)),
         "read" => (
             "Read",
-            parse_read(&call.arguments).ok().map(|read| read_digest(&read)),
+            Read::parse(&call.arguments).ok().map(|read| read.digest()),
         ),
-        "edit" => ("Edit", parse_edit(&call.arguments).ok().map(|edit| edit.path)),
+        "edit" => ("Edit", Edit::parse(&call.arguments).ok().map(|edit| edit.path)),
         "fetch" => (
             "Fetch",
             web::parse_fetch(&call.arguments).ok().map(|fetch| fetch.url),
@@ -536,7 +554,7 @@ async fn run_framed(
 ) -> (String, String, Option<i32>) {
     // All tools run through here, so they can't get stuck forever.
     match run_watched(command, Some(timeout), kill).await {
-        Ok(run) => frame_run(run, timeout),
+        Ok(run) => run.frame(timeout),
         Err(error) => {
             let text = format!("error: {error}");
             (text.clone(), text, None)
@@ -554,7 +572,7 @@ async fn run_bash<F: Fn(Progress)>(
     kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
-    let bash = parse_bash(&call.arguments)?;
+    let bash = Bash::parse(&call.arguments)?;
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
     let mut sandboxed = policy.command("/bin/bash");
@@ -587,16 +605,6 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     }
 }
 
-/// The digest for a read call: the path, with any bounds as `path:start-end`.
-fn read_digest(read: &Read) -> String {
-    match (read.start_line, read.end_line) {
-        (None, None) => read.path.clone(),
-        (Some(start), Some(end)) => format!("{}:{start}-{end}", read.path),
-        (Some(start), None) => format!("{}:{start}-", read.path),
-        (None, Some(end)) => format!("{}:-{end}", read.path),
-    }
-}
-
 /// Run one read tool call under `policy`, reporting its steps to `on_progress`.
 async fn run_read<F: Fn(Progress)>(
     call: &FunctionToolCall,
@@ -604,7 +612,7 @@ async fn run_read<F: Fn(Progress)>(
     kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
-    let read = parse_read(&call.arguments)?;
+    let read = Read::parse(&call.arguments)?;
     let mut command = policy.command("/usr/bin/perl");
     command
         .arg("-e")
@@ -614,7 +622,7 @@ async fn run_read<F: Fn(Progress)>(
     Ok(traced(
         call,
         "Read",
-        read_digest(&read),
+        read.digest(),
         on_progress,
         // The watchdog bounds the read tool so deadlocks can time out.
         run_framed(command, DEFAULT_BASH_TIMEOUT, kill.clone()),
@@ -633,76 +641,78 @@ async fn run_edit<F: Fn(Progress)>(
     kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
-    let edit = parse_edit(&call.arguments)?;
+    let edit = Edit::parse(&call.arguments)?;
     Ok(traced(call, "Edit", edit.path.clone(), on_progress, async {
-        let (result, exit) = apply_edit(&edit, policy, kill).await;
+        let (result, exit) = edit.apply(policy, kill).await;
         (result.clone(), result, exit)
     })
     .await)
 }
 
-/// Apply one parsed edit under `policy`, returning outcome message and the exit code.
-///
-/// We pre-check that the edit is valid in rust for performance, though the perl script
-/// verifies to ensure we don't run into TOCTOU issues between here and the lock.
-async fn apply_edit(edit: &Edit, policy: &Policy, kill: &CancelToken) -> (String, Option<i32>) {
-    let path = Path::new(&edit.path);
-    if edit.old_string.is_empty() {
-        return (
-            format!("edit: old_string must not be empty: {}", path.display()),
-            None,
-        );
+impl Edit {
+    /// Apply one parsed edit under `policy`, returning outcome message and the exit code.
+    ///
+    /// We pre-check that the edit is valid in rust for performance, though the perl script
+    /// verifies to ensure we don't run into TOCTOU issues between here and the lock.
+    async fn apply(&self, policy: &Policy, kill: &CancelToken) -> (String, Option<i32>) {
+        let path = Path::new(&self.path);
+        if self.old_string.is_empty() {
+            return (
+                format!("edit: old_string must not be empty: {}", path.display()),
+                None,
+            );
+        }
+        if self.old_string == self.new_string {
+            return (
+                format!(
+                    "edit: old_string and new_string are identical: {}",
+                    path.display()
+                ),
+                None,
+            );
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => return (format!("edit: cannot read {}: {error}", path.display()), None),
+        };
+        let count = content.matches(&self.old_string).count();
+        if count == 0 {
+            return (
+                format!(
+                    "edit: old_string not found in {}; the match must be exact, including whitespace",
+                    path.display()
+                ),
+                None,
+            );
+        }
+        if count > 1 && !self.replace_all {
+            return (
+                format!(
+                    "edit: old_string matches {count} times in {}; pass replace_all or include more \
+                    surrounding lines to make it unique",
+                    path.display()
+                ),
+                None,
+            );
+        }
+        let mut cmd = policy.command("/usr/bin/perl");
+        self.arm(&mut cmd);
+        frame_perl(
+            run_watched(cmd, Some(DEFAULT_BASH_TIMEOUT), kill.clone()).await,
+            Path::new(&self.path),
+        )
     }
-    if edit.old_string == edit.new_string {
-        return (
-            format!(
-                "edit: old_string and new_string are identical: {}",
-                path.display()
-            ),
-            None,
-        );
-    }
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) => return (format!("edit: cannot read {}: {error}", path.display()), None),
-    };
-    let count = content.matches(&edit.old_string).count();
-    if count == 0 {
-        return (
-            format!(
-                "edit: old_string not found in {}; the match must be exact, including whitespace",
-                path.display()
-            ),
-            None,
-        );
-    }
-    if count > 1 && !edit.replace_all {
-        return (
-            format!(
-                "edit: old_string matches {count} times in {}; pass replace_all or include more \
-                surrounding lines to make it unique",
-                path.display()
-            ),
-            None,
-        );
-    }
-    let mut cmd = policy.command("/usr/bin/perl");
-    arm_perl(edit, &mut cmd);
-    frame_perl(
-        run_watched(cmd, Some(DEFAULT_BASH_TIMEOUT), kill.clone()).await,
-        Path::new(&edit.path),
-    )
-}
 
-/// Set [`EDIT_PROGRAM`] and its arguments and environment on `cmd`.
-fn arm_perl(edit: &Edit, cmd: &mut std::process::Command) {
-    cmd.arg("-e")
-        .arg(EDIT_PROGRAM)
-        .arg("--")
-        .arg(&edit.path)
-        .env("TART_OLD", &edit.old_string)
-        .env("TART_NEW", &edit.new_string)
-        .envs(edit.replace_all.then_some(("TART_ALL", "1")));
+    /// Set [`EDIT_PROGRAM`] and its arguments and environment on `cmd`.
+    fn arm(&self, cmd: &mut std::process::Command) {
+        cmd.arg("-e")
+            .arg(EDIT_PROGRAM)
+            .arg("--")
+            .arg(&self.path)
+            .env("TART_OLD", &self.old_string)
+            .env("TART_NEW", &self.new_string)
+            .envs(self.replace_all.then_some(("TART_ALL", "1")));
+    }
 }
 
 /// Map one watched perl run to the message the model sees: perl's report on
@@ -713,10 +723,9 @@ fn frame_perl(run: io::Result<WatchedRun>, path: &Path) -> (String, Option<i32>)
             String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
             Some(0),
         ),
-        Ok(WatchedRun { output, stopped }) if stopped.is_some() => (
-            frame_run(WatchedRun { output, stopped }, DEFAULT_BASH_TIMEOUT).0,
-            None,
-        ),
+        Ok(WatchedRun { output, stopped }) if stopped.is_some() => {
+            (WatchedRun { output, stopped }.frame(DEFAULT_BASH_TIMEOUT).0, None)
+        }
         Ok(WatchedRun { output, .. }) => (
             format!(
                 "edit failed on {}: {}{}",
@@ -736,7 +745,7 @@ fn frame_perl(run: io::Result<WatchedRun>, path: &Path) -> (String, Option<i32>)
 /// Run [`EDIT_PROGRAM`] through an already-configured `perl` command.
 #[cfg(test)]
 fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i32>) {
-    arm_perl(edit, cmd);
+    edit.arm(cmd);
     frame_perl(
         run_watched_sync(cmd, Some(DEFAULT_BASH_TIMEOUT), &CancelToken::new()),
         Path::new(&edit.path),
@@ -786,45 +795,45 @@ mod tests {
 
     #[test]
     fn parse_bash_reads_the_command_field() {
-        assert_eq!(parse_bash(r#"{"command":"ls -la"}"#).unwrap().command, "ls -la");
+        assert_eq!(Bash::parse(r#"{"command":"ls -la"}"#).unwrap().command, "ls -la");
     }
 
     #[test]
     fn parse_bash_defaults_the_timeout_when_absent() {
-        let bash = parse_bash(r#"{"command":"ls"}"#).unwrap();
+        let bash = Bash::parse(r#"{"command":"ls"}"#).unwrap();
 
         assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
     }
 
     #[test]
     fn parse_bash_clamps_out_of_range_timeouts() {
-        let bash = parse_bash(r#"{"command":"sleep 5","timeout":9000}"#).unwrap();
+        let bash = Bash::parse(r#"{"command":"sleep 5","timeout":9000}"#).unwrap();
         assert_eq!(bash.timeout, MAX_BASH_TIMEOUT);
 
         // Both ends: a negative joins the clamp rather than falling to the default
-        let bash = parse_bash(r#"{"command":"ls","timeout":0}"#).unwrap();
+        let bash = Bash::parse(r#"{"command":"ls","timeout":0}"#).unwrap();
         assert_eq!(bash.timeout, Duration::from_secs(1));
-        let bash = parse_bash(r#"{"command":"ls","timeout":-5}"#).unwrap();
+        let bash = Bash::parse(r#"{"command":"ls","timeout":-5}"#).unwrap();
         assert_eq!(bash.timeout, Duration::from_secs(1));
     }
 
     #[test]
     fn parse_bash_ignores_a_wrong_typed_timeout() {
-        let bash = parse_bash(r#"{"command":"ls","timeout":"300"}"#).unwrap();
+        let bash = Bash::parse(r#"{"command":"ls","timeout":"300"}"#).unwrap();
 
         assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
     }
 
     #[test]
     fn parse_bash_rejects_non_json() {
-        let error = parse_bash("not json").unwrap_err().to_string();
+        let error = Bash::parse("not json").unwrap_err().to_string();
 
         assert!(error.contains("weren't JSON"), "{error}");
     }
 
     #[test]
     fn parse_bash_rejects_a_missing_command() {
-        let error = parse_bash(r#"{"other":1}"#).unwrap_err().to_string();
+        let error = Bash::parse(r#"{"other":1}"#).unwrap_err().to_string();
 
         assert!(error.contains("missing 'command'"), "{error}");
     }
@@ -1379,18 +1388,18 @@ mod tests {
 
     #[test]
     fn parse_read_reads_the_path_and_bounds() {
-        let read = parse_read(r#"{"path":"src/main.rs","start_line":10,"end_line":50}"#).unwrap();
+        let read = Read::parse(r#"{"path":"src/main.rs","start_line":10,"end_line":50}"#).unwrap();
 
         assert_eq!(read.path, "src/main.rs");
         assert_eq!((read.start_line, read.end_line), (Some(10), Some(50)));
 
-        let whole = parse_read(r#"{"path":"src/main.rs"}"#).unwrap();
+        let whole = Read::parse(r#"{"path":"src/main.rs"}"#).unwrap();
         assert_eq!((whole.start_line, whole.end_line), (None, None));
     }
 
     #[test]
     fn parse_read_rejects_a_missing_path() {
-        let error = parse_read(r#"{"start_line":1}"#).unwrap_err().to_string();
+        let error = Read::parse(r#"{"start_line":1}"#).unwrap_err().to_string();
 
         assert!(error.contains("missing 'path'"), "{error}");
     }

@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_openai::types::responses::{FunctionToolCall, Tool};
 
 use super::{
-    CancelToken, WatchedRun, combined_output, command_text, frame_run, parse_arguments,
+    CancelToken, WatchedRun, combined_output, command_text, parse_arguments,
     run_watched, string_field, tool, traced,
 };
 use crate::Progress;
@@ -300,7 +300,7 @@ pub(super) async fn run_search<F: Fn(Progress)>(
         match json.as_deref().and_then(|json| render_results(&search, json)) {
             Some(rendered) => (rendered.clone(), rendered, Some(0)),
             None => match outcome {
-                Ok(run) => frame_run(run, SEARCH_TIMEOUT),
+                Ok(run) => run.frame(SEARCH_TIMEOUT),
                 Err(error) => {
                     let text = format!("error: {error}");
                     (text.clone(), text, None)
@@ -502,7 +502,7 @@ pub(super) async fn run_fetch<F: Fn(Progress)>(
             }
             // A stopped run (deadline or Esc) is framed wholesale; a natural
             // one still needs the redirect split and truncation below.
-            Ok(run) if run.stopped.is_some() => frame_run(run, FETCH_TIMEOUT),
+            Ok(run) if run.stopped.is_some() => run.frame(FETCH_TIMEOUT),
             Ok(WatchedRun { output, .. }) => {
                 let exit = output.status.code();
                 let text = combined_output(&output);
