@@ -16,8 +16,8 @@ use std::time::Duration;
 use async_openai::types::responses::{FunctionToolCall, Tool};
 
 use super::{
-    WatchedRun, combined_output, command_text, parse_arguments, run_with_timeout, string_field,
-    timeout_text, tool, traced,
+    CancelToken, WatchedRun, combined_output, command_text, frame_run, parse_arguments,
+    run_watched, string_field, tool, traced,
 };
 use crate::Progress;
 
@@ -272,8 +272,9 @@ fn ddgs_args(search: &Search, results: &Path) -> Vec<OsString> {
 ///
 /// As with bash, a failure (no CLI, a rate-limited backend, a timeout) is
 /// content for the model, not an error.
-pub(super) fn run_search<F: Fn(Progress)>(
+pub(super) async fn run_search<F: Fn(Progress)>(
     call: &FunctionToolCall,
+    kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let search = parse_search(&call.arguments)?;
@@ -282,7 +283,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
     } else {
         search.query.clone()
     };
-    Ok(traced(call, "Search", digest, on_progress, || {
+    Ok(traced(call, "Search", digest, on_progress, async {
         let Some(binary) = search_binary() else {
             let text = "search: no ddgs CLI found; install one with `uv tool install ddgs` \
                         or point TART_SEARCH_BIN at it"
@@ -292,31 +293,22 @@ pub(super) fn run_search<F: Fn(Progress)>(
         let results = results_path();
         let mut ddgs = web_command(binary);
         ddgs.args(ddgs_args(&search, &results));
-        let outcome = run_with_timeout(&mut ddgs, SEARCH_TIMEOUT);
+        let outcome = run_watched(ddgs, Some(SEARCH_TIMEOUT), kill.clone()).await;
         // The results file is ours whatever happened: read it, then drop it.
         let json = std::fs::read_to_string(&results).ok();
         let _ = std::fs::remove_file(&results);
         match json.as_deref().and_then(|json| render_results(&search, json)) {
             Some(rendered) => (rendered.clone(), rendered, Some(0)),
             None => match outcome {
-                Ok(run) => {
-                    let WatchedRun { output, killed } = run;
-                    let text = combined_output(&output);
-                    let exit = output.status.code();
-                    if killed {
-                        let marked = timeout_text(&text, SEARCH_TIMEOUT);
-                        (marked.clone(), marked, exit)
-                    } else {
-                        (command_text(&text, output.status), text, exit)
-                    }
-                }
+                Ok(run) => frame_run(run, SEARCH_TIMEOUT),
                 Err(error) => {
                     let text = format!("error: {error}");
                     (text.clone(), text, None)
                 }
             },
         }
-    }))
+    })
+    .await)
 }
 
 /// Reject URLs that are not plain public web addresses.
@@ -484,13 +476,14 @@ fn fetch_args(fetch: &Fetch, url: &str) -> Vec<OsString> {
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
 /// Like `search` this runs outside the sandbox.
-pub(super) fn run_fetch<F: Fn(Progress)>(
+pub(super) async fn run_fetch<F: Fn(Progress)>(
     call: &FunctionToolCall,
+    kill: &CancelToken,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let fetch = parse_fetch(&call.arguments)?;
     let digest = fetch.url.clone();
-    Ok(traced(call, "Fetch", digest, on_progress, || {
+    Ok(traced(call, "Fetch", digest, on_progress, async {
         let Some(binary) = fetch_binary() else {
             let text = format!("fetch: no curl found at {FETCH_DEFAULT}; set TART_FETCH_BIN");
             return (text.clone(), text, None);
@@ -502,15 +495,14 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
         };
         let mut curl = web_command(binary);
         curl.args(fetch_args(&fetch, &url));
-        match run_with_timeout(&mut curl, FETCH_TIMEOUT) {
+        match run_watched(curl, Some(FETCH_TIMEOUT), kill.clone()).await {
             Err(error) => {
                 let text = format!("error: {error}");
                 (text.clone(), text, None)
             }
-            Ok(WatchedRun { output, killed: true }) => {
-                let marked = timeout_text(&combined_output(&output), FETCH_TIMEOUT);
-                (marked.clone(), marked, output.status.code())
-            }
+            // A stopped run (deadline or Esc) is framed wholesale; a natural
+            // one still needs the redirect split and truncation below.
+            Ok(run) if run.stopped.is_some() => frame_run(run, FETCH_TIMEOUT),
             Ok(WatchedRun { output, .. }) => {
                 let exit = output.status.code();
                 let text = combined_output(&output);
@@ -529,7 +521,8 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
                 (command_text(&text, output.status), text, exit)
             }
         }
-    }))
+    })
+    .await)
 }
 
 /// Split curl's final-URL trailer off a captured raw fetch, when present.
@@ -977,9 +970,14 @@ mod tests {
             r#"{"query":"rust programming language","max_results":3}"#,
         );
 
-        let output = execute(&request, &policy, &|progress| {
-            events.borrow_mut().push(progress);
-        })
+        let output = futures::executor::block_on(execute(
+            &request,
+            &policy,
+            &CancelToken::new(),
+            &|progress| {
+                events.borrow_mut().push(progress);
+            },
+        ))
         .unwrap();
 
         assert!(
@@ -1012,9 +1010,14 @@ mod tests {
         let events = std::cell::RefCell::new(Vec::new());
         let request = call("fetch", r#"{"url":"https://example.com","raw":true}"#);
 
-        let output = execute(&request, &policy, &|progress| {
-            events.borrow_mut().push(progress);
-        })
+        let output = futures::executor::block_on(execute(
+            &request,
+            &policy,
+            &CancelToken::new(),
+            &|progress| {
+                events.borrow_mut().push(progress);
+            },
+        ))
         .unwrap();
 
         assert!(output.contains("Example Domain"), "{output}");
