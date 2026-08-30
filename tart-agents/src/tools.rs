@@ -606,8 +606,7 @@ async fn run_read<F: Fn(Progress)>(
         "Read",
         read_digest(&read),
         on_progress,
-        // The watchdog bounds the read like bash: a FIFO with no writer dies
-        // at the deadline — or on Esc — instead of wedging the generation.
+        // The watchdog bounds the read tool so deadlocks can time out.
         run_framed(command, DEFAULT_BASH_TIMEOUT, kill.clone()),
     )
     .await)
