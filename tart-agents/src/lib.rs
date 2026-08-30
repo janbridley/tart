@@ -17,7 +17,7 @@ pub use session::{SESSIONS_ROOT, Session};
 
 pub use agent::{Agent, ChatMode, TurnControl};
 
-pub use tools::{CONTENT_CAP, CancelToken, head_cap, manual_command, merge_digests};
+pub use tools::{CONTENT_CAP, CancelToken, head_cap, manual_command};
 
 /// Most model rounds one generation may take before giving up.
 pub const MAX_TOOL_ROUNDS: usize = 128;
