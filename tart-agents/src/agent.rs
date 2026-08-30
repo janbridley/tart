@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -6,14 +8,16 @@ use async_compat::Compat;
 use async_openai::{
     Client,
     config::OpenAIConfig,
+    error::OpenAIError,
     types::responses::{
-        CreateResponseArgs, FunctionToolCall, InputParam, OutputItem, Reasoning, ReasoningEffort,
-        ReasoningItem, ResponseStreamEvent, Tool,
+        CreateResponse, CreateResponseArgs, FunctionToolCall, InputParam, OutputItem, Reasoning,
+        ReasoningEffort, ReasoningItem, ResponseStreamEvent, Tool,
     },
 };
+use futures::FutureExt;
 use futures::channel::mpsc;
-use futures::future::{Either, select};
-use futures::{StreamExt, executor::block_on};
+use futures::executor::block_on;
+use futures::stream::{Stream, StreamExt};
 
 use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
 
@@ -38,10 +42,19 @@ pub enum ChatMode {
     Plan,
 }
 
+/// One item of a response stream, as the provider yields it.
+type StreamItem = Result<ResponseStreamEvent, OpenAIError>;
+
+/// One response stream, as the provider yields it.
+type ResponseStream = Pin<Box<dyn Stream<Item = StreamItem> + Send>>;
+
+/// The future that opens one round's response stream.
+type OpenStreamFuture = Pin<Box<dyn Future<Output = Result<ResponseStream, OpenAIError>> + Send>>;
+
 /// A Responses-API model configured to run the tart tool loop.
 #[derive(Clone)]
 pub struct Agent {
-    /// HTTP client for an OpenAI-compatible endpoint; shares its connection pool.
+    /// HTTP client for an OpenAI-compatible endpoint with a shared connection pool.
     client: Client<OpenAIConfig>,
     /// Model name sent with every request.
     model: String,
@@ -59,6 +72,15 @@ pub struct Agent {
     control: TurnControl,
 }
 
+/// One interrupt the front end can send a running turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Poke {
+    /// Esc: save the partial answer, if any, and stop.
+    Cancel,
+    /// A steering message: save the partial, record this text, restart the round.
+    Steer(String),
+}
+
 /// The front end's control plane for running turns.
 #[derive(Clone, Default)]
 pub struct TurnControl {
@@ -70,11 +92,9 @@ pub struct TurnControl {
 struct TurnState {
     /// Which turn owns the lever; a finishing worker retires only its own.
     generation: u64,
-    /// The running turn's wake sender, where pokes reach it.
-    sender: Option<mpsc::Sender<()>>,
-    /// Esc was pressed and we should attempt to cancel.
-    cancelled: bool,
-    /// The steering message waiting to interrupt the turn, if any.
+    /// The running turn's poke sender, where interrupts reach it. `None` at idle
+    sender: Option<mpsc::Sender<Poke>>,
+    /// Message queue and effective label for the frontend to observe what's waiting.
     steer: Option<String>,
 }
 
@@ -91,10 +111,10 @@ impl TurnControl {
     #[inline]
     pub fn cancel(&self) {
         let mut state = self.state();
-        state.cancelled = true;
-        if let Some(sender) = &mut state.sender {
-            // A failed poke means one is already pending; the flag decides.
-            let _ = sender.try_send(());
+        if let Some(sender) = state.sender.as_mut() {
+            // A failed send means a poke is already queued; a pending Cancel
+            // says everything a second one would.
+            let _ = sender.try_send(Poke::Cancel);
         }
     }
 
@@ -109,10 +129,11 @@ impl TurnControl {
         if state.steer.is_some() {
             return false;
         }
-        state.steer = Some(text);
-        if let Some(sender) = &mut state.sender {
-            let _ = sender.try_send(());
+        if let Some(sender) = state.sender.as_mut() {
+            // A failed send means a poke is already queued behind this text.
+            let _ = sender.try_send(Poke::Steer(text.clone()));
         }
+        state.steer = Some(text);
         true
     }
 
@@ -130,10 +151,9 @@ impl TurnControl {
 
     /// Install `sender` as the next turn's lever, forgetting the last turn's
     /// intents, and report the turn's id.
-    fn claim(&self, sender: mpsc::Sender<()>) -> u64 {
+    fn claim(&self, sender: mpsc::Sender<Poke>) -> u64 {
         let mut state = self.state();
         state.generation += 1;
-        state.cancelled = false;
         state.steer = None;
         state.sender = Some(sender);
         state.generation
@@ -145,24 +165,7 @@ impl TurnControl {
         let mut state = self.state();
         if state.generation == generation {
             state.sender = None;
-            state.cancelled = false;
         }
-    }
-
-    /// Whether the front end cancelled the turn: pokes only wake a parked wait
-    fn cancelled(&self, cancel_rx: &mut mpsc::Receiver<()>) -> bool {
-        while cancel_rx.try_recv().is_ok() {}
-        self.state().cancelled
-    }
-
-    /// The cancel flag, without draining pokes — the select already woke.
-    fn is_cancelled(&self) -> bool {
-        self.state().cancelled
-    }
-
-    /// Whether a steering message waits.
-    fn has_steer(&self) -> bool {
-        self.state().steer.is_some()
     }
 }
 
@@ -240,16 +243,14 @@ impl Agent {
         self.control.clone()
     }
 
-    /// Record the queued steering message, reporting it so the front end can echo
+    /// Record one steering message, reporting it so the front end can echo
     fn record_steer<F: Fn(Progress)>(
-        &self,
         transcript: &Transcript,
+        text: &str,
         on_progress: &F,
     ) -> anyhow::Result<()> {
-        if let Some(text) = self.control.take_steer() {
-            transcript.push_user(text.clone())?;
-            on_progress(Progress::Steered(text));
-        }
+        transcript.push_user(text.to_string())?;
+        on_progress(Progress::Steered(text.to_string()));
         Ok(())
     }
 
@@ -277,14 +278,21 @@ impl Agent {
     pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
         let agent = self.clone();
         let transcript = transcript.clone();
-        // This turn's wake channel: the sender waits where Esc can reach it, and
-        // the receiver races the stream inside the worker.
-        let (esc_sender, receiver) = mpsc::channel(1);
-        let generation = self.control.claim(esc_sender);
+        // This turn's poke channel: the sender waits where Esc and steering
+        // reach it, and the receiver races the stream inside the worker.
+        // Four slots, so a Cancel can queue behind a Steer.
+        let (sender, pokes) = mpsc::channel(4);
+        let generation = self.control.claim(sender);
         std::thread::spawn(move || {
+            // One provider call per round, from the agent's collection pool.
+            let open_client = agent.client.clone();
+            let open = move |request: CreateResponse| -> OpenStreamFuture {
+                let client = open_client.clone();
+                Box::pin(async move { client.responses().create_stream(request).await })
+            };
             // A panicking worker must still deliver the terminal event to the caller
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                agent.run(&transcript, receiver, &on_progress);
+                block_on(agent.run(&transcript, pokes, open, &on_progress))
             }));
             // The turn is over: retire the lever unless a newer turn claimed it.
             agent.control.release(generation);
@@ -324,22 +332,34 @@ impl Agent {
         clippy::too_many_lines,
         reason = "the round loop reads best as one straight-line function"
     )]
-    fn run<F: Fn(Progress)>(
+    async fn run<O, F>(
         &self,
         transcript: &Transcript,
-        mut cancel_rx: mpsc::Receiver<()>,
+        mut pokes: mpsc::Receiver<Poke>,
+        open: O,
         on_progress: &F,
-    ) {
+    ) -> Progress
+    where
+        O: Fn(CreateResponse) -> OpenStreamFuture,
+        F: Fn(Progress),
+    {
         // Set once a cancel is consumed, so the rest of the turn's calls and rounds
         // skip without re-reading the channel.
         let mut cancelled = false;
         for _ in 0..self.max_rounds {
             // A cancelled generation stops before spending another request.
-            if cancelled || self.control.cancelled(&mut cancel_rx) {
+            if cancelled {
+                return terminate_and_log(on_progress, Progress::Cancelled);
+            }
+            // Pokes that arrived between rounds ride on this request; Esc > steer.
+            let (cancel, steer) = drain_pokes(&mut pokes);
+            if cancel {
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
             // Steering left over from the last round rides on this request.
-            if let Err(error) = self.record_steer(transcript, on_progress) {
+            if let Some(text) = steer
+                && let Err(error) = Self::record_steer(transcript, &text, on_progress)
+            {
                 return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             // The sandboxed trio less `edit` in plan mode, plus web tools if available
@@ -363,14 +383,14 @@ impl Agent {
 
             debug::log_json("round request", || serde_json::to_string(&request));
 
-            // `Compat` enters the global tokio runtime and exposes `futures` blocking control.
-            let mut stream =
-                match block_on(Compat::new(self.client.responses().create_stream(request))) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-                    }
-                };
+            // `Compat` enters the global tokio runtime so the provider's future polls
+            // correctly from any executor. Its stream is a channel the pump feeds
+            let mut stream = match Compat::new(open(request)).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
+            };
 
             let mut answer = String::new();
             // Completed calls, captured from finished output items, in stream order.
@@ -389,134 +409,154 @@ impl Agent {
 
             // Race the stream against Esc and steering pokes; a won cancel
             // returns and drops the stream, a won steer restarts the round
-            loop {
-                let item = match block_on(Compat::new(select(stream.next(), cancel_rx.next()))) {
-                    Either::Right(_) => {
-                        if self.control.is_cancelled() {
-                            // Esc won: dropping the stream keeps what it streamed.
-                            if !answer.is_empty()
-                                && let Err(error) = transcript.push_assistant(answer.clone())
-                            {
-                                return terminate_and_log(
-                                    on_progress,
-                                    Progress::Failed(error.to_string()),
-                                );
-                            }
-                            return terminate_and_log(on_progress, Progress::Cancelled);
-                        }
-                        if !self.control.has_steer() {
-                            // A stale poke: nothing to do but keep streaming.
-                            continue;
-                        }
-                        // A steer won: record the partial, then the steered input,
-                        // and restart the round from it.
-                        if !answer.is_empty()
-                            && let Err(error) =
-                                transcript.push_assistant(std::mem::take(&mut answer))
-                        {
-                            return terminate_and_log(
-                                on_progress,
-                                Progress::Failed(error.to_string()),
-                            );
-                        }
-                        if let Err(error) = self.record_steer(transcript, on_progress) {
-                            return terminate_and_log(
-                                on_progress,
-                                Progress::Failed(error.to_string()),
-                            );
-                        }
-                        aborted = true;
-                        break;
-                    }
-                    Either::Left((item, _)) => item,
+            let mut pokes_closed = false;
+            'events: loop {
+                // The poke future borrows the receiver; scoping it here frees the drain
+                let woke = {
+                    let mut poke_fut = if pokes_closed {
+                        futures::future::pending::<Option<Poke>>().boxed_local().fuse()
+                    } else {
+                        pokes.next().boxed_local().fuse()
+                    };
+                    let mut closed = false;
+                    let woke = futures::select! {
+                     item = stream.next().fuse() => {
+                         let Some(item) = item else { break 'events };
+                         match item {
+                     Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
+                         answer.push_str(&delta.delta);
+                         saw_output = true;
+                         on_progress(Progress::Answer(delta.delta));
+                     }
+                     Ok(ResponseStreamEvent::ResponseReasoningTextDelta(delta)) => {
+                         saw_output = true;
+                         on_progress(Progress::Thinking(delta.delta));
+                     }
+                     Ok(ResponseStreamEvent::ResponseOutputItemAdded(added)) => {
+                         if matches!(added.item, OutputItem::FunctionCall(_)) {
+                             call_in_flight = true;
+                         }
+                     }
+                     Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => match &done.item {
+                         OutputItem::Reasoning(item) => {
+                             debug::log_json("captured reasoning item", || {
+                                 serde_json::to_string(item)
+                             });
+                             reasoning = Some(item.clone());
+                             saw_output = true;
+                         }
+                         OutputItem::FunctionCall(call) => {
+                             calls.push(call.clone());
+                             call_in_flight = false;
+                             saw_output = true;
+                         }
+                         _ => {}
+                     },
+                     Ok(ResponseStreamEvent::ResponseCompleted(completed)) => {
+                         // A completed response is output even when it holds no items.
+                         saw_output = true;
+                         if let Some(usage) = completed.response.usage {
+                             on_progress(Progress::Usage {
+                                 input: u64::from(usage.input_tokens),
+                                 cached: u64::from(usage.input_tokens_details.cached_tokens),
+                                 output: u64::from(usage.output_tokens),
+                             });
+                         }
+                     }
+                     Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
+                         debug::log_json("response failed event", || serde_json::to_string(&failed));
+                         return terminate_and_log(
+                             on_progress,
+                             Progress::Failed(failed.response.error.map_or_else(
+                                 || "response failed".to_string(),
+                                 |error| error.message,
+                             )),
+                         );
+                     }
+                     // The provider said the stream broke; not recoverable here.
+                     Ok(ResponseStreamEvent::ResponseError(error)) => {
+                         debug::log_json("response error event", || serde_json::to_string(&error));
+                         return terminate_and_log(
+                             on_progress,
+                             Progress::Failed(format!(
+                                 "{}: {}",
+                                 error.code.unwrap_or_else(|| "error".to_string()),
+                                 error.message
+                             )),
+                         );
+                     }
+                     // Truncated (max output tokens, content filter): report it
+                     Ok(ResponseStreamEvent::ResponseIncomplete(incomplete)) => {
+                         debug::log_json("response incomplete event", || {
+                             serde_json::to_string(&incomplete)
+                         });
+                         let reason = incomplete
+                             .response
+                             .incomplete_details
+                             .map_or_else(|| "unknown reason".to_string(), |details| details.reason);
+                         return terminate_and_log(
+                             on_progress,
+                             Progress::Failed(format!("response incomplete: {reason}")),
+                         );
+                     }
+                     Ok(_) => {}
+                     // Transport errors are skipped: the stream ends on its own,
+                     // and the checks after the loop decide what the round got.
+                     Err(error) => {
+                         let error = error.to_string();
+                         debug::log("stream error", || error.clone());
+                         last_error = Some(error);
+                     }
+                     }
+                         None
+                     }
+                     // The poke arm hands back what it woke on
+                    poke = poke_fut => {
+                         if poke.is_none() {
+                             closed = true;
+                         }
+                         poke
+                     },
+                     };
+                    pokes_closed = closed;
+                    woke
                 };
-                let Some(item) = item else { break };
-                match item {
-                    Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
-                        answer.push_str(&delta.delta);
-                        saw_output = true;
-                        on_progress(Progress::Answer(delta.delta));
+                let Some(poke) = woke else {
+                    continue;
+                };
+                // The poke that woke us has been consumed; drain its company.
+                // An Esc queued behind a steer still wins.
+                let (cancel, steer) = match poke {
+                    Poke::Cancel => (true, None),
+                    Poke::Steer(text) => {
+                        let (cancel, more) = drain_pokes(&mut pokes);
+                        (cancel, more.or(Some(text)))
                     }
-                    Ok(ResponseStreamEvent::ResponseReasoningTextDelta(delta)) => {
-                        saw_output = true;
-                        on_progress(Progress::Thinking(delta.delta));
+                };
+                if cancel {
+                    // Esc won: dropping the stream keeps what it streamed.
+                    if !answer.is_empty()
+                        && let Err(error) = transcript.push_assistant(answer.clone())
+                    {
+                        return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
                     }
-                    Ok(ResponseStreamEvent::ResponseOutputItemAdded(added)) => {
-                        if matches!(added.item, OutputItem::FunctionCall(_)) {
-                            call_in_flight = true;
-                        }
-                    }
-                    Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => match &done.item {
-                        OutputItem::Reasoning(item) => {
-                            debug::log_json("captured reasoning item", || {
-                                serde_json::to_string(item)
-                            });
-                            reasoning = Some(item.clone());
-                            saw_output = true;
-                        }
-                        OutputItem::FunctionCall(call) => {
-                            calls.push(call.clone());
-                            call_in_flight = false;
-                            saw_output = true;
-                        }
-                        _ => {}
-                    },
-                    Ok(ResponseStreamEvent::ResponseCompleted(completed)) => {
-                        // A completed response is output even when it holds no items.
-                        saw_output = true;
-                        if let Some(usage) = completed.response.usage {
-                            on_progress(Progress::Usage {
-                                input: u64::from(usage.input_tokens),
-                                cached: u64::from(usage.input_tokens_details.cached_tokens),
-                                output: u64::from(usage.output_tokens),
-                            });
-                        }
-                    }
-                    Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
-                        debug::log_json("response failed event", || serde_json::to_string(&failed));
-                        return terminate_and_log(
-                            on_progress,
-                            Progress::Failed(failed.response.error.map_or_else(
-                                || "response failed".to_string(),
-                                |error| error.message,
-                            )),
-                        );
-                    }
-                    // The provider said the stream broke; not recoverable here.
-                    Ok(ResponseStreamEvent::ResponseError(error)) => {
-                        debug::log_json("response error event", || serde_json::to_string(&error));
-                        return terminate_and_log(
-                            on_progress,
-                            Progress::Failed(format!(
-                                "{}: {}",
-                                error.code.unwrap_or_else(|| "error".to_string()),
-                                error.message
-                            )),
-                        );
-                    }
-                    // Truncated (max output tokens, content filter): report it
-                    Ok(ResponseStreamEvent::ResponseIncomplete(incomplete)) => {
-                        debug::log_json("response incomplete event", || {
-                            serde_json::to_string(&incomplete)
-                        });
-                        let reason = incomplete
-                            .response
-                            .incomplete_details
-                            .map_or_else(|| "unknown reason".to_string(), |details| details.reason);
-                        return terminate_and_log(
-                            on_progress,
-                            Progress::Failed(format!("response incomplete: {reason}")),
-                        );
-                    }
-                    Ok(_) => {}
-                    // Transport errors are skipped: the stream ends on its own,
-                    // and the checks after the loop decide what the round got.
-                    Err(error) => {
-                        let error = error.to_string();
-                        debug::log("stream error", || error.clone());
-                        last_error = Some(error);
-                    }
+                    return terminate_and_log(on_progress, Progress::Cancelled);
                 }
+                let Some(text) = steer else {
+                    // Nothing actionable woke us: keep streaming.
+                    continue;
+                };
+                // A steer won: record the partial, then the steered input, then restart
+                if !answer.is_empty()
+                    && let Err(error) = transcript.push_assistant(std::mem::take(&mut answer))
+                {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
+                if let Err(error) = Self::record_steer(transcript, &text, on_progress) {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
+                aborted = true;
+                break;
             }
 
             // The stream was dropped for a steer -> rebuild from truncated output
@@ -565,16 +605,17 @@ impl Agent {
             // error so the round's earlier effects stay in the transcript.
             let mut failure: Option<String> = None;
             // The tool loop broke early to consume a steering message.
-            let mut steered = false;
+            let mut steered_text: Option<String> = None;
             for call in calls {
-                // A cancelled turn skips its remaining calls; the one in
-                // flight finishes first.
-                if cancelled || self.control.cancelled(&mut cancel_rx) {
+                // Pokes that arrived mid-tools stop the loop the way Esc
+                // between calls always has; the one in flight finishes first.
+                let (cancel, steer) = drain_pokes(&mut pokes);
+                if cancel || cancelled {
                     cancelled = true;
                     break;
                 }
-                if self.control.has_steer() {
-                    steered = true;
+                if let Some(text) = steer {
+                    steered_text = Some(text);
                     break;
                 }
                 match tools::execute(&call, self.policy(), on_progress) {
@@ -603,9 +644,9 @@ impl Agent {
                 // The turn stops here, keeping the rounds recorded so far.
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
-            if steered {
+            if let Some(text) = steered_text {
                 // The steered input rides on the next round's request.
-                if let Err(error) = self.record_steer(transcript, on_progress) {
+                if let Err(error) = Self::record_steer(transcript, &text, on_progress) {
                     return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
                 }
                 continue;
@@ -618,8 +659,21 @@ impl Agent {
         terminate_and_log(
             on_progress,
             Progress::Failed(format!("gave up after {rounds} tool rounds")),
-        );
+        )
     }
+}
+
+/// Drain every pending poke, reporting whether an Esc is among them.
+fn drain_pokes(pokes: &mut mpsc::Receiver<Poke>) -> (bool, Option<String>) {
+    let mut cancel = false;
+    let mut steer = None;
+    while let Ok(poke) = pokes.try_recv() {
+        match poke {
+            Poke::Cancel => cancel = true,
+            Poke::Steer(text) => steer = Some(text),
+        }
+    }
+    (cancel, steer)
 }
 
 /// A failure message with the last skipped transport error, if any, appended.
@@ -630,8 +684,9 @@ fn with_last_error(message: &str, last_error: Option<String>) -> String {
     }
 }
 
-/// Deliver the generation's terminal event, mirroring its outcome to the debug lob.
-fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
+/// Deliver the generation's terminal event, mirroring its outcome to the debug
+/// log, and hand it back so a driving wrapper can observe the outcome.
+fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) -> Progress {
     debug::log("generation outcome", || match &event {
         Progress::Done { message } => {
             format!("done ({} answer chars)", message.as_deref().map_or(0, str::len))
@@ -640,12 +695,17 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
         Progress::Cancelled => "cancelled".to_string(),
         _ => "not a terminal event".to_string(),
     });
-    on_progress(event);
+    on_progress(event.clone());
+    event
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
     use super::*;
+    use serde_json::json;
+    use std::cell::RefCell;
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -704,27 +764,246 @@ mod tests {
         assert_eq!(control.steering(), Some("first".to_string()));
         assert_eq!(control.take_steer(), Some("first".to_string()));
 
-        // Claiming resets both intents and installs the wake sender.
-        let (sender, mut rx) = mpsc::channel(1);
+        // Claiming resets the slot and installs the poke sender.
+        let (sender, mut pokes) = mpsc::channel(4);
         let first = control.claim(sender);
         assert_eq!(control.steering(), None);
-        assert!(!control.cancelled(&mut rx));
+        assert_eq!(drain_pokes(&mut pokes), (false, None));
 
-        // Cancel pokes the claimed sender; the drained flag decides.
+        // Cancel sends a typed poke the worker drains.
         control.cancel();
-        assert!(control.cancelled(&mut rx));
+        assert_eq!(drain_pokes(&mut pokes), (true, None));
+
+        // A steer delivers its text in the message; the slot mirrors it.
+        assert!(control.steer("redirect".to_string()));
+        assert_eq!(control.steering(), Some("redirect".to_string()));
+        assert_eq!(drain_pokes(&mut pokes), (false, Some("redirect".to_string())));
+        // The pane clears the mirror when the steer is echoed.
+        assert_eq!(control.take_steer().as_deref(), Some("redirect"));
+
+        // An Esc queued behind a steer still wins the drain.
+        assert!(control.steer("second thought".to_string()));
+        control.cancel();
+        assert_eq!(
+            drain_pokes(&mut pokes),
+            (true, Some("second thought".to_string()))
+        );
 
         // A stale release must not retire the newer turn's lever.
-        let (sender, _) = mpsc::channel(1);
+        let (sender, _) = mpsc::channel(4);
         let second = control.claim(sender);
         control.release(first);
-        control.cancel();
-        assert!(control.is_cancelled());
 
-        // Retiring the right turn clears its intents but not a later steer —
-        // the front end reads that when the terminal event lands.
+        // Retiring the right turn clears its intents but not a later steer.
         control.release(second);
         assert!(control.steer("survives".to_string()));
         assert_eq!(control.take_steer(), Some("survives".to_string()));
+    }
+
+    #[test]
+    fn a_poked_steer_records_and_restarts_the_round() {
+        let agent = test_agent();
+        let open = scripted(vec![
+            // Round one streams a partial answer, then a poke redirects it.
+            stays_open(vec![delta("partial ")]),
+            // Round two answers from the steered input.
+            ends(vec![delta("redirected")]),
+        ]);
+        let (sender, pokes) = mpsc::channel::<Poke>(4);
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("original".to_string()).unwrap();
+        // The poke rides in mid-stream: the first delta queues the redirect,
+        // the way a user's message lands during a live generation.
+        let mid_stream = RefCell::new(Some(sender));
+        let events = RefCell::new(Vec::new());
+        let outcome = block_on(agent.run(&transcript, pokes, open, &|progress| {
+            if matches!(&progress, Progress::Answer(delta) if delta == "partial ")
+                && let Some(mut sender) = mid_stream.borrow_mut().take()
+            {
+                sender
+                    .try_send(Poke::Steer("redirect".to_string()))
+                    .expect("four slots");
+            }
+            events.borrow_mut().push(progress);
+        }));
+
+        assert!(matches!(outcome, Progress::Done { message: Some(text) } if text == "redirected"));
+        // The record reads: user, assistant partial, user redirect, assistant.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"], "original");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"], "partial ");
+        assert_eq!(items[3]["role"], "user");
+        assert_eq!(items[3]["content"], "redirect");
+        assert_eq!(items[4]["role"], "assistant");
+        assert_eq!(items[4]["content"], "redirected");
+        // The steer was reported so the front end can echo it.
+        assert!(events.borrow().iter().any(|event| matches!(
+            event,
+            Progress::Steered(text) if text == "redirect"
+        )));
+    }
+
+    /// A poked cancel mid-stream saves the partial answer and stops.
+    #[test]
+    fn a_poked_cancel_saves_the_partial_answer() {
+        let agent = test_agent();
+        let open = scripted(vec![stays_open(vec![delta("partial answer")])]);
+        let (sender, pokes) = mpsc::channel::<Poke>(4);
+        let transcript = Transcript::new().unwrap();
+        // Esc lands after the first delta: the partial answer is kept.
+        let mid_stream = RefCell::new(Some(sender));
+        let outcome = block_on(agent.run(&transcript, pokes, open, &|progress| {
+            if matches!(&progress, Progress::Answer(delta) if delta == "partial answer")
+                && let Some(mut sender) = mid_stream.borrow_mut().take()
+            {
+                sender.try_send(Poke::Cancel).expect("four slots");
+            }
+        }));
+
+        assert!(matches!(outcome, Progress::Cancelled));
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items[1]["role"], "assistant");
+        assert_eq!(items[1]["content"], "partial answer");
+    }
+
+    /// The truncation rules port verbatim: a stream that ends mid tool call
+    /// or delivers nothing fails the turn.
+    #[test]
+    fn truncated_streams_fail_the_turn() {
+        let agent = test_agent();
+        let open = scripted(vec![ends(vec![item(json!({
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "c1", "name": "bash",
+                "arguments": "", "status": "in_progress"
+            }
+        }))])]);
+        let (_sender, pokes) = mpsc::channel::<Poke>(4);
+        let outcome = block_on(agent.run(&Transcript::new().unwrap(), pokes, open, &|_| {}));
+        assert!(matches!(outcome, Progress::Failed(reason) if reason.contains("mid tool call")));
+
+        let agent = test_agent();
+        let open = scripted(vec![ends(Vec::new())]);
+        let (_sender, pokes) = mpsc::channel::<Poke>(4);
+        let outcome = block_on(agent.run(&Transcript::new().unwrap(), pokes, open, &|_| {}));
+        assert!(matches!(outcome, Progress::Failed(reason) if reason.contains("without output")));
+    }
+
+    /// The reasoning item is captured and replayed before its round's call
+    /// exchanges: thinking-mode providers 400 without it.
+    #[test]
+    fn reasoning_replays_before_its_rounds_calls() {
+        let agent = test_agent();
+        let open = scripted(vec![
+            ends(vec![
+                item(json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1", "summary": []}
+                })),
+                item(json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call", "id": "fc_1", "call_id": "c1", "name": "bash",
+                        "arguments": "{\"command\":\"true\"}", "status": "completed"
+                    }
+                })),
+            ]),
+            ends(vec![delta("done now")]),
+        ]);
+        let (_sender, pokes) = mpsc::channel::<Poke>(4);
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        let outcome = block_on(agent.run(&transcript, pokes, open, &|_| {}));
+
+        assert!(matches!(outcome, Progress::Done { .. }));
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let kinds: Vec<&str> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                item["type"]
+                    .as_str()
+                    .unwrap_or(item["role"].as_str().unwrap_or(""))
+            })
+            .collect();
+        let reasoning_at = kinds.iter().position(|k| *k == "reasoning").unwrap();
+        let call_at = kinds.iter().position(|k| *k == "function_call").unwrap();
+        assert!(
+            reasoning_at < call_at,
+            "reasoning must precede its calls: {kinds:?}"
+        );
+    }
+
+    /// One canned stream item from JSON: the wire shape the provider sends.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the stream's items are Results; canned ones are always Ok"
+    )]
+    fn item(json: serde_json::Value) -> StreamItem {
+        Ok(serde_json::from_value::<ResponseStreamEvent>(json).unwrap())
+    }
+
+    /// A text delta event carrying `text`.
+    fn delta(text: &str) -> StreamItem {
+        item(json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "item_0",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text
+        }))
+    }
+
+    /// One scripted round: its events, and whether the stream stays open
+    /// after them (a mid-stream poke test needs the poke as its only wake).
+    struct Script {
+        items: Vec<StreamItem>,
+        stay_open: bool,
+    }
+
+    /// A round that ends with its items: the stream's natural end.
+    fn ends(items: Vec<StreamItem>) -> Script {
+        Script { items, stay_open: false }
+    }
+
+    /// A round whose stream stays open after its items.
+    fn stays_open(items: Vec<StreamItem>) -> Script {
+        Script { items, stay_open: true }
+    }
+
+    /// An agent pointed at nothing, for driving `run` with a scripted opener.
+    fn test_agent() -> Agent {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        Agent::new("http://localhost:9", "key", "model", policy)
+    }
+
+    /// An opener that replays canned rounds, one stream per round.
+    fn scripted(rounds: Vec<Script>) -> impl Fn(CreateResponse) -> OpenStreamFuture {
+        use std::sync::Mutex;
+
+        let rounds = Mutex::new(rounds.into_iter().rev().collect::<Vec<_>>());
+        move |request: CreateResponse| -> OpenStreamFuture {
+            let _ = request;
+            let script = rounds.lock().unwrap().pop().unwrap_or_else(|| ends(Vec::new()));
+            Box::pin(async move {
+                let items = futures::stream::iter(script.items).boxed();
+                let stream: ResponseStream = if script.stay_open {
+                    items.chain(futures::stream::pending().boxed()).boxed()
+                } else {
+                    items
+                };
+                Ok::<ResponseStream, OpenAIError>(stream)
+            })
+        }
     }
 }
