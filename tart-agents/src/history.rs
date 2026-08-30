@@ -5,7 +5,7 @@ use async_openai::types::responses::{
     FunctionToolCall, InputItem, Item, ReasoningItem, ReasoningItemContent, Role,
 };
 
-use crate::{Progress, tools};
+use crate::Progress;
 
 /// The system prompt for *tart*, included in every conversation.
 const SYSTEM: &str = include_str!("data/SYSTEM.md");
@@ -134,11 +134,23 @@ impl Transcript {
         Ok(())
     }
 
-    /// The stored record, oldest first, as `Session` persists and replays
+    /// How many items the stored record holds.
     #[inline]
     #[must_use]
-    pub(crate) fn stored_items(&self) -> Vec<InputItem> {
-        self.items().clone()
+    pub(crate) fn len(&self) -> usize {
+        self.items().len()
+    }
+
+    /// The stored items from `start` on, oldest first, as `Session` persists
+    /// and replays.
+    ///
+    /// A cursor read: only the tail past what a session has already flushed is
+    /// cloned, so recording a turn costs its new lines, not the whole record.
+    /// A `start` past the end yields nothing.
+    #[inline]
+    #[must_use]
+    pub(crate) fn items_after(&self, start: usize) -> Vec<InputItem> {
+        self.items().get(start..).map_or_else(Vec::new, ToOwned::to_owned)
     }
 
     /// The input items for the next request: the stored record with the
@@ -189,12 +201,11 @@ impl Transcript {
             }
             InputItem::Item(Item::FunctionCall(call)) => {
                 // Just show the header, exits/output are not super necessary
-                let (name, digest) = tools::describe(call);
                 vec![
                     Progress::ToolStart {
                         id: call.call_id.clone(),
-                        name,
-                        digest,
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
                     },
                     Progress::ToolOutput {
                         id: call.call_id.clone(),
@@ -273,7 +284,7 @@ mod tests {
         transcript.push_user("look at the auth flow".to_string()).unwrap();
 
         // Without a reminder the request is exactly the stored record.
-        assert_eq!(transcript.request_items().len(), transcript.stored_items().len());
+        assert_eq!(transcript.request_items().len(), transcript.items_after(0).len());
 
         transcript.set_reminder(Some("plan mode is on")).unwrap();
         let request = serde_json::to_value(transcript.request_items()).unwrap();
@@ -287,13 +298,13 @@ mod tests {
 
         // The stored record is an exact prefix of the request, so neither
         // arming nor clearing the reminder invalidates it.
-        let stored = serde_json::to_value(transcript.stored_items()).unwrap();
+        let stored = serde_json::to_value(transcript.items_after(0)).unwrap();
         for (sent, kept) in request.iter().zip(stored.as_array().unwrap()) {
             assert_eq!(sent, kept, "the record leads the request unchanged");
         }
 
         // It stays one copy as turns accrue, and never reaches the record.
-        let record = serde_json::to_string(&transcript.stored_items()).unwrap();
+        let record = serde_json::to_string(&transcript.items_after(0)).unwrap();
         assert!(!record.contains("plan mode is on"), "never stored: {record}");
         transcript.push_user("and the tests?".to_string()).unwrap();
         let with_two_turns = serde_json::to_string(&transcript.request_items()).unwrap();
@@ -307,7 +318,7 @@ mod tests {
         transcript.set_reminder(None).unwrap();
         assert_eq!(
             serde_json::to_value(transcript.request_items()).unwrap(),
-            serde_json::to_value(transcript.stored_items()).unwrap()
+            serde_json::to_value(transcript.items_after(0)).unwrap()
         );
     }
 
@@ -319,7 +330,7 @@ mod tests {
             .push_user("plan the auth refactor".to_string())
             .unwrap();
         // What the last planning request sent as its prefix: the record alone.
-        let sent = serde_json::to_value(transcript.stored_items()).unwrap();
+        let sent = serde_json::to_value(transcript.items_after(0)).unwrap();
         transcript.set_reminder(Some("plan mode is on")).unwrap();
 
         // The plan lands, the mode leaves, the approval turn is recorded.
@@ -479,6 +490,30 @@ mod tests {
         assert_eq!(transcript.request_items().len(), 1);
     }
 
+    /// The cursor read yields exactly the unseen tail, never the flushed prefix.
+    #[test]
+    fn items_after_returns_the_unseen_tail_only() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+
+        // From zero the whole record reads back, matching a full request.
+        let whole = serde_json::to_value(transcript.items_after(0)).unwrap();
+        assert_eq!(whole, serde_json::to_value(transcript.request_items()).unwrap());
+
+        // Past the system prompt: only the turn items follow.
+        let tail = serde_json::to_value(transcript.items_after(1)).unwrap();
+        let tail = tail.as_array().unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0]["role"], "user");
+        assert_eq!(tail[1]["role"], "assistant");
+
+        // Reading to the end, and past it, yields nothing without panicking:
+        // a cleared record can end before a session's flushed prefix.
+        assert!(transcript.items_after(transcript.len()).is_empty());
+        assert!(transcript.items_after(transcript.len() + 3).is_empty());
+    }
+
     #[test]
     fn items_round_trip_through_jsonl_lines() {
         let transcript = Transcript::new().unwrap();
@@ -524,8 +559,8 @@ mod tests {
                 Thinking(thinking),
                 ToolStart {
                     id,
-                    name: "Bash",
-                    digest
+                    name,
+                    arguments,
                 },
                 ToolOutput {
                     output,
@@ -533,9 +568,7 @@ mod tests {
                     ..
                 },
                 ToolStart {
-                    id: second_id,
-                    name: "Bash",
-                    ..
+                    id: second_id, ..
                 },
                 ToolOutput {
                     output: second_output,
@@ -546,7 +579,8 @@ mod tests {
             ] if text == "run it"
                 && thinking == "thinking"
                 && id == "call_0"
-                && digest == "ls"
+                && name == "bash"
+                && arguments == r#"{"command":"ls"}"#
                 && output.is_empty()
                 && second_id == "call_1"
                 && second_output.is_empty()
