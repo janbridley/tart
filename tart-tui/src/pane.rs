@@ -449,6 +449,10 @@ impl Pane {
             // A steering message aborted that response: retire its thinking
             // run (the record dropped it too), then echo like a submitted one.
             Progress::Steered(text) => {
+                // The worker consumed this steer, so its mirror slot is free again.
+                if self.control.steering().as_deref() == Some(text) {
+                    self.control.take_steer();
+                }
                 self.begin_response();
                 self.echo(text);
             }
@@ -1265,6 +1269,23 @@ mod tests {
         pane.popup = Some(Popup::Files(FilePopup::from_files(vec![], String::new())));
         pane.on_key(key(KeyCode::Up, KeyModifiers::ALT));
         assert_eq!(pane.prompt.text(), "also this\none now two");
+    }
+
+    #[test]
+    fn echoing_a_consumed_steer_frees_the_slot() {
+        let mut pane = Pane::default();
+        pane.set_generating(true);
+        assert!(pane.control.steer("redirect".to_string()));
+
+        // The worker records the steer and reports it; the echo clears the
+        // slot, so a second steer queues instead of being refused.
+        pane.apply(&Progress::Steered("redirect".to_string()));
+        assert_eq!(pane.control.steering(), None);
+        assert!(pane.control.steer("again".to_string()));
+
+        // A different steer echoed (an older turn's, say) leaves the slot be.
+        pane.apply(&Progress::Steered("redirect".to_string()));
+        assert_eq!(pane.control.steering(), Some("again".to_string()));
     }
 
     /// A steered message retires the aborted response's thinking run, then
