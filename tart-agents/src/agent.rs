@@ -81,6 +81,32 @@ pub enum Poke {
     Steer(String),
 }
 
+impl Poke {
+    /// Drain every pending poke, reporting whether an Esc is among them.
+    fn drain(pokes: &mut mpsc::Receiver<Self>) -> (bool, Option<String>) {
+        let mut cancel = false;
+        let mut steer = None;
+        while let Ok(poke) = pokes.try_recv() {
+            match poke {
+                Self::Cancel => cancel = true,
+                Self::Steer(text) => steer = Some(text),
+            }
+        }
+        (cancel, steer)
+    }
+
+    /// Read the poke that woke us and then [`Poke::drain`].
+    fn absorb(self, pokes: &mut mpsc::Receiver<Self>) -> (bool, Option<String>) {
+        match self {
+            Self::Cancel => (true, None),
+            Self::Steer(text) => {
+                let (cancel, more) = Self::drain(pokes);
+                (cancel, more.or(Some(text)))
+            }
+        }
+    }
+}
+
 /// The front end's lever on one running turn.
 pub struct TurnHandle {
     /// The turn's poke sender, where interrupts reach the round loop.
@@ -353,7 +379,7 @@ impl Agent {
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
             // Pokes that arrived between rounds ride on this request; Esc > steer.
-            let (cancel, steer) = drain_pokes(&mut pokes);
+            let (cancel, steer) = Poke::drain(&mut pokes);
             if cancel {
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
@@ -527,13 +553,7 @@ impl Agent {
                 };
                 // The poke that woke us has been consumed; drain its company.
                 // An Esc queued behind a steer still wins.
-                let (cancel, steer) = match poke {
-                    Poke::Cancel => (true, None),
-                    Poke::Steer(text) => {
-                        let (cancel, more) = drain_pokes(&mut pokes);
-                        (cancel, more.or(Some(text)))
-                    }
-                };
+                let (cancel, steer) = poke.absorb(&mut pokes);
                 if cancel {
                     // Esc won: dropping the stream keeps what it streamed.
                     if !answer.is_empty()
@@ -610,7 +630,7 @@ impl Agent {
             for call in calls {
                 // Pokes that arrived between calls stop the loop the way
                 // they always have.
-                let (cancel, steer) = drain_pokes(&mut pokes);
+                let (cancel, steer) = Poke::drain(&mut pokes);
                 if cancel || cancelled {
                     cancelled = true;
                     break;
@@ -634,11 +654,7 @@ impl Agent {
                         // an Esc queued behind a steer still wins, and the
                         // steer it retracts is discarded instead of recorded.
                         let (cancel, steer) = match poke {
-                            Some(Poke::Cancel) => (true, None),
-                            Some(Poke::Steer(text)) => {
-                                let (cancel, more) = drain_pokes(&mut pokes);
-                                (cancel, more.or(Some(text)))
-                            }
+                            Some(poke) => poke.absorb(&mut pokes),
                             None => (false, None),
                         };
                         if cancel {
@@ -696,19 +712,6 @@ impl Agent {
             Progress::Failed(format!("gave up after {rounds} tool rounds")),
         )
     }
-}
-
-/// Drain every pending poke, reporting whether an Esc is among them.
-fn drain_pokes(pokes: &mut mpsc::Receiver<Poke>) -> (bool, Option<String>) {
-    let mut cancel = false;
-    let mut steer = None;
-    while let Ok(poke) = pokes.try_recv() {
-        match poke {
-            Poke::Cancel => cancel = true,
-            Poke::Steer(text) => steer = Some(text),
-        }
-    }
-    (cancel, steer)
 }
 
 /// A failure message with the last skipped transport error, if any, appended.
@@ -807,13 +810,13 @@ mod tests {
         let (sender, mut pokes) = mpsc::channel(4);
         steering.begin(TurnHandle { sender });
         assert_eq!(steering.steering(), None);
-        assert_eq!(drain_pokes(&mut pokes), (false, None));
+        assert_eq!(Poke::drain(&mut pokes), (false, None));
 
         // Cancel and steer deliver typed pokes the worker drains; an Esc
         // queued behind a steer still wins.
         assert!(steering.steer("redirect".to_string()));
         steering.cancel();
-        assert_eq!(drain_pokes(&mut pokes), (true, Some("redirect".to_string())));
+        assert_eq!(Poke::drain(&mut pokes), (true, Some("redirect".to_string())));
 
         // The matched clear frees the slot the worker just consumed; a
         // different steer queued in the same breath survives it.
@@ -829,6 +832,30 @@ mod tests {
         steering.end();
         steering.cancel();
         drop(pokes);
+    }
+
+    #[test]
+    fn a_waking_poke_drains_its_company() {
+        let (mut sender, mut pokes) = mpsc::channel(4);
+
+        // The waking steer keeps its text when nothing else queued.
+        sender.try_send(Poke::Steer("alone".to_string())).unwrap();
+        let woken = pokes.try_recv().unwrap();
+        assert_eq!(woken.absorb(&mut pokes), (false, Some("alone".to_string())));
+
+        // An Esc queued behind a steer wins, and retracts the steer.
+        sender.try_send(Poke::Steer("redirect".to_string())).unwrap();
+        sender.try_send(Poke::Cancel).unwrap();
+        let woken = pokes.try_recv().unwrap();
+        assert_eq!(woken.absorb(&mut pokes), (true, Some("redirect".to_string())));
+
+        // An Esc that woke us first leaves the later steer queued; the turn's
+        // cancel path drops it without recording.
+        sender.try_send(Poke::Cancel).unwrap();
+        sender.try_send(Poke::Steer("behind".to_string())).unwrap();
+        let woken = pokes.try_recv().unwrap();
+        assert_eq!(woken.absorb(&mut pokes), (true, None));
+        assert_eq!(pokes.try_recv().unwrap(), Poke::Steer("behind".to_string()));
     }
 
     #[test]
