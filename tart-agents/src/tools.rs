@@ -34,7 +34,7 @@ const READ_PROGRAM: &str = include_str!("data/read.pl");
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The longest timeout a bash call may ask for.
-const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The most of any one blob the model is handed, in bytes.
 pub const CONTENT_CAP: usize = 64 * 1024;
@@ -80,7 +80,7 @@ fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
 
 /// A function tool with the given name, description, and JSON-schema parameters.
 #[must_use]
-fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
+pub(crate) fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
     Tool::Function(FunctionTool {
         defer_loading: None,
         name: name.to_string(),
@@ -155,13 +155,13 @@ pub(crate) fn edit() -> Tool {
 }
 
 /// Parse a tool call's arguments as JSON.
-fn parse_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn parse_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
     serde_json::from_str(arguments)
         .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))
 }
 
 /// A required string field from parsed tool arguments.
-fn string_field(args: &serde_json::Value, name: &str) -> anyhow::Result<String> {
+pub(crate) fn string_field(args: &serde_json::Value, name: &str) -> anyhow::Result<String> {
     args[name]
         .as_str()
         .map(str::to_string)
@@ -364,6 +364,16 @@ pub fn head_cap(text: &str, cap: usize) -> String {
     format!("{}\n[truncated; first {} KB shown]", &text[..end], cap / 1024)
 }
 
+/// The first line of `text`, capped to `cap` characters with an ellipsis.
+pub(crate) fn one_line_capped(text: &str, cap: usize) -> String {
+    let line = text.split('\n').next().unwrap_or_default();
+    let mut capped = line.chars().take(cap).collect::<String>();
+    if line.chars().nth(cap).is_some() {
+        capped.push('…');
+    }
+    capped
+}
+
 /// Keep the last `cap` bytes of `text`, prefixing a marker when it cut.
 fn tail_cap(text: &str, cap: usize) -> String {
     if text.len() <= cap {
@@ -494,7 +504,7 @@ async fn run_watched(
 /// The run arrives as a future: it is inert until polled, so the
 /// [`Progress::ToolStart`] pair always opens before any work and closes after
 /// it, whatever the body awaits.
-async fn traced<F: Fn(Progress), Run>(
+pub(crate) async fn traced<F: Fn(Progress), Run>(
     call: &FunctionToolCall,
     name: &'static str,
     digest: String,
