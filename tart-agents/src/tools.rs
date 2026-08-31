@@ -400,7 +400,7 @@ fn command_text(text: &str, status: ExitStatus) -> String {
         };
     }
 
-    let status = status.code().map_or("signal".into(), |c| c.to_string());
+    let status = status.code().map_or_else(|| "signal".into(), |c| c.to_string());
 
     let separator = if text.is_empty() { "" } else { "\n" };
     format!("[exit {status}]{separator}{text}")
