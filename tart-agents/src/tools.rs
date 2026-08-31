@@ -5,7 +5,7 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 use nix::sys::signal::{Signal, killpg};
@@ -61,7 +61,7 @@ impl CancelToken {
     }
 
     /// Whether [`CancelToken::cancel`] was called.
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 }
@@ -254,13 +254,13 @@ fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
 /// should see.
 pub(crate) fn execute<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     match call.name.as_str() {
-        "bash" => run_bash(call, policy, on_progress),
-        "read" => run_read(call, policy, on_progress),
-        "edit" => run_edit(call, policy, on_progress),
+        "bash" => run_bash(call, tools, on_progress),
+        "read" => run_read(call, tools, on_progress),
+        "edit" => run_edit(call, tools, on_progress),
         // The unsandboxed pair: they need the network the sandbox denies.
         "search" => web::run_search(call, on_progress),
         "fetch" => web::run_fetch(call, on_progress),
@@ -294,12 +294,29 @@ fn command_text(text: &str, status: ExitStatus) -> String {
     format!("[exit {status}]{separator}{text}")
 }
 
+/// What a tool call runs with: the turn's sandbox policy and command lever.
+pub(crate) struct Tooling<'a> {
+    /// The policy the call's commands run sandboxed under.
+    pub(crate) policy: &'a Policy,
+    /// The turn's cancel lever: Esc kills a command in flight.
+    pub(crate) cancel: &'a CancelToken,
+}
+
 /// One finished command run under a watchdog: a deadline or a cancel.
 struct WatchedRun {
     /// The command's streams and exit status, as `output()` returns them.
     output: Output,
-    /// The watchdog killed the process group: a deadline or a cancel.
-    killed: bool,
+    /// Why the watchdog killed the process group, when it did.
+    killed: Option<KillReason>,
+}
+
+/// Which lever a watchdog pulled to kill a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillReason {
+    /// The deadline passed.
+    Timeout,
+    /// The cancel token fired.
+    Cancelled,
 }
 
 /// Model-facing explanation for a command the timeout killed.
@@ -356,59 +373,48 @@ fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)
     Ok((child, group))
 }
 
-/// Run `command` to completion, killing its process group if it outlives `timeout`.
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<WatchedRun> {
+/// Run `command` to completion, killing its process group the moment `cancel`
+/// fires or, with a `deadline`, once it outlives it.
+///
+/// The watchdog polls both levers, so a kill lands within one [`CANCEL_POLL`]
+/// of its cause. Four rules hold arm-for-arm: the reason is reported before
+/// the kill lands, the reaped child's sender drop wakes the watchdog, the
+/// group dies even when the wait errors, and the watchdog joins before
+/// returning.
+fn run_watched(
+    command: &mut Command,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> io::Result<WatchedRun> {
     let (child, group) = spawn_grouped(command)?;
 
-    let killed = Arc::new(AtomicBool::new(false));
-    // The sender drops once the command is reaped, waking the watchdog immediatedly
-    let (finished, slept) = mpsc::channel::<()>();
-    let flagged = Arc::clone(&killed);
-    let watchdog = std::thread::spawn(move || {
-        if matches!(slept.recv_timeout(timeout), Err(RecvTimeoutError::Timeout)) {
-            // Flag before killing, so the caller cannot mistake the death for a
-            // natural signal once the wait returns.
-            flagged.store(true, Ordering::Release);
-            let _ = killpg(group, Signal::SIGKILL);
-        }
-    });
-
-    let output = child.wait_with_output();
-    drop(finished);
-    // Double check we've killed everything even if the wait errors.
-    if output.is_err() {
-        let _ = killpg(group, Signal::SIGKILL);
-    }
-    let _ = watchdog.join();
-
-    Ok(WatchedRun {
-        output: output?,
-        killed: killed.load(Ordering::Acquire),
-    })
-}
-
-/// Run `command` to completion, killing its process group the moment `cancel` enters.
-fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command)?;
-
-    let killed = Arc::new(AtomicBool::new(false));
+    // The watchdog's kill reason, when it killed: sent before the kill lands
+    // and read after the watchdog joins, so a killed group is never mistaken
+    // for a natural exit.
+    let (killer, killed_by) = mpsc::channel::<KillReason>();
     // The sender drops once the command is reaped, waking the watchdog at once.
     let (finished, slept) = mpsc::channel::<()>();
-    let flagged = Arc::clone(&killed);
     let token = cancel.clone();
-    let watchdog = std::thread::spawn(move || {
-        while !token.cancelled() {
-            if matches!(
-                slept.recv_timeout(CANCEL_POLL),
-                Err(RecvTimeoutError::Disconnected)
-            ) {
-                return;
-            }
+    let end = deadline.map(|timeout| Instant::now() + timeout);
+    let watchdog = std::thread::spawn(move || loop {
+        if token.cancelled() {
+            let _ = killer.send(KillReason::Cancelled);
+            let _ = killpg(group, Signal::SIGKILL);
+            return;
         }
-        // Flag before killing, so the caller cannot mistake the death for a
-        // natural signal once the wait returns.
-        flagged.store(true, Ordering::Release);
-        let _ = killpg(group, Signal::SIGKILL);
+        // Sleep only until the nearer of the poll and the deadline, so a
+        // deadline kills on time rather than a poll late.
+        let wait = CANCEL_POLL.min(end.map_or(CANCEL_POLL, |end| {
+            end.saturating_duration_since(Instant::now())
+        }));
+        if matches!(slept.recv_timeout(wait), Err(RecvTimeoutError::Disconnected)) {
+            return;
+        }
+        if end.is_some_and(|end| Instant::now() >= end) {
+            let _ = killer.send(KillReason::Timeout);
+            let _ = killpg(group, Signal::SIGKILL);
+            return;
+        }
     });
 
     let output = child.wait_with_output();
@@ -421,7 +427,7 @@ fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Resul
 
     Ok(WatchedRun {
         output: output?,
-        killed: killed.load(Ordering::Acquire),
+        killed: killed_by.try_recv().ok(),
     })
 }
 
@@ -448,33 +454,39 @@ fn traced<F: Fn(Progress)>(
     result
 }
 
-/// Run one bash tool call under `policy`, reporting its steps to `on_progress`.
+/// Run one bash tool call under `tools`, reporting its steps to `on_progress`.
 ///
 /// A command that outlives its timeout is killed with everything it started.
-/// The model sees `[timed out after Ns]` and any partial output.
+/// The model sees `[timed out after Ns]` and any partial output; one the user
+/// cancelled mid-flight sees `[cancelled]`.
 fn run_bash<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let bash = parse_bash(&call.arguments)?;
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
-    let mut sandboxed = policy.command("/bin/bash");
+    let mut sandboxed = tools.policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
     Ok(traced(call, on_progress, || {
         // Decode the stream into output for the front and backends.
-        match run_with_timeout(&mut sandboxed, bash.timeout) {
+        match run_watched(&mut sandboxed, Some(bash.timeout), tools.cancel) {
             Ok(run) => {
                 let WatchedRun { output, killed } = run;
                 let text = combined_output(&output);
                 let exit = output.status.code();
-                if killed {
-                    // A timeout has no exit code for the header, so we mark up the body.
-                    let marked = timeout_text(&text, bash.timeout);
-                    (marked.clone(), marked, exit)
-                } else {
-                    (command_text(&text, output.status), text, exit)
+                match killed {
+                    // A kill has no exit code for the header, so we mark up the body.
+                    Some(KillReason::Timeout) => {
+                        let marked = timeout_text(&text, bash.timeout);
+                        (marked.clone(), marked, exit)
+                    }
+                    Some(KillReason::Cancelled) => {
+                        let marked = cancel_text(&text);
+                        (marked.clone(), marked, exit)
+                    }
+                    None => (command_text(&text, output.status), text, exit),
                 }
             }
             Err(error) => {
@@ -490,27 +502,27 @@ fn run_bash<F: Fn(Progress)>(
 pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     let mut shell = Command::new("/bin/bash");
     shell.arg("-c").arg(command);
-    match run_until_cancelled(&mut shell, cancel) {
+    match run_watched(&mut shell, None, cancel) {
         Ok(WatchedRun { output, killed }) => {
             let text = tail_cap(&combined_output(&output), CONTENT_CAP);
-            if killed {
-                cancel_text(&text)
-            } else {
-                command_text(&text, output.status)
+            match killed {
+                Some(KillReason::Cancelled) => cancel_text(&text),
+                // No deadline exists to outlive, so nothing else kills it.
+                _ => command_text(&text, output.status),
             }
         }
         Err(error) => format!("error: {error}"),
     }
 }
 
-/// Run one read tool call under `policy`, reporting its steps to `on_progress`.
+/// Run one read tool call under `tools`, reporting its steps to `on_progress`.
 fn run_read<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let read = parse_read(&call.arguments)?;
-    let mut command = policy.command("/usr/bin/perl");
+    let mut command = tools.policy.command("/usr/bin/perl");
     command
         .arg("-e")
         .arg(numbered_read(read.start_line, read.end_line))
@@ -538,12 +550,12 @@ fn run_read<F: Fn(Progress)>(
 /// on and retry.
 fn run_edit<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
     Ok(traced(call, on_progress, || {
-        let (result, exit) = apply_edit(&edit, policy);
+        let (result, exit) = apply_edit(&edit, tools.policy);
         (result.clone(), result, exit)
     }))
 }
