@@ -15,7 +15,9 @@ use futures::channel::mpsc;
 use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
-use crate::{CancelToken, MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
+use crate::{
+    Agents, CancelToken, MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools,
+};
 
 /// The session's collaboration mode, mirroring Codex's `ModeKind`.
 ///
@@ -49,6 +51,10 @@ pub struct Agent {
     writable: Policy,
     /// The shared runtime every agent and turn drives its futures on.
     runtime: Arc<Runtime>,
+    /// Whether this agent is offered the subagent tools: `true` only for the main agent
+    spawns: bool,
+    /// The subagent registry, or `None` for subagents.
+    subagents: Option<Arc<Agents>>,
     /// The front end's lever on the running turn (cancel).
     control: TurnHandle,
 }
@@ -144,6 +150,8 @@ impl Agent {
             mode: ChatMode::Default,
             writable: policy,
             runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
+            spawns: true,
+            subagents: None,
             control: TurnHandle::default(),
         }
     }
@@ -172,15 +180,34 @@ impl Agent {
         }
     }
 
-    /// The tools `mode` offers to the model. Plan mode withholds the `edit` tool.
-    fn tools_for(mode: ChatMode) -> Vec<Tool> {
+    /// The tools this agent offers the model. Plan mode withholds the `edit` tool.
+    fn tools_for(&self) -> Vec<Tool> {
         let mut definitions = vec![tools::bash(), tools::read()];
-        if mode == ChatMode::Default {
+        if self.mode == ChatMode::Default {
             definitions.push(tools::edit());
         }
         definitions.extend(tools::search());
         definitions.extend(tools::fetch());
+        if self.spawns {
+            definitions.push(tools::spawn());
+            definitions.push(tools::wait());
+        }
         definitions
+    }
+
+    /// A child agent: this agent's model and policy, with no subagent recursion.
+    pub(crate) fn child(&self) -> Agent {
+        let mut child = self.clone();
+        child.control = TurnHandle::default();
+        child.spawns = false;
+        child.subagents = None;
+        child
+    }
+
+    /// Arm the subagent tools with a registry, for the front end's agent.
+    #[inline]
+    pub fn set_subagents(&mut self, agents: Arc<Agents>) {
+        self.subagents = Some(agents);
     }
 
     /// The front end's lever on the running turn, for the pane to hold.
@@ -279,8 +306,9 @@ impl Agent {
             if self.control.cancelled(&mut cancel_rx) {
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
-            // The sandboxed trio less `edit` in plan mode, plus web tools if available
-            let definitions = Self::tools_for(self.mode);
+            // The sandboxed trio less `edit` in plan mode, plus web tools if
+            // available, plus the subagent pair for a spawning agent.
+            let definitions = self.tools_for();
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
                 .stream(true)
@@ -470,7 +498,12 @@ impl Agent {
 
             // Run the round's calls in order, then record the round as one group.
             let policy = self.policy();
-            let tooling = tools::Tooling { policy: &policy, cancel: token };
+            let tooling = tools::Tooling {
+                policy: &policy,
+                cancel: token,
+                agents: self.subagents.as_deref(),
+                template: self,
+            };
             let mut exchanges = Vec::with_capacity(calls.len());
             // A call the harness cannot run ends the round, but is recorded with its
             // error so the round's earlier effects stay in the transcript.
@@ -624,10 +657,13 @@ mod tests {
         let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
         let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
 
-        // Default: the granted roots are writable, and `edit` is offered.
+        // Default: the granted roots are writable, and `edit` is offered alongside the
+        // subagent pair only a spawning agent gets.
         assert_eq!(agent.mode(), ChatMode::Default);
         assert!(!agent.policy().writable_roots().is_empty());
-        assert!(names(&Agent::tools_for(ChatMode::Default)).contains(&"edit"));
+        assert!(names(&agent.tools_for()).contains(&"edit"));
+        assert!(names(&agent.tools_for()).contains(&"spawn"));
+        assert!(names(&agent.tools_for()).contains(&"wait"));
 
         // Plan: the workspace is not writable, the temp scratch alone is, and not edit
         agent.set_mode(ChatMode::Plan);
@@ -637,7 +673,7 @@ mod tests {
         let scratch =
             std::fs::canonicalize(std::env::temp_dir()).expect("the temp dir canonicalizes");
         assert_eq!(writable[0], scratch);
-        let plan_tools = Agent::tools_for(ChatMode::Plan);
+        let plan_tools = agent.tools_for();
         let offered = names(&plan_tools);
         assert!(!offered.contains(&"edit"));
         assert!(offered.contains(&"read") && offered.contains(&"bash"));
@@ -844,9 +880,87 @@ mod tests {
         assert_eq!(items[2]["content"], "Once upon a time");
     }
 
-    /// The loopback listener the worker test streams from, or `None` where the
-    /// enclosing sandbox denies binding one: the test then skips, exactly like
-    /// the live sandbox tests do.
+    #[test]
+    fn spawned_subagents_run_and_report() {
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let events = Arc::new(Mutex::new(Vec::<(crate::AgentId, Progress)>::new()));
+        let log = events.clone();
+        let agents = crate::Agents::new(move |id, progress| {
+            log.lock().unwrap().push((id, progress));
+        });
+
+        // The child's one round streams an answer, then the stream closes:
+        // the turn ends on its own, no cancel needed.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the child connects");
+            read_request(&mut stream);
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            let event = serde_json::to_string(&delta("found it")).expect("serializes");
+            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            let _ = stream.flush();
+        });
+
+        let id = agents
+            .spawn(&agent, "find the flaky test")
+            .expect("the registry has room");
+        let outcome = agents
+            .wait(id, Duration::from_secs(5), &CancelToken::new())
+            .expect("the child is registered");
+        assert_eq!(outcome, Some(crate::Outcome::Done(Some("found it".to_string()))));
+        server.join().expect("the server exits");
+
+        // The box opener precedes every child event.
+        let events = events.lock().unwrap();
+        assert!(
+            matches!(events.first(), Some((first, Progress::ToolStart { name, .. })) if *first == id && name == "agent"),
+            "{events:?}"
+        );
+        assert_eq!(events.len(), 3, "opener, one answer delta, terminal: {events:?}");
+
+        // The delivered report is gone: one delivery, and the slot is freed.
+        assert_eq!(agents.take_outcome(id), None);
+        assert!(
+            agents
+                .wait(id, Duration::from_secs(1), &CancelToken::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reports_deliver_once_and_free_their_slots() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let agent = Agent::new("http://localhost:9", "key", "model", policy);
+        let agents = crate::Agents::new(|_, _| {});
+
+        let mut ids = Vec::new();
+        for _ in 0..crate::MAX_SUBAGENTS {
+            ids.push(agents.spawn(&agent, "task").expect("a slot is free"));
+        }
+        assert!(agents.spawn(&agent, "task").is_err(), "the slots are full");
+
+        // The unreachable endpoint fails each child fast (a test's retry
+        // pause is 1ms); waiting delivers the report and prunes the child.
+        let token = CancelToken::new();
+        for id in ids {
+            let outcome = agents
+                .wait(id, Duration::from_secs(30), &token)
+                .expect("the child ends");
+            assert!(outcome.is_some(), "a failed child still reports: {outcome:?}");
+            assert_eq!(agents.take_outcome(id), None, "one delivery only");
+        }
+        assert!(agents.running().is_empty());
+        agents
+            .spawn(&agent, "task")
+            .expect("the slots freed with the reports");
+    }
+
+    /// The loopback listener the worker test streams from, or `None` where denied
     fn loopback() -> Option<std::net::TcpListener> {
         match std::net::TcpListener::bind(("127.0.0.1", 0)) {
             Ok(listener) => Some(listener),
