@@ -43,8 +43,6 @@ use tart_agents::{
     ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
 };
 
-use crate::config::Models;
-
 use tmux_override::{override_shift_up, restore_tmux};
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
@@ -56,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     let label = agent_config.to_string();
     let context_tokens = agent_config.context_tokens;
     let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
-    let (mut agent, current) = agent_config.into_agent(policy);
+    let mut agent = agent_config.into_agent(policy);
     let root = &SESSIONS_ROOT;
     let cwd = std::env::current_dir()?;
     let mut session = Session::start(root, &cwd);
@@ -76,14 +74,13 @@ fn main() -> anyhow::Result<()> {
     pane.note(format!("tart · {label}"));
     pane.set_context_tokens(context_tokens);
     pane.set_models(config.agents());
-    let models = Models { config, current };
     let result = run(
         &mut terminal,
         &mut agent,
         transcript,
         &mut session,
         &mut pane,
-        models,
+        &config,
     );
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
@@ -139,7 +136,7 @@ fn run(
     mut transcript: Transcript,
     session: &mut Session,
     pane: &mut Pane,
-    mut models: Models,
+    config: &config::Config,
 ) -> anyhow::Result<()> {
     // The sandbox's grant root, for deciding which mentions need attaching.
     let cwd = std::env::current_dir()?;
@@ -338,7 +335,7 @@ fn run(
                 }
                 // An agent picked in the `/model` chooser: swap the endpoint,
                 // the model, and the effort for the next turn.
-                Some(PaneEvent::Model(choice)) => models.swap(&choice, agent, pane),
+                Some(PaneEvent::Model(choice)) => config.swap(&choice, agent, pane),
                 None => {}
             },
             Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),

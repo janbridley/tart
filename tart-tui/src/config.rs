@@ -43,20 +43,13 @@ impl fmt::Display for ResolvedAgent {
 }
 
 impl ResolvedAgent {
-    /// Consume the resolution and a Policy into the loop's agent + a stored choice.
-    pub(crate) fn into_agent(self, policy: Policy) -> (Agent, AgentChoice) {
-        let mut agent = Agent::new(self.base_url, self.api_key, self.model.clone(), policy);
+    /// Consume the resolution and a Policy into the loop's agent.
+    pub(crate) fn into_agent(self, policy: Policy) -> Agent {
+        let mut agent = Agent::new(self.base_url, self.api_key, self.model, policy);
         if let Some(effort) = self.effort {
             agent = agent.reasoning_effort(effort);
         }
-        (
-            agent,
-            AgentChoice {
-                provider: self.provider,
-                name: self.name,
-                model: self.model,
-            },
-        )
+        agent
     }
 }
 
@@ -75,41 +68,6 @@ pub(crate) struct AgentChoice {
 impl fmt::Display for AgentChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} · {} · {}", self.provider, self.name, self.model)
-    }
-}
-/// Digest of model parameters that the run interface can switch to.
-pub(crate) struct Models {
-    /// Resolves a picked row to its endpoint, key, model, and effort.
-    pub(crate) config: Config,
-    /// The running row; picking it again changes nothing.
-    pub(crate) current: AgentChoice,
-}
-
-impl Models {
-    /// Swap `agent` to the picked row and note it, or note why not.
-    pub(crate) fn swap(
-        &mut self,
-        choice: &AgentChoice,
-        agent: &mut Agent,
-        pane: &mut crate::pane::Pane,
-    ) {
-        if self.current == *choice {
-            pane.note("model unchanged");
-            return;
-        }
-        match self.config.resolve(&choice.provider, &choice.name) {
-            Ok(next) => {
-                agent.set_model(next.base_url.clone(), next.api_key.clone(), next.model.clone());
-                if let Some(effort) = next.effort.clone() {
-                    agent.set_reasoning_effort(effort);
-                }
-                pane.set_context_tokens(next.context_tokens);
-                pane.note(format!("model: {next}"));
-                self.current = choice.clone();
-            }
-            // A key that fails to resolve leaves the agent be.
-            Err(error) => pane.note(error.to_string()),
-        }
     }
 }
 
@@ -228,6 +186,27 @@ impl Config {
             })
             .collect()
     }
+
+    /// Swap `agent` to the picked row and note it, or note why not. A pick
+    /// that fails to resolve leaves the running agent be.
+    pub(crate) fn swap(
+        &self,
+        choice: &AgentChoice,
+        agent: &mut Agent,
+        pane: &mut crate::pane::Pane,
+    ) {
+        match self.resolve(&choice.provider, &choice.name) {
+            Ok(next) => {
+                agent.set_model(next.base_url.clone(), next.api_key.clone(), next.model.clone());
+                if let Some(effort) = next.effort.clone() {
+                    agent.set_reasoning_effort(effort);
+                }
+                pane.set_context_tokens(next.context_tokens);
+                pane.note(format!("model: {next}"));
+            }
+            Err(error) => pane.note(error.to_string()),
+        }
+    }
 }
 
 /// Obtain the provider's API key: the env variable or command in `api_key`.
@@ -308,15 +287,14 @@ reasoning_effort = "high"
         assert!(error.contains("label"), "{error}");
     }
 
-    /// A resolution consumes into the loop's agent and its picker row; the
-    /// row carries the identity the `/model` swap compares against.
+    /// A resolution consumes into a runnable agent: the endpoint, key, model, & effort
     #[test]
-    fn a_resolution_consumes_into_agent_and_choice() {
+    fn a_resolution_consumes_into_the_agent() {
         let spec = Config::parse(MINIMAL).unwrap().default_agent().unwrap();
         let policy = Policy::new(std::env::temp_dir()).unwrap();
-        let (_agent, choice) = spec.into_agent(policy);
 
-        assert_eq!(choice.to_string(), "zai · tart · glm-5.3");
+        // Constructing is the assertion: the effort wires through without error.
+        let _agent = spec.into_agent(policy);
     }
 
     /// The shipped example file parses and lists its agents: the spec and its
