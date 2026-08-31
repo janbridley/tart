@@ -11,7 +11,7 @@ use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
-use crate::{Progress, sandbox::Policy};
+use crate::{Agent, AgentId, Agents, Progress, REPORT_CAP, sandbox::Policy};
 
 mod web;
 
@@ -151,6 +151,46 @@ pub(crate) fn edit() -> Tool {
     )
 }
 
+/// The spawn tool; only the main agent is offered it.
+#[must_use]
+pub(crate) fn spawn() -> Tool {
+    tool(
+        "spawn",
+        "Start a subagent on a self-contained task and return at once. The subagent runs \
+        independently with your tools (minus spawning) and its final message becomes its \
+        report; it is injected into your next conversation turn, or read it sooner with \
+        wait. At most 8 subagents run at once",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The complete task for the subagent: it sees nothing else of this conversation"}
+            },
+            "required": ["task"]
+        }),
+    )
+}
+
+/// The wait tool; only the main agent is offered it.
+#[must_use]
+pub(crate) fn wait() -> Tool {
+    tool(
+        "wait",
+        "Block until a spawned subagent ends, returning its report (or its failure); \
+        timeout_ms (1000-300000, default 30000) bounds the wait, after which the \
+        subagent is reported still running. Waiting is the join point: wait on \
+        every subagent whose result you need before proceeding, or its report \
+        arrives on its own in a later turn",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "The subagent's id, as `spawn` reported it"},
+                "timeout_ms": {"type": "integer", "description": "Milliseconds to block before reporting the subagent still running; default 30000"}
+            },
+            "required": ["id"]
+        }),
+    )
+}
+
 /// Parse a tool call's arguments as JSON.
 fn parse_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
     serde_json::from_str(arguments)
@@ -264,8 +304,75 @@ pub(crate) fn execute<F: Fn(Progress)>(
         // The unsandboxed pair: they need the network the sandbox denies.
         "search" => web::run_search(call, on_progress),
         "fetch" => web::run_fetch(call, on_progress),
+        // The subagent pair, offered to spawning agents only.
+        "spawn" => run_spawn(call, tools, on_progress),
+        "wait" => run_wait(call, tools, on_progress),
         other => anyhow::bail!("unknown tool: {other}"),
     }
+}
+
+/// Fork a subagent on the task and return at once.
+fn run_spawn<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    tools: &Tooling<'_>,
+    on_progress: &F,
+) -> anyhow::Result<String> {
+    let task = string_field(&parse_arguments(&call.arguments)?, "task")?;
+    let Some(agents) = tools.agents else {
+        anyhow::bail!("subagents cannot spawn their own");
+    };
+    let spawned = agents.spawn(tools.template, &task);
+    Ok(traced(call, on_progress, || match spawned {
+        Ok(id) => {
+            let text = format!("started subagent {id}: {task}");
+            (text.clone(), text, Some(0))
+        }
+        Err(error) => (error.to_string(), error.to_string(), None),
+    }))
+}
+
+/// How long a `wait` blocks when the model does not ask for a window.
+const DEFAULT_WAIT_MS: u64 = 30_000;
+
+/// The shortest and longest windows a `wait` may ask for, in milliseconds.
+const MIN_WAIT_MS: u64 = 1_000;
+const MAX_WAIT_MS: u64 = 300_000;
+
+/// Run one wait tool call, blocking at most `timeout_ms`, until the subagent ends.
+fn run_wait<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    tools: &Tooling<'_>,
+    on_progress: &F,
+) -> anyhow::Result<String> {
+    let args = parse_arguments(&call.arguments)?;
+    let id = args["id"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("wait needs an integer 'id'"))?;
+    let timeout = Duration::from_millis(
+        args["timeout_ms"]
+            .as_u64()
+            .unwrap_or(DEFAULT_WAIT_MS)
+            .clamp(MIN_WAIT_MS, MAX_WAIT_MS),
+    );
+    let Some(agents) = tools.agents else {
+        anyhow::bail!("subagents have nothing to wait on");
+    };
+    Ok(traced(call, on_progress, || {
+        match agents.wait(AgentId::from(id), timeout, tools.cancel) {
+            Ok(Some(outcome)) => {
+                let text = head_cap(&outcome.report(), REPORT_CAP);
+                (text.clone(), text, Some(0))
+            }
+            Ok(None) => {
+                let text = format!(
+                    "subagent {id} is still running after {}s; wait again",
+                    timeout.as_secs()
+                );
+                (text.clone(), text, None)
+            }
+            Err(error) => (error.to_string(), error.to_string(), None),
+        }
+    }))
 }
 
 /// One finished process's combined streams: stdout then stderr, lossily decoded.
@@ -294,12 +401,16 @@ fn command_text(text: &str, status: ExitStatus) -> String {
     format!("[exit {status}]{separator}{text}")
 }
 
-/// What a tool call runs with: the turn's sandbox policy and command lever.
+/// Information required for a tool call, including sandbox and cancellation info.
 pub(crate) struct Tooling<'a> {
     /// The policy the call's commands run sandboxed under.
     pub(crate) policy: &'a Policy,
     /// The turn's cancel lever: Esc kills a command in flight.
     pub(crate) cancel: &'a CancelToken,
+    /// The subagent registry, when this agent can spawn.
+    pub(crate) agents: Option<&'a Agents>,
+    /// The agent whose turn this is: the template a `spawn` clones.
+    pub(crate) template: &'a Agent,
 }
 
 /// One finished command run under a watchdog: a deadline or a cancel.
@@ -985,9 +1096,12 @@ mod tests {
     #[test]
     fn execute_reports_command_then_output() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
         let tools = Tooling {
             policy: &policy,
             cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
         };
         let events = std::cell::RefCell::new(Vec::new());
         let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &tools, &|progress| {
@@ -1029,9 +1143,12 @@ mod tests {
     #[test]
     fn execute_rejects_unknown_tool_names() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
         let tools = Tooling {
             policy: &policy,
             cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
         };
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
@@ -1167,7 +1284,13 @@ mod tests {
             let policy = policy.clone();
             std::thread::spawn(move || {
                 let token = CancelToken::new();
-                let tools = Tooling { policy: &policy, cancel: &token };
+                let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+                let tools = Tooling {
+                    policy: &policy,
+                    cancel: &token,
+                    agents: None,
+                    template: &agent,
+                };
                 execute(&call, &tools, &|_| {}).unwrap()
             })
         };
@@ -1266,9 +1389,12 @@ mod tests {
         }
         let file = scratch(&contents);
         let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
         let tools = Tooling {
             policy: &policy,
             cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
         };
         let events = std::cell::RefCell::new(Vec::new());
 
