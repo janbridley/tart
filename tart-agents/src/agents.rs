@@ -201,7 +201,7 @@ impl Agents {
     /// Claim the subagent's terminal result, with the task it ran: the one
     /// delivery of that report, removing the child from the registry. `None`
     /// when no such child exists, it is still running, or its report was
-    /// already delivered — one answer for all three.
+    /// already delivered: one answer for all three.
     #[inline]
     pub fn take_outcome(&self, id: AgentId) -> Option<(String, Outcome)> {
         let mut children = self.inner.lock_children();
@@ -225,9 +225,7 @@ impl Agents {
             .collect()
     }
 
-    /// Block until the subagent ends, `timeout` passes, or `cancel` fires,
-    /// returning its outcome — `None` when the wait ended first and the
-    /// subagent is still running.
+    /// Block until the subagent ends, `timeout` passes, or `cancel` fires.
     ///
     /// The registry's lock is never held while blocked: Esc's
     /// [`Agents::cancel_all`] must reach the child whose end is the wakeup,
@@ -259,7 +257,7 @@ impl Agents {
             match receiver.recv_timeout(WAIT_POLL) {
                 Ok(_) => {
                     // The worker stored the outcome before sending, so the
-                    // take succeeds — unless the front end delivered first.
+                    // take succeeds unless the front end delivered first.
                     return self
                         .take_outcome(id)
                         .map(|(_, outcome)| Some(outcome))
