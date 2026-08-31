@@ -19,7 +19,9 @@ pub enum Progress {
         /// The tool's name on the wire: one of {`bash`, `read`, `edit`, `search`,
         /// `fetch`, `spawn`, `wait`}, or `agent` for a subagent's box opener.
         name: String,
-        /// The call's raw JSON arguments, exactly as the provider sent them.
+        /// The call's raw JSON arguments, exactly as the provider sent them;
+        /// a subagent's box opener carries its task text instead, there
+        /// having been no call to quote.
         arguments: String,
     },
     /// A finished tool invocation, paired with its start by `id`.

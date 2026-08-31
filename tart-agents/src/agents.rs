@@ -165,13 +165,14 @@ impl Agents {
             },
         ));
         // The box opens before any child event can arrive, so the front end
-        // never sees a call for a box it lacks.
+        // never sees a call for a box it lacks. The opener carries the task
+        // text itself, not provider JSON: there was no call to quote.
         (self.inner.events)(
             id,
             Progress::ToolStart {
                 id: id.tag(),
                 name: AGENT_TOOL.to_string(),
-                arguments: serde_json::json!({ "task": task }).to_string(),
+                arguments: task.to_string(),
             },
         );
 

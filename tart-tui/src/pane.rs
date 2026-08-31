@@ -500,11 +500,9 @@ impl Pane {
         self.transcript.start_tool(id, name, arguments);
     }
 
-    /// Open a subagent's running box from its opener event's raw arguments;
-    /// see [`Transcript::start_agent`].
+    /// Open a subagent's running box on its task; see [`Transcript::start_agent`].
     pub fn start_agent(&mut self, id: AgentId, arguments: &str) {
-        let task = digest::argument("spawn", arguments);
-        self.transcript.start_agent(id.tag(), task);
+        self.transcript.start_agent(id.tag(), arguments.to_string());
     }
 
     /// Append a subagent's latest call to its box; see [`Transcript::touch_agent`].
@@ -1416,9 +1414,7 @@ mod tests {
         }
 
         // A waited report is claimed by the wait so delivery never sees it.
-        let waited = registry
-            .wait(one, std::time::Duration::from_secs(1), &CancelToken::new())
-            .unwrap();
+        let waited = registry.wait(one, &CancelToken::new()).unwrap();
         assert!(waited.is_some(), "the stored outcome waits: {waited:?}");
 
         pane.report(one);
