@@ -33,6 +33,7 @@ fn argument(name: &str, raw: &str) -> String {
         .and_then(|args| match name {
             "bash" => args["command"].as_str().map(str::to_string),
             "fetch" => args["url"].as_str().map(str::to_string),
+            "read" | "edit" => args["path"].as_str().map(str::to_string),
             "search" => args["query"].as_str().map(|query| {
                 let news = args["news"].as_bool() == Some(true);
                 format!("{query}{}", if news { " [news]" } else { "" })
@@ -97,6 +98,11 @@ fn span((start, end): (u64, u64)) -> String {
         (0, _) => format!("-{end}"),
         _ => format!("{start}-{end}"),
     }
+}
+
+/// One child-agent tool call as it reads inside the agent box's header.
+pub(crate) fn child_call(name: &str, raw: &str) -> String {
+    format!("{}({})", display_name(name), argument(name, raw))
 }
 
 /// The first line of `text`, capped with an ellipsis.
