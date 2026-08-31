@@ -848,29 +848,22 @@ mod tests {
     /// A wait that gives up hands its receiver back, so a later wait on the
     /// same child still blocks instead of erroring.
     #[test]
-    fn a_timed_out_wait_can_be_repeated() {
+    fn a_giving_up_wait_can_be_repeated() {
         // A listener that never accepts holds the child mid-request, so it
-        // stays running through both waits.
+        // stays running through both waits; the cancelled token makes each
+        // wait give up at its first poll.
         let Some(listener) = loopback() else { return };
         let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
         let address = listener.local_addr().expect("a bound address");
         let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
         let agents = Agents::new(|_, _| {});
         let id = agents.spawn(&agent, "outlive the waits").unwrap();
+        let token = CancelToken::new();
+        token.cancel();
 
-        assert!(
-            agents
-                .wait(id, Duration::from_millis(1), &CancelToken::new())
-                .unwrap()
-                .is_none()
-        );
+        assert!(agents.wait(id, &token).unwrap().is_none());
         // Before the hand-back the receiver was gone and this errored.
-        assert!(
-            agents
-                .wait(id, Duration::from_millis(1), &CancelToken::new())
-                .unwrap()
-                .is_none()
-        );
+        assert!(agents.wait(id, &token).unwrap().is_none());
     }
 
     #[test]
