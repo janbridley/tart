@@ -14,6 +14,9 @@ const AGENT_PROMPT: &str = include_str!("data/AGENT.md");
 /// How often a bounded `wait` wakes to check its cancel token.
 const WAIT_POLL: Duration = Duration::from_millis(100);
 
+/// How long a `wait` blocks before reporting the child still running.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One conversation in the process: the main one, or a subagent it spawned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AgentId(u64);
@@ -220,18 +223,13 @@ impl Agents {
             .collect()
     }
 
-    /// Block until the subagent ends, `timeout` passes, or `cancel` fires.
+    /// Block until the subagent ends, [`WAIT_TIMEOUT`] passes, or `cancel` fires.
     ///
     /// The registry's lock is never held while blocked: Esc's
     /// [`Agents::cancel_all`] must reach the child whose end is the wakeup,
     /// and it takes the lock to find the child.
     #[inline]
-    pub fn wait(
-        &self,
-        id: AgentId,
-        timeout: Duration,
-        cancel: &CancelToken,
-    ) -> anyhow::Result<Option<Outcome>> {
+    pub fn wait(&self, id: AgentId, cancel: &CancelToken) -> anyhow::Result<Option<Outcome>> {
         // An ended, undelivered child answers at once.
         if let Some((_, outcome)) = self.take_outcome(id) {
             return Ok(Some(outcome));
@@ -244,7 +242,7 @@ impl Agents {
             })?
             .ok_or_else(|| anyhow::anyhow!("subagent {id} is already being waited on"))?;
         // Off the lock: the child's terminal event is the wakeup.
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             match receiver.recv_timeout(WAIT_POLL) {
                 Ok(_) => {

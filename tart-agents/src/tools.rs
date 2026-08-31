@@ -178,17 +178,15 @@ pub(crate) fn spawn() -> Tool {
 pub(crate) fn wait() -> Tool {
     tool(
         "wait",
-        "Wait for a subagent to reach a final status, returning its report; timeout_ms \
-        (1000-300000, default 30000) bounds the wait, and returns saying it is still \
-        running when timed out. Prefer longer waits to avoid busy polling. A finished \
+        "Wait for a subagent to reach a final status, returning its report; a wait \
+        blocks at most 30 seconds, then reports the subagent still running. A finished \
         subagent's report also arrives on its own in a later turn, so call this very \
         sparingly: only when you need the result immediately for the next critical-path \
         step and are blocked until it returns",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "The subagent's id, as `spawn` reported it"},
-                "timeout_ms": {"type": "integer", "description": "Milliseconds to block before reporting the subagent still running; default 30000. Prefer longer waits to avoid busy polling"}
+                "id": {"type": "integer", "description": "The subagent's id, as `spawn` reported it"}
             },
             "required": ["id"]
         }),
