@@ -321,13 +321,14 @@ fn run_spawn<F: Fn(Progress)>(
     let Some(agents) = tools.agents else {
         anyhow::bail!("subagents cannot spawn their own");
     };
-    let spawned = agents.spawn(tools.template, &task);
-    Ok(traced(call, on_progress, || match spawned {
-        Ok(id) => {
-            let text = format!("started subagent {id}: {task}");
-            (text.clone(), text, Some(0))
+    Ok(traced(call, on_progress, || {
+        match agents.spawn(tools.template, &task) {
+            Ok(id) => {
+                let text = format!("started subagent {id}: {task}");
+                (text.clone(), text, Some(0))
+            }
+            Err(error) => (error.to_string(), error.to_string(), None),
         }
-        Err(error) => (error.to_string(), error.to_string(), None),
     }))
 }
 
