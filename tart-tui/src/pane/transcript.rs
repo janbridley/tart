@@ -3,6 +3,7 @@
 use itertools::Itertools;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use tart_agents::AGENT_TOOL;
 
 #[cfg(test)]
 use crate::testutil::texts;
@@ -86,7 +87,7 @@ fn thinking_lines(raw: &str, shown: bool) -> Vec<Line<'static>> {
 struct ToolCall {
     /// Pairs the finishing `ToolOutput` with this start.
     id: String,
-    /// The tool's name on the wire: `bash`, `read`, or `edit`.
+    /// The tool's name on the wire; `agent` names a subagent's box.
     name: String,
     /// The raw JSON arguments of each call in the run, as the provider sent them
     arguments: Vec<String>,
@@ -98,11 +99,14 @@ struct ToolCall {
     exit: Option<i32>,
     /// A later invocation folded this box down to its header line.
     superseded: bool,
-    /// A subagent's box, which persists until the subagent exits.
-    agent: bool,
 }
 
 impl ToolCall {
+    /// A subagent's box, which rides apart from the turn's own calls.
+    fn is_agent(&self) -> bool {
+        self.name == AGENT_TOOL
+    }
+
     /// The box's rows: a status header and then the rendered output
     ///
     /// Running calls show just the header with a dim ellipsis; finished ones add
@@ -227,7 +231,7 @@ impl Transcript {
             return;
         }
         let fold = self.messages.iter().position(
-            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && !tool.superseded && !tool.agent),
+            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && !tool.superseded && !tool.is_agent()),
         );
         let think = self
             .messages
@@ -241,7 +245,7 @@ impl Transcript {
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
                 && !tool.running
-                && !tool.agent
+                && !tool.is_agent()
             {
                 tool.superseded = true;
             }
@@ -254,7 +258,6 @@ impl Transcript {
             output: None,
             exit: None,
             superseded: false,
-            agent: false,
         }));
         // The thinking block rides below the boxes: pull it to the tail.
         if let Some(at) = think {
@@ -267,24 +270,22 @@ impl Transcript {
     pub(crate) fn start_agent(&mut self, id: String, task: String) {
         self.messages.push(Entry::Tool(ToolCall {
             id,
-            name: "agent".to_string(),
+            name: AGENT_TOOL.to_string(),
             arguments: vec![task],
             running: true,
             output: None,
             exit: None,
             superseded: false,
-            agent: true,
         }));
     }
 
-    /// Append the subagent's latest tool call to its box -> task + calls its making
+    /// Append the subagent's latest tool call to its box: the task, then the
+    /// calls it is making.
     pub(crate) fn touch_agent(&mut self, id: &str, name: &str, arguments: &str) {
         let call = child_call(name, arguments);
-        let Some(index) = self
-            .messages
-            .iter()
-            .position(|entry| matches!(entry, Entry::Tool(tool) if tool.agent && tool.id == id))
-        else {
+        let Some(index) = self.messages.iter().position(
+            |entry| matches!(entry, Entry::Tool(tool) if tool.is_agent() && tool.id == id),
+        ) else {
             return;
         };
         if let Entry::Tool(tool) = &mut self.messages[index] {
@@ -359,7 +360,7 @@ impl Transcript {
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
                 && tool.running
-                && !tool.agent
+                && !tool.is_agent()
             {
                 tool.output = Some(reason.to_string());
                 tool.exit = None;
