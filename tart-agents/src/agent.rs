@@ -1,7 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use async_compat::Compat;
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -10,9 +9,10 @@ use async_openai::{
         ReasoningItem, ResponseStreamEvent, Tool,
     },
 };
+use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future::{Either, select};
-use futures::{StreamExt, executor::block_on};
+use tokio::runtime::Runtime;
 
 use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
 
@@ -48,6 +48,8 @@ pub struct Agent {
     writable: Policy,
     /// The Plan-mode policy: the same grants, but most paths are read-only.
     planning: Policy,
+    /// The shared runtime every agent and turn drives its futures on.
+    runtime: Arc<Runtime>,
     /// The front end's lever on the running turn (cancel).
     control: TurnControl,
 }
@@ -139,6 +141,7 @@ impl Agent {
             mode: ChatMode::Default,
             writable: policy,
             planning,
+            runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
             control: TurnControl::default(),
         }
     }
@@ -292,14 +295,16 @@ impl Agent {
 
             debug::log_json("round request", || serde_json::to_string(&request));
 
-            // `Compat` enters the global tokio runtime and exposes `futures` blocking control.
-            let mut stream =
-                match block_on(Compat::new(self.client.responses().create_stream(request))) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-                    }
-                };
+            // The owned runtime drives the future
+            let mut stream = match self
+                .runtime
+                .block_on(self.client.responses().create_stream(request))
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
+            };
 
             let mut answer = String::new();
             // Completed calls, captured from finished output items, in stream order.
@@ -317,7 +322,7 @@ impl Agent {
             // Race the stream against Esc pokes; a won cancel returns and
             // drops the stream, keeping whatever it streamed
             loop {
-                let item = match block_on(Compat::new(select(stream.next(), cancel_rx.next()))) {
+                let item = match self.runtime.block_on(select(stream.next(), cancel_rx.next())) {
                     Either::Right(_) => {
                         // A stale poke only wakes the wait: the flag decides.
                         if !self.control.cancelled(&mut cancel_rx) {
@@ -548,6 +553,29 @@ mod tests {
         // Reaching here means the client constructed without the provider panic.
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
         let _ = agent.model;
+    }
+
+    /// Every turn worker blocks onto the agent's runtime from its own thread:
+    /// eight concurrent `block_on`s on the one runtime must all come back.
+    #[test]
+    fn the_runtime_blocks_eight_concurrent_threads() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let agent = Agent::new("http://localhost:9", "key", "model", policy);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let runtime = agent.runtime.clone();
+                std::thread::spawn(move || {
+                    // The `async` block defers the timer's construction to
+                    // inside the runtime context `block_on` provides.
+                    runtime.block_on(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    });
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a blocked thread comes back");
+        }
     }
 
     /// Plan mode runs under the read-only twin of the Default policy and witholds
