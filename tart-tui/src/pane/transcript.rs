@@ -511,7 +511,8 @@ impl Transcript {
     fn fold_entry(&mut self, index: usize, width: usize, expanded: bool) {
         let separated = self.separated(index);
         let wrapped = match &self.messages[index] {
-            // An answer wraps its rendering without cloning
+            // If we've already wrapped everything we don't have to do it again.
+            Entry::Answer { lines, .. } if width > 0 => lines.clone(),
             Entry::Answer { lines, .. } => wrap_lines(lines, width),
             Entry::Thinking { raw } => wrap_lines(&thinking_lines(raw, self.show_thinking), width),
             entry => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
