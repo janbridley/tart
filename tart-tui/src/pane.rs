@@ -29,9 +29,8 @@ pub(crate) use editor::{Editor, g_to_byte, graphemes};
 use crate::attachments;
 use crate::clipboard::Selection;
 use crate::config::AgentChoice;
-use crate::file_mentions::{self, FilePopup};
-use crate::model_picker::{ModelPopup, derive_query as model_query};
-use crate::session_picker::{SessionPopup, derive_query as session_query};
+use crate::file_mentions::{self, FilePopup, Picker, render_picker};
+use crate::session_picker::{derive_query as session_query, session_picker};
 use copy::{CopyCursor, clamp_cell, moved, window_top};
 use transcript::Transcript;
 use wrap::wrap_draft;
@@ -119,36 +118,9 @@ pub(crate) enum Mode {
 pub(crate) enum Popup {
     /// The `@file` typeahead over the working directory.
     Files(FilePopup),
-    /// The `/resume` chooser over this project's sessions.
-    Sessions(SessionPopup),
-    /// The `/model` chooser over the agents file's agents.
-    Models(ModelPopup),
-}
-
-impl Popup {
-    /// The list machinery under this popup kind.
-    fn list(&mut self) -> &mut FilePopup {
-        match self {
-            Self::Files(popup) => popup,
-            Self::Sessions(sessions) => &mut sessions.popup,
-            Self::Models(models) => &mut models.popup,
-        }
-    }
-
-    /// Move the highlight up one row.
-    fn select_prev(&mut self) {
-        self.list().select_prev();
-    }
-
-    /// Move the highlight down one row.
-    fn select_next(&mut self) {
-        self.list().select_next();
-    }
-
-    /// Point the popup at a new query, refiltering when it changed.
-    fn set_query(&mut self, query: String) {
-        self.list().set_query(query);
-    }
+    /// The `/resume` and `/model` choosers: typed picks over a list.
+    Sessions(Picker<PathBuf>),
+    Models(Picker<AgentChoice>),
 }
 
 /// One finished response's token usage, as shown on the status line.
@@ -238,24 +210,31 @@ impl Pane {
             self.sync_completion(false);
             return;
         }
-        match model_query(&self.prompt) {
+        match file_mentions::command_query(&self.prompt, "/model") {
             // The `/model` chooser, mirroring the `/resume` arm below.
             Some(query) => {
-                if let Some(popup @ Popup::Models(_)) = &mut self.popup {
-                    popup.set_query(query);
+                if let Some(Popup::Models(picker)) = &mut self.popup {
+                    picker.set_query(query);
                 } else if key.is_some_and(|key| key.code != KeyCode::Esc) && !self.models.is_empty()
                 {
-                    self.popup = Some(Popup::Models(ModelPopup::new(&self.models, query)));
+                    let picks: Vec<_> = self
+                        .models
+                        .iter()
+                        .map(|choice| (choice.clone(), choice.to_string()))
+                        .collect();
+                    self.popup = Some(Popup::Models(Picker::from_picks(picks, query)));
                 }
             }
             None => match session_query(&self.prompt) {
                 Some(query) => {
-                    if let Some(popup @ Popup::Sessions(_)) = &mut self.popup {
-                        popup.set_query(query);
+                    if let Some(Popup::Sessions(picker)) = &mut self.popup {
+                        picker.set_query(query);
                     } else if key.is_some_and(|key| key.code != KeyCode::Esc) {
-                        self.popup = self.session_dir.as_ref().map(|(root, project)| {
-                            Popup::Sessions(SessionPopup::new(root, project, query))
-                        });
+                        self.popup = self
+                            .session_dir
+                            .as_ref()
+                            .and_then(|(root, project)| session_picker(root, project, query))
+                            .map(Popup::Sessions);
                     }
                 }
                 None => {
@@ -272,11 +251,25 @@ impl Pane {
     /// One key the open popup owns: arrows move the highlight, Tab/Enter accepts.
     fn popup_key(&mut self, key: KeyEvent) -> Option<PaneEvent> {
         let popup = self.popup.as_mut()?;
-        match key.code {
-            KeyCode::Up => popup.select_prev(),
-            KeyCode::Down => popup.select_next(),
-            KeyCode::Tab | KeyCode::Enter => return self.accept_popup(),
-            _ => {}
+        match popup {
+            Popup::Files(popup) => match key.code {
+                KeyCode::Up => popup.select_prev(),
+                KeyCode::Down => popup.select_next(),
+                KeyCode::Tab | KeyCode::Enter => return self.accept_popup(),
+                _ => {}
+            },
+            Popup::Sessions(picker) => match key.code {
+                KeyCode::Up => picker.select_prev(),
+                KeyCode::Down => picker.select_next(),
+                KeyCode::Tab | KeyCode::Enter => return self.accept_popup(),
+                _ => {}
+            },
+            Popup::Models(picker) => match key.code {
+                KeyCode::Up => picker.select_prev(),
+                KeyCode::Down => picker.select_next(),
+                KeyCode::Tab | KeyCode::Enter => return self.accept_popup(),
+                _ => {}
+            },
         }
         None
     }
@@ -285,18 +278,19 @@ impl Pane {
     fn accept_popup(&mut self) -> Option<PaneEvent> {
         // Completed files close the popup, but completed *folders* may not
         match self.popup.take() {
-            Some(Popup::Sessions(sessions)) => {
+            Some(Popup::Sessions(picker)) => {
                 if self.spin.is_none()
-                    && let Some(path) = sessions.selected_path()
+                    && let Some(path) = picker.selected().cloned()
                 {
                     self.clear_prompt();
                     return Some(PaneEvent::Resume(path));
                 }
             }
-            Some(Popup::Models(models)) => {
-                if let Some(choice) = models.selected_choice() {
+            Some(Popup::Models(picker)) => {
+                if let Some(choice) = picker.selected() {
+                    let choice = choice.clone();
                     self.clear_prompt();
-                    return Some(PaneEvent::Model(choice.clone()));
+                    return Some(PaneEvent::Model(choice));
                 }
             }
             Some(Popup::Files(popup)) => {
@@ -1017,8 +1011,20 @@ impl Pane {
         };
         match self.popup.as_mut() {
             Some(Popup::Files(popup)) => popup.render(frame, bar_top, "files", hint),
-            Some(Popup::Sessions(sessions)) => sessions.render(frame, bar_top),
-            Some(Popup::Models(models)) => models.render(frame, bar_top),
+            Some(Popup::Sessions(picker)) => render_picker(
+                picker,
+                frame,
+                bar_top,
+                "sessions",
+                "↑↓ select · Enter to resume · Esc to close popup",
+            ),
+            Some(Popup::Models(picker)) => render_picker(
+                picker,
+                frame,
+                bar_top,
+                "models",
+                "↑↓ select · Enter to switch · Esc to close popup",
+            ),
             None => {}
         }
     }
@@ -2168,7 +2174,7 @@ mod tests {
         pane.set_models(vec![choice.clone()]);
 
         // Typing filters: a query naming no agent highlights nothing, and
-        // Enter then has nothing to pick — the chooser stays open.
+        // Enter then has nothing to pick and the chooser stays open.
         pane.type_keys("/model nomatch");
         assert!(matches!(pane.popup, Some(Popup::Models(_))));
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);

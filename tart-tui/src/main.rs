@@ -14,7 +14,6 @@ mod clipboard;
 mod config;
 mod file_mentions;
 mod keybinds;
-mod model_picker;
 mod pane;
 mod perf;
 mod session_picker;
@@ -439,8 +438,7 @@ fn on_main_event(
     Ok(())
 }
 
-/// Apply one child event: its box, its spend, and — once it has ended with no
-/// turn running — the delivery of its report.
+/// Apply one child event: its box, its spend, and, once it has ended, its report.
 fn on_child_event(
     pane: &mut Pane,
     agent: &Agent,
