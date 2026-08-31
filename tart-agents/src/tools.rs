@@ -157,9 +157,9 @@ pub(crate) fn spawn() -> Tool {
     tool(
         "spawn",
         "Spawn a subagent for a well-scoped task. Returns an id immediately; the subagent \
-        runs independently with your tools (minus spawning) and its final message becomes \
-        its report, delivered to you by `wait` or on its own in a later turn. Only call \
-        this tool for a concrete, bounded subtask that can run independently alongside \
+        runs independently with your tools (minus `spawn` and `wait`) and its final message \
+        becomes its report, delivered to you by `wait` or on its own in a later turn. Only \
+        call this tool for a concrete, bounded subtask that can run independently alongside \
         useful local work; otherwise continue locally. Do not spawn subagents unless the \
         user explicitly asks for subagents, delegation, or parallel agent work. At most 8 \
         subagents run or await delivery at once",
