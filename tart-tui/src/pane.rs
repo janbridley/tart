@@ -1407,10 +1407,13 @@ mod tests {
         let registry = Agents::new(|_, _| {});
         let mut pane = Pane::default();
 
-        // Two children fail fast against the unreachable endpoint; their
-        // outcomes wait in the registry, unclaimed.
+        // Two children end at once, cancelled rather than retried: the
+        // endpoint is unreachable and the retry backoff would outlast the
+        // test. Their outcomes wait in the registry, unclaimed.
         let one = registry.spawn(&agent, "find the tests, see @/etc/hosts").unwrap();
         let two = registry.spawn(&agent, "fix the docs").unwrap();
+        registry.cancel(one);
+        registry.cancel(two);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while registry.outcome(one).is_none() || registry.outcome(two).is_none() {
             assert!(std::time::Instant::now() < deadline, "the children end");
