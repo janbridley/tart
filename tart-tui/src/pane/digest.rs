@@ -42,48 +42,61 @@ fn argument(name: &str, raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-/// A read call's bounds as `start-end`, `start-`, or `-end`; `None` reads the whole file.
-fn bounds(args: &Value) -> Option<String> {
-    let side = |key: &str| args[key].as_u64().map(|n| format!("{n}")).unwrap_or_default();
-    let bounds = format!("{}-{}", side("start_line"), side("end_line"));
-    if bounds == "-" { None } else { Some(bounds) }
-}
-
-/// One `edit`/`read` call's `(path, share)`, a read's share being its bounds;
-/// `None` when the arguments name no path.
-fn parts(name: &str, raw: &str) -> Option<(String, Option<String>)> {
+/// One `edit`/`read` call's `(path, span)`; `None` when the arguments name no path.
+fn parts(raw: &str) -> Option<(String, (u64, u64))> {
     let args: Value = serde_json::from_str(raw).ok()?;
     let path = args["path"].as_str()?.to_string();
-    Some((path, if name == "read" { bounds(&args) } else { None }))
+    let side = |key: &str, or: u64| args[key].as_u64().unwrap_or(or);
+    Some((path, (side("start_line", 0), side("end_line", u64::MAX))))
 }
 
-/// Several `edit`/`read` calls grouped per path, each path once in
-/// first-call order — reads trailing their unmerged bounds unless subsumed by
-/// a whole-file read, edits counting repeats as ` × N` — with calls naming no
-/// path falling in at the end as their raw strings.
+/// Group several `edit`/`read` calls grouped per path, each path once.
 fn group_paths(name: &str, arguments: &[String]) -> String {
-    let mut grouped: Vec<(String, Vec<Option<String>>)> = Vec::new();
+    let mut grouped: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
     let mut loose: Vec<String> = Vec::new();
     for raw in arguments {
-        let Some((path, share)) = parts(name, raw) else {
+        let Some((path, bounds)) = parts(raw) else {
             loose.push(raw.clone());
             continue;
         };
         match grouped.iter_mut().find(|(known, _)| known == &path) {
-            Some((_, shares)) => shares.push(share),
-            None => grouped.push((path, vec![share])),
+            Some((_, spans)) => spans.push(bounds),
+            None => grouped.push((path, vec![bounds])),
         }
     }
     grouped
         .iter()
-        .map(|(path, shares)| match name {
-            "edit" if shares.len() > 1 => format!("{path} × {}", shares.len()),
+        .map(|(path, spans)| match name {
+            "edit" if spans.len() > 1 => format!("{path} × {}", spans.len()),
             "edit" => path.clone(),
-            _ if shares.iter().any(Option::is_none) => path.clone(),
-            _ => format!("{path}:{}", shares.iter().flatten().join(",")),
+            _ => coalesce(path, spans),
         })
         .chain(loose)
         .join(", ")
+}
+
+/// A read path's spans, sorted and merged where adjacent or overlapping.
+fn coalesce(path: &str, spans: &[(u64, u64)]) -> String {
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in spans.iter().copied().sorted() {
+        match merged.last_mut() {
+            Some(last) if last.1.saturating_add(1) >= start => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    if merged == [(0, u64::MAX)] {
+        return path.to_string();
+    }
+    format!("{path}:{}", merged.iter().copied().map(span).join(","))
+}
+
+/// One range as `start-end`, an open end (`0`, `u64::MAX`) rendered bare.
+fn span((start, end): (u64, u64)) -> String {
+    match (start, end) {
+        (_, u64::MAX) => format!("{start}-"),
+        (0, _) => format!("-{end}"),
+        _ => format!("{start}-{end}"),
+    }
 }
 
 /// The first line of `text`, capped with an ellipsis.
@@ -134,10 +147,17 @@ mod tests {
     fn runs_of_calls_group_or_join() {
         let a12 = r#"{"path":"a.rs","start_line":1,"end_line":2}"#;
         let (x, a, b) = (r#"{"path":"x.py"}"#, r#"{"path":"a.rs"}"#, r#"{"path":"b.rs"}"#);
+        let a10_20 = r#"{"path":"a.rs","start_line":10,"end_line":20}"#;
+        let a15_30 = r#"{"path":"a.rs","start_line":15,"end_line":30}"#;
+        let (a5, a60, head12) = (
+            r#"{"path":"a.rs","start_line":5}"#,
+            r#"{"path":"a.rs","start_line":60}"#,
+            r#"{"path":"a.rs","end_line":12}"#,
+        );
         let calls: &[(&str, &[&str], &str)] = &[
             // The tools without paths join plainly, identical or not.
             ("fetch", &[r#"{"url":"u"}"#, r#"{"url":"u"}"#], "Fetch(u, u)"),
-            // One file, several ranges — unmerged, repeats included.
+            // One file, several adjacent ranges — they coalesce into one span.
             (
                 "read",
                 &[
@@ -145,8 +165,16 @@ mod tests {
                     r#"{"path":"README.md","start_line":11,"end_line":20}"#,
                     r#"{"path":"README.md","start_line":21,"end_line":30}"#,
                 ],
-                "Read(README.md:1-10,11-20,21-30)",
+                "Read(README.md:1-30)",
             ),
+            // Overlapping ranges merge into the one span covering them.
+            ("read", &[a10_20, a15_30], "Read(a.rs:10-30)"),
+            // Ranges render in range order, whatever the call order.
+            ("read", &[a10_20, a12], "Read(a.rs:1-2,10-20)"),
+            // Two open tails union into the earlier one.
+            ("read", &[a5, a60], "Read(a.rs:5-)"),
+            // An open head and an open tail cover the file between them.
+            ("read", &[head12, a5], "Read(a.rs)"),
             // Interleaved files keep first-call order; open tails ride along.
             (
                 "read",
@@ -167,11 +195,11 @@ mod tests {
                 ],
                 "Read(a.rs, b.rs:1-2)",
             ),
-            // Reads never count repeats; unparsed company ends up raw.
+            // Repeated bounds collapse to one; unparsed company ends up raw.
             (
                 "read",
                 &[a12, a12, r#"{"start_line":3}"#, "not json"],
-                r#"Read(a.rs:1-2,1-2, {"start_line":3}, not json)"#,
+                r#"Read(a.rs:1-2, {"start_line":3}, not json)"#,
             ),
             // Edits name each path once, counting repeats from the second on.
             ("edit", &[x, x, x], "Edit(x.py × 3)"),
