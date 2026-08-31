@@ -55,14 +55,13 @@ fn fence_len(text: &str) -> usize {
 /// One outside-the-sandbox mention's attachment block and its note for the pane.
 fn attach(mention: &str) -> (String, String) {
     let path = file_mentions::expand_tilde(mention).unwrap_or_else(|| PathBuf::from(mention));
-    let why = |error: &std::io::Error| {
+    let why = |error: &std::io::Error| -> &str {
         match error.kind() {
             ErrorKind::NotFound => "not found",
             ErrorKind::IsADirectory => "a directory",
             ErrorKind::InvalidData => "not UTF-8 text",
             _ => "unreadable",
         }
-        .to_string()
     };
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
@@ -77,7 +76,7 @@ fn attach(mention: &str) -> (String, String) {
         }
         Err(error) => {
             let reason = why(&error);
-            (reason.clone(), format!("{mention}: {reason}, not attached"))
+            (reason.to_string(), format!("{mention}: {reason}, not attached"))
         }
     }
 }
