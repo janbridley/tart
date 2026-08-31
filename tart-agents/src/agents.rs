@@ -28,6 +28,13 @@ impl AgentId {
     pub const fn id(&self) -> u64 {
         self.0
     }
+
+    /// The id as its agent box names it: `agent-N`.
+    #[inline]
+    #[must_use]
+    pub fn tag(&self) -> String {
+        format!("agent-{self}")
+    }
 }
 
 impl From<u64> for AgentId {
@@ -72,6 +79,9 @@ pub enum Outcome {
 
 /// The most subagents that may run (or await delivery) at once.
 pub const MAX_SUBAGENTS: usize = 8;
+
+/// The wire name of the synthetic tool call that carries a subagent's box.
+pub const AGENT_TOOL: &str = "agent";
 
 /// The most of any one subagent report the model is handed, in bytes.
 pub const REPORT_CAP: usize = 128 * 1024; // Large so we rarely truncate
@@ -159,8 +169,8 @@ impl Agents {
         (self.inner.events)(
             id,
             Progress::ToolStart {
-                id: format!("agent-{id}"),
-                name: "agent".to_string(),
+                id: id.tag(),
+                name: AGENT_TOOL.to_string(),
                 arguments: serde_json::json!({ "task": task }).to_string(),
             },
         );
@@ -170,13 +180,7 @@ impl Agents {
             // A terminal outcome is stored and its waiter woken before
             // the event forwards, so whoever acts on the event always finds
             // the outcome already registered.
-            let outcome = match &progress {
-                Progress::Done { message } => Some(Outcome::Done(message.clone())),
-                Progress::Failed(error) => Some(Outcome::Failed(error.clone())),
-                Progress::Cancelled => Some(Outcome::Cancelled),
-                _ => None,
-            };
-            if let Some(outcome) = outcome {
+            if let Some(outcome) = progress.outcome() {
                 inner.with_child(id, |child| {
                     child.outcome = Some(outcome.clone());
                     let _ = child.sender.send(outcome);
@@ -191,11 +195,7 @@ impl Agents {
     /// nothing, for drawing its box. Delivery is [`Agents::take_outcome`].
     #[inline]
     pub fn outcome(&self, id: AgentId) -> Option<Outcome> {
-        self.inner
-            .lock_children()
-            .iter()
-            .find(|(sid, _)| *sid == id)
-            .and_then(|(_, child)| child.outcome.clone())
+        self.inner.with_child(id, |child| child.outcome.clone()).flatten()
     }
 
     /// Claim the subagent's terminal result, with the task it ran: the one
@@ -208,9 +208,7 @@ impl Agents {
         let index = children.iter().position(|(sid, _)| *sid == id)?;
         // Taking the outcome delivers it: the child leaves the registry,
         // freeing its slot.
-        let outcome = children
-            .get_mut(index)
-            .and_then(|(_, child)| child.outcome.take());
+        let outcome = children[index].1.outcome.take();
         outcome.map(|outcome| (children.remove(index).1.task, outcome))
     }
 
@@ -258,12 +256,10 @@ impl Agents {
                 Ok(_) => {
                     // The worker stored the outcome before sending, so the
                     // take succeeds unless the front end delivered first.
-                    return self
-                        .take_outcome(id)
-                        .map(|(_, outcome)| Some(outcome))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("subagent {id}'s report was already delivered")
-                        });
+                    return match self.take_outcome(id) {
+                        Some((_, outcome)) => Ok(Some(outcome)),
+                        None => anyhow::bail!("subagent {id}'s report was already delivered"),
+                    };
                 }
                 Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
                     return Ok(None);

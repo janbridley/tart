@@ -51,9 +51,8 @@ pub struct Agent {
     writable: Policy,
     /// The shared runtime every agent and turn drives its futures on.
     runtime: Arc<Runtime>,
-    /// Whether this agent is offered the subagent tools: `true` only for the main agent
-    spawns: bool,
-    /// The subagent registry, or `None` for subagents.
+    /// The subagent registry, which also arms the subagent tools; `None` for
+    /// subagents themselves.
     subagents: Option<Arc<Agents>>,
     /// The front end's lever on the running turn (cancel).
     control: TurnHandle,
@@ -150,7 +149,6 @@ impl Agent {
             mode: ChatMode::Default,
             writable: policy,
             runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
-            spawns: true,
             subagents: None,
             control: TurnHandle::default(),
         }
@@ -188,7 +186,7 @@ impl Agent {
         }
         definitions.extend(tools::search());
         definitions.extend(tools::fetch());
-        if self.spawns {
+        if self.subagents.is_some() {
             definitions.push(tools::spawn());
             definitions.push(tools::wait());
         }
@@ -199,7 +197,6 @@ impl Agent {
     pub(crate) fn child(&self) -> Agent {
         let mut child = self.clone();
         child.control = TurnHandle::default();
-        child.spawns = false;
         child.subagents = None;
         child
     }
@@ -656,6 +653,7 @@ mod tests {
     fn plan_mode_is_read_only_and_drops_edit() {
         let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
         let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
+        agent.set_subagents(Arc::new(Agents::new(|_, _| ())));
 
         // Default: the granted roots are writable, and `edit` is offered alongside the
         // subagent pair only a spawning agent gets.
