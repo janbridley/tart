@@ -615,6 +615,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use crate::Agent;
     use crate::sandbox::Policy;
     use crate::sandbox::live::skip_unless_networked;
     use crate::tools::{Tooling, execute};
@@ -966,7 +967,13 @@ mod tests {
         };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let token = CancelToken::new();
-        let tools = Tooling { policy: &policy, cancel: &token };
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
         let events = std::cell::RefCell::new(Vec::new());
         let request = call(
             "search",
@@ -1004,7 +1011,13 @@ mod tests {
         };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let token = CancelToken::new();
-        let tools = Tooling { policy: &policy, cancel: &token };
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
         let events = std::cell::RefCell::new(Vec::new());
         let request = call("fetch", r#"{"url":"https://example.com","raw":true}"#);
 
