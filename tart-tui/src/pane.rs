@@ -547,22 +547,17 @@ impl Pane {
     fn status_text(&self) -> Option<String> {
         let usage = self.usage?;
         let context = usage.input + usage.output;
-        let mut text = match self.context_tokens {
+        let mut parts = vec![match self.context_tokens {
             Some(window) => format!("{} / {}", token_count(context), token_count(window)),
             None => token_count(context),
-        };
+        }];
         if usage.cached > 0 && usage.input > 0 {
-            let percent = usage.cached * 100 / usage.input;
-            text.push_str(" · ");
-            text.push_str(&percent.to_string());
-            text.push_str("% cached");
+            parts.push(format!("{}% cached", usage.cached * 100 / usage.input));
         }
         if self.child_tokens > 0 {
-            text.push_str(" · ");
-            text.push_str(&token_count(self.child_tokens));
-            text.push_str(" in agents");
+            parts.push(format!("{} in agents", token_count(self.child_tokens)));
         }
-        Some(text)
+        Some(parts.join(" · "))
     }
 
     /// The status rule's current spinner frame, or None while idle: it spins
