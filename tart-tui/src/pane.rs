@@ -7,6 +7,7 @@ mod markdown;
 mod transcript;
 mod wrap;
 
+use itertools::Itertools;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -742,7 +743,7 @@ impl Pane {
         transcript: &Conversation,
         wake: &Sender<Wake>,
     ) -> anyhow::Result<bool> {
-        let texts: Vec<String> = std::mem::take(&mut self.reports)
+        let text = std::mem::take(&mut self.reports)
             .into_iter()
             .filter_map(|id| agents.take_outcome(id).map(|(task, outcome)| (id, task, outcome)))
             .map(|(id, task, outcome)| {
@@ -752,11 +753,10 @@ impl Pane {
                     outcome.report()
                 )
             })
-            .collect();
-        if texts.is_empty() {
+            .join("\n\n");
+        if text.is_empty() {
             return Ok(false);
         }
-        let text = texts.join("\n\n");
         self.transcript
             .push(Line::from(Span::styled("● ".to_string(), DIM_STYLE)));
         // The reports are the agents' words, not the user's, so the report text is dim
@@ -797,7 +797,7 @@ impl Pane {
 
     /// Move every queued message into the composer as editable text
     pub fn spill_queued(&mut self) {
-        let text = self.queued.drain(..).collect::<Vec<_>>().join("\n");
+        let text = itertools::join(self.queued.drain(..), "\n");
         if text.is_empty() {
             return;
         }

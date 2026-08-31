@@ -83,9 +83,6 @@ pub const MAX_SUBAGENTS: usize = 8;
 /// The wire name of the synthetic tool call that carries a subagent's box.
 pub const AGENT_TOOL: &str = "agent";
 
-/// The most of any one subagent report the model is handed, in bytes.
-pub const REPORT_CAP: usize = 128 * 1024; // Large so we rarely truncate
-
 /// One registered subagent.
 struct Child {
     /// The task it was given, for its box and its injection message.

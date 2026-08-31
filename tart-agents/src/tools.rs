@@ -11,7 +11,7 @@ use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
-use crate::{Agent, AgentId, Agents, Progress, REPORT_CAP, sandbox::Policy};
+use crate::{Agent, AgentId, Agents, Progress, sandbox::Policy};
 
 mod web;
 
@@ -365,7 +365,7 @@ fn run_wait<F: Fn(Progress)>(
     Ok(traced(call, on_progress, || {
         match agents.wait(AgentId::from(id), timeout, tools.cancel) {
             Ok(Some(outcome)) => {
-                let text = head_cap(&outcome.report(), REPORT_CAP);
+                let text = outcome.report();
                 (text.clone(), text, Some(0))
             }
             Ok(None) => {

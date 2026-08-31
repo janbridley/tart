@@ -180,17 +180,16 @@ impl Agent {
 
     /// The tools this agent offers the model. Plan mode withholds the `edit` tool.
     fn tools_for(&self) -> Vec<Tool> {
-        let mut definitions = vec![tools::bash(), tools::read()];
-        if self.mode == ChatMode::Default {
-            definitions.push(tools::edit());
-        }
-        definitions.extend(tools::search());
-        definitions.extend(tools::fetch());
-        if self.subagents.is_some() {
-            definitions.push(tools::spawn());
-            definitions.push(tools::wait());
-        }
-        definitions
+        [tools::bash(), tools::read()]
+            .into_iter()
+            .chain((self.mode == ChatMode::Default).then_some(tools::edit()))
+            .chain([tools::search(), tools::fetch()].into_iter().flatten())
+            .chain(
+                self.subagents
+                    .iter()
+                    .flat_map(|_| [tools::spawn(), tools::wait()]),
+            )
+            .collect()
     }
 
     /// A child agent: this agent's model and policy, with no subagent recursion.
@@ -596,7 +595,7 @@ fn retry_dropped<F: Fn(Progress)>(on_progress: &F, reason: &str, retries: &mut u
 /// Bound one tool result before it enters history.
 fn bounded_for_history<F: Fn(Progress)>(name: &str, output: &str, on_progress: &F) -> String {
     let capped = tools::bounded(output, tools::CONTENT_CAP);
-    if capped.len() < output.len() {
+    if output.len() > tools::CONTENT_CAP {
         on_progress(Progress::Note(format!(
             "{name} output truncated to {} KiB",
             tools::CONTENT_CAP / 1024

@@ -38,9 +38,8 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use tart_agents::{
-    AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress, REPORT_CAP,
-    ReasoningEffort, SESSIONS_ROOT, Session, Transcript, head_cap, manual_command, prompts,
-    sandbox::Policy,
+    AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
+    ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
 };
 use tmux_override::{override_shift_up, restore_tmux};
 
@@ -457,7 +456,7 @@ fn on_child_event(
                     pane.report(id);
                     pane.finish_agent(
                         id,
-                        head_cap(&outcome.report(), REPORT_CAP),
+                        outcome.report(),
                         matches!(outcome, Outcome::Done(_)).then_some(0),
                     );
                 }

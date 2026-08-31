@@ -44,10 +44,6 @@ const DEFAULT_SEARCH_RESULTS: u64 = 8;
 /// Most results one search may return; more is noise the model cannot use.
 const MAX_SEARCH_RESULTS: u64 = 25;
 
-/// Characters of a fetched page kept: the reader output is markdown, so this is
-/// far more than the model can usefully read.
-const FETCH_LIMIT: usize = 150_000;
-
 /// The reader service: it renders a page as markdown so curl hands back text.
 const READER: &str = "https://r.jina.ai/";
 
@@ -519,7 +515,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
                     },
                     None => text.as_str(),
                 };
-                let text = truncate(checked, FETCH_LIMIT);
+                let text = checked.to_string();
                 (command_text(&text, output.status), text, exit)
             }
         }
@@ -543,15 +539,6 @@ fn private_redirect(final_url: &str) -> Option<String> {
     let rest = final_url.split_once("://").map_or(final_url, |(_, rest)| rest);
     is_private_host(authority_host(rest))
         .then(|| format!("fetch: refusing redirect to non-public host {final_url}"))
-}
-
-/// Cut `text` to its last character boundary at or before `limit` bytes, marking the cut
-fn truncate(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let cut = text.floor_char_boundary(limit);
-    format!("{}\n[truncated]", &text[..cut])
 }
 
 /// A non-empty, trimmed string field of a results record.
@@ -891,20 +878,6 @@ mod tests {
         ];
 
         assert_eq!(fetch_args(&fetch, "https://example.com/x"), expected);
-    }
-
-    #[test]
-    fn truncate_cuts_at_a_character_boundary_and_marks_the_cut() {
-        // Two bytes per é: an odd limit lands mid-character.
-        let page = "é".repeat(80_000);
-        let cut = truncate(&page, FETCH_LIMIT);
-
-        assert!(cut.ends_with("[truncated]"), "{}…", &cut[cut.len() - 40..]);
-        assert!(cut.len() < page.len());
-        assert!(cut.starts_with(&page[..page.len() / 2]));
-
-        // Under the limit the text passes through untouched.
-        assert_eq!(truncate("short", FETCH_LIMIT), "short");
     }
 
     #[test]
