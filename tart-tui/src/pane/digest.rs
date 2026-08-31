@@ -157,7 +157,7 @@ mod tests {
         let calls: &[(&str, &[&str], &str)] = &[
             // The tools without paths join plainly, identical or not.
             ("fetch", &[r#"{"url":"u"}"#, r#"{"url":"u"}"#], "Fetch(u, u)"),
-            // One file, several adjacent ranges — they coalesce into one span.
+            // One file, several adjacent ranges -> they coalesce into one span.
             (
                 "read",
                 &[
