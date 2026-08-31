@@ -608,7 +608,6 @@ mod tests {
     use super::*;
     use async_openai::types::responses::ResponseTextDeltaEvent;
     use std::io::{Read, Write};
-    use std::time::Duration;
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -896,7 +895,7 @@ mod tests {
             .spawn(&agent, "find the flaky test")
             .expect("the registry has room");
         let outcome = agents
-            .wait(id, Duration::from_secs(5), &CancelToken::new())
+            .wait(id, &CancelToken::new())
             .expect("the child is registered");
         assert_eq!(outcome, Some(crate::Outcome::Done(Some("found it".to_string()))));
         server.join().expect("the server exits");
@@ -911,11 +910,7 @@ mod tests {
 
         // The delivered report is gone: one delivery, and the slot is freed.
         assert_eq!(agents.take_outcome(id), None);
-        assert!(
-            agents
-                .wait(id, Duration::from_secs(1), &CancelToken::new())
-                .is_err()
-        );
+        assert!(agents.wait(id, &CancelToken::new()).is_err());
     }
 
     #[test]
@@ -934,9 +929,7 @@ mod tests {
         // pause is 1ms); waiting delivers the report and prunes the child.
         let token = CancelToken::new();
         for id in ids {
-            let outcome = agents
-                .wait(id, Duration::from_secs(30), &token)
-                .expect("the child ends");
+            let outcome = agents.wait(id, &token).expect("the child ends");
             assert!(outcome.is_some(), "a failed child still reports: {outcome:?}");
             assert_eq!(agents.take_outcome(id), None, "one delivery only");
         }
