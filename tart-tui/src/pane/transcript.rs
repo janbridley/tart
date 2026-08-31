@@ -646,10 +646,7 @@ mod tests {
         t.sync(40);
         let rows = texts(t.rows());
         assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 1);
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("● Read(a.rs:1-10, a.rs:20-30) …"))
-        );
+        assert!(rows.iter().any(|row| row.contains("● Read(a.rs:1-10,20-30) …")));
         t.assert_rows_match_full_rewrap();
 
         // The newest output lands on the merged box.
@@ -700,7 +697,7 @@ mod tests {
         assert!(
             reopened
                 .iter()
-                .any(|row| row.contains("● Read(a.rs:1-10, a.rs:20-30) …"))
+                .any(|row| row.contains("● Read(a.rs:1-10,20-30) …"))
         );
         assert!(
             reopened.iter().any(|row| row.contains("⎿ three")),
