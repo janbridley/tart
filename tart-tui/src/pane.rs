@@ -16,7 +16,9 @@ use ratatui::{Frame, symbols};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
-use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnHandle, prompts};
+use tart_agents::{
+    Agent, AgentId, ChatMode, MAIN, Progress, Transcript as Conversation, TurnHandle, prompts,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
@@ -83,8 +85,8 @@ pub enum PaneEvent {
 pub enum Wake {
     /// Terminal input, read on its own thread.
     Input(Event),
-    /// Progress from the background generation.
-    Generation(Progress),
+    /// Progress from a background generation, tagged with the agent that ran it.
+    Generation(AgentId, Progress),
     /// A finished manual command's framed output.
     Command(String),
 }
@@ -609,7 +611,7 @@ impl Pane {
         self.set_generating(true);
         let sender = wake.clone();
         agent.spawn(transcript, move |progress| {
-            let _ = sender.send(Wake::Generation(progress));
+            let _ = sender.send(Wake::Generation(MAIN, progress));
         });
     }
 

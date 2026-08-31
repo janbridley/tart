@@ -378,7 +378,7 @@ mod tests {
         transcript.push_assistant("partial".to_string()).unwrap();
         transcript.push_user("actually, go faster".to_string()).unwrap();
 
-        // A steered round's user/partial/user shape replays as recorded.
+        // An interrupted round's user/partial/user shape replays as recorded.
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         assert_eq!(items[1]["role"], "user");
         assert_eq!(items[2]["role"], "assistant");

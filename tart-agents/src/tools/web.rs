@@ -16,8 +16,8 @@ use std::time::Duration;
 use async_openai::types::responses::{FunctionToolCall, Tool};
 
 use super::{
-    WatchedRun, combined_output, command_text, parse_arguments, run_with_timeout, string_field,
-    timeout_text, tool, traced,
+    CancelToken, WatchedRun, combined_output, command_text, parse_arguments, run_watched,
+    string_field, timeout_text, tool, traced,
 };
 use crate::Progress;
 
@@ -287,7 +287,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
         let results = results_path();
         let mut ddgs = web_command(binary);
         ddgs.args(ddgs_args(&search, &results));
-        let outcome = run_with_timeout(&mut ddgs, SEARCH_TIMEOUT);
+        let outcome = run_watched(&mut ddgs, Some(SEARCH_TIMEOUT), &CancelToken::new());
         // The results file is ours whatever happened: read it, then drop it.
         let json = std::fs::read_to_string(&results).ok();
         let _ = std::fs::remove_file(&results);
@@ -298,7 +298,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
                     let WatchedRun { output, killed } = run;
                     let text = combined_output(&output);
                     let exit = output.status.code();
-                    if killed {
+                    if killed.is_some() {
                         let marked = timeout_text(&text, SEARCH_TIMEOUT);
                         (marked.clone(), marked, exit)
                     } else {
@@ -496,12 +496,12 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
         };
         let mut curl = web_command(binary);
         curl.args(fetch_args(&fetch, &url));
-        match run_with_timeout(&mut curl, FETCH_TIMEOUT) {
+        match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
             Err(error) => {
                 let text = format!("error: {error}");
                 (text.clone(), text, None)
             }
-            Ok(WatchedRun { output, killed: true }) => {
+            Ok(WatchedRun { output, killed: Some(_) }) => {
                 let marked = timeout_text(&combined_output(&output), FETCH_TIMEOUT);
                 (marked.clone(), marked, output.status.code())
             }
@@ -617,7 +617,7 @@ mod tests {
     use super::*;
     use crate::sandbox::Policy;
     use crate::sandbox::live::skip_unless_networked;
-    use crate::tools::execute;
+    use crate::tools::{Tooling, execute};
     use macro_rules_attribute::apply;
 
     /// A tool call for `name` with raw JSON `arguments`.
@@ -965,13 +965,15 @@ mod tests {
             return;
         };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let tools = Tooling { policy: &policy, cancel: &token };
         let events = std::cell::RefCell::new(Vec::new());
         let request = call(
             "search",
             r#"{"query":"rust programming language","max_results":3}"#,
         );
 
-        let output = execute(&request, &policy, &|progress| {
+        let output = execute(&request, &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -1001,10 +1003,12 @@ mod tests {
             return;
         };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let tools = Tooling { policy: &policy, cancel: &token };
         let events = std::cell::RefCell::new(Vec::new());
         let request = call("fetch", r#"{"url":"https://example.com","raw":true}"#);
 
-        let output = execute(&request, &policy, &|progress| {
+        let output = execute(&request, &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();

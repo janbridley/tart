@@ -37,8 +37,8 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use tart_agents::{
-    Agent, CancelToken, ChatMode, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript,
-    manual_command, prompts, sandbox::Policy,
+    Agent, Agents, CancelToken, ChatMode, MAIN, Progress, ReasoningEffort, SESSIONS_ROOT, Session,
+    Transcript, manual_command, prompts, sandbox::Policy,
 };
 use tmux_override::{override_shift_up, restore_tmux};
 
@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
     let _tmux = override_shift_up();
     let mut pane = Pane::default();
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
-    pane.set_control(agent.control());
+    pane.set_control(agent.handle());
     pane.note(format!("tart · {label}"));
     if let Some(tokens) = agent_config.context_tokens {
         pane.set_context_tokens(tokens);
@@ -155,9 +155,10 @@ fn run(
     let mut quit = false;
     let mut perf_on = false;
     let mut perf = Perf::default();
-    let control = agent.control();
+    let agents = Agents::new();
+    agents.adopt(agent.handle());
     // A manual command's cancel lever, held while one runs; Esc and quit set it.
-    let mut manual_cancel: Option<(CancelToken, std::thread::JoinHandle<()>)> = None;
+    let mut manual_cancel: Option<CancelToken> = None;
     // A plan switch deferred by a running turn, applied when the turn ends.
     let mut pending_plan: Option<bool> = None;
     // State-mutation time since the last frame.
@@ -174,13 +175,12 @@ fn run(
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
-                // Esc with nothing open aborts whatever is in flight: the turn
-                // (a no-op when idle) and any manual command.
+                // Esc with nothing open aborts whatever is in flight.
                 Some(PaneEvent::Cancel) => {
-                    control.cancel();
+                    agents.cancel_all();
                     // Esc also cancels a plan switch still waiting for the turn.
                     pending_plan = None;
-                    if let Some((token, _)) = &manual_cancel {
+                    if let Some(token) = &manual_cancel {
                         token.cancel();
                     }
                 }
@@ -190,15 +190,15 @@ fn run(
                 Some(PaneEvent::Command(command)) => {
                     pane.manual_running(Some(command.clone()));
                     let token = CancelToken::new();
-                    let runner = {
+                    {
                         let token = token.clone();
                         let sender = wake.clone();
                         std::thread::spawn(move || {
                             let framed = manual_command(&command, &token);
                             let _ = sender.send(Wake::Command(framed));
-                        })
-                    };
-                    manual_cancel = Some((token, runner));
+                        });
+                    }
+                    manual_cancel = Some(token);
                 }
                 // Shift+Tab: toggle plan mode, exactly as `/plan` does.
                 Some(PaneEvent::Plan) => {
@@ -286,9 +286,6 @@ fn run(
                 None => {}
             },
             Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),
-            // Resizes are handled at render time (see Pane::render); the redraw
-            // timer just loops around and draws again.
-            Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
             // A manual command finished: echo it, then record the exchange as user msg
             Ok(Wake::Command(framed)) => {
@@ -299,7 +296,7 @@ fn run(
                 }
             }
             // Update the pane as progress arrives and time it into `work`.
-            Ok(Wake::Generation(progress)) => {
+            Ok(Wake::Generation(id, progress)) if id == MAIN => {
                 let ping = Instant::now();
                 match &progress {
                     // When the turn ends the worker has already recorded the entire turn
@@ -337,15 +334,17 @@ fn run(
                 }
                 work += ping.elapsed();
             }
+            // Resizes are handled at render time (see Pane::render); the redraw
+            // timer just loops around and draws again.
+            Ok(Wake::Input(_) | Wake::Generation(..)) | Err(RecvTimeoutError::Timeout) => {}
         }
     }
     // A quit mid-generation keeps the partial turn; in-flight requests (if
     // any) are reconstructed or repaired in the transcript.
     session.record(&transcript)?;
     // A quit mid-manual-command kills it rather than orphaning the group.
-    if let Some((token, runner)) = manual_cancel {
+    if let Some(token) = manual_cancel {
         token.cancel();
-        let _ = runner.join();
     }
     Ok(())
 }

@@ -396,24 +396,25 @@ fn run_watched(
     let (finished, slept) = mpsc::channel::<()>();
     let token = cancel.clone();
     let end = deadline.map(|timeout| Instant::now() + timeout);
-    let watchdog = std::thread::spawn(move || loop {
-        if token.cancelled() {
-            let _ = killer.send(KillReason::Cancelled);
-            let _ = killpg(group, Signal::SIGKILL);
-            return;
-        }
-        // Sleep only until the nearer of the poll and the deadline, so a
-        // deadline kills on time rather than a poll late.
-        let wait = CANCEL_POLL.min(end.map_or(CANCEL_POLL, |end| {
-            end.saturating_duration_since(Instant::now())
-        }));
-        if matches!(slept.recv_timeout(wait), Err(RecvTimeoutError::Disconnected)) {
-            return;
-        }
-        if end.is_some_and(|end| Instant::now() >= end) {
-            let _ = killer.send(KillReason::Timeout);
-            let _ = killpg(group, Signal::SIGKILL);
-            return;
+    let watchdog = std::thread::spawn(move || {
+        loop {
+            if token.cancelled() {
+                let _ = killer.send(KillReason::Cancelled);
+                let _ = killpg(group, Signal::SIGKILL);
+                return;
+            }
+            // Sleep only until the nearer of the poll and the deadline, so a
+            // deadline kills on the right cycle
+            let wait = CANCEL_POLL
+                .min(end.map_or(CANCEL_POLL, |end| end.saturating_duration_since(Instant::now())));
+            if matches!(slept.recv_timeout(wait), Err(RecvTimeoutError::Disconnected)) {
+                return;
+            }
+            if end.is_some_and(|end| Instant::now() >= end) {
+                let _ = killer.send(KillReason::Timeout);
+                let _ = killpg(group, Signal::SIGKILL);
+                return;
+            }
         }
     });
 
@@ -868,9 +869,9 @@ mod tests {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
 
-        let run = run_until_cancelled(&mut command, &CancelToken::new()).unwrap();
+        let run = run_watched(&mut command, None, &CancelToken::new()).unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.killed, None);
         assert_eq!(combined_output(&run.output), "hi\n");
     }
 
@@ -892,56 +893,88 @@ mod tests {
         }
     }
 
-    /// These drive `run_with_timeout` with plain commands, so they run without
-    /// the sandbox; their deadlines are milliseconds to stay fast.
+    /// These drive `run_watched` with plain commands, so they run without the sandbox
     #[test]
-    fn run_with_timeout_returns_a_fast_command_normally() {
+    fn run_watched_returns_a_fast_command_normally() {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
 
-        let run = run_with_timeout(&mut command, Duration::from_secs(10)).unwrap();
+        let run =
+            run_watched(&mut command, Some(Duration::from_secs(10)), &CancelToken::new()).unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.killed, None);
         assert_eq!(combined_output(&run.output), "hi\n");
         assert!(run.output.status.success());
     }
 
     #[test]
-    fn run_with_timeout_kills_a_command_that_outruns_the_deadline() {
+    fn run_watched_kills_a_command_that_outruns_the_deadline() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+        let run = run_watched(
+            &mut command,
+            Some(Duration::from_millis(300)),
+            &CancelToken::new(),
+        )
+        .unwrap();
 
-        assert!(run.killed);
+        assert_eq!(run.killed, Some(KillReason::Timeout));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!run.output.status.success());
     }
 
     #[test]
-    fn run_with_timeout_kills_the_whole_process_group() {
+    fn run_watched_kills_a_command_the_moment_the_token_fires() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let token = CancelToken::new();
+        let trip = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                token.cancel();
+            })
+        };
+        let started = Instant::now();
+
+        let run = run_watched(&mut command, Some(Duration::from_secs(60)), &token).unwrap();
+
+        assert_eq!(run.killed, Some(KillReason::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        trip.join().unwrap();
+    }
+
+    #[test]
+    fn run_watched_kills_the_whole_process_group() {
         // The backgrounded sleeps outlive bash and hold the output pipe; only a
         // group kill frees the capture, so returning promptly proves they died.
         let mut command = Command::new("/bin/bash");
         command.arg("-c").arg("sleep 9871 & sleep 9871 & wait");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+        let run = run_watched(
+            &mut command,
+            Some(Duration::from_millis(300)),
+            &CancelToken::new(),
+        )
+        .unwrap();
 
-        assert!(run.killed);
+        assert_eq!(run.killed, Some(KillReason::Timeout));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
-    fn run_with_timeout_wakes_the_watchdog_when_the_command_finishes_early() {
+    fn run_watched_wakes_the_watchdog_when_the_command_finishes_early() {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, DEFAULT_BASH_TIMEOUT).unwrap();
+        let run =
+            run_watched(&mut command, Some(DEFAULT_BASH_TIMEOUT), &CancelToken::new()).unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.killed, None);
         // The sender's drop joins the watchdog at once rather than letting it
         // sleep out the full timeout.
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -952,8 +985,12 @@ mod tests {
     #[test]
     fn execute_reports_command_then_output() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+        };
         let events = std::cell::RefCell::new(Vec::new());
-        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &policy, &|progress| {
+        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -980,11 +1017,11 @@ mod tests {
 
         // The exit status reaches the model verbatim.
         assert_eq!(
-            execute(&bash_call(r#"{"command":"false"}"#), &policy, &|_| {}).unwrap(),
+            execute(&bash_call(r#"{"command":"false"}"#), &tools, &|_| {}).unwrap(),
             "[exit 1]"
         );
         assert_eq!(
-            execute(&bash_call(r#"{"command":"true"}"#), &policy, &|_| {}).unwrap(),
+            execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}).unwrap(),
             "done"
         );
     }
@@ -992,10 +1029,14 @@ mod tests {
     #[test]
     fn execute_rejects_unknown_tool_names() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+        };
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
 
-        let error = execute(&call, &policy, &|_| {}).unwrap_err().to_string();
+        let error = execute(&call, &tools, &|_| {}).unwrap_err().to_string();
 
         assert!(error.contains("unknown tool"), "{error}");
     }
@@ -1124,7 +1165,11 @@ mod tests {
         let spawn_edit = |old: &str, new: &str| {
             let call = edit_call(file.path(), old, new);
             let policy = policy.clone();
-            std::thread::spawn(move || execute(&call, &policy, &|_| {}).unwrap())
+            std::thread::spawn(move || {
+                let token = CancelToken::new();
+                let tools = Tooling { policy: &policy, cancel: &token };
+                execute(&call, &tools, &|_| {}).unwrap()
+            })
         };
         let first = spawn_edit("UNO", "uno");
         let second = spawn_edit("DOS", "dos");
@@ -1221,9 +1266,13 @@ mod tests {
         }
         let file = scratch(&contents);
         let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+        };
         let events = std::cell::RefCell::new(Vec::new());
 
-        let whole = execute(&read_call(file.path(), None, None), &policy, &|progress| {
+        let whole = execute(&read_call(file.path(), None, None), &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -1245,13 +1294,9 @@ mod tests {
 
         // A bounded read's arguments ride along untouched.
         events.borrow_mut().clear();
-        let range = execute(
-            &read_call(file.path(), Some(10), Some(12)),
-            &policy,
-            &|progress| {
-                events.borrow_mut().push(progress);
-            },
-        )
+        let range = execute(&read_call(file.path(), Some(10), Some(12)), &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        })
         .unwrap();
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
         assert!(matches!(
@@ -1267,12 +1312,12 @@ mod tests {
                         .to_string()
         ));
 
-        let tail = execute(&read_call(file.path(), Some(28), None), &policy, &|_| {}).unwrap();
+        let tail = execute(&read_call(file.path(), Some(28), None), &tools, &|_| {}).unwrap();
         assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
         assert_eq!(tail.lines().count(), 3);
 
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
-        let absent = execute(&read_call(&missing, None, None), &policy, &|_| {}).unwrap();
+        let absent = execute(&read_call(&missing, None, None), &tools, &|_| {}).unwrap();
         assert!(absent.contains("No such file or directory"), "{absent}");
     }
 }

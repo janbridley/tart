@@ -1,6 +1,7 @@
 //! The *tart* agent harness.
 
 mod agent;
+mod agents;
 mod debug;
 mod history;
 mod progress;
@@ -16,6 +17,7 @@ pub use progress::Progress;
 pub use session::{SESSIONS_ROOT, Session};
 
 pub use agent::{Agent, ChatMode, TurnHandle};
+pub use agents::{AgentId, Agents, MAIN};
 
 pub use tools::{CONTENT_CAP, CancelToken, head_cap, manual_command};
 
