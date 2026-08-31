@@ -56,9 +56,9 @@ impl Progress {
     /// The terminal result this event carries, when it is one.
     pub(crate) fn outcome(&self) -> Option<crate::Outcome> {
         match self {
-            Progress::Done { message } => Some(crate::Outcome::Done(message.clone())),
-            Progress::Failed(error) => Some(crate::Outcome::Failed(error.clone())),
-            Progress::Cancelled => Some(crate::Outcome::Cancelled),
+            Self::Done { message } => Some(crate::Outcome::Done(message.clone())),
+            Self::Failed(error) => Some(crate::Outcome::Failed(error.clone())),
+            Self::Cancelled => Some(crate::Outcome::Cancelled),
             _ => None,
         }
     }
@@ -67,9 +67,6 @@ impl Progress {
     #[inline]
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Progress::Done { .. } | Progress::Failed(_) | Progress::Cancelled
-        )
+        matches!(self, Self::Done { .. } | Self::Failed(_) | Self::Cancelled)
     }
 }

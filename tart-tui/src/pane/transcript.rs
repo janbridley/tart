@@ -49,16 +49,16 @@ impl Entry {
     /// The display lines the entry renders as. Stale entries render immediately
     fn lines(&self, expanded: bool, thinking: bool) -> Vec<Line<'static>> {
         match self {
-            Entry::Text(line) => vec![line.clone()],
-            Entry::Tool(tool) => tool.lines(expanded),
-            Entry::Answer { raw, width, lines } => {
+            Self::Text(line) => vec![line.clone()],
+            Self::Tool(tool) => tool.lines(expanded),
+            Self::Answer { raw, width, lines } => {
                 if *width == 0 {
                     markdown::render(raw, 0)
                 } else {
                     lines.clone()
                 }
             }
-            Entry::Thinking { raw } => thinking_lines(raw, thinking),
+            Self::Thinking { raw } => thinking_lines(raw, thinking),
         }
     }
 }

@@ -52,7 +52,7 @@ impl Session {
 
     /// Open a session, returning its transcript and location data.
     #[inline]
-    pub fn open(root: &Path, project: &Path, path: &Path) -> anyhow::Result<(Transcript, Session)> {
+    pub fn open(root: &Path, project: &Path, path: &Path) -> anyhow::Result<(Transcript, Self)> {
         let mut loaded = load(path)?;
         if loaded.items.is_empty() {
             anyhow::bail!("session file {} has no items", path.display());
@@ -77,8 +77,8 @@ impl Session {
 
     /// Open a sibiling session at the same root and project as the current one.
     #[inline]
-    pub fn reopen(&self, path: &Path) -> anyhow::Result<(Transcript, Session)> {
-        Session::open(&self.root, &self.project, path)
+    pub fn reopen(&self, path: &Path) -> anyhow::Result<(Transcript, Self)> {
+        Self::open(&self.root, &self.project, path)
     }
 
     /// Append the transcript's items past `written`, creating the file if needed.

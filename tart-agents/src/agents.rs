@@ -51,9 +51,9 @@ impl Outcome {
     #[must_use]
     pub fn report(&self) -> String {
         match self {
-            Outcome::Done(report) => report.clone().unwrap_or_else(|| "(no report)".to_string()),
-            Outcome::Failed(error) => format!("failed: {error}"),
-            Outcome::Cancelled => "cancelled".to_string(),
+            Self::Done(report) => report.clone().unwrap_or_else(|| "(no report)".to_string()),
+            Self::Failed(error) => format!("failed: {error}"),
+            Self::Cancelled => "cancelled".to_string(),
         }
     }
 }

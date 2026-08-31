@@ -193,7 +193,7 @@ impl Agent {
     }
 
     /// A child agent: this agent's model and policy, with no subagent recursion.
-    pub(crate) fn child(&self) -> Agent {
+    pub(crate) fn child(&self) -> Self {
         let mut child = self.clone();
         child.control = TurnHandle::default();
         child.subagents = None;
