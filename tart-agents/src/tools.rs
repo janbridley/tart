@@ -334,14 +334,7 @@ fn run_spawn<F: Fn(Progress)>(
     }))
 }
 
-/// How long a `wait` blocks when the model does not ask for a window.
-const DEFAULT_WAIT_MS: u64 = 30_000;
-
-/// The shortest and longest windows a `wait` may ask for, in milliseconds.
-const MIN_WAIT_MS: u64 = 1_000;
-const MAX_WAIT_MS: u64 = 300_000;
-
-/// Run one wait tool call, blocking at most `timeout_ms`, until the subagent ends.
+/// Run one wait tool call, blocking until the subagent ends or the wait gives up.
 fn run_wait<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
@@ -351,26 +344,17 @@ fn run_wait<F: Fn(Progress)>(
     let id = args["id"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("wait needs an integer 'id'"))?;
-    let timeout = Duration::from_millis(
-        args["timeout_ms"]
-            .as_u64()
-            .unwrap_or(DEFAULT_WAIT_MS)
-            .clamp(MIN_WAIT_MS, MAX_WAIT_MS),
-    );
     let Some(agents) = tools.agents else {
         anyhow::bail!("subagents have nothing to wait on");
     };
     Ok(traced(call, on_progress, || {
-        match agents.wait(AgentId::from(id), timeout, tools.cancel) {
+        match agents.wait(AgentId::from(id), tools.cancel) {
             Ok(Some(outcome)) => {
                 let text = outcome.report();
                 (text.clone(), text, Some(0))
             }
             Ok(None) => {
-                let text = format!(
-                    "subagent {id} is still running after {}s; wait again",
-                    timeout.as_secs()
-                );
+                let text = format!("subagent {id} is still running; wait again");
                 (text.clone(), text, None)
             }
             Err(error) => (error.to_string(), error.to_string(), None),

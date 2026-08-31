@@ -103,8 +103,6 @@ materially advances the main task.
 Call `wait` with:
 
 - `id` (integer): the subagent's id, as `spawn` reported it.
-- `timeout_ms` (integer, optional): how long to block, 1000-300000; default 30000.
-  Prefer longer waits to avoid busy polling.
 
 Wait for a subagent to reach a final status. Completed statuses include the subagent's
 report; returns saying it is still running when timed out. Once the subagent reaches a
