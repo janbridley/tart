@@ -251,13 +251,13 @@ fn ddgs_args(search: &Search, results: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         if search.news { "news" } else { "text" }.into(),
         "-q".into(),
-        search.query.clone().into(),
+        search.query.as_str().into(),
         "-m".into(),
         search.max_results.to_string().into(),
     ];
     if let Some(timelimit) = &search.timelimit {
         args.push("-t".into());
-        args.push(timelimit.clone().into());
+        args.push(timelimit.as_str().into());
     }
     args.push("-o".into());
     args.push(results.as_os_str().to_owned());
