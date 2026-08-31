@@ -17,7 +17,7 @@ pub use progress::Progress;
 pub use session::{SESSIONS_ROOT, Session};
 
 pub use agent::{Agent, ChatMode, TurnHandle};
-pub use agents::{AgentId, Agents, MAIN};
+pub use agents::{AgentId, Agents, MAIN, MAX_SUBAGENTS, Outcome, REPORT_CAP};
 
 pub use tools::{CONTENT_CAP, CancelToken, head_cap, manual_command};
 
