@@ -289,7 +289,7 @@ fn run(
                     }
                     _ if line.trim().starts_with('/') => pane.note(format!(
                         "unknown command {} · /clear /resume /plan /effort /agents /stop /perf /quit",
-                        line.trim().split_whitespace().next().unwrap_or_default()
+                        line.split_whitespace().next().unwrap_or_default()
                     )),
                     _ => {
                         // A queued message drains into the record ahead of the

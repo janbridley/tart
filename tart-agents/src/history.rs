@@ -50,7 +50,7 @@ impl Transcript {
     /// agent's `instructions` as a second system message, when non-empty.
     #[inline]
     pub fn with_instructions(instructions: String) -> anyhow::Result<Self> {
-        let mut transcript = Self::new()?;
+        let transcript = Self::new()?;
         if !instructions.is_empty() {
             transcript
                 .items()
