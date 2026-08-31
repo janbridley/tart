@@ -246,9 +246,6 @@ impl Agents {
         // Off the lock: the child's terminal event is the wakeup.
         let deadline = Instant::now() + timeout;
         loop {
-            if cancel.cancelled() {
-                return Ok(None);
-            }
             match receiver.recv_timeout(WAIT_POLL) {
                 Ok(_) => {
                     // The worker stored the outcome before sending, so the
@@ -258,7 +255,12 @@ impl Agents {
                         None => anyhow::bail!("subagent {id}'s report was already delivered"),
                     };
                 }
-                Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
+                // A wait that gives up hands the receiver back, so a later wait for the
+                // same child still works
+                Err(RecvTimeoutError::Timeout)
+                    if cancel.cancelled() || Instant::now() >= deadline =>
+                {
+                    self.inner.with_child(id, |child| child.terminal = Some(receiver));
                     return Ok(None);
                 }
                 Err(RecvTimeoutError::Disconnected) => {
