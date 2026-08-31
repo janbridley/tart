@@ -358,7 +358,7 @@ fn run(
                                 // Pending subagent reports deliver together as
                                 // one turn; a queued user message follows when
                                 // that turn ends.
-                                pane.deliver_reports(agent, &transcript, &wake)?
+                                pane.deliver_reports(&agents, agent, &transcript, &wake)?
                                     || pane.requeue(agent, &transcript, &cwd, &wake)?
                             } else {
                                 pane.spill_queued();
@@ -391,31 +391,22 @@ fn run(
                         }
                     }
                     Progress::Done { .. } | Progress::Failed(_) | Progress::Cancelled => {
-                        // Taking the outcome delivers it; when a `wait` took
-                        // it first, the box closes saying so.
-                        match agents.take_outcome(id) {
-                            Some((task, outcome)) => {
-                                let exit = matches!(outcome, Outcome::Done(_)).then_some(0);
-                                let report = outcome.report();
-                                pane.finish_tool(
-                                    &format!("agent-{id}"),
-                                    head_cap(&report, REPORT_CAP),
-                                    exit,
-                                );
-                                pane.report(format!(
-                                    "Subagent {id} finished ({task}):\n\n{report}"
-                                ));
-                            }
-                            None => pane.finish_tool(
+                        // The peek resolves the box and queues the id; the
+                        // claim happens at delivery, so a `wait` inside this
+                        // turn can still take the report for itself.
+                        if let Some(outcome) = agents.outcome(id) {
+                            let exit = matches!(outcome, Outcome::Done(_)).then_some(0);
+                            pane.finish_tool(
                                 &format!("agent-{id}"),
-                                "report delivered through wait".to_string(),
-                                Some(0),
-                            ),
+                                head_cap(&outcome.report(), REPORT_CAP),
+                                exit,
+                            );
+                            pane.report(id);
                         }
                         // Idle: the reports start their turn now. Busy: the
                         // running turn's end delivers them.
                         if !pane.is_generating() {
-                            pane.deliver_reports(agent, &transcript, &wake)?;
+                            pane.deliver_reports(&agents, agent, &transcript, &wake)?;
                         }
                     }
                     // A child's spend meters into the status line's agent total.
