@@ -34,6 +34,9 @@ fn argument(name: &str, raw: &str) -> String {
             "bash" => args["command"].as_str().map(str::to_string),
             "fetch" => args["url"].as_str().map(str::to_string),
             "read" | "edit" => args["path"].as_str().map(str::to_string),
+            // The subagent pair: the task spawned, and the id waited on.
+            "spawn" => args["task"].as_str().map(str::to_string),
+            "wait" => args["id"].as_u64().map(|id| id.to_string()),
             "search" => args["query"].as_str().map(|query| {
                 let news = args["news"].as_bool() == Some(true);
                 format!("{query}{}", if news { " [news]" } else { "" })
