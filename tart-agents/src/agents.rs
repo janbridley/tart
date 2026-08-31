@@ -187,6 +187,17 @@ impl Agents {
         Ok(id)
     }
 
+    /// The subagent's terminal result, when it has ended: a peek that claims
+    /// nothing, for drawing its box. Delivery is [`Agents::take_outcome`].
+    #[inline]
+    pub fn outcome(&self, id: AgentId) -> Option<Outcome> {
+        self.inner
+            .lock_children()
+            .iter()
+            .find(|(sid, _)| *sid == id)
+            .and_then(|(_, child)| child.outcome.clone())
+    }
+
     /// Claim the subagent's terminal result, with the task it ran: the one
     /// delivery of that report, removing the child from the registry. `None`
     /// when no such child exists, it is still running, or its report was
