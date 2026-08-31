@@ -129,7 +129,7 @@ impl ToolCall {
             });
         let digest = Span::styled(format!("({arguments})"), DIM_STYLE);
         // An exit code shows only on a finished, failed call.
-        let exit = self.exit.filter(|&c| c != 0).filter(|_| !self.running);
+        let exit = self.exit.filter(|&c| c != 0 && !self.running);
         let header = [
             Span::styled("● ", status),
             Span::styled(name.to_owned(), status),
