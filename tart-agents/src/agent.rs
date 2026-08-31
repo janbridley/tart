@@ -558,11 +558,12 @@ fn with_last_error(message: &str, last_error: Option<String>) -> String {
 }
 
 /// The most consecutive rounds a dropped stream retries before failing.
-const MAX_STREAM_RETRIES: usize = 3;
+const MAX_STREAM_RETRIES: usize = 4;
 
-/// The pause before retrying a dropped stream.
+/// The pause before the first retry; it doubles on each further one
+/// (2s, 4s, 8s, 16s).
 #[cfg(not(test))]
-const RETRY_PAUSE: Duration = Duration::from_secs(1);
+const RETRY_PAUSE: Duration = Duration::from_secs(2);
 /// A test's pause is nothing, so budget tests run in milliseconds.
 #[cfg(test)]
 const RETRY_PAUSE: Duration = Duration::from_millis(1);
@@ -570,7 +571,7 @@ const RETRY_PAUSE: Duration = Duration::from_millis(1);
 /// Count one dropped round, reporting the retry and pausing while one remains.
 ///
 /// Returns whether the round should re-run. `false` means the caller fails the
-/// turn with the reason. A completed round resets the count, so three *consecutive*
+/// turn with the reason. A completed round resets the count, so four *consecutive*
 /// drops end the turn.
 fn retry_dropped<F: Fn(Progress)>(on_progress: &F, reason: &str, retries: &mut usize) -> bool {
     *retries += 1;
@@ -580,7 +581,7 @@ fn retry_dropped<F: Fn(Progress)>(on_progress: &F, reason: &str, retries: &mut u
     on_progress(Progress::Note(format!(
         "{reason}; retry {retries}/{MAX_STREAM_RETRIES}"
     )));
-    std::thread::sleep(RETRY_PAUSE);
+    std::thread::sleep(RETRY_PAUSE * (1u32 << (*retries - 1)));
     true
 }
 
@@ -790,10 +791,10 @@ mod tests {
         server.join().expect("the server exits");
     }
 
-    /// The retry budget: each drop reports its retry, and the fourth
+    /// The retry budget: each drop reports its retry, and the fifth
     /// consecutive one ends the turn instead.
     #[test]
-    fn three_consecutive_drops_then_give_up() {
+    fn four_consecutive_drops_then_give_up() {
         let notes = Mutex::new(Vec::new());
         let mut retries = 0;
         // Keep dropping until `retry_dropped` stops offering a retry.
@@ -811,13 +812,14 @@ mod tests {
         assert_eq!(
             *notes,
             vec![
-                "stream ended without output; retry 1/3",
-                "stream ended without output; retry 2/3",
-                "stream ended without output; retry 3/3",
+                "stream ended without output; retry 1/4",
+                "stream ended without output; retry 2/4",
+                "stream ended without output; retry 3/4",
+                "stream ended without output; retry 4/4",
             ],
         );
         // The count a completed round resets.
-        assert_eq!(retries, 4);
+        assert_eq!(retries, 5);
     }
 
     /// A stream that delivers nothing and closes drops its round; the retry
@@ -866,7 +868,7 @@ mod tests {
         let log = log.lock().unwrap();
         // The stall is visible as a note, and the retry completes the turn.
         assert!(
-            log.iter().any(|entry| entry.contains("retry 1/3")),
+            log.iter().any(|entry| entry.contains("retry 1/4")),
             "the retry is noted: {log:?}"
         );
         assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
