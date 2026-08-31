@@ -1,0 +1,25 @@
+# Needles reading a provider error as refused outright — auth, money,
+# moderation — so retrying is the backoff in front of the same death:
+# substrings of the lowercased error text, one per line, `#` comments aside.
+
+unauthorized
+forbidden
+api key
+authentication
+permission denied
+quota
+billing
+credit balance
+credit_balance
+spend limit
+spend_limit
+insufficient balance
+insufficient credit
+content filter
+content_filter
+content policy
+content_policy
+# z.ai's moderation message names neither filter nor policy.
+sensitive content
+moderation
+has expired

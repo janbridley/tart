@@ -3,6 +3,7 @@
 mod agent;
 mod agents;
 mod debug;
+mod errors;
 mod history;
 mod progress;
 pub mod prompts;

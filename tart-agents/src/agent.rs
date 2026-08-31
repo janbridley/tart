@@ -1,6 +1,5 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use async_openai::{
     Client,
@@ -16,7 +15,8 @@ use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
 use crate::{
-    Agents, CancelToken, MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools,
+    Agents, CancelToken, MAX_TOOL_ROUNDS, Progress, Transcript, debug, errors, sandbox::Policy,
+    tools,
 };
 
 /// The session's collaboration mode, mirroring Codex's `ModeKind`.
@@ -297,7 +297,7 @@ impl Agent {
         let mut round = 0;
         // Consecutive dropped streams; any completed round resets it.
         let mut retries = 0;
-        while round < self.max_rounds {
+        'round: while round < self.max_rounds {
             // A cancelled generation stops before spending another request.
             if self.control.cancelled(&mut cancel_rx) {
                 return terminate_and_log(on_progress, Progress::Cancelled);
@@ -331,13 +331,14 @@ impl Agent {
             {
                 Ok(stream) => stream,
                 Err(error) => {
-                    // A request that never opened dropped the round before recording,
-                    // so we can retry it
+                    // The error's class decides the round's next move.
                     let reason = error.to_string();
-                    if retry_dropped(on_progress, &reason, &mut retries) {
-                        continue;
+                    if let Some(terminal) =
+                        errors::absorb_provider_error(on_progress, &reason, &mut retries)
+                    {
+                        return terminate_and_log(on_progress, terminal);
                     }
-                    return terminate_and_log(on_progress, Progress::Failed(reason));
+                    continue;
                 }
             };
 
@@ -418,25 +419,32 @@ impl Agent {
                     }
                     Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
                         debug::log_json("response failed event", || serde_json::to_string(&failed));
-                        return terminate_and_log(
-                            on_progress,
-                            Progress::Failed(failed.response.error.map_or_else(
-                                || "response failed".to_string(),
-                                |error| error.message,
-                            )),
+                        let reason = failed.response.error.map_or_else(
+                            || "response failed".to_string(),
+                            |error| format!("{}: {}", error.code, error.message),
                         );
+                        if let Some(terminal) =
+                            errors::absorb_provider_error(on_progress, &reason, &mut retries)
+                        {
+                            return terminate_and_log(on_progress, terminal);
+                        }
+                        // Retry: the partial round is discarded unrecorded.
+                        continue 'round;
                     }
-                    // The provider said the stream broke; not recoverable here.
+                    // The provider said the stream broke mid-flight.
                     Ok(ResponseStreamEvent::ResponseError(error)) => {
                         debug::log_json("response error event", || serde_json::to_string(&error));
-                        return terminate_and_log(
-                            on_progress,
-                            Progress::Failed(format!(
-                                "{}: {}",
-                                error.code.unwrap_or_else(|| "error".to_string()),
-                                error.message
-                            )),
+                        let reason = format!(
+                            "{}: {}",
+                            error.code.unwrap_or_else(|| "error".to_string()),
+                            error.message
                         );
+                        if let Some(terminal) =
+                            errors::absorb_provider_error(on_progress, &reason, &mut retries)
+                        {
+                            return terminate_and_log(on_progress, terminal);
+                        }
+                        continue 'round;
                     }
                     // Truncated (max output tokens, content filter): report it
                     Ok(ResponseStreamEvent::ResponseIncomplete(incomplete)) => {
@@ -473,7 +481,7 @@ impl Agent {
                     },
                     last_error,
                 );
-                if retry_dropped(on_progress, &reason, &mut retries) {
+                if errors::retry_dropped(on_progress, &reason, &mut retries) {
                     continue;
                 }
                 return terminate_and_log(on_progress, Progress::Failed(reason));
@@ -560,34 +568,6 @@ fn with_last_error(message: &str, last_error: Option<String>) -> String {
     last_error.map_or_else(|| message.to_string(), |error| format!("{message}: {error}"))
 }
 
-/// The most consecutive rounds a dropped stream retries before failing.
-const MAX_STREAM_RETRIES: usize = 4;
-
-/// The pause before the first retry; it doubles on each further one
-/// (2s, 4s, 8s, 16s).
-#[cfg(not(test))]
-const RETRY_PAUSE: Duration = Duration::from_secs(2);
-/// A test's pause is nothing, so budget tests run in milliseconds.
-#[cfg(test)]
-const RETRY_PAUSE: Duration = Duration::from_millis(1);
-
-/// Count one dropped round, reporting the retry and pausing while one remains.
-///
-/// Returns whether the round should re-run. `false` means the caller fails the
-/// turn with the reason. A completed round resets the count, so four *consecutive*
-/// drops end the turn.
-fn retry_dropped<F: Fn(Progress)>(on_progress: &F, reason: &str, retries: &mut usize) -> bool {
-    *retries += 1;
-    if *retries > MAX_STREAM_RETRIES {
-        return false;
-    }
-    on_progress(Progress::Note(format!(
-        "{reason}; retry {retries}/{MAX_STREAM_RETRIES}"
-    )));
-    std::thread::sleep(RETRY_PAUSE * (1u32 << (*retries - 1)));
-    true
-}
-
 /// Bound one tool result before it enters history.
 fn bounded_for_history<F: Fn(Progress)>(name: &str, output: &str, on_progress: &F) -> String {
     let capped = tools::bounded(output, tools::CONTENT_CAP);
@@ -628,6 +608,7 @@ mod tests {
     use super::*;
     use async_openai::types::responses::ResponseTextDeltaEvent;
     use std::io::{Read, Write};
+    use std::time::Duration;
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -806,37 +787,6 @@ mod tests {
         server.join().expect("the server exits");
     }
 
-    /// The retry budget: each drop reports its retry, and the fifth
-    /// consecutive one ends the turn instead.
-    #[test]
-    fn four_consecutive_drops_then_give_up() {
-        let notes = Mutex::new(Vec::new());
-        let mut retries = 0;
-        // Keep dropping until `retry_dropped` stops offering a retry.
-        while retry_dropped(
-            &|progress| {
-                if let Progress::Note(text) = progress {
-                    notes.lock().unwrap().push(text);
-                }
-            },
-            "stream ended without output",
-            &mut retries,
-        ) {}
-
-        let notes = notes.lock().unwrap();
-        assert_eq!(
-            *notes,
-            vec![
-                "stream ended without output; retry 1/4",
-                "stream ended without output; retry 2/4",
-                "stream ended without output; retry 3/4",
-                "stream ended without output; retry 4/4",
-            ],
-        );
-        // The count a completed round resets.
-        assert_eq!(retries, 5);
-    }
-
     /// A stream that delivers nothing and closes drops its round; the retry
     /// re-sends the request verbatim and the turn completes on the second one.
     #[test]
@@ -893,6 +843,34 @@ mod tests {
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         assert_eq!(items.as_array().map(Vec::len), Some(3));
         assert_eq!(items[2]["content"], "Once upon a time");
+    }
+
+    /// A wait that gives up hands its receiver back, so a later wait on the
+    /// same child still blocks instead of erroring.
+    #[test]
+    fn a_timed_out_wait_can_be_repeated() {
+        // A listener that never accepts holds the child mid-request, so it
+        // stays running through both waits.
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let agents = Agents::new(|_, _| {});
+        let id = agents.spawn(&agent, "outlive the waits").unwrap();
+
+        assert!(
+            agents
+                .wait(id, Duration::from_millis(1), &CancelToken::new())
+                .unwrap()
+                .is_none()
+        );
+        // Before the hand-back the receiver was gone and this errored.
+        assert!(
+            agents
+                .wait(id, Duration::from_millis(1), &CancelToken::new())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
