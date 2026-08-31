@@ -641,7 +641,7 @@ mod tests {
                 .contains(r#"(allow file-write* (subpath (param "WRITABLE_ROOT_0")))"#)
         );
 
-        let plan = base.clone().read_only();
+        let plan = base.read_only();
         // The former workspace root is now named as a read-only root instead,
         // and exactly one write rule survives in the whole profile: scratch.
         let rendered = plan.render();

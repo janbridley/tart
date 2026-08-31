@@ -209,7 +209,7 @@ struct Table {
 impl Blocks {
     /// Start a walk whose rows wrap to `width` cells, or to none when 0.
     fn new(width: usize) -> Self {
-        Self { width, ..Blocks::default() }
+        Self { width, ..Self::default() }
     }
 
     /// Fold one parser event into the state.

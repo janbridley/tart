@@ -1,0 +1,19 @@
+# Needles reading a provider error as over the model's context window:
+# substrings of the lowercased error text, one per line, `#` comments aside.
+# This class outranks permanent; an error matching neither file is transient.
+
+context length
+context_length
+context window
+maximum context
+too many tokens
+# z.ai's wording carries no "is".
+prompt too long
+prompt is too long
+prompt_too_long
+reduce the length
+# vLLM names its own limit in both the pre-check and the engine.
+max_model_len
+# OpenRouter's 413: an identical body cannot be resent smaller.
+payload_too_large
+request body exceeds

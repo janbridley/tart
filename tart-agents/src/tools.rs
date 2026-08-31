@@ -5,18 +5,16 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
-use crate::{Progress, sandbox::Policy};
+use crate::{Agent, AgentId, Agents, Progress, sandbox::Policy};
 
-mod render_tool;
 mod web;
 
-pub use render_tool::merge_digests;
 pub(crate) use web::{fetch, search};
 
 /// Perform a raw string find-and-replace operation, holding a lock for thread safety..
@@ -63,7 +61,7 @@ impl CancelToken {
     }
 
     /// Whether [`CancelToken::cancel`] was called.
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 }
@@ -149,6 +147,48 @@ pub(crate) fn edit() -> Tool {
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of one unique match"}
             },
             "required": ["path", "old_string", "new_string"]
+        }),
+    )
+}
+
+/// The spawn tool; only the main agent is offered it.
+#[must_use]
+pub(crate) fn spawn() -> Tool {
+    tool(
+        "spawn",
+        "Spawn a subagent for a well-scoped task. Returns an id immediately; the subagent \
+        runs independently with your tools (minus `spawn` and `wait`) and its final message \
+        becomes its report, delivered to you by `wait` or on its own in a later turn. Only \
+        call this tool for a concrete, bounded subtask that can run independently alongside \
+        useful local work; otherwise continue locally. Do not spawn subagents unless the \
+        user explicitly asks for subagents, delegation, or parallel agent work. At most 8 \
+        subagents run or await delivery at once",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The complete task for the subagent: it sees nothing else of this conversation"}
+            },
+            "required": ["task"]
+        }),
+    )
+}
+
+/// The wait tool; only the main agent is offered it.
+#[must_use]
+pub(crate) fn wait() -> Tool {
+    tool(
+        "wait",
+        "Wait for a subagent to reach a final status, returning its report; a wait \
+        blocks at most 30 seconds, then reports the subagent still running. A finished \
+        subagent's report also arrives on its own in a later turn, so call this very \
+        sparingly: only when you need the result immediately for the next critical-path \
+        step and are blocked until it returns",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "The subagent's id, as `spawn` reported it"}
+            },
+            "required": ["id"]
         }),
     )
 }
@@ -256,18 +296,70 @@ fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
 /// should see.
 pub(crate) fn execute<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     match call.name.as_str() {
-        "bash" => run_bash(call, policy, on_progress),
-        "read" => run_read(call, policy, on_progress),
-        "edit" => run_edit(call, policy, on_progress),
+        "bash" => run_bash(call, tools, on_progress),
+        "read" => run_read(call, tools, on_progress),
+        "edit" => run_edit(call, tools, on_progress),
         // The unsandboxed pair: they need the network the sandbox denies.
         "search" => web::run_search(call, on_progress),
         "fetch" => web::run_fetch(call, on_progress),
+        // The subagent pair, offered to spawning agents only.
+        "spawn" => run_spawn(call, tools, on_progress),
+        "wait" => run_wait(call, tools, on_progress),
         other => anyhow::bail!("unknown tool: {other}"),
     }
+}
+
+/// Fork a subagent on the task and return at once.
+fn run_spawn<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    tools: &Tooling<'_>,
+    on_progress: &F,
+) -> anyhow::Result<String> {
+    let task = string_field(&parse_arguments(&call.arguments)?, "task")?;
+    let Some(agents) = tools.agents else {
+        anyhow::bail!("subagents cannot spawn their own");
+    };
+    Ok(traced(call, on_progress, || {
+        match agents.spawn(tools.template, &task) {
+            Ok(id) => {
+                let text = format!("started subagent {id}: {task}");
+                (text.clone(), text, Some(0))
+            }
+            Err(error) => (error.to_string(), error.to_string(), None),
+        }
+    }))
+}
+
+/// Run one wait tool call, blocking until the subagent ends or the wait gives up.
+fn run_wait<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    tools: &Tooling<'_>,
+    on_progress: &F,
+) -> anyhow::Result<String> {
+    let args = parse_arguments(&call.arguments)?;
+    let id = args["id"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("wait needs an integer 'id'"))?;
+    let Some(agents) = tools.agents else {
+        anyhow::bail!("subagents have nothing to wait on");
+    };
+    Ok(traced(call, on_progress, || {
+        match agents.wait(AgentId::from(id), tools.cancel) {
+            Ok(Some(outcome)) => {
+                let text = outcome.report();
+                (text.clone(), text, Some(0))
+            }
+            Ok(None) => {
+                let text = format!("subagent {id} is still running; wait again");
+                (text.clone(), text, None)
+            }
+            Err(error) => (error.to_string(), error.to_string(), None),
+        }
+    }))
 }
 
 /// One finished process's combined streams: stdout then stderr, lossily decoded.
@@ -290,18 +382,39 @@ fn command_text(text: &str, status: ExitStatus) -> String {
         };
     }
 
-    let status = status.code().map_or("signal".into(), |c| c.to_string());
+    let status = status.code().map_or_else(|| "signal".into(), |c| c.to_string());
 
     let separator = if text.is_empty() { "" } else { "\n" };
     format!("[exit {status}]{separator}{text}")
+}
+
+/// Information required for a tool call, including sandbox and cancellation info.
+pub(crate) struct Tooling<'a> {
+    /// The policy the call's commands run sandboxed under.
+    pub(crate) policy: &'a Policy,
+    /// The turn's cancel lever: Esc kills a command in flight.
+    pub(crate) cancel: &'a CancelToken,
+    /// The subagent registry, when this agent can spawn.
+    pub(crate) agents: Option<&'a Agents>,
+    /// The agent whose turn this is: the template a `spawn` clones.
+    pub(crate) template: &'a Agent,
 }
 
 /// One finished command run under a watchdog: a deadline or a cancel.
 struct WatchedRun {
     /// The command's streams and exit status, as `output()` returns them.
     output: Output,
-    /// The watchdog killed the process group: a deadline or a cancel.
-    killed: bool,
+    /// Why the watchdog killed the process group, when it did.
+    killed: Option<KillReason>,
+}
+
+/// Which lever a watchdog pulled to kill a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillReason {
+    /// The deadline passed.
+    Timeout,
+    /// The cancel token fired.
+    Cancelled,
 }
 
 /// Model-facing explanation for a command the timeout killed.
@@ -324,10 +437,7 @@ pub fn head_cap(text: &str, cap: usize) -> String {
         return text.to_string();
     }
     // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(cap);
     format!("{}\n[truncated; first {} KB shown]", &text[..end], cap / 1024)
 }
 
@@ -337,42 +447,25 @@ fn tail_cap(text: &str, cap: usize) -> String {
         return text.to_string();
     }
     // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let mut start = text.len() - cap;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
+    let start = text.ceil_char_boundary(text.len() - cap);
     format!("[truncated; last {} KB shown]\n{}", cap / 1024, &text[start..])
 }
 
-/// The display name and digest for a recorded call, to be replayed as a tool header.
-///
-/// Recorded arguments are re-parsed so the header matches what the front end showed
-/// live. Unparseable arguments and unknown tools degrade to the raw JSON.
-pub(crate) fn describe(call: &FunctionToolCall) -> (&'static str, String) {
-    let (name, digest) = match call.name.as_str() {
-        "bash" => ("Bash", parse_bash(&call.arguments).ok().map(|bash| bash.command)),
-        "read" => (
-            "Read",
-            parse_read(&call.arguments).ok().map(|read| read_digest(&read)),
-        ),
-        "edit" => ("Edit", parse_edit(&call.arguments).ok().map(|edit| edit.path)),
-        "fetch" => (
-            "Fetch",
-            web::parse_fetch(&call.arguments).ok().map(|fetch| fetch.url),
-        ),
-        "search" => (
-            "Search",
-            web::parse_search(&call.arguments).ok().map(|search| {
-                if search.news {
-                    format!("{} [news]", search.query)
-                } else {
-                    search.query
-                }
-            }),
-        ),
-        _ => ("Tool", None),
-    };
-    (name, digest.unwrap_or_else(|| call.arguments.clone()))
+/// Keep the first and last `cap / 2` bytes of `text`, marking the omitted middle.
+pub fn bounded(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let half = cap / 2;
+    // Slicing must land on a char boundary; lossy decoding made `text` valid.
+    let end = text.floor_char_boundary(half);
+    let start = text.ceil_char_boundary(text.len() - half);
+    format!(
+        "{}\n[truncated; first and last {} KB shown]\n{}",
+        &text[..end],
+        half / 1024,
+        &text[start..]
+    )
 }
 
 /// Spawn `command` in its own process group with piped output and no input,
@@ -389,59 +482,49 @@ fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)
     Ok((child, group))
 }
 
-/// Run `command` to completion, killing its process group if it outlives `timeout`.
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<WatchedRun> {
+/// Run `command` to completion, killing its process group the moment `cancel`
+/// fires or, with a `deadline`, once it outlives it.
+///
+/// The watchdog polls both levers, so a kill lands within one [`CANCEL_POLL`]
+/// of its cause. Four rules hold arm-for-arm: the reason is reported before
+/// the kill lands, the reaped child's sender drop wakes the watchdog, the
+/// group dies even when the wait errors, and the watchdog joins before
+/// returning.
+fn run_watched(
+    command: &mut Command,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> io::Result<WatchedRun> {
     let (child, group) = spawn_grouped(command)?;
 
-    let killed = Arc::new(AtomicBool::new(false));
-    // The sender drops once the command is reaped, waking the watchdog immediatedly
-    let (finished, slept) = mpsc::channel::<()>();
-    let flagged = Arc::clone(&killed);
-    let watchdog = std::thread::spawn(move || {
-        if matches!(slept.recv_timeout(timeout), Err(RecvTimeoutError::Timeout)) {
-            // Flag before killing, so the caller cannot mistake the death for a
-            // natural signal once the wait returns.
-            flagged.store(true, Ordering::Release);
-            let _ = killpg(group, Signal::SIGKILL);
-        }
-    });
-
-    let output = child.wait_with_output();
-    drop(finished);
-    // Double check we've killed everything even if the wait errors.
-    if output.is_err() {
-        let _ = killpg(group, Signal::SIGKILL);
-    }
-    let _ = watchdog.join();
-
-    Ok(WatchedRun {
-        output: output?,
-        killed: killed.load(Ordering::Acquire),
-    })
-}
-
-/// Run `command` to completion, killing its process group the moment `cancel` enters.
-fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command)?;
-
-    let killed = Arc::new(AtomicBool::new(false));
+    // The watchdog's kill reason, when it killed: sent before the kill lands
+    // and read after the watchdog joins, so a killed group is never mistaken
+    // for a natural exit.
+    let (killer, killed_by) = mpsc::channel::<KillReason>();
     // The sender drops once the command is reaped, waking the watchdog at once.
     let (finished, slept) = mpsc::channel::<()>();
-    let flagged = Arc::clone(&killed);
     let token = cancel.clone();
+    let end = deadline.map(|timeout| Instant::now() + timeout);
     let watchdog = std::thread::spawn(move || {
-        while !token.cancelled() {
-            if matches!(
-                slept.recv_timeout(CANCEL_POLL),
-                Err(RecvTimeoutError::Disconnected)
-            ) {
+        loop {
+            if token.cancelled() {
+                let _ = killer.send(KillReason::Cancelled);
+                let _ = killpg(group, Signal::SIGKILL);
+                return;
+            }
+            // Sleep only until the nearer of the poll and the deadline, so a
+            // deadline kills on the right cycle
+            let wait = CANCEL_POLL
+                .min(end.map_or(CANCEL_POLL, |end| end.saturating_duration_since(Instant::now())));
+            if matches!(slept.recv_timeout(wait), Err(RecvTimeoutError::Disconnected)) {
+                return;
+            }
+            if end.is_some_and(|end| Instant::now() >= end) {
+                let _ = killer.send(KillReason::Timeout);
+                let _ = killpg(group, Signal::SIGKILL);
                 return;
             }
         }
-        // Flag before killing, so the caller cannot mistake the death for a
-        // natural signal once the wait returns.
-        flagged.store(true, Ordering::Release);
-        let _ = killpg(group, Signal::SIGKILL);
     });
 
     let output = child.wait_with_output();
@@ -454,22 +537,23 @@ fn run_until_cancelled(command: &mut Command, cancel: &CancelToken) -> io::Resul
 
     Ok(WatchedRun {
         output: output?,
-        killed: killed.load(Ordering::Acquire),
+        killed: killed_by.try_recv().ok(),
     })
 }
 
 /// Announce a tool call, run it, and report its conclusion.
+///
+/// The announcement carries the call's identity as the provider sent it; how
+/// that reads on screen is the front end's business.
 fn traced<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    name: &'static str,
-    digest: String,
     on_progress: &F,
     run: impl FnOnce() -> (String, String, Option<i32>),
 ) -> String {
     on_progress(Progress::ToolStart {
         id: call.call_id.clone(),
-        name,
-        digest,
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
     });
     let (result, output, exit) = run();
     on_progress(Progress::ToolOutput {
@@ -480,33 +564,39 @@ fn traced<F: Fn(Progress)>(
     result
 }
 
-/// Run one bash tool call under `policy`, reporting its steps to `on_progress`.
+/// Run one bash tool call under `tools`, reporting its steps to `on_progress`.
 ///
 /// A command that outlives its timeout is killed with everything it started.
-/// The model sees `[timed out after Ns]` and any partial output.
+/// The model sees `[timed out after Ns]` and any partial output; one the user
+/// cancelled mid-flight sees `[cancelled]`.
 fn run_bash<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let bash = parse_bash(&call.arguments)?;
     // A failure to launch comes back as an error string rather than a `Result`,
     // so the output can be handed straight back to the model.
-    let mut sandboxed = policy.command("/bin/bash");
+    let mut sandboxed = tools.policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
-    Ok(traced(call, "Bash", bash.command.clone(), on_progress, || {
+    Ok(traced(call, on_progress, || {
         // Decode the stream into output for the front and backends.
-        match run_with_timeout(&mut sandboxed, bash.timeout) {
+        match run_watched(&mut sandboxed, Some(bash.timeout), tools.cancel) {
             Ok(run) => {
                 let WatchedRun { output, killed } = run;
                 let text = combined_output(&output);
                 let exit = output.status.code();
-                if killed {
-                    // A timeout has no exit code for the header, so we mark up the body.
-                    let marked = timeout_text(&text, bash.timeout);
-                    (marked.clone(), marked, exit)
-                } else {
-                    (command_text(&text, output.status), text, exit)
+                match killed {
+                    // A kill has no exit code for the header, so we mark up the body.
+                    Some(KillReason::Timeout) => {
+                        let marked = timeout_text(&text, bash.timeout);
+                        (marked.clone(), marked, exit)
+                    }
+                    Some(KillReason::Cancelled) => {
+                        let marked = cancel_text(&text);
+                        (marked.clone(), marked, exit)
+                    }
+                    None => (command_text(&text, output.status), text, exit),
                 }
             }
             Err(error) => {
@@ -522,43 +612,33 @@ fn run_bash<F: Fn(Progress)>(
 pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     let mut shell = Command::new("/bin/bash");
     shell.arg("-c").arg(command);
-    match run_until_cancelled(&mut shell, cancel) {
+    match run_watched(&mut shell, None, cancel) {
         Ok(WatchedRun { output, killed }) => {
             let text = tail_cap(&combined_output(&output), CONTENT_CAP);
-            if killed {
-                cancel_text(&text)
-            } else {
-                command_text(&text, output.status)
+            match killed {
+                Some(KillReason::Cancelled) => cancel_text(&text),
+                // No deadline exists to outlive, so nothing else kills it.
+                _ => command_text(&text, output.status),
             }
         }
         Err(error) => format!("error: {error}"),
     }
 }
 
-/// The digest for a read call: the path, with any bounds as `path:start-end`.
-fn read_digest(read: &Read) -> String {
-    match (read.start_line, read.end_line) {
-        (None, None) => read.path.clone(),
-        (Some(start), Some(end)) => format!("{}:{start}-{end}", read.path),
-        (Some(start), None) => format!("{}:{start}-", read.path),
-        (None, Some(end)) => format!("{}:-{end}", read.path),
-    }
-}
-
-/// Run one read tool call under `policy`, reporting its steps to `on_progress`.
+/// Run one read tool call under `tools`, reporting its steps to `on_progress`.
 fn run_read<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let read = parse_read(&call.arguments)?;
-    let mut command = policy.command("/usr/bin/perl");
+    let mut command = tools.policy.command("/usr/bin/perl");
     command
         .arg("-e")
         .arg(numbered_read(read.start_line, read.end_line))
         .arg("--")
         .arg(&read.path);
-    Ok(traced(call, "Read", read_digest(&read), on_progress, || {
+    Ok(traced(call, on_progress, || {
         // A failure to launch comes back as an error string for the model to deal with.
         match &command.output() {
             Ok(spawned) => {
@@ -580,13 +660,13 @@ fn run_read<F: Fn(Progress)>(
 /// on and retry.
 fn run_edit<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    policy: &Policy,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
-    Ok(traced(call, "Edit", edit.path.clone(), on_progress, || {
-        let (result, exit) = apply_edit(&edit, policy);
-        (result.clone(), result, exit)
+    Ok(traced(call, on_progress, || {
+        let (result, exit_code) = apply_edit(&edit, tools.policy);
+        (result.clone(), result, exit_code)
     }))
 }
 
@@ -853,6 +933,28 @@ mod tests {
         assert!(tail.chars().all(|c| c == '語'), "cut inside a character");
     }
 
+    #[test]
+    fn bounded_keeps_both_ends_and_marks_the_middle() {
+        assert_eq!(bounded("hi\n", 10), "hi\n");
+
+        let text = "abcdef".repeat(1024); // 6 KB
+        let capped = bounded(&text, 2048);
+        let (head, rest) = capped.split_once('\n').unwrap();
+        let (marker, tail) = rest.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; first and last 1 KB shown]");
+        assert_eq!(head, &text[..1024]);
+        assert_eq!(tail, &text[text.len() - 1024..]);
+
+        // Multi-byte characters must not split at either cut.
+        let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
+        let capped = bounded(&wide, 2048);
+        let (head, rest) = capped.split_once('\n').unwrap();
+        let (marker, tail) = rest.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; first and last 1 KB shown]");
+        assert!(head.chars().all(|c| c == '語'), "cut inside a character");
+        assert!(tail.chars().all(|c| c == '語'), "cut inside a character");
+    }
+
     /// Manual runs reuse the bash tool's framing; these run unsandboxed
     #[test]
     fn manual_command_frames_success_and_failure() {
@@ -898,9 +1000,9 @@ mod tests {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
 
-        let run = run_until_cancelled(&mut command, &CancelToken::new()).unwrap();
+        let run = run_watched(&mut command, None, &CancelToken::new()).unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.killed, None);
         assert_eq!(combined_output(&run.output), "hi\n");
     }
 
@@ -922,56 +1024,88 @@ mod tests {
         }
     }
 
-    /// These drive `run_with_timeout` with plain commands, so they run without
-    /// the sandbox; their deadlines are milliseconds to stay fast.
+    /// These drive `run_watched` with plain commands, so they run without the sandbox
     #[test]
-    fn run_with_timeout_returns_a_fast_command_normally() {
+    fn run_watched_returns_a_fast_command_normally() {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
 
-        let run = run_with_timeout(&mut command, Duration::from_secs(10)).unwrap();
+        let run =
+            run_watched(&mut command, Some(Duration::from_secs(10)), &CancelToken::new()).unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.killed, None);
         assert_eq!(combined_output(&run.output), "hi\n");
         assert!(run.output.status.success());
     }
 
     #[test]
-    fn run_with_timeout_kills_a_command_that_outruns_the_deadline() {
+    fn run_watched_kills_a_command_that_outruns_the_deadline() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+        let run = run_watched(
+            &mut command,
+            Some(Duration::from_millis(300)),
+            &CancelToken::new(),
+        )
+        .unwrap();
 
-        assert!(run.killed);
+        assert_eq!(run.killed, Some(KillReason::Timeout));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!run.output.status.success());
     }
 
     #[test]
-    fn run_with_timeout_kills_the_whole_process_group() {
+    fn run_watched_kills_a_command_the_moment_the_token_fires() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let token = CancelToken::new();
+        let trip = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                token.cancel();
+            })
+        };
+        let started = Instant::now();
+
+        let run = run_watched(&mut command, Some(Duration::from_secs(60)), &token).unwrap();
+
+        assert_eq!(run.killed, Some(KillReason::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        trip.join().unwrap();
+    }
+
+    #[test]
+    fn run_watched_kills_the_whole_process_group() {
         // The backgrounded sleeps outlive bash and hold the output pipe; only a
         // group kill frees the capture, so returning promptly proves they died.
         let mut command = Command::new("/bin/bash");
         command.arg("-c").arg("sleep 9871 & sleep 9871 & wait");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, Duration::from_millis(300)).unwrap();
+        let run = run_watched(
+            &mut command,
+            Some(Duration::from_millis(300)),
+            &CancelToken::new(),
+        )
+        .unwrap();
 
-        assert!(run.killed);
+        assert_eq!(run.killed, Some(KillReason::Timeout));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
-    fn run_with_timeout_wakes_the_watchdog_when_the_command_finishes_early() {
+    fn run_watched_wakes_the_watchdog_when_the_command_finishes_early() {
         let mut command = Command::new("/bin/echo");
         command.arg("hi");
         let started = Instant::now();
 
-        let run = run_with_timeout(&mut command, DEFAULT_BASH_TIMEOUT).unwrap();
+        let run =
+            run_watched(&mut command, Some(DEFAULT_BASH_TIMEOUT), &CancelToken::new()).unwrap();
 
-        assert!(!run.killed);
+        assert_eq!(run.killed, None);
         // The sender's drop joins the watchdog at once rather than letting it
         // sleep out the full timeout.
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -982,8 +1116,15 @@ mod tests {
     #[test]
     fn execute_reports_command_then_output() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
+        };
         let events = std::cell::RefCell::new(Vec::new());
-        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &policy, &|progress| {
+        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -994,24 +1135,27 @@ mod tests {
             [
                 Progress::ToolStart {
                     id,
-                    name: "Bash",
-                    digest
+                    name,
+                    arguments,
                 },
                 Progress::ToolOutput {
                     output,
                     exit: Some(0),
                     ..
                 }
-            ] if id == "call_0" && digest == "echo hi" && output == "hi\n"
+            ] if id == "call_0"
+                && name == "bash"
+                && arguments == r#"{"command":"echo hi"}"#
+                && output == "hi\n"
         ));
 
         // The exit status reaches the model verbatim.
         assert_eq!(
-            execute(&bash_call(r#"{"command":"false"}"#), &policy, &|_| {}).unwrap(),
+            execute(&bash_call(r#"{"command":"false"}"#), &tools, &|_| {}).unwrap(),
             "[exit 1]"
         );
         assert_eq!(
-            execute(&bash_call(r#"{"command":"true"}"#), &policy, &|_| {}).unwrap(),
+            execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}).unwrap(),
             "done"
         );
     }
@@ -1019,10 +1163,17 @@ mod tests {
     #[test]
     fn execute_rejects_unknown_tool_names() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
+        };
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
 
-        let error = execute(&call, &policy, &|_| {}).unwrap_err().to_string();
+        let error = execute(&call, &tools, &|_| {}).unwrap_err().to_string();
 
         assert!(error.contains("unknown tool"), "{error}");
     }
@@ -1151,7 +1302,17 @@ mod tests {
         let spawn_edit = |old: &str, new: &str| {
             let call = edit_call(file.path(), old, new);
             let policy = policy.clone();
-            std::thread::spawn(move || execute(&call, &policy, &|_| {}).unwrap())
+            std::thread::spawn(move || {
+                let token = CancelToken::new();
+                let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+                let tools = Tooling {
+                    policy: &policy,
+                    cancel: &token,
+                    agents: None,
+                    template: &agent,
+                };
+                execute(&call, &tools, &|_| {}).unwrap()
+            })
         };
         let first = spawn_edit("UNO", "uno");
         let second = spawn_edit("DOS", "dos");
@@ -1248,9 +1409,16 @@ mod tests {
         }
         let file = scratch(&contents);
         let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
+        };
         let events = std::cell::RefCell::new(Vec::new());
 
-        let whole = execute(&read_call(file.path(), None, None), &policy, &|progress| {
+        let whole = execute(&read_call(file.path(), None, None), &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -1261,38 +1429,41 @@ mod tests {
         assert!(matches!(
             events.borrow().as_slice(),
             [
-                Progress::ToolStart {
-                    name: "Read",
-                    digest,
-                    ..
-                },
+                Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { .. }
-            ] if digest == &file.path().display().to_string()
+            ] if name == "read"
+                && arguments
+                    == &serde_json::json!({"path": file.path(), "start_line": null,
+                                           "end_line": null})
+                        .to_string()
         ));
 
-        // A bounded read digests its range into the box header.
+        // A bounded read's arguments ride along untouched.
         events.borrow_mut().clear();
-        let range = execute(
-            &read_call(file.path(), Some(10), Some(12)),
-            &policy,
-            &|progress| {
-                events.borrow_mut().push(progress);
-            },
-        )
+        let range = execute(&read_call(file.path(), Some(10), Some(12)), &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        })
         .unwrap();
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
         assert!(matches!(
             events.borrow().as_slice(),
-            [Progress::ToolStart { digest, .. }, _]
-                if digest == &format!("{}:10-12", file.path().display())
+            [Progress::ToolStart { name, arguments, .. }, _]
+                if name == "read"
+                    && arguments
+                        == &serde_json::json!({
+                            "path": file.path(),
+                            "start_line": 10,
+                            "end_line": 12
+                        })
+                        .to_string()
         ));
 
-        let tail = execute(&read_call(file.path(), Some(28), None), &policy, &|_| {}).unwrap();
+        let tail = execute(&read_call(file.path(), Some(28), None), &tools, &|_| {}).unwrap();
         assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
         assert_eq!(tail.lines().count(), 3);
 
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
-        let absent = execute(&read_call(&missing, None, None), &policy, &|_| {}).unwrap();
+        let absent = execute(&read_call(&missing, None, None), &tools, &|_| {}).unwrap();
         assert!(absent.contains("No such file or directory"), "{absent}");
     }
 }

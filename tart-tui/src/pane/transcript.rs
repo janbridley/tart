@@ -3,11 +3,12 @@
 use itertools::Itertools;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use tart_agents::merge_digests;
+use tart_agents::AGENT_TOOL;
 
 #[cfg(test)]
 use crate::testutil::texts;
 
+use super::digest::{child_call, tool_header};
 use super::markdown;
 use super::wrap::wrap_lines;
 use super::{DIM_STYLE, HIGHLIGHT_STYLE};
@@ -48,16 +49,16 @@ impl Entry {
     /// The display lines the entry renders as. Stale entries render immediately
     fn lines(&self, expanded: bool, thinking: bool) -> Vec<Line<'static>> {
         match self {
-            Entry::Text(line) => vec![line.clone()],
-            Entry::Tool(tool) => tool.lines(expanded),
-            Entry::Answer { raw, width, lines } => {
+            Self::Text(line) => vec![line.clone()],
+            Self::Tool(tool) => tool.lines(expanded),
+            Self::Answer { raw, width, lines } => {
                 if *width == 0 {
                     markdown::render(raw, 0)
                 } else {
                     lines.clone()
                 }
             }
-            Entry::Thinking { raw } => thinking_lines(raw, thinking),
+            Self::Thinking { raw } => thinking_lines(raw, thinking),
         }
     }
 }
@@ -86,10 +87,10 @@ fn thinking_lines(raw: &str, shown: bool) -> Vec<Line<'static>> {
 struct ToolCall {
     /// Pairs the finishing `ToolOutput` with this start.
     id: String,
-    /// Display name: `Bash`, `Read`, or `Edit`.
-    name: &'static str,
-    /// The argument digest of each call in the run, e.g. `ls -la` or `main.rs:10-50`
-    digests: Vec<String>,
+    /// The tool's name on the wire; `agent` names a subagent's box.
+    name: String,
+    /// The raw JSON arguments of each call in the run, as the provider sent them
+    arguments: Vec<String>,
     /// Whether a call is in flight; `false` once finished, which always fills `output`
     running: bool,
     /// Combined output; `None` until the first call of the run finishes.
@@ -101,6 +102,11 @@ struct ToolCall {
 }
 
 impl ToolCall {
+    /// A subagent's box, which rides apart from the turn's own calls.
+    fn is_agent(&self) -> bool {
+        self.name == AGENT_TOOL
+    }
+
     /// The box's rows: a status header and then the rendered output
     ///
     /// Running calls show just the header with a dim ellipsis; finished ones add
@@ -114,15 +120,19 @@ impl ToolCall {
             _ => TOOL_ERR,
         };
 
-        let digest = Span::styled(
-            format!("({})", merge_digests(self.name, &self.digests)),
-            DIM_STYLE,
-        );
+        let header_text = tool_header(&self.name, &self.arguments);
+        // The name carries the status color and the arguments render dimly
+        let (name, arguments) = header_text
+            .split_once('(')
+            .map_or((header_text.as_str(), ""), |(name, rest)| {
+                (name, rest.strip_suffix(')').unwrap_or(rest))
+            });
+        let digest = Span::styled(format!("({arguments})"), DIM_STYLE);
         // An exit code shows only on a finished, failed call.
-        let exit = self.exit.filter(|&c| c != 0).filter(|_| !self.running);
+        let exit = self.exit.filter(|&c| c != 0 && !self.running);
         let header = [
             Span::styled("● ", status),
-            Span::styled(self.name, status),
+            Span::styled(name.to_owned(), status),
             digest,
         ]
         .into_iter()
@@ -211,17 +221,17 @@ impl Transcript {
     }
 
     /// Record a tool invocation's start; it renders as a running header until
-    /// finished. A `Read` or `Edit` following its own kind merges into that
+    /// finished. A `read` or `edit` following its own kind merges into that
     /// trailing finished box instead of stacking a fresh one. Otherwise the
     /// call supersedes every finished box before it, folding each down to its
     /// header line, and moves the thinking block below itself so the
     /// chain-of-thought always renders under the tool boxes.
-    pub(crate) fn start_tool(&mut self, id: String, name: &'static str, digest: String) {
-        if self.merge_into_tail(&id, name, &digest) {
+    pub(crate) fn start_tool(&mut self, id: String, name: String, arguments: String) {
+        if self.merge_into_tail(&id, &name, &arguments) {
             return;
         }
         let fold = self.messages.iter().position(
-            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && !tool.superseded),
+            |entry| matches!(entry, Entry::Tool(tool) if !tool.running && !tool.superseded && !tool.is_agent()),
         );
         let think = self
             .messages
@@ -235,6 +245,7 @@ impl Transcript {
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
                 && !tool.running
+                && !tool.is_agent()
             {
                 tool.superseded = true;
             }
@@ -242,7 +253,7 @@ impl Transcript {
         self.messages.push(Entry::Tool(ToolCall {
             id,
             name,
-            digests: vec![digest],
+            arguments: vec![arguments],
             running: true,
             output: None,
             exit: None,
@@ -255,8 +266,37 @@ impl Transcript {
         }
     }
 
+    /// Open a subagent's running box on its task.
+    pub(crate) fn start_agent(&mut self, id: String, task: String) {
+        self.messages.push(Entry::Tool(ToolCall {
+            id,
+            name: AGENT_TOOL.to_string(),
+            arguments: vec![task],
+            running: true,
+            output: None,
+            exit: None,
+            superseded: false,
+        }));
+    }
+
+    /// Append the subagent's latest tool call to its box: the task, then the
+    /// calls it is making.
+    pub(crate) fn touch_agent(&mut self, id: &str, name: &str, arguments: &str) {
+        let call = child_call(name, arguments);
+        let Some(index) = self.messages.iter().position(
+            |entry| matches!(entry, Entry::Tool(tool) if tool.is_agent() && tool.id == id),
+        ) else {
+            return;
+        };
+        if let Entry::Tool(tool) = &mut self.messages[index] {
+            tool.arguments.push(call);
+        }
+        // The header grew; re-fold the box's rows.
+        self.rewind(index);
+    }
+
     /// Fold a same-kind call into a trailing finished box.
-    fn merge_into_tail(&mut self, id: &str, name: &'static str, digest: &str) -> bool {
+    fn merge_into_tail(&mut self, id: &str, name: &str, arguments: &str) -> bool {
         // The thinking block rides below the boxes, so step past it to the fresh entry
         let Some(index) = self
             .messages
@@ -265,7 +305,7 @@ impl Transcript {
         else {
             return false;
         };
-        if !matches!(name, "Read" | "Edit")
+        if !matches!(name, "read" | "edit")
             || !matches!(&self.messages[index],
                 Entry::Tool(tool) if tool.name == name && !tool.running)
         {
@@ -273,7 +313,7 @@ impl Transcript {
         }
         self.rewind(index);
         if let Entry::Tool(tool) = &mut self.messages[index] {
-            tool.digests.push(digest.to_owned());
+            tool.arguments.push(arguments.to_owned());
             id.clone_into(&mut tool.id);
             tool.running = true;
             return true;
@@ -314,12 +354,20 @@ impl Transcript {
         self.folds.truncate(index);
     }
 
-    /// Resolve every still-running invocation as failed to prevent stuck boxes.
+    /// Drop the whole wrap cache, so the next `sync` refolds every message.
+    fn reset(&mut self) {
+        self.rows.clear();
+        self.folds.clear();
+        self.cache.1 = 0;
+    }
+
+    /// Resolve every still-running invocation as failed to prevent stuck boxes
     pub(crate) fn fail_pending(&mut self, reason: &str) {
         let mut failed = false;
         for entry in &mut self.messages {
             if let Entry::Tool(tool) = entry
                 && tool.running
+                && !tool.is_agent()
             {
                 tool.output = Some(reason.to_string());
                 tool.exit = None;
@@ -328,9 +376,7 @@ impl Transcript {
             }
         }
         if failed {
-            self.rows.clear();
-            self.folds.clear();
-            self.cache.1 = 0;
+            self.reset();
         }
     }
 
@@ -338,9 +384,7 @@ impl Transcript {
     pub(crate) fn toggle_expand(&mut self) {
         if self.messages.iter().any(|entry| matches!(entry, Entry::Tool(_))) {
             self.show_tool_output = !self.show_tool_output;
-            self.rows.clear();
-            self.folds.clear();
-            self.cache.1 = 0;
+            self.reset();
         }
     }
 
@@ -418,9 +462,7 @@ impl Transcript {
             .any(|entry| matches!(entry, Entry::Thinking { .. }))
         {
             // The block's rows change wholesale; rebuild from scratch.
-            self.rows.clear();
-            self.folds.clear();
-            self.cache.1 = 0;
+            self.reset();
         }
     }
 
@@ -430,26 +472,21 @@ impl Transcript {
             .retain(|entry| !matches!(entry, Entry::Thinking { .. }));
         // Rows that included the drained block are stale; rewrapping once
         // per turn is fine.
-        self.rows.clear();
-        self.folds.clear();
-        self.cache.1 = 0;
+        self.reset();
     }
 
     /// Drop every message and reset our caches, persisting the thinking preference
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
-        self.rows.clear();
-        self.folds.clear();
-        self.cache.1 = 0;
+        self.reset();
     }
 
     /// Wrap the visible messages not yet folded into `rows`; a width change
     /// rewraps everything, and a stale answer re-renders first.
     pub(crate) fn sync(&mut self, width: usize) -> &[Line<'static>] {
         if self.cache.0 != width {
-            self.rows.clear();
-            self.folds.clear();
-            self.cache = (width, 0);
+            self.reset();
+            self.cache.0 = width;
         }
         let expanded = self.show_tool_output;
         let done = self.cache.1;
@@ -474,7 +511,8 @@ impl Transcript {
     fn fold_entry(&mut self, index: usize, width: usize, expanded: bool) {
         let separated = self.separated(index);
         let wrapped = match &self.messages[index] {
-            // An answer wraps its rendering without cloning
+            // If we've already wrapped everything we don't have to do it again.
+            Entry::Answer { lines, .. } if width > 0 => lines.clone(),
             Entry::Answer { lines, .. } => wrap_lines(lines, width),
             Entry::Thinking { raw } => wrap_lines(&thinking_lines(raw, self.show_thinking), width),
             entry => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
@@ -569,14 +607,90 @@ mod tests {
 
     use super::*;
 
-    /// Start a pending `Bash(echo hi)` invocation, as the pane would on a `ToolStart`
+    /// Start a pending `bash` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {
-        t.start_tool(id.to_string(), "Bash", "echo hi".to_string());
+        t.start_tool(
+            id.to_string(),
+            "bash".to_string(),
+            r#"{"command":"echo hi"}"#.to_string(),
+        );
     }
 
-    /// Start a pending `Read(digest)` invocation, as the pane would on a `ToolStart`
-    fn start_read(t: &mut Transcript, id: &str, digest: &str) {
-        t.start_tool(id.to_string(), "Read", digest.to_string());
+    /// Start a pending `read` invocation, as the pane would on a `ToolStart`
+    fn start_read(t: &mut Transcript, id: &str, arguments: &str) {
+        t.start_tool(id.to_string(), "read".to_string(), arguments.to_string());
+    }
+
+    #[test]
+    fn a_delivered_report_box_shows_success() {
+        let mut t = Transcript::default();
+        t.start_agent("agent-1".to_string(), "find it".to_string());
+        t.finish_tool("agent-1", "found it\n".to_string(), Some(0));
+        t.sync(60);
+        let rows = texts(t.rows());
+        assert!(
+            rows.iter().any(|row| row.contains("● Agent(find it)")),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("⎿ found it")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("exit")), "{rows:?}");
+        t.assert_rows_match_full_rewrap();
+    }
+
+    #[test]
+    fn agent_boxes_ride_apart_from_the_turns_calls() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+        start_bash(&mut t, "call_0");
+        t.start_agent("agent-1".to_string(), "find the flaky test".to_string());
+        t.touch_agent("agent-1", "bash", r#"{"command":"cargo test -p foo"}"#);
+        t.touch_agent("agent-1", "read", r#"{"path":"a.rs"}"#);
+        t.sync(120);
+        assert!(
+            texts(t.rows()).iter().any(|row| row
+                .contains("● Agent(find the flaky test, Bash(cargo test -p foo), Read(a.rs)) …")),
+            "{:?}",
+            texts(t.rows())
+        );
+
+        // A later main-turn call supersedes its own boxes, never the agent's.
+        start_bash(&mut t, "call_1");
+        t.finish_tool("call_1", "done\n".to_string(), Some(0));
+        t.sync(120);
+        let rows = texts(t.rows());
+        assert!(
+            rows.iter().any(|row| row.contains("● Agent(find the flaky test")),
+            "{rows:?}"
+        );
+        // The superseded main box folded; the agent box stayed standing.
+        assert_eq!(rows.iter().filter(|row| row.contains("⎿")).count(), 1, "{rows:?}");
+
+        // A failed turn resolves its own pending box, not the agent's.
+        t.fail_pending("generation failed");
+        t.sync(120);
+        let rows = texts(t.rows());
+        assert!(
+            rows.iter().any(|row| row.contains("⎿ generation failed")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("● Agent(find the flaky test") && row.ends_with('…')),
+            "the agent box keeps running: {rows:?}"
+        );
+
+        // The subagent's terminal event is what resolves its box.
+        t.finish_tool("agent-1", "found it in the retry loop\n".to_string(), None);
+        t.sync(120);
+        assert!(
+            texts(t.rows())
+                .iter()
+                .any(|row| row.contains("⎿ found it in the retry loop")),
+            "{:?}",
+            texts(t.rows())
+        );
+        t.assert_rows_match_full_rewrap();
     }
 
     /// A blank row separates an answer from an adjacent tool box, in either order
@@ -631,10 +745,10 @@ mod tests {
         t.push(Line::from("❯ go"));
         t.begin_response();
 
-        start_read(&mut t, "r0", "a.rs:1-10");
+        start_read(&mut t, "r0", r#"{"path":"a.rs","start_line":1,"end_line":10}"#);
         t.finish_tool("r0", "one\n".to_string(), Some(0));
         t.append_thinking("mid-run reasoning"); // rides below the boxes
-        start_read(&mut t, "r1", "a.rs:20-30");
+        start_read(&mut t, "r1", r#"{"path":"a.rs","start_line":20,"end_line":30}"#);
         t.sync(40);
         let rows = texts(t.rows());
         assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 1);
@@ -648,7 +762,7 @@ mod tests {
 
         // An answer between calls breaks the run: a second box.
         t.append("done reading");
-        start_read(&mut t, "r2", "b.rs:1-5");
+        start_read(&mut t, "r2", r#"{"path":"b.rs","start_line":1,"end_line":5}"#);
         t.sync(40);
         assert_eq!(
             texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
@@ -656,7 +770,7 @@ mod tests {
         );
 
         // A box still running never absorbs the next call.
-        start_read(&mut t, "r3", "b.rs:9-9");
+        start_read(&mut t, "r3", r#"{"path":"b.rs","start_line":9,"end_line":9}"#);
         t.sync(40);
         assert_eq!(
             texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
@@ -676,13 +790,13 @@ mod tests {
         let mut t = Transcript::default();
         t.push(Line::from("❯ go"));
         t.begin_response();
-        start_read(&mut t, "r0", "a.rs:1-10");
+        start_read(&mut t, "r0", r#"{"path":"a.rs","start_line":1,"end_line":10}"#);
         t.finish_tool("r0", "one\ntwo\nthree\n".to_string(), Some(0));
         t.sync(40);
         let settled = texts(t.rows());
         assert_eq!(settled.len(), 5, "{settled:?}"); // prompt, header, three rows
 
-        start_read(&mut t, "r1", "a.rs:20-30");
+        start_read(&mut t, "r1", r#"{"path":"a.rs","start_line":20,"end_line":30}"#);
         t.sync(40);
         let reopened = texts(t.rows());
         assert_eq!(reopened.len(), settled.len(), "{reopened:?}");
@@ -1311,7 +1425,11 @@ and the analytics dashboard rewrite.\n\n\
         assert!(texts(&t.rows).iter().any(|row| row.contains("⎿ one")));
 
         // The second call folds the first: only the two headers render.
-        t.start_tool("call_1".to_string(), "Bash", "ls -la".to_string());
+        t.start_tool(
+            "call_1".to_string(),
+            "bash".to_string(),
+            r#"{"command":"ls -la"}"#.to_string(),
+        );
         t.sync(40);
         assert_fresh(&t);
         let rows = texts(&t.rows);

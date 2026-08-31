@@ -39,19 +39,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-compat"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1ba85bc55464dcbf728b56d97e119d673f4cf9062be330a9a26f3acf504a590"
-dependencies = [
- "futures-core",
- "futures-io",
- "once_cell",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "async-openai"
 version = "0.41.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1387,12 +1374,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rangemap"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
-
-[[package]]
 name = "ratatui"
 version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1942,17 +1923,16 @@ name = "tart-agents"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-compat",
  "async-openai",
  "futures",
  "itertools 0.15.0",
  "macro_rules_attribute",
  "nix",
- "rangemap",
  "rustls",
  "serde_json",
  "tempfile",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -1968,6 +1948,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "serde",
+ "serde_json",
  "tart-agents",
  "tempfile",
  "toml",

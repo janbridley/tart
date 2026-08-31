@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-async-compat = "0.2.5"
 # rustls-no-provider keeps aws-lc-rs provider out of our dependency chain and speed up
 # compiles. We directly depend on rustls to get the required components.
 async-openai = { version = "0.41.3", default-features = false, features = ["responses", "rustls-no-provider"] }
@@ -16,8 +15,8 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # Just `killpg` and the `Pid` it takes, so the harness itself stays free of
 # `unsafe`: signalling a group cannot violate memory safety, which nix encodes.
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
-rangemap = "1.8.0"
 itertools = "0.15.0"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 
 [dev-dependencies]
 # Test scratch files and directories; tempfile removes them on drop.

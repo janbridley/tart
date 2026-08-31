@@ -52,19 +52,20 @@ impl Session {
 
     /// Open a session, returning its transcript and location data.
     #[inline]
-    pub fn open(root: &Path, project: &Path, path: &Path) -> anyhow::Result<(Transcript, Session)> {
-        let mut items = load(path)?;
-        if items.is_empty() {
+    pub fn open(root: &Path, project: &Path, path: &Path) -> anyhow::Result<(Transcript, Self)> {
+        let mut loaded = load(path)?;
+        if loaded.items.is_empty() {
             anyhow::bail!("session file {} has no items", path.display());
         }
         // Try and trim a broken transcript into one we can send back to a provider.
-        let recorded = items.len();
-        trim_unpaired(&mut items);
-        if items.len() != recorded {
-            save(path, &items)?;
+        let recorded = loaded.items.len();
+        trim_unpaired(&mut loaded.items);
+        // Rewrite the file ONLY if its damaged or missing entries
+        if loaded.damaged || loaded.items.len() != recorded {
+            rewrite(path, &loaded.items)?;
         }
-        let written = items.len();
-        let transcript = Transcript::from_items(items);
+        let written = loaded.items.len();
+        let transcript = Transcript::from_items(loaded.items);
         let session = Self {
             root: root.to_path_buf(),
             project: project.to_path_buf(),
@@ -76,23 +77,20 @@ impl Session {
 
     /// Open a sibiling session at the same root and project as the current one.
     #[inline]
-    pub fn reopen(&self, path: &Path) -> anyhow::Result<(Transcript, Session)> {
-        Session::open(&self.root, &self.project, path)
+    pub fn reopen(&self, path: &Path) -> anyhow::Result<(Transcript, Self)> {
+        Self::open(&self.root, &self.project, path)
     }
 
     /// Append the transcript's items past `written`, creating the file if needed.
     #[inline]
     pub fn record(&mut self, transcript: &Transcript) -> anyhow::Result<()> {
-        let items = transcript.stored_items();
         // A cleared record can end before the flushed prefix; flush from there.
-        self.written = self.written.min(items.len());
+        self.written = self.written.min(transcript.len());
+        let fresh = transcript.items_after(self.written);
         // If the session is empty (no user input), we don't need to save a record.
-        if self.path.is_none() && !items.iter().any(is_user_message) {
+        if self.path.is_none() && !fresh.iter().any(is_user_message) {
             return Ok(());
         }
-        let Some(fresh) = items.get(self.written..) else {
-            return Ok(());
-        };
         let path = if let Some(path) = &self.path {
             path.clone()
         } else {
@@ -107,12 +105,10 @@ impl Session {
             .create(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        // One write per line: a crash tears at most the last line.
-        for item in fresh {
-            let line = serde_json::to_string(item)?;
-            writeln!(file, "{line}").with_context(|| format!("writing {}", path.display()))?;
+        for item in &fresh {
+            write_line(&mut file, &path, item)?;
         }
-        self.written = items.len();
+        self.written += fresh.len();
         Ok(())
     }
 
@@ -121,16 +117,6 @@ impl Session {
     pub fn reset(&mut self) {
         self.path = None;
         self.written = 0;
-    }
-
-    /// `items` as JSONL text: one line each, each newline-terminated.
-    fn jsonl<'a>(items: impl IntoIterator<Item = &'a InputItem>) -> anyhow::Result<String> {
-        let mut text = String::new();
-        for item in items {
-            text.push_str(&serde_json::to_string(item)?);
-            text.push('\n');
-        }
-        Ok(text)
     }
 }
 
@@ -146,7 +132,8 @@ fn is_user_message(item: &InputItem) -> bool {
     matches!(item, InputItem::EasyMessage(message) if message.role == Role::User)
 }
 
-/// Enumerate the project's session files, newest first, as a nice label for the picker
+/// Enumerate the project's session files, newest first, each paired with the
+/// first line of its opening user message, uncapped
 #[inline]
 pub fn list(root: &Path, project: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
     let dir = root.join(slug(project));
@@ -170,19 +157,16 @@ pub fn list(root: &Path, project: &Path) -> anyhow::Result<Vec<(PathBuf, String)
     });
     Ok(files
         .into_iter()
-        .map(|path| (path.clone(), label(&path)))
+        .map(|path| (path.clone(), opening(&path)))
         .collect())
 }
 
-/// One line naming the session in `path`: its stamp, then its opening request.
-fn label(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let stamp = name.strip_suffix(".jsonl").unwrap_or(&name);
+/// The first line of the session in `path`'s opening user message, or empty
+/// when it never got one
+fn opening(path: &Path) -> String {
     // The lines are scanned, not slurped: a session's first message is at the
     // top of a file that can be long.
-    let opening = std::fs::File::open(path)
+    std::fs::File::open(path)
         .map(|file| {
             std::io::BufReader::new(file)
                 .lines()
@@ -190,11 +174,12 @@ fn label(path: &Path) -> String {
                 .find_map(|line| first_user_text(&line))
         })
         .ok()
-        .flatten();
-    let opening = opening
-        .as_deref()
-        .map_or_else(|| "(no messages)".to_string(), one_line);
-    format!("{stamp}  {opening}")
+        .flatten()
+        .map_or_else(String::new, |text| {
+            text.split_once('\n')
+                .map_or(text.as_str(), |(line, _)| line)
+                .to_string()
+        })
 }
 
 /// The content of the first user message in one JSONL item line, if it is one.
@@ -203,18 +188,20 @@ fn first_user_text(line: &str) -> Option<String> {
     (item["role"] == "user").then(|| item["content"].as_str().map(str::to_string))?
 }
 
-/// The first line of `text`, capped with an ellipsis.
-pub(crate) fn one_line(text: &str) -> String {
-    let line = text.split('\n').next().unwrap_or_default();
-    let mut capped = line.chars().take(60).collect::<String>();
-    if line.chars().nth(60).is_some() {
-        capped.push('…');
-    }
-    capped
+/// A session file as [`load`] read it: its items, and whether it held damage.
+struct Loaded {
+    /// Every item up to the first damaged line.
+    items: Vec<InputItem>,
+    /// Whether the file continues past that prefix: a torn final write or an
+    /// unparseable line ends the record early.
+    damaged: bool,
 }
 
 /// The items in a session file, stopping at the first damaged line.
-fn load(path: &Path) -> anyhow::Result<Vec<InputItem>> {
+///
+/// The file is left exactly as it lies; [`Session::open`] decides whether the
+/// damage is worth a rewrite.
+fn load(path: &Path) -> anyhow::Result<Loaded> {
     let text =
         fs::read_to_string(path).with_context(|| format!("reading session {}", path.display()))?;
     let mut items = Vec::new();
@@ -236,18 +223,32 @@ fn load(path: &Path) -> anyhow::Result<Vec<InputItem>> {
             Err(_) => break,
         }
     }
-    // Rewrite only when something parsed, bad sesions should not attempt to write
-    if good < text.len() && !items.is_empty() {
-        fs::write(path, &text[..good])
-            .with_context(|| format!("trimming session {}", path.display()))?;
-    }
-    Ok(items)
+    Ok(Loaded { items, damaged: good < text.len() })
 }
 
 /// Rewrite `path` with exactly `items`, one JSON line each.
-fn save(path: &Path, items: &[InputItem]) -> anyhow::Result<()> {
-    fs::write(path, Session::jsonl(items)?)
-        .with_context(|| format!("trimming session {}", path.display()))
+///
+/// The only rewrite there is: [`Session::open`] repairs a file that held damage
+/// or orphaned calls here, once, and every write after it appends.
+fn rewrite(path: &Path, items: &[InputItem]) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(path)
+        .with_context(|| format!("rewriting session {}", path.display()))?;
+    for item in items {
+        write_line(&mut file, path, item)?;
+    }
+    Ok(())
+}
+
+/// Append `item` to `file` as one JSON line, whatever is being written.
+///
+/// One write per line: a crash tears at most the last line.
+fn write_line(file: &mut fs::File, path: &Path, item: &InputItem) -> anyhow::Result<()> {
+    let line = serde_json::to_string(item)?;
+    writeln!(file, "{line}").with_context(|| format!("writing {}", path.display()))
 }
 
 /// Drop trailing calls whose outputs never arrived.
@@ -314,9 +315,14 @@ mod tests {
         std::fs::read_to_string(path).unwrap().lines().count()
     }
 
-    /// Write `transcript`'s items to `path`, one JSON line each.
+    /// Write `transcript`'s items to `path`, one JSON line each, as `record` does.
     fn write_session(path: &Path, transcript: &Transcript) {
-        std::fs::write(path, Session::jsonl(&transcript.request_items()).unwrap()).unwrap();
+        let mut text = String::new();
+        for item in transcript.request_items() {
+            text.push_str(&serde_json::to_string(&item).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(path, text).unwrap();
     }
 
     #[test]
@@ -379,6 +385,33 @@ mod tests {
         );
     }
 
+    /// A record that shrank below the flushed prefix resyncs at its new end:
+    /// what follows still flushes, rather than landing behind the cursor
+    /// forever. (A `/clear` resets the cursor with it, so this only shows up
+    /// when the two drift apart.)
+    #[test]
+    fn a_shrunk_record_still_flushes_what_follows() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+        let file = session.path.clone().unwrap();
+        assert_eq!(line_count(&file), 3);
+
+        // The clear leaves the cursor past the record's new end; the next
+        // record resyncs to it, skipping the turn that landed behind.
+        transcript.clear();
+        transcript.push_user("again".to_string()).unwrap();
+        session.record(&transcript).unwrap();
+        assert_eq!(line_count(&file), 3);
+        // The turn after it flushes on top, instead of being skipped too.
+        transcript.push_assistant("ok".to_string()).unwrap();
+        session.record(&transcript).unwrap();
+        assert_eq!(line_count(&file), 4);
+    }
+
     #[test]
     fn record_never_writes_the_reminder() {
         let root = tempfile::tempdir().unwrap();
@@ -406,6 +439,69 @@ mod tests {
                 .contains("plan mode is on"),
             "a resumed transcript starts with no reminder"
         );
+    }
+
+    /// Reading a damaged file leaves it exactly as it lay: only `open` rewrites.
+    #[test]
+    fn load_leaves_a_damaged_file_as_it_lies() {
+        let root = tempfile::tempdir().unwrap();
+        let torn = root.path().join("torn.jsonl");
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        write_session(&torn, &transcript);
+        let ripped = std::fs::read_to_string(&torn).unwrap() + r#"{"type":"message","role":"ass"#;
+        std::fs::write(&torn, &ripped).unwrap();
+
+        let loaded = load(&torn).unwrap();
+
+        assert_eq!(loaded.items.len(), 2);
+        assert!(loaded.damaged, "the torn tail is damage past the prefix");
+        assert_eq!(std::fs::read_to_string(&torn).unwrap(), ripped);
+    }
+
+    /// A file that is both torn and orphaned is repaired by the one rewrite:
+    /// the good prefix minus its unpaired calls, byte for byte, with nothing
+    /// appended over the damage afterwards.
+    #[test]
+    fn a_torn_and_orphaned_file_is_repaired_by_one_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let both = root.path().join("both.jsonl");
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        write_session(&both, &transcript);
+        let call = FunctionToolCall {
+            namespace: None,
+            name: "bash".to_string(),
+            arguments: r#"{"command":"ls"}"#.to_string(),
+            call_id: "call_0".to_string(),
+            id: None,
+            status: None,
+        };
+        let orphan = format!(
+            "{}\n",
+            serde_json::to_string(&InputItem::Item(Item::FunctionCall(call))).unwrap()
+        );
+        let torn = std::fs::read_to_string(&both).unwrap() + &orphan + r#"{"type":"me"#;
+        std::fs::write(&both, torn).unwrap();
+
+        let (resumed, mut session) =
+            Session::open(root.path(), Path::new("/tmp/other"), &both).unwrap();
+
+        // The record keeps the paired prefix: the system prompt and the turn.
+        assert_eq!(resumed.request_items().len(), 2);
+        let mut expected = String::new();
+        for item in resumed.request_items() {
+            expected.push_str(&serde_json::to_string(&item).unwrap());
+            expected.push('\n');
+        }
+        assert_eq!(std::fs::read_to_string(&both).unwrap(), expected);
+
+        // The repaired session appends from there like any other.
+        resumed.push_user("again".to_string()).unwrap();
+        resumed.push_assistant("ok".to_string()).unwrap();
+        session.record(&resumed).unwrap();
+        let (reopened, _) = Session::open(root.path(), Path::new("/tmp/other"), &both).unwrap();
+        assert_eq!(reopened.request_items().len(), 4);
     }
 
     #[test]
@@ -472,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn list_orders_newest_first_and_labels_the_opening_request() {
+    fn list_orders_newest_first_and_extracts_the_opening_request() {
         let root = tempfile::tempdir().unwrap();
         let project = Path::new("/tmp/proj");
         let dir = root.path().join(slug(project));
@@ -492,12 +588,14 @@ mod tests {
 
         let listed = list(root.path(), project).unwrap();
 
+        // The opening text arrives raw and uncapped: formatting it is the
+        // front end's business.
         assert_eq!(listed.len(), 4);
         assert!(listed[0].0.ends_with("20260102-000002.jsonl"));
-        assert_eq!(listed[0].1, format!("20260102-000002  {}…", "x".repeat(60)));
-        assert_eq!(listed[1].1, "20260102-000001  (no messages)");
-        assert_eq!(listed[2].1, "20260102-000000  from the new session");
-        assert_eq!(listed[3].1, "20260101-000000  from the old session");
+        assert_eq!(listed[0].1, "x".repeat(80));
+        assert_eq!(listed[1].1, "");
+        assert_eq!(listed[2].1, "from the new session");
+        assert_eq!(listed[3].1, "from the old session");
     }
 
     #[test]
@@ -536,6 +634,33 @@ mod tests {
         let empty =
             std::fs::read_dir(root.path()).map_or(true, |mut entries| entries.next().is_none());
         assert!(empty);
+    }
+
+    /// A reset abandons the file untouched; the next turn starts a fresh one.
+    #[test]
+    fn reset_starts_a_fresh_file_and_leaves_the_old_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let project = Path::new("/tmp/proj");
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        let mut session = Session::start(root.path(), project);
+        session.record(&transcript).unwrap();
+        let abandoned = session.path.clone().unwrap();
+        let was = std::fs::read_to_string(&abandoned).unwrap();
+
+        // The `/clear` flow: the record empties back to its system items and
+        // the session forgets its file.
+        transcript.clear();
+        session.reset();
+        transcript.push_user("start over".to_string()).unwrap();
+        transcript.push_assistant("fresh".to_string()).unwrap();
+        session.record(&transcript).unwrap();
+
+        let fresh = session.path.clone().unwrap();
+        assert_ne!(fresh, abandoned);
+        assert_eq!(line_count(&fresh), 3, "the fresh file holds the new turn only");
+        assert_eq!(std::fs::read_to_string(&abandoned).unwrap(), was);
     }
 
     #[test]

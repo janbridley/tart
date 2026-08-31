@@ -16,8 +16,8 @@ use std::time::Duration;
 use async_openai::types::responses::{FunctionToolCall, Tool};
 
 use super::{
-    WatchedRun, combined_output, command_text, parse_arguments, run_with_timeout, string_field,
-    timeout_text, tool, traced,
+    CancelToken, WatchedRun, combined_output, command_text, parse_arguments, run_watched,
+    string_field, timeout_text, tool, traced,
 };
 use crate::Progress;
 
@@ -43,10 +43,6 @@ const DEFAULT_SEARCH_RESULTS: u64 = 8;
 
 /// Most results one search may return; more is noise the model cannot use.
 const MAX_SEARCH_RESULTS: u64 = 25;
-
-/// Characters of a fetched page kept: the reader output is markdown, so this is
-/// far more than the model can usefully read.
-const FETCH_LIMIT: usize = 150_000;
 
 /// The reader service: it renders a page as markdown so curl hands back text.
 const READER: &str = "https://r.jina.ai/";
@@ -255,13 +251,13 @@ fn ddgs_args(search: &Search, results: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         if search.news { "news" } else { "text" }.into(),
         "-q".into(),
-        search.query.clone().into(),
+        search.query.as_str().into(),
         "-m".into(),
         search.max_results.to_string().into(),
     ];
     if let Some(timelimit) = &search.timelimit {
         args.push("-t".into());
-        args.push(timelimit.clone().into());
+        args.push(timelimit.as_str().into());
     }
     args.push("-o".into());
     args.push(results.as_os_str().to_owned());
@@ -277,12 +273,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let search = parse_search(&call.arguments)?;
-    let digest = if search.news {
-        format!("{} [news]", search.query)
-    } else {
-        search.query.clone()
-    };
-    Ok(traced(call, "Search", digest, on_progress, || {
+    Ok(traced(call, on_progress, || {
         let Some(binary) = search_binary() else {
             let text = "search: no ddgs CLI found; install one with `uv tool install ddgs` \
                         or point TART_SEARCH_BIN at it"
@@ -292,7 +283,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
         let results = results_path();
         let mut ddgs = web_command(binary);
         ddgs.args(ddgs_args(&search, &results));
-        let outcome = run_with_timeout(&mut ddgs, SEARCH_TIMEOUT);
+        let outcome = run_watched(&mut ddgs, Some(SEARCH_TIMEOUT), &CancelToken::new());
         // The results file is ours whatever happened: read it, then drop it.
         let json = std::fs::read_to_string(&results).ok();
         let _ = std::fs::remove_file(&results);
@@ -303,7 +294,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
                     let WatchedRun { output, killed } = run;
                     let text = combined_output(&output);
                     let exit = output.status.code();
-                    if killed {
+                    if killed.is_some() {
                         let marked = timeout_text(&text, SEARCH_TIMEOUT);
                         (marked.clone(), marked, exit)
                     } else {
@@ -489,8 +480,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
     on_progress: &F,
 ) -> anyhow::Result<String> {
     let fetch = parse_fetch(&call.arguments)?;
-    let digest = fetch.url.clone();
-    Ok(traced(call, "Fetch", digest, on_progress, || {
+    Ok(traced(call, on_progress, || {
         let Some(binary) = fetch_binary() else {
             let text = format!("fetch: no curl found at {FETCH_DEFAULT}; set TART_FETCH_BIN");
             return (text.clone(), text, None);
@@ -502,12 +492,12 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
         };
         let mut curl = web_command(binary);
         curl.args(fetch_args(&fetch, &url));
-        match run_with_timeout(&mut curl, FETCH_TIMEOUT) {
+        match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
             Err(error) => {
                 let text = format!("error: {error}");
                 (text.clone(), text, None)
             }
-            Ok(WatchedRun { output, killed: true }) => {
+            Ok(WatchedRun { output, killed: Some(_) }) => {
                 let marked = timeout_text(&combined_output(&output), FETCH_TIMEOUT);
                 (marked.clone(), marked, output.status.code())
             }
@@ -525,7 +515,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
                     },
                     None => text.as_str(),
                 };
-                let text = truncate(checked, FETCH_LIMIT);
+                let text = checked.to_string();
                 (command_text(&text, output.status), text, exit)
             }
         }
@@ -549,18 +539,6 @@ fn private_redirect(final_url: &str) -> Option<String> {
     let rest = final_url.split_once("://").map_or(final_url, |(_, rest)| rest);
     is_private_host(authority_host(rest))
         .then(|| format!("fetch: refusing redirect to non-public host {final_url}"))
-}
-
-/// Cut `text` to its last character boundary at or before `limit` bytes, marking the cut
-fn truncate(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let mut cut = limit;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}\n[truncated]", &text[..cut])
 }
 
 /// A non-empty, trimmed string field of a results record.
@@ -621,9 +599,10 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use crate::Agent;
     use crate::sandbox::Policy;
     use crate::sandbox::live::skip_unless_networked;
-    use crate::tools::execute;
+    use crate::tools::{Tooling, execute};
     use macro_rules_attribute::apply;
 
     /// A tool call for `name` with raw JSON `arguments`.
@@ -902,20 +881,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_cuts_at_a_character_boundary_and_marks_the_cut() {
-        // Two bytes per é: an odd limit lands mid-character.
-        let page = "é".repeat(80_000);
-        let cut = truncate(&page, FETCH_LIMIT);
-
-        assert!(cut.ends_with("[truncated]"), "{}…", &cut[cut.len() - 40..]);
-        assert!(cut.len() < page.len());
-        assert!(cut.starts_with(&page[..page.len() / 2]));
-
-        // Under the limit the text passes through untouched.
-        assert_eq!(truncate("short", FETCH_LIMIT), "short");
-    }
-
-    #[test]
     fn separate_final_url_takes_the_last_marker_and_first_word() {
         let captured = "page body\n[tart-url]\nnot this\n[tart-url]\nhttps://final.example/x \
                         curl: noise\n";
@@ -971,13 +936,21 @@ mod tests {
             return;
         };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
         let events = std::cell::RefCell::new(Vec::new());
         let request = call(
             "search",
             r#"{"query":"rust programming language","max_results":3}"#,
         );
 
-        let output = execute(&request, &policy, &|progress| {
+        let output = execute(&request, &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -990,13 +963,11 @@ mod tests {
         assert!(matches!(
             events.borrow().as_slice(),
             [
-                Progress::ToolStart {
-                    name: "Search",
-                    digest,
-                    ..
-                },
+                Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { exit: Some(0), .. }
-            ] if digest == "rust programming language"
+            ] if name == "search"
+                && arguments
+                    == r#"{"query":"rust programming language","max_results":3}"#
         ));
     }
 
@@ -1009,10 +980,18 @@ mod tests {
             return;
         };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
         let events = std::cell::RefCell::new(Vec::new());
         let request = call("fetch", r#"{"url":"https://example.com","raw":true}"#);
 
-        let output = execute(&request, &policy, &|progress| {
+        let output = execute(&request, &tools, &|progress| {
             events.borrow_mut().push(progress);
         })
         .unwrap();
@@ -1021,13 +1000,9 @@ mod tests {
         assert!(matches!(
             events.borrow().as_slice(),
             [
-                Progress::ToolStart {
-                    name: "Fetch",
-                    digest,
-                    ..
-                },
+                Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { exit: Some(0), .. }
-            ] if digest == "https://example.com"
+            ] if name == "fetch" && arguments == r#"{"url":"https://example.com","raw":true}"#
         ));
     }
 }

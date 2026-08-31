@@ -154,12 +154,12 @@ fn resolve_api_key(key: &str, auth: &Auth) -> anyhow::Result<String> {
         Auth::Env(var) => std::env::var(var)
             .with_context(|| format!("provider [{key}]: environment variable {var} is not set")),
         Auth::Command(argv) => {
-            let [program, args @ ..] = argv.as_slice() else {
+            let [program, extra_args @ ..] = argv.as_slice() else {
                 bail!("provider [{key}]: api_key command is empty");
             };
             let command = argv.join(" ");
             let output = Command::new(program)
-                .args(args)
+                .args(extra_args)
                 .output()
                 .with_context(|| format!("provider [{key}]: failed to run `{command}`"))?;
             if !output.status.success() {

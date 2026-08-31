@@ -3,7 +3,7 @@
 /// This struct is a compatibility shim to separate `async-openai` generation types from
 /// terminal frontend. As a side benefit, it gives us more control over how we store and
 /// track history/context.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Progress {
     /// A user message from the record; replay only, never live generation.
@@ -16,10 +16,13 @@ pub enum Progress {
     ToolStart {
         /// The call's id, pairing the start with its eventual output.
         id: String,
-        /// The tool's display name: one of {`Bash`, `Read`, `Edit`, `Search`, `Fetch`}.
-        name: &'static str,
-        /// An argument digest, e.g. `ls -la` or `src/main.rs:10-50`.
-        digest: String,
+        /// The tool's name on the wire: one of {`bash`, `read`, `edit`, `search`,
+        /// `fetch`, `spawn`, `wait`}, or `agent` for a subagent's box opener.
+        name: String,
+        /// The call's raw JSON arguments, exactly as the provider sent them;
+        /// a subagent's box opener carries its task text instead, there
+        /// having been no call to quote.
+        arguments: String,
     },
     /// A finished tool invocation, paired with its start by `id`.
     ToolOutput {
@@ -47,6 +50,25 @@ pub enum Progress {
     Failed(String),
     /// The front end cancelled the turn and any partial answer that arrived is recorded
     Cancelled,
-    /// A steering message the user submitted mid-turn.
-    Steered(String),
+    /// A transient bit of text that is *not* part of the session record.
+    Note(String),
+}
+
+impl Progress {
+    /// The terminal result this event carries, when it is one.
+    pub(crate) fn outcome(&self) -> Option<crate::Outcome> {
+        match self {
+            Self::Done { message } => Some(crate::Outcome::Done(message.clone())),
+            Self::Failed(error) => Some(crate::Outcome::Failed(error.clone())),
+            Self::Cancelled => Some(crate::Outcome::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Whether this event ends its conversation's turn.
+    #[inline]
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done { .. } | Self::Failed(_) | Self::Cancelled)
+    }
 }

@@ -23,7 +23,8 @@ mod tmux_override;
 mod testutil;
 
 use std::io::stdout;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::path::Path;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
@@ -37,8 +38,8 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use tart_agents::{
-    Agent, CancelToken, ChatMode, Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript,
-    manual_command, prompts, sandbox::Policy,
+    AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
+    ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
 };
 use tmux_override::{override_shift_up, restore_tmux};
 
@@ -77,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     let _tmux = override_shift_up();
     let mut pane = Pane::default();
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
-    pane.set_control(agent.control());
+    pane.set_control(agent.handle());
     pane.note(format!("tart · {label}"));
     if let Some(tokens) = agent_config.context_tokens {
         pane.set_context_tokens(tokens);
@@ -155,9 +156,18 @@ fn run(
     let mut quit = false;
     let mut perf_on = false;
     let mut perf = Perf::default();
-    let control = agent.control();
+    // The registry every conversation registers in: the main turn's lever at startup,
+    // each subagent's as the model spawns it.
+    let agents = Agents::new({
+        let sender = wake.clone();
+        move |id, progress| {
+            let _ = sender.send(Wake::Generation(id, progress));
+        }
+    });
+    agent.set_subagents(std::sync::Arc::new(agents.clone()));
+    agents.adopt(agent.handle());
     // A manual command's cancel lever, held while one runs; Esc and quit set it.
-    let mut manual_cancel: Option<(CancelToken, std::thread::JoinHandle<()>)> = None;
+    let mut manual_cancel: Option<CancelToken> = None;
     // A plan switch deferred by a running turn, applied when the turn ends.
     let mut pending_plan: Option<bool> = None;
     // State-mutation time since the last frame.
@@ -174,13 +184,12 @@ fn run(
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
-                // Esc with nothing open aborts whatever is in flight: the turn
-                // (a no-op when idle) and any manual command.
+                // Esc with nothing open aborts whatever is in flight.
                 Some(PaneEvent::Cancel) => {
-                    control.cancel();
+                    agents.cancel_all();
                     // Esc also cancels a plan switch still waiting for the turn.
                     pending_plan = None;
-                    if let Some((token, _)) = &manual_cancel {
+                    if let Some(token) = &manual_cancel {
                         token.cancel();
                     }
                 }
@@ -190,15 +199,15 @@ fn run(
                 Some(PaneEvent::Command(command)) => {
                     pane.manual_running(Some(command.clone()));
                     let token = CancelToken::new();
-                    let runner = {
+                    {
                         let token = token.clone();
                         let sender = wake.clone();
                         std::thread::spawn(move || {
                             let framed = manual_command(&command, &token);
                             let _ = sender.send(Wake::Command(framed));
-                        })
-                    };
-                    manual_cancel = Some((token, runner));
+                        });
+                    }
+                    manual_cancel = Some(token);
                 }
                 // Shift+Tab: toggle plan mode, exactly as `/plan` does.
                 Some(PaneEvent::Plan) => {
@@ -224,11 +233,37 @@ fn run(
                         // The abandoned file stays as history; the next turn
                         // starts a fresh one.
                         session.reset();
+                        // Its subagents die with it, reports included.
+                        agents.clear();
                     }
                     "/quit" | "/exit" => quit = true,
                     "/perf" => {
                         perf_on = !perf_on;
                         perf = Perf::default();
+                    }
+                    // Stop one subagent without stopping anything else.
+                    _ if let Some(arg) = line.trim().strip_prefix("/stop") => {
+                        match arg.trim().parse::<u64>() {
+                            Ok(id) => {
+                                agents.cancel(AgentId::from(id));
+                                pane.note(format!("stop sent to subagent {id}"));
+                            }
+                            Err(_) => pane.note("usage: /stop <id> · /agents to list"),
+                        }
+                    }
+                    // List the running subagents.
+                    "/agents" => {
+                        let running = agents.running();
+                        let listed = if running.is_empty() {
+                            "none".to_string()
+                        } else {
+                            running
+                                .into_iter()
+                                .map(|(id, task)| format!("{id}: {task}"))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        };
+                        pane.note(format!("subagents: {listed}"));
                     }
                     // A submitted `/resume` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
@@ -252,12 +287,14 @@ fn run(
                         let on = !pane.is_plan();
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
+                    _ if line.trim().starts_with('/') => pane.note(format!(
+                        "unknown command {} · /clear /resume /plan /effort /agents /stop /perf /quit",
+                        line.split_whitespace().next().unwrap_or_default()
+                    )),
                     _ => {
-                        // Steering message is emptied on the same iteration it sends.
-                        if let Some(text) = control.take_steer() {
-                            pane.echo(&text);
-                            pane.submit_text(&transcript, &text, &cwd)?;
-                        }
+                        // A queued message drains into the record ahead of the
+                        // fresh submit, joining its turn.
+                        pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
                         pane.start_turn(agent, &transcript, &wake);
                     }
@@ -275,6 +312,9 @@ fn run(
                         transcript
                             .set_reminder(pane.is_plan().then_some(prompts::PLAN_REMINDER))?;
                         pane.clear();
+                        // The resumed conversation's subagents are not its:
+                        // they die with the one it replaced.
+                        agents.clear();
                         let name = path.file_stem().map_or_else(
                             || path.display().to_string(),
                             |stem| stem.to_string_lossy().into_owned(),
@@ -288,9 +328,6 @@ fn run(
                 None => {}
             },
             Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),
-            // Resizes are handled at render time (see Pane::render); the redraw
-            // timer just loops around and draws again.
-            Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("event channel closed"),
             // A manual command finished: echo it, then record the exchange as user msg
             Ok(Wake::Command(framed)) => {
@@ -301,56 +338,139 @@ fn run(
                 }
             }
             // Update the pane as progress arrives and time it into `work`.
-            Ok(Wake::Generation(progress)) => {
+            Ok(Wake::Generation(id, progress)) => {
                 let ping = Instant::now();
-                match &progress {
-                    // When the turn ends the worker has already recorded the entire turn
-                    Progress::Done { .. } | Progress::Failed(_) | Progress::Cancelled => {
-                        pane.set_generating(false);
-                        // A finished plan in plan mode is ready for Enter to approve
-                        pane.set_plan_ready(matches!(&progress, Progress::Done { .. }));
-                        // A plan switch queued mid-turn takes effect now, ahead of
-                        // any steer that starts the next turn.
-                        if let Some(on) = pending_plan.take() {
-                            pane.set_plan(agent, &mut transcript, on)?;
-                        }
-                        // A failure also resolves anything still running, then
-                        // shows the error.
-                        if let Progress::Failed(error) = &progress {
-                            pane.fail_pending(error);
-                            pane.append_span(&Span::styled(error.clone(), DIM_STYLE));
-                        }
-                        // A cancelled turn keeps its streamed partial message + notify.
-                        // (The pane already spilled any queued steering when
-                        // Esc landed. A cancel is a take-back.)
-                        if matches!(progress, Progress::Cancelled) {
-                            pane.note("⎋ cancelled");
-                        } else if control.steering().is_some() {
-                            // A steer that outlived its turn starts a fresh one
-                            if matches!(progress, Progress::Done { .. }) {
-                                let text = control.take_steer().expect("checked above");
-                                pane.echo(&text);
-                                pane.submit_text(&transcript, &text, &cwd)?;
-                                pane.start_turn(agent, &transcript, &wake);
-                            } else {
-                                pane.spill_steer();
-                            }
-                        }
-                        session.record(&transcript)?;
-                    }
-                    _ => pane.apply(&progress),
+                if id == MAIN {
+                    on_main_event(
+                        pane,
+                        agent,
+                        &mut transcript,
+                        session,
+                        &agents,
+                        &cwd,
+                        &wake,
+                        &mut pending_plan,
+                        &progress,
+                    )?;
+                } else {
+                    on_child_event(pane, agent, &agents, &transcript, &wake, id, &progress)?;
                 }
                 work += ping.elapsed();
             }
+            // Resizes are handled at render time (see Pane::render); the redraw
+            // timer just loops around and draws again.
+            Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
         }
     }
     // A quit mid-generation keeps the partial turn; in-flight requests (if
     // any) are reconstructed or repaired in the transcript.
     session.record(&transcript)?;
     // A quit mid-manual-command kills it rather than orphaning the group.
-    if let Some((token, runner)) = manual_cancel {
+    if let Some(token) = manual_cancel {
         token.cancel();
-        let _ = runner.join();
+    }
+    Ok(())
+}
+
+/// Apply one MAIN event: the pane, the record, the session. A terminal event
+/// ends the turn, delivers pending subagent reports, and requeues.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the event touches every arm of the loop's state"
+)]
+fn on_main_event(
+    pane: &mut Pane,
+    agent: &mut Agent,
+    transcript: &mut Transcript,
+    session: &mut Session,
+    agents: &Agents,
+    cwd: &Path,
+    wake: &Sender<Wake>,
+    pending_plan: &mut Option<bool>,
+    progress: &Progress,
+) -> anyhow::Result<()> {
+    // When the turn ends the worker has already recorded the entire turn
+    if progress.is_terminal() {
+        pane.set_generating(false);
+        // A finished plan in plan mode is ready for Enter to approve
+        pane.set_plan_ready(matches!(progress, Progress::Done { .. }));
+        // A plan switch queued mid-turn takes effect now, ahead of
+        // any queued message that starts the next turn.
+        if let Some(on) = pending_plan.take() {
+            pane.set_plan(agent, transcript, on)?;
+        }
+        // A failure also resolves anything still running, then
+        // shows the error.
+        if let Progress::Failed(error) = progress {
+            pane.fail_pending(error);
+            pane.append_span(&Span::styled(error.clone(), DIM_STYLE));
+        }
+        let requeued = if matches!(progress, Progress::Done { .. } | Progress::Cancelled) {
+            // Pending subagent reports deliver together as
+            // one turn; a queued user message follows when
+            // that turn ends.
+            pane.deliver_reports(agents, agent, transcript, wake)?
+                || pane.requeue(agent, transcript, cwd, wake)?
+        } else {
+            pane.spill_queued();
+            false
+        };
+        // A cancelled turn keeps its streamed partial message + notify.
+        // (The pane already spilled any queued message when
+        // Esc landed. A cancel is a take-back.)
+        if matches!(progress, Progress::Cancelled) && !requeued {
+            pane.note("⎋ cancelled");
+        }
+        session.record(transcript)?;
+    } else {
+        pane.apply(progress);
+    }
+    Ok(())
+}
+
+/// Apply one child event: its box, its spend, and — once it has ended with no
+/// turn running — the delivery of its report.
+fn on_child_event(
+    pane: &mut Pane,
+    agent: &Agent,
+    agents: &Agents,
+    transcript: &Transcript,
+    wake: &Sender<Wake>,
+    id: AgentId,
+    progress: &Progress,
+) -> anyhow::Result<()> {
+    match progress {
+        Progress::ToolStart { name, arguments, .. } => {
+            if name == AGENT_TOOL {
+                pane.start_agent(id, arguments);
+            } else {
+                pane.touch_agent(id, name, arguments);
+            }
+        }
+        _ if progress.is_terminal() => {
+            // The peek resolves the box and queues the id; the
+            // claim happens at delivery, so a `wait` inside this
+            // turn can still take the report for itself.
+            match agents.outcome(id) {
+                Some(outcome) => {
+                    pane.report(id);
+                    pane.finish_agent(
+                        id,
+                        outcome.report(),
+                        matches!(outcome, Outcome::Done(_)).then_some(0),
+                    );
+                }
+                None => pane.finish_agent(id, "report delivered through wait".to_string(), Some(0)),
+            }
+            // Idle: the reports start their turn now. Busy: the
+            // running turn's end delivers them.
+            if !pane.is_generating() {
+                pane.deliver_reports(agents, agent, transcript, wake)?;
+            }
+        }
+        // A child's spend meters into the status line's agent total.
+        Progress::Usage { output, .. } => pane.add_child_output(*output),
+        _ => {}
     }
     Ok(())
 }
