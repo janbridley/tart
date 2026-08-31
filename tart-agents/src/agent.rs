@@ -648,7 +648,7 @@ mod tests {
         let agent = Agent::new("http://localhost:9", "key", "model", policy);
         let threads: Vec<_> = (0..8)
             .map(|_| {
-                let runtime = agent.runtime.clone();
+                let runtime = Arc::clone(&agent.runtime);
                 std::thread::spawn(move || {
                     // The `async` block defers the timer's construction to
                     // inside the runtime context `block_on` provides.
@@ -770,7 +770,7 @@ mod tests {
         // the parked select with the partial already in hand.
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let interrupt = {
-            let log = log.clone();
+            let log = Arc::clone(&log);
             let handle = agent.handle();
             std::thread::spawn(move || {
                 while !log.lock().unwrap().iter().any(|entry| entry.contains(" a time")) {
@@ -902,7 +902,7 @@ mod tests {
         let address = listener.local_addr().expect("a bound address");
         let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
         let events = Arc::new(Mutex::new(Vec::<(crate::AgentId, Progress)>::new()));
-        let log = events.clone();
+        let log = Arc::clone(&events);
         let agents = crate::Agents::new(move |id, progress| {
             log.lock().unwrap().push((id, progress));
         });
