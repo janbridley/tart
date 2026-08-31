@@ -51,3 +51,25 @@ pub enum Progress {
     /// A transient bit of text that is *not* part of the session record.
     Note(String),
 }
+
+impl Progress {
+    /// The terminal result this event carries, when it is one.
+    pub(crate) fn outcome(&self) -> Option<crate::Outcome> {
+        match self {
+            Progress::Done { message } => Some(crate::Outcome::Done(message.clone())),
+            Progress::Failed(error) => Some(crate::Outcome::Failed(error.clone())),
+            Progress::Cancelled => Some(crate::Outcome::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Whether this event ends its conversation's turn.
+    #[inline]
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Progress::Done { .. } | Progress::Failed(_) | Progress::Cancelled
+        )
+    }
+}
