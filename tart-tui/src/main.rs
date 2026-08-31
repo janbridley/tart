@@ -14,6 +14,7 @@ mod clipboard;
 mod config;
 mod file_mentions;
 mod keybinds;
+mod model_picker;
 mod pane;
 mod perf;
 mod session_picker;
@@ -47,18 +48,12 @@ pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
     let path = cli::agents_path();
-    let agent_config = config::Config::load(&path)?.default_agent()?;
+    let config = config::Config::load(&path)?;
+    let agent_config = config.default_agent()?;
     let label = agent_config.to_string();
+    let context_tokens = agent_config.context_tokens;
     let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
-    let mut agent = Agent::new(
-        agent_config.base_url,
-        agent_config.api_key,
-        agent_config.model,
-        policy,
-    );
-    if let Some(effort) = agent_config.effort {
-        agent = agent.reasoning_effort(effort);
-    }
+    let (mut agent, current) = agent_config.into_agent(policy);
     let root = &SESSIONS_ROOT;
     let cwd = std::env::current_dir()?;
     let mut session = Session::start(root, &cwd);
@@ -76,10 +71,17 @@ fn main() -> anyhow::Result<()> {
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
     pane.set_control(agent.handle());
     pane.note(format!("tart · {label}"));
-    if let Some(tokens) = agent_config.context_tokens {
-        pane.set_context_tokens(tokens);
-    }
-    let result = run(&mut terminal, &mut agent, transcript, &mut session, &mut pane);
+    pane.set_context_tokens(context_tokens);
+    pane.set_models(config.agents());
+    let result = run(
+        &mut terminal,
+        &mut agent,
+        transcript,
+        &mut session,
+        &mut pane,
+        &config,
+        current,
+    );
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
@@ -134,6 +136,8 @@ fn run(
     mut transcript: Transcript,
     session: &mut Session,
     pane: &mut Pane,
+    config: &config::Config,
+    mut current: config::AgentChoice,
 ) -> anyhow::Result<()> {
     // The sandbox's grant root, for deciding which mentions need attaching.
     let cwd = std::env::current_dir()?;
@@ -266,6 +270,15 @@ fn run(
                     _ if line.trim().starts_with("/resume") => {
                         pane.note("type /resume and pick a session as you type");
                     }
+                    // A submitted `/model` line means the chooser was closed;
+                    // it opens by itself while the line is being typed.
+                    _ if line
+                        .trim()
+                        .strip_prefix("/model")
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')) =>
+                    {
+                        pane.note("type /model and pick an agent as you type");
+                    }
                     // Set how hard the model reasons.
                     _ if let Some(arg) = line.trim().strip_prefix("/effort") => {
                         let arg = arg.trim();
@@ -284,7 +297,7 @@ fn run(
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ if line.trim().starts_with('/') => pane.note(format!(
-                        "unknown command {} · /clear /resume /plan /effort /agents /stop /perf /quit",
+                        "unknown command {} · /clear /resume /model /plan /effort /agents /stop /perf /quit",
                         line.split_whitespace().next().unwrap_or_default()
                     )),
                     _ => {
@@ -320,6 +333,31 @@ fn run(
                     }
                     // A file too damaged to open just puts the error into our pane.
                     Err(error) => pane.note(error.to_string()),
+                }
+                // An agent picked in the `/model` chooser: swap the endpoint,
+                // the model, and the effort for the next turn.
+                Some(PaneEvent::Model(choice)) => {
+                    if current == choice {
+                        pane.note("model unchanged");
+                    } else {
+                        match config.resolve(&choice.provider, &choice.name) {
+                            Ok(next) => {
+                                agent.set_model(
+                                    next.base_url.clone(),
+                                    next.api_key.clone(),
+                                    next.model.clone(),
+                                );
+                                if let Some(effort) = next.effort.clone() {
+                                    agent.set_reasoning_effort(effort);
+                                }
+                                pane.set_context_tokens(next.context_tokens);
+                                pane.note(format!("model: {next}"));
+                                current = choice;
+                            }
+                            // A key that fails to resolve leaves the agent be.
+                            Err(error) => pane.note(error.to_string()),
+                        }
+                    }
                 },
                 None => {}
             },

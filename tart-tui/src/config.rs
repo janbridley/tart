@@ -9,7 +9,8 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use itertools::Itertools;
 use serde::Deserialize;
-use tart_agents::ReasoningEffort;
+use tart_agents::sandbox::Policy;
+use tart_agents::{Agent, ReasoningEffort};
 
 /// A parsed agents file. `default_agent` picks the agent the TUI runs.
 #[derive(Debug)]
@@ -38,6 +39,24 @@ pub(crate) struct ResolvedAgent {
 impl fmt::Display for ResolvedAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} · {}", self.provider, self.name)
+    }
+}
+
+impl ResolvedAgent {
+    /// Consume the resolution and a Policy into the loop's agent + a stored choice.
+    pub(crate) fn into_agent(self, policy: Policy) -> (Agent, AgentChoice) {
+        let mut agent = Agent::new(self.base_url, self.api_key, self.model.clone(), policy);
+        if let Some(effort) = self.effort {
+            agent = agent.reasoning_effort(effort);
+        }
+        (
+            agent,
+            AgentChoice {
+                provider: self.provider,
+                name: self.name,
+                model: self.model,
+            },
+        )
     }
 }
 
@@ -252,6 +271,17 @@ reasoning_effort = "high"
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
         assert!(error.contains("label"), "{error}");
+    }
+
+    /// A resolution consumes into the loop's agent and its picker row; the
+    /// row carries the identity the `/model` swap compares against.
+    #[test]
+    fn a_resolution_consumes_into_agent_and_choice() {
+        let spec = Config::parse(MINIMAL).unwrap().default_agent().unwrap();
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let (_agent, choice) = spec.into_agent(policy);
+
+        assert_eq!(choice.to_string(), "zai · tart · glm-5.3");
     }
 
     /// The shipped example file parses and lists its agents: the spec and its
