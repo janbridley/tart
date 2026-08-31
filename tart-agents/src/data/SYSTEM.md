@@ -83,7 +83,7 @@ Call `spawn` with:
 - `task` (string): the complete, self-contained task for the subagent.
 
 Spawn a subagent for a well-scoped task. It returns an id immediately; the subagent runs
-independently with your tools (minus spawning), seeing nothing else of this
+independently with your tools (minus `spawn` and `wait`), seeing nothing else of this
 conversation, and its final message becomes its report. This report is delivered to you
 automatically in a later turn, or manually by `wait`. At most 8 subagents run or await
 delivery at once. *Use the `wait` tool sparingly - see the guidance in
