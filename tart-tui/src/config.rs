@@ -77,6 +77,41 @@ impl fmt::Display for AgentChoice {
         write!(f, "{} · {} · {}", self.provider, self.name, self.model)
     }
 }
+/// Digest of model parameters that the run interface can switch to.
+pub(crate) struct Models {
+    /// Resolves a picked row to its endpoint, key, model, and effort.
+    pub(crate) config: Config,
+    /// The running row; picking it again changes nothing.
+    pub(crate) current: AgentChoice,
+}
+
+impl Models {
+    /// Swap `agent` to the picked row and note it, or note why not.
+    pub(crate) fn swap(
+        &mut self,
+        choice: &AgentChoice,
+        agent: &mut Agent,
+        pane: &mut crate::pane::Pane,
+    ) {
+        if self.current == *choice {
+            pane.note("model unchanged");
+            return;
+        }
+        match self.config.resolve(&choice.provider, &choice.name) {
+            Ok(next) => {
+                agent.set_model(next.base_url.clone(), next.api_key.clone(), next.model.clone());
+                if let Some(effort) = next.effort.clone() {
+                    agent.set_reasoning_effort(effort);
+                }
+                pane.set_context_tokens(next.context_tokens);
+                pane.note(format!("model: {next}"));
+                self.current = choice.clone();
+            }
+            // A key that fails to resolve leaves the agent be.
+            Err(error) => pane.note(error.to_string()),
+        }
+    }
+}
 
 /// One provider table: a base URL, a credential, and the agents behind it.
 #[derive(Debug, Deserialize)]

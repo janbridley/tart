@@ -42,6 +42,9 @@ use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
     ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
 };
+
+use crate::config::Models;
+
 use tmux_override::{override_shift_up, restore_tmux};
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
@@ -73,14 +76,14 @@ fn main() -> anyhow::Result<()> {
     pane.note(format!("tart · {label}"));
     pane.set_context_tokens(context_tokens);
     pane.set_models(config.agents());
+    let models = Models { config, current };
     let result = run(
         &mut terminal,
         &mut agent,
         transcript,
         &mut session,
         &mut pane,
-        &config,
-        current,
+        models,
     );
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
@@ -136,8 +139,7 @@ fn run(
     mut transcript: Transcript,
     session: &mut Session,
     pane: &mut Pane,
-    config: &config::Config,
-    mut current: config::AgentChoice,
+    mut models: Models,
 ) -> anyhow::Result<()> {
     // The sandbox's grant root, for deciding which mentions need attaching.
     let cwd = std::env::current_dir()?;
@@ -336,29 +338,7 @@ fn run(
                 }
                 // An agent picked in the `/model` chooser: swap the endpoint,
                 // the model, and the effort for the next turn.
-                Some(PaneEvent::Model(choice)) => {
-                    if current == choice {
-                        pane.note("model unchanged");
-                    } else {
-                        match config.resolve(&choice.provider, &choice.name) {
-                            Ok(next) => {
-                                agent.set_model(
-                                    next.base_url.clone(),
-                                    next.api_key.clone(),
-                                    next.model.clone(),
-                                );
-                                if let Some(effort) = next.effort.clone() {
-                                    agent.set_reasoning_effort(effort);
-                                }
-                                pane.set_context_tokens(next.context_tokens);
-                                pane.note(format!("model: {next}"));
-                                current = choice;
-                            }
-                            // A key that fails to resolve leaves the agent be.
-                            Err(error) => pane.note(error.to_string()),
-                        }
-                    }
-                },
+                Some(PaneEvent::Model(choice)) => models.swap(&choice, agent, pane),
                 None => {}
             },
             Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),
