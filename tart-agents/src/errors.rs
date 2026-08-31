@@ -85,7 +85,7 @@ pub(crate) fn absorb_provider_error<F: Fn(Progress)>(
         // An over-window record cannot be retried into fitting: the turn
         // ends saying the drastic action instead.
         ProviderError::Overflow => Some(Progress::Failed(format!(
-            "the transcript exceeds the model's context window — /clear or trim the session: {reason}"
+            "the transcript exceeds the model's context window: /clear or trim the session: {reason}"
         ))),
         ProviderError::Permanent => Some(Progress::Failed(reason.to_string())),
     }
