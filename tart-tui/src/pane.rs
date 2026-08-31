@@ -28,7 +28,9 @@ pub(crate) use editor::{Editor, g_to_byte, graphemes};
 
 use crate::attachments;
 use crate::clipboard::Selection;
+use crate::config::AgentChoice;
 use crate::file_mentions::{self, FilePopup};
+use crate::model_picker::{ModelPopup, derive_query as model_query};
 use crate::session_picker::{SessionPopup, derive_query as session_query};
 use copy::{CopyCursor, clamp_cell, moved, window_top};
 use transcript::Transcript;
@@ -75,6 +77,8 @@ pub enum PaneEvent {
     Copy(String),
     /// A session picked in the `/resume` chooser, ready to swap to.
     Resume(PathBuf),
+    /// An agent picked in the `/model` chooser, ready to switch to.
+    Model(AgentChoice),
     /// Esc with nothing open, with a turn or a manual command in flight.
     Cancel,
     /// Shift+Tab or `/plan`: toggle plan mode, moving the agent's mode with it.
@@ -117,6 +121,8 @@ pub(crate) enum Popup {
     Files(FilePopup),
     /// The `/resume` chooser over this project's sessions.
     Sessions(SessionPopup),
+    /// The `/model` chooser over the agents file's agents.
+    Models(ModelPopup),
 }
 
 impl Popup {
@@ -125,6 +131,7 @@ impl Popup {
         match self {
             Self::Files(popup) => popup,
             Self::Sessions(sessions) => &mut sessions.popup,
+            Self::Models(models) => &mut models.popup,
         }
     }
 
@@ -176,6 +183,8 @@ pub struct Pane {
     popup: Option<Popup>,
     /// Where `/resume` lists sessions from: the sessions root and project.
     session_dir: Option<(PathBuf, PathBuf)>,
+    /// The agents `/model` lists, from the agents file.
+    models: Vec<AgentChoice>,
     /// The `/perf` stats line, shown on the bottom rule row; `None` when off.
     perf: Option<String>,
     /// The last response's token usage.
@@ -229,23 +238,34 @@ impl Pane {
             self.sync_completion(false);
             return;
         }
-        match session_query(&self.prompt) {
+        match model_query(&self.prompt) {
+            // The `/model` chooser, mirroring the `/resume` arm below.
             Some(query) => {
-                if let Some(popup @ Popup::Sessions(_)) = &mut self.popup {
+                if let Some(popup @ Popup::Models(_)) = &mut self.popup {
                     popup.set_query(query);
-                } else if key.is_some_and(|key| key.code != KeyCode::Esc) {
-                    self.popup = self.session_dir.as_ref().map(|(root, project)| {
-                        Popup::Sessions(SessionPopup::new(root, project, query))
-                    });
+                } else if key.is_some_and(|key| key.code != KeyCode::Esc) && !self.models.is_empty()
+                {
+                    self.popup = Some(Popup::Models(ModelPopup::new(&self.models, query)));
                 }
             }
-            None => {
-                file_mentions::update(
-                    &mut self.popup,
-                    file_mentions::derive_query(&self.prompt),
-                    key.is_some_and(file_mentions::rearm),
-                );
-            }
+            None => match session_query(&self.prompt) {
+                Some(query) => {
+                    if let Some(popup @ Popup::Sessions(_)) = &mut self.popup {
+                        popup.set_query(query);
+                    } else if key.is_some_and(|key| key.code != KeyCode::Esc) {
+                        self.popup = self.session_dir.as_ref().map(|(root, project)| {
+                            Popup::Sessions(SessionPopup::new(root, project, query))
+                        });
+                    }
+                }
+                None => {
+                    file_mentions::update(
+                        &mut self.popup,
+                        file_mentions::derive_query(&self.prompt),
+                        key.is_some_and(file_mentions::rearm),
+                    );
+                }
+            },
         }
     }
 
@@ -271,6 +291,12 @@ impl Pane {
                 {
                     self.clear_prompt();
                     return Some(PaneEvent::Resume(path));
+                }
+            }
+            Some(Popup::Models(models)) => {
+                if let Some(choice) = models.selected_choice() {
+                    self.clear_prompt();
+                    return Some(PaneEvent::Model(choice.clone()));
                 }
             }
             Some(Popup::Files(popup)) => {
@@ -530,9 +556,15 @@ impl Pane {
         self.usage = Some(Usage { input, cached, output });
     }
 
-    /// Record the model's context window, from the agents file.
-    pub fn set_context_tokens(&mut self, tokens: u64) {
-        self.context_tokens = Some(tokens);
+    /// Record the model's context window, from the agents file; `None` leaves
+    /// the status line's gauge without a window.
+    pub fn set_context_tokens(&mut self, tokens: Option<u64>) {
+        self.context_tokens = tokens;
+    }
+
+    /// Name the agents `/model` picks from, from the agents file.
+    pub fn set_models(&mut self, models: Vec<AgentChoice>) {
+        self.models = models;
     }
 
     /// Name the directory `/resume` picks sessions from.
@@ -986,6 +1018,7 @@ impl Pane {
         match self.popup.as_mut() {
             Some(Popup::Files(popup)) => popup.render(frame, bar_top, "files", hint),
             Some(Popup::Sessions(sessions)) => sessions.render(frame, bar_top),
+            Some(Popup::Models(models)) => models.render(frame, bar_top),
             None => {}
         }
     }
@@ -1261,7 +1294,7 @@ mod tests {
         pane.push(Line::from("text"));
         assert!(!render(&mut pane, (60, 8)).contains('['));
 
-        pane.set_context_tokens(200_000);
+        pane.set_context_tokens(Some(200_000));
         pane.set_usage(45_000, 40_000, 3_000);
         let gauge = render(&mut pane, (60, 8));
         assert!(gauge.contains("───[ 48k / 200k · 88% cached ]"), "{gauge}");
@@ -2119,6 +2152,45 @@ mod tests {
         assert!(matches!(pane.popup, Some(Popup::Sessions(_))));
         pane.set_generating(true);
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+    }
+
+    /// A `/model` line opens the agent chooser; Enter picks the highlighted
+    /// agent, and a generating turn defers the switch rather than swapping the
+    /// record under the worker.
+    #[test]
+    fn a_model_line_opens_the_chooser_and_enter_picks() {
+        let choice = AgentChoice {
+            provider: "zai".to_string(),
+            name: "tart".to_string(),
+            model: "glm-5.3".to_string(),
+        };
+        let mut pane = Pane::default();
+        pane.set_models(vec![choice.clone()]);
+
+        // Typing filters: a query naming no agent highlights nothing, and
+        // Enter then has nothing to pick — the chooser stays open.
+        pane.type_keys("/model nomatch");
+        assert!(matches!(pane.popup, Some(Popup::Models(_))));
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(matches!(pane.popup, Some(Popup::Models(_))), "nothing to pick");
+
+        pane.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        pane.type_keys("/model glm");
+        assert!(matches!(pane.popup, Some(Popup::Models(_))));
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Model(choice.clone()))
+        );
+        assert_eq!(pane.prompt.text(), "");
+
+        // A pick while a turn runs is safe: the worker holds its own clone,
+        // so the swap lands on the next turn.
+        pane.type_keys("/model glm");
+        pane.set_generating(true);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Model(choice))
+        );
     }
 
     /// Replaying a session renders the echoes, tool headers, and answers the
