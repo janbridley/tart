@@ -512,9 +512,17 @@ impl Agent {
                     break;
                 }
                 match tools::execute(&call, &tooling, on_progress) {
-                    Ok(output) => exchanges.push((call, output)),
+                    Ok(output) => {
+                        let bounded = bounded_for_history(&call.name, &output, on_progress);
+                        exchanges.push((call, bounded));
+                    }
                     Err(error) => {
-                        exchanges.push((call, format!("error: {error}")));
+                        let bounded = bounded_for_history(
+                            &call.name,
+                            &format!("error: {error}"),
+                            on_progress,
+                        );
+                        exchanges.push((call, bounded));
                         failure = Some(error.to_string());
                         break;
                     }
@@ -583,6 +591,18 @@ fn retry_dropped<F: Fn(Progress)>(on_progress: &F, reason: &str, retries: &mut u
     )));
     std::thread::sleep(RETRY_PAUSE * (1u32 << (*retries - 1)));
     true
+}
+
+/// Bound one tool result before it enters history.
+fn bounded_for_history<F: Fn(Progress)>(name: &str, output: &str, on_progress: &F) -> String {
+    let capped = tools::bounded(output, tools::CONTENT_CAP);
+    if capped.len() < output.len() {
+        on_progress(Progress::Note(format!(
+            "{name} output truncated to {} KiB",
+            tools::CONTENT_CAP / 1024
+        )));
+    }
+    capped
 }
 
 /// Record the answer a round streamed, when it streamed one at all.

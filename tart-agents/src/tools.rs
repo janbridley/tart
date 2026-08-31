@@ -455,10 +455,7 @@ pub fn head_cap(text: &str, cap: usize) -> String {
         return text.to_string();
     }
     // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(cap);
     format!("{}\n[truncated; first {} KB shown]", &text[..end], cap / 1024)
 }
 
@@ -468,11 +465,25 @@ fn tail_cap(text: &str, cap: usize) -> String {
         return text.to_string();
     }
     // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let mut start = text.len() - cap;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
+    let start = text.ceil_char_boundary(text.len() - cap);
     format!("[truncated; last {} KB shown]\n{}", cap / 1024, &text[start..])
+}
+
+/// Keep the first and last `cap / 2` bytes of `text`, marking the omitted middle.
+pub fn bounded(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let half = cap / 2;
+    // Slicing must land on a char boundary; lossy decoding made `text` valid.
+    let end = text.floor_char_boundary(half);
+    let start = text.ceil_char_boundary(text.len() - half);
+    format!(
+        "{}\n[truncated; first and last {} KB shown]\n{}",
+        &text[..end],
+        half / 1024,
+        &text[start..]
+    )
 }
 
 /// Spawn `command` in its own process group with piped output and no input,
@@ -937,6 +948,28 @@ mod tests {
         let capped = tail_cap(&wide, 1024);
         let (marker, tail) = capped.split_once('\n').unwrap();
         assert_eq!(marker, "[truncated; last 1 KB shown]");
+        assert!(tail.chars().all(|c| c == '語'), "cut inside a character");
+    }
+
+    #[test]
+    fn bounded_keeps_both_ends_and_marks_the_middle() {
+        assert_eq!(bounded("hi\n", 10), "hi\n");
+
+        let text = "abcdef".repeat(1024); // 6 KB
+        let capped = bounded(&text, 2048);
+        let (head, rest) = capped.split_once('\n').unwrap();
+        let (marker, tail) = rest.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; first and last 1 KB shown]");
+        assert_eq!(head, &text[..1024]);
+        assert_eq!(tail, &text[text.len() - 1024..]);
+
+        // Multi-byte characters must not split at either cut.
+        let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
+        let capped = bounded(&wide, 2048);
+        let (head, rest) = capped.split_once('\n').unwrap();
+        let (marker, tail) = rest.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; first and last 1 KB shown]");
+        assert!(head.chars().all(|c| c == '語'), "cut inside a character");
         assert!(tail.chars().all(|c| c == '語'), "cut inside a character");
     }
 

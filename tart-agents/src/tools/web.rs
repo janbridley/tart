@@ -550,10 +550,7 @@ fn truncate(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
-    let mut cut = limit;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = text.floor_char_boundary(limit);
     format!("{}\n[truncated]", &text[..cut])
 }
 
