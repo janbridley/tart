@@ -394,14 +394,21 @@ fn run(
                         // The peek resolves the box and queues the id; the
                         // claim happens at delivery, so a `wait` inside this
                         // turn can still take the report for itself.
-                        if let Some(outcome) = agents.outcome(id) {
-                            let exit = matches!(outcome, Outcome::Done(_)).then_some(0);
-                            pane.finish_tool(
+                        match agents.outcome(id) {
+                            Some(outcome) => {
+                                let exit = matches!(outcome, Outcome::Done(_)).then_some(0);
+                                pane.finish_tool(
+                                    &format!("agent-{id}"),
+                                    head_cap(&outcome.report(), REPORT_CAP),
+                                    exit,
+                                );
+                                pane.report(id);
+                            }
+                            None => pane.finish_tool(
                                 &format!("agent-{id}"),
-                                head_cap(&outcome.report(), REPORT_CAP),
-                                exit,
-                            );
-                            pane.report(id);
+                                "report delivered through wait".to_string(),
+                                Some(0),
+                            ),
                         }
                         // Idle: the reports start their turn now. Busy: the
                         // running turn's end delivers them.
