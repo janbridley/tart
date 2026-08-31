@@ -564,17 +564,32 @@ impl Blocks {
                 widths[i] = widths[i].max(cell_width(cell));
             }
         }
+        // Bound the table to the current pane width, shrinking widest columns first
+        let surround = self.indents();
+        if self.width > 0 {
+            let lead = surround.iter().map(Span::width).sum::<usize>();
+            let separators = 3 * columns.saturating_sub(1);
+            let avail = self.width.saturating_sub(lead + separators);
+            // Shave the widest column until the row fits, never under three cells
+            while widths.iter().sum::<usize>() > avail
+                && let Some(widest) = widths.iter_mut().max().filter(|w| **w > 3)
+            {
+                *widest -= 1;
+            }
+        }
         // A short row pads with empty cells and a missing alignment pads left.
-        let cells = |row: &[Vec<Span<'static>>]| {
+        // Each cell wraps to its column, so a wide cell makes its row several lines
+        let cells = |row: &[Vec<Span<'static>>]| -> Vec<Vec<Vec<Span<'static>>>> {
             (0..columns)
                 .map(|i| {
-                    pad_cell(
-                        row.get(i).cloned().unwrap_or_default(),
-                        widths[i],
-                        aligns.get(i).copied().unwrap_or(Alignment::None),
-                    )
+                    let cell = row.get(i).cloned().unwrap_or_default();
+                    let align = aligns.get(i).copied().unwrap_or(Alignment::None);
+                    cell_lines(cell, widths[i])
+                        .into_iter()
+                        .map(|line| pad_cell(line, widths[i], align))
+                        .collect()
                 })
-                .collect::<Vec<_>>()
+                .collect()
         };
         // One dash run per column, joined where the cell separators sit.
         let rule: Vec<Span<'static>> = widths
@@ -583,11 +598,36 @@ impl Blocks {
             .map(|w| Span::styled("─".repeat(w), QUIET))
             .intersperse(Span::styled("─┼─", QUIET))
             .collect();
-        let surround = self.indents();
-        self.push_row(row_line(surround.clone(), cells(&head), true));
+        // A column-wide blank, so a record's shorter cells keep the grid on
+        // the continuation lines of its wrapped ones.
+        let blanks: Vec<Vec<Span<'static>>> =
+            widths.iter().map(|w| vec![Span::raw(" ".repeat(*w))]).collect();
+        let record = |row| {
+            let mut cells = cells(row);
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+            cells.iter_mut().zip(&blanks).for_each(|(cell, blank)| {
+                cell.resize(height, blank.clone());
+            });
+            cells
+        };
+        self.push_table_rows(&surround, &record(&head), true);
         self.push_row(row_line(surround.clone(), vec![rule], false));
         for row in &rows {
-            self.push_row(row_line(surround.clone(), cells(row), false));
+            self.push_table_rows(&surround, &record(row), false);
+        }
+    }
+
+    /// Push one record's wrapped cells as its rows, its tallest cell setting how many
+    fn push_table_rows(
+        &mut self,
+        surround: &[Span<'static>],
+        cells: &[Vec<Vec<Span<'static>>>],
+        header: bool,
+    ) {
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        for at in 0..height {
+            let line: Vec<Vec<Span<'static>>> = cells.iter().map(|cell| cell[at].clone()).collect();
+            self.push_row(row_line(surround.to_vec(), line, header));
         }
     }
 
@@ -604,6 +644,14 @@ impl Blocks {
 /// A cell's width in terminal cells.
 fn cell_width(cell: &[Span<'static>]) -> usize {
     cell.iter().map(Span::width).sum()
+}
+
+/// A cell's spans wrapped to its bounded column width, one Vec of spans per line.
+fn cell_lines(cell: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    wrap_lines(&[Line::from(cell)], width)
+        .into_iter()
+        .map(|line| line.spans)
+        .collect()
 }
 
 /// One cell padded to its column's width and alignment.
@@ -910,5 +958,46 @@ mod tests {
         assert_eq!(lines[2][4], ("    c".into(), Style::new()));
         // A table still streaming renders the rows it has.
         assert_eq!(rows("| a | b |\n|---|---|"), ["a │ b", "──┼──"]);
+    }
+
+    #[test]
+    fn wide_tables_wrap_within_their_columns() {
+        let raw = concat!(
+            "| name | description |\n|---|---|\n",
+            "| rust | a systems language that compiles fast |\n",
+            "| go | concurrently simple |"
+        );
+        let lines = texts(&render(raw, 20));
+        // The grid survives: header, rule, one record per row pair, and every
+        // row within the pane width.
+        assert_eq!(
+            lines,
+            [
+                "name │ description  ",
+                "─────┼──────────────",
+                "rust │ a systems    ",
+                "     │ language that",
+                "     │ compiles fast",
+                "go   │ concurrently ",
+                "     │ simple       ",
+            ],
+            "wrapped in place, grid intact"
+        );
+        for line in &lines {
+            assert!(line.chars().count() <= 20, "row fits: {lines:?}");
+        }
+    }
+
+    /// A table inside a container bounds against the width left of its rail.
+    #[test]
+    fn wide_tables_wrap_inside_a_quote() {
+        let raw = "> | a | b |\n> |---|---|\n> | 1 | a very long cell indeed |";
+        let lines = texts(&render(raw, 16));
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        for line in &lines {
+            assert!(line.chars().count() <= 16, "row fits: {lines:?}");
+        }
+        assert!(lines[0].starts_with("│ a │"), "rail kept: {lines:?}");
+        assert!(lines[2].starts_with("│ 1 │ a very"), "{lines:?}");
     }
 }
