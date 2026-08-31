@@ -195,7 +195,8 @@ pub struct Pane {
     queued: VecDeque<String>,
     /// The finished subagents whose reports await delivery.
     ///
-    /// All pendings deliver together as one message, unless a `wait` claimed first.
+    /// All pending reports deliver together as one message, unless a `wait`
+    /// claimed one first.
     reports: Vec<AgentId>,
     /// Output tokens the subagents have spent, metered apart from the main
     /// turn's own usage.
@@ -498,16 +499,21 @@ impl Pane {
         self.transcript.start_tool(id, name, arguments);
     }
 
-    /// Open a subagent's running box; see [`Transcript::start_agent`].
-    pub fn start_agent(&mut self, id: AgentId, task: &str) {
-        self.transcript
-            .start_agent(format!("agent-{id}"), task.to_string());
+    /// Open a subagent's running box from its opener event's raw arguments;
+    /// see [`Transcript::start_agent`].
+    pub fn start_agent(&mut self, id: AgentId, arguments: &str) {
+        let task = digest::argument("spawn", arguments);
+        self.transcript.start_agent(id.tag(), task);
     }
 
     /// Append a subagent's latest call to its box; see [`Transcript::touch_agent`].
     pub fn touch_agent(&mut self, id: AgentId, name: &str, arguments: &str) {
-        self.transcript
-            .touch_agent(&format!("agent-{id}"), name, arguments);
+        self.transcript.touch_agent(&id.tag(), name, arguments);
+    }
+
+    /// Resolve the subagent's box with its report; see [`Transcript::finish_tool`].
+    pub fn finish_agent(&mut self, id: AgentId, output: String, exit: Option<i32>) {
+        self.finish_tool(&id.tag(), output, exit);
     }
 
     /// Fill in the pending invocation; see [`Transcript::finish_tool`].
