@@ -683,8 +683,8 @@ fn run_edit<F: Fn(Progress)>(
 ) -> anyhow::Result<String> {
     let edit = parse_edit(&call.arguments)?;
     Ok(traced(call, on_progress, || {
-        let (result, exit) = apply_edit(&edit, tools.policy);
-        (result.clone(), result, exit)
+        let (result, exit_code) = apply_edit(&edit, tools.policy);
+        (result.clone(), result, exit_code)
     }))
 }
 
