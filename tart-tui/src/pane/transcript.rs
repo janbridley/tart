@@ -354,6 +354,13 @@ impl Transcript {
         self.folds.truncate(index);
     }
 
+    /// Drop the whole wrap cache, so the next `sync` refolds every message.
+    fn reset(&mut self) {
+        self.rows.clear();
+        self.folds.clear();
+        self.cache.1 = 0;
+    }
+
     /// Resolve every still-running invocation as failed to prevent stuck boxes
     pub(crate) fn fail_pending(&mut self, reason: &str) {
         let mut failed = false;
@@ -369,9 +376,7 @@ impl Transcript {
             }
         }
         if failed {
-            self.rows.clear();
-            self.folds.clear();
-            self.cache.1 = 0;
+            self.reset();
         }
     }
 
@@ -379,9 +384,7 @@ impl Transcript {
     pub(crate) fn toggle_expand(&mut self) {
         if self.messages.iter().any(|entry| matches!(entry, Entry::Tool(_))) {
             self.show_tool_output = !self.show_tool_output;
-            self.rows.clear();
-            self.folds.clear();
-            self.cache.1 = 0;
+            self.reset();
         }
     }
 
@@ -459,9 +462,7 @@ impl Transcript {
             .any(|entry| matches!(entry, Entry::Thinking { .. }))
         {
             // The block's rows change wholesale; rebuild from scratch.
-            self.rows.clear();
-            self.folds.clear();
-            self.cache.1 = 0;
+            self.reset();
         }
     }
 
@@ -471,26 +472,21 @@ impl Transcript {
             .retain(|entry| !matches!(entry, Entry::Thinking { .. }));
         // Rows that included the drained block are stale; rewrapping once
         // per turn is fine.
-        self.rows.clear();
-        self.folds.clear();
-        self.cache.1 = 0;
+        self.reset();
     }
 
     /// Drop every message and reset our caches, persisting the thinking preference
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
-        self.rows.clear();
-        self.folds.clear();
-        self.cache.1 = 0;
+        self.reset();
     }
 
     /// Wrap the visible messages not yet folded into `rows`; a width change
     /// rewraps everything, and a stale answer re-renders first.
     pub(crate) fn sync(&mut self, width: usize) -> &[Line<'static>] {
         if self.cache.0 != width {
-            self.rows.clear();
-            self.folds.clear();
-            self.cache = (width, 0);
+            self.reset();
+            self.cache.0 = width;
         }
         let expanded = self.show_tool_output;
         let done = self.cache.1;
