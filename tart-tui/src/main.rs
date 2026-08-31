@@ -37,8 +37,9 @@ use ratatui::text::Span;
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use tart_agents::{
-    Agent, Agents, CancelToken, ChatMode, MAIN, Progress, ReasoningEffort, SESSIONS_ROOT, Session,
-    Transcript, manual_command, prompts, sandbox::Policy,
+    Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress, REPORT_CAP,
+    ReasoningEffort, SESSIONS_ROOT, Session, Transcript, head_cap, manual_command, prompts,
+    sandbox::Policy,
 };
 use tmux_override::{override_shift_up, restore_tmux};
 
@@ -155,7 +156,15 @@ fn run(
     let mut quit = false;
     let mut perf_on = false;
     let mut perf = Perf::default();
-    let agents = Agents::new();
+    // The registry every conversation registers in: the main turn's lever at startup,
+    // each subagent's as the model spawns it.
+    let agents = Agents::new({
+        let sender = wake.clone();
+        move |id, progress| {
+            let _ = sender.send(Wake::Generation(id, progress));
+        }
+    });
+    agent.set_subagents(std::sync::Arc::new(agents.clone()));
     agents.adopt(agent.handle());
     // A manual command's cancel lever, held while one runs; Esc and quit set it.
     let mut manual_cancel: Option<CancelToken> = None;
@@ -224,11 +233,37 @@ fn run(
                         // The abandoned file stays as history; the next turn
                         // starts a fresh one.
                         session.reset();
+                        // Its subagents die with it, reports included.
+                        agents.clear();
                     }
                     "/quit" | "/exit" => quit = true,
                     "/perf" => {
                         perf_on = !perf_on;
                         perf = Perf::default();
+                    }
+                    // Stop one subagent without stopping anything else.
+                    _ if let Some(arg) = line.trim().strip_prefix("/stop") => {
+                        match arg.trim().parse::<u64>() {
+                            Ok(id) => {
+                                agents.cancel(AgentId::from(id));
+                                pane.note(format!("stop sent to subagent {id}"));
+                            }
+                            Err(_) => pane.note("usage: /stop <id> · /agents to list"),
+                        }
+                    }
+                    // List the running subagents.
+                    "/agents" => {
+                        let running = agents.running();
+                        let listed = if running.is_empty() {
+                            "none".to_string()
+                        } else {
+                            running
+                                .into_iter()
+                                .map(|(id, task)| format!("{id}: {task}"))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        };
+                        pane.note(format!("subagents: {listed}"));
                     }
                     // A submitted `/resume` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
@@ -273,6 +308,9 @@ fn run(
                         transcript
                             .set_reminder(pane.is_plan().then_some(prompts::PLAN_REMINDER))?;
                         pane.clear();
+                        // The resumed conversation's subagents are not its:
+                        // they die with the one it replaced.
+                        agents.clear();
                         let name = path.file_stem().map_or_else(
                             || path.display().to_string(),
                             |stem| stem.to_string_lossy().into_owned(),
@@ -317,7 +355,11 @@ fn run(
                         }
                         let requeued =
                             if matches!(progress, Progress::Done { .. } | Progress::Cancelled) {
-                                pane.requeue(agent, &transcript, &cwd, &wake)?
+                                // Pending subagent reports deliver together as
+                                // one turn; a queued user message follows when
+                                // that turn ends.
+                                pane.deliver_reports(agent, &transcript, &wake)?
+                                    || pane.requeue(agent, &transcript, &cwd, &wake)?
                             } else {
                                 pane.spill_queued();
                                 false
@@ -334,9 +376,57 @@ fn run(
                 }
                 work += ping.elapsed();
             }
+            Ok(Wake::Generation(id, progress)) => {
+                let ping = Instant::now();
+                match &progress {
+                    Progress::ToolStart { name, arguments, .. } => {
+                        if name == "agent" {
+                            let task = serde_json::from_str::<serde_json::Value>(arguments)
+                                .ok()
+                                .and_then(|args| args["task"].as_str().map(str::to_string))
+                                .unwrap_or_default();
+                            pane.start_agent(id, &task);
+                        } else {
+                            pane.touch_agent(id, name, arguments);
+                        }
+                    }
+                    Progress::Done { .. } | Progress::Failed(_) | Progress::Cancelled => {
+                        // Taking the outcome delivers it; when a `wait` took
+                        // it first, the box closes saying so.
+                        match agents.take_outcome(id) {
+                            Some((task, outcome)) => {
+                                let exit = matches!(outcome, Outcome::Done(_)).then_some(0);
+                                let report = outcome.report();
+                                pane.finish_tool(
+                                    &format!("agent-{id}"),
+                                    head_cap(&report, REPORT_CAP),
+                                    exit,
+                                );
+                                pane.report(format!(
+                                    "Subagent {id} finished ({task}):\n\n{report}"
+                                ));
+                            }
+                            None => pane.finish_tool(
+                                &format!("agent-{id}"),
+                                "report delivered through wait".to_string(),
+                                Some(0),
+                            ),
+                        }
+                        // Idle: the reports start their turn now. Busy: the
+                        // running turn's end delivers them.
+                        if !pane.is_generating() {
+                            pane.deliver_reports(agent, &transcript, &wake)?;
+                        }
+                    }
+                    // A child's spend meters into the status line's agent total.
+                    Progress::Usage { output, .. } => pane.add_child_output(*output),
+                    _ => {}
+                }
+                work += ping.elapsed();
+            }
             // Resizes are handled at render time (see Pane::render); the redraw
             // timer just loops around and draws again.
-            Ok(Wake::Input(_) | Wake::Generation(..)) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Wake::Input(_)) | Err(RecvTimeoutError::Timeout) => {}
         }
     }
     // A quit mid-generation keeps the partial turn; in-flight requests (if
