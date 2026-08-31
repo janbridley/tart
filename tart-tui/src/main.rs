@@ -62,11 +62,7 @@ fn main() -> anyhow::Result<()> {
     let root = &SESSIONS_ROOT;
     let cwd = std::env::current_dir()?;
     let mut session = Session::start(root, &cwd);
-    // A fresh conversation opens on the configured prompt and instructions.
-    let transcript = match agent_config.instructions {
-        Some(instructions) => Transcript::with_instructions(instructions)?,
-        None => Transcript::new()?,
-    };
+    let transcript = Transcript::new()?;
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;

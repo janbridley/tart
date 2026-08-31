@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::{Agent, CancelToken, Progress, Transcript, TurnHandle};
 
-/// The subagent prompt, appended after the system like the front end's instructions
+/// The subagent preamble, opening the child's first user message ahead of its task
 const AGENT_PROMPT: &str = include_str!("data/AGENT.md");
 
 /// How often a bounded `wait` wakes to check its cancel token.
@@ -151,8 +151,9 @@ impl Agents {
         // must never retire the child's wake sender, nor the child's retire
         // MAIN's.
         let agent = template.child();
-        let transcript = Transcript::with_instructions(AGENT_PROMPT.to_string())?;
-        transcript.push_user(task.to_string())?;
+        // The subagent preamble, then the task, as one user turn
+        let transcript = Transcript::new()?;
+        transcript.push_user(format!("{AGENT_PROMPT}\n\n{task}"))?;
         let (sender, terminal) = mpsc::channel::<Outcome>();
         self.inner.lock_children().push((
             id,

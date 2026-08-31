@@ -29,8 +29,6 @@ pub(crate) struct ResolvedAgent {
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
-    /// Extra system prompt, appended after the built-in one.
-    pub(crate) instructions: Option<String>,
     /// The model's context window, for the status line's token gauge.
     pub(crate) context_tokens: Option<u64>,
 }
@@ -79,7 +77,6 @@ struct AgentSpec {
     name: String,
     model: String,
     reasoning_effort: Option<ReasoningEffort>,
-    instructions: Option<String>,
     context_tokens: Option<u64>,
 }
 
@@ -142,7 +139,6 @@ impl Config {
             api_key: resolve_api_key(key, &provider.api_key)?,
             model: agent.model.clone(),
             effort: agent.reasoning_effort.clone(),
-            instructions: agent.instructions.clone(),
             context_tokens: agent.context_tokens,
         })
     }
@@ -203,7 +199,6 @@ api_key = ["echo", "secret-key"]
 name = "tart"
 model = "glm-5.3"
 reasoning_effort = "high"
-instructions = "Write performant, safe code."
 "#;
 
     #[test]
@@ -215,10 +210,6 @@ instructions = "Write performant, safe code."
         assert_eq!(agent.api_key, "secret-key");
         assert_eq!(agent.model, "glm-5.3");
         assert_eq!(agent.effort, Some(ReasoningEffort::High));
-        assert_eq!(
-            agent.instructions.as_deref(),
-            Some("Write performant, safe code.")
-        );
     }
 
     #[test]
@@ -321,14 +312,11 @@ instructions = "Write performant, safe code."
 
     #[test]
     fn unknown_agent_key_is_an_error() {
-        let text = MINIMAL.replacen(
-            "instructions = \"Write performant, safe code.\"",
-            "instruction = \"Write performant, safe code.\"",
-            1,
-        );
+        let text =
+            MINIMAL.replacen("reasoning_effort = \"high\"", "reasoning_efforts = \"high\"", 1);
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
-        assert!(error.contains("instruction"), "{error}");
+        assert!(error.contains("reasoning_efforts"), "{error}");
     }
 
     #[test]
