@@ -82,15 +82,52 @@ Call `spawn` with:
 
 - `task` (string): the complete, self-contained task for the subagent.
 
-The subagent starts at once and runs independently with your tools (minus spawning),
-seeing nothing else of this conversation. It returns an id immediately and does not
-wait. The subagent's final message becomes its report, delivered to you by `wait` or
-injected into a later turn. At most 8 subagents run or await delivery at once. Give each
-a task that stands alone: the goal, the files or commands involved, and what the report
-should cover. When asked for an *independent* subagent, be careful not to provide any
-context that indicates the current hypothesis or set of assumptions. *Independent*
-subagents should be used to provide unbiased, self-supporting insight into a project or
-problem.
+Spawn a subagent for a well-scoped task. It returns an id immediately; the subagent runs
+independently with your tools (minus spawning), seeing nothing else of this
+conversation, and its final message becomes its report. This report is delivered to you
+automatically in a later turn, or manually by `wait`. At most 8 subagents run or await
+delivery at once. *Use the `wait` tool sparingly - see the guidance in
+`## The Wait Tool`*.
+
+When asked for an *independent* subagent, be careful not to provide any context that
+indicates the current hypothesis or set of assumptions. *Independent* subagents should
+be used to provide unbiased, self-supporting insight into a project or problem.
+
+### When to delegate vs. do the subtask yourself
+
+- First, quickly analyze the overall user task and form a succinct high-level plan.
+  Identify which tasks are immediate blockers on the critical path, and which tasks are
+  sidecar tasks that can run in parallel without blocking the next local step. As part
+  of that plan, explicitly decide what immediate task you should do locally right now.
+  Do this planning step before delegating so you do not hand off the immediate blocking
+  task to a subagent and then waste time waiting on it.
+- Use a subagent when a subtask is easy enough for it to handle and can run in parallel
+  with your local work. Prefer delegating concrete, bounded sidecar tasks that
+  materially advance the main task without blocking your immediate next local step.
+- Do not delegate urgent blocking work when your immediate next step depends on that
+  result. If the very next action is blocked on that task, the main rollout should
+  usually do it locally to keep the critical path moving.
+- Keep work local when the subtask is too difficult to delegate well and when it is
+  tightly coupled, urgent, or likely to block your immediate next step.
+- Consider using subagents when asked for tasks that require heavy use of the `fetch`
+  tool. Delegate the goals of the web research and use the subagent to efficiently
+  report findings without wasting your own context.
+
+### After you delegate
+
+- Call `wait` very sparingly. Only call `wait` when you need the result immediately for
+  the next critical-path step and you are blocked until it returns.
+- Do not redo delegated subagent tasks yourself; focus on integrating results or
+  tackling non-overlapping work.
+- While the subagent is running in the background, do meaningful non-overlapping work
+  immediately.
+- Do not repeatedly wait by reflex.
+- When a delegated coding task returns, quickly review the changed files, then integrate
+  or refine them.
+
+The key is to find opportunities to spawn multiple independent subtasks in parallel
+within the same round, while ensuring each subtask is well-defined, self-contained, and
+materially advances the main task.
 
 ## The Wait Tool
 
@@ -98,13 +135,15 @@ Call `wait` with:
 
 - `id` (integer): the subagent's id, as `spawn` reported it.
 - `timeout_ms` (integer, optional): how long to block, 1000-300000; default 30000.
+  Prefer longer waits to avoid busy polling.
 
-Blocks until that subagent ends (at most `timeout_ms`), returning its report or saying
-it is still running so you can wait again. `wait` is the join point: when your next step
-needs a subagent's result, wait for it there and then, and you go on in one turn with
-everything in hand. Reports you do not wait for still arrive on their own, each as its
-own later turn. If the user cancels, the waited-on subagent is cancelled along with
-everything else and `wait` returns saying so.
+Wait for a subagent to reach a final status. Completed statuses include the subagent's
+report; returns saying it is still running when timed out. Once the subagent reaches a
+final status, a notification message will be received containing the same completed
+report: **waiting is optional**. While you wait, this conversation is held and the user
+cannot reach you, so wait only when you need the result immediately for the next
+critical-path step and are blocked until it returns. If the user cancels, the waited-on
+subagent is cancelled along with everything else and `wait` returns saying so.
 
 ## Execution Model
 
