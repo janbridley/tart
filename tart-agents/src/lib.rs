@@ -15,7 +15,7 @@ pub use history::Transcript;
 pub use progress::Progress;
 pub use session::{SESSIONS_ROOT, Session};
 
-pub use agent::{Agent, ChatMode, TurnControl};
+pub use agent::{Agent, ChatMode, TurnHandle};
 
 pub use tools::{CONTENT_CAP, CancelToken, head_cap, manual_command};
 

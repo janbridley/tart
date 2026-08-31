@@ -14,7 +14,7 @@ use futures::channel::mpsc;
 use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
-use crate::{MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
+use crate::{CancelToken, MAX_TOOL_ROUNDS, Progress, Transcript, debug, sandbox::Policy, tools};
 
 /// The session's collaboration mode, mirroring Codex's `ModeKind`.
 ///
@@ -46,17 +46,15 @@ pub struct Agent {
     mode: ChatMode,
     /// The Default-mode policy: the granted roots stay writable.
     writable: Policy,
-    /// The Plan-mode policy: the same grants, but most paths are read-only.
-    planning: Policy,
     /// The shared runtime every agent and turn drives its futures on.
     runtime: Arc<Runtime>,
     /// The front end's lever on the running turn (cancel).
-    control: TurnControl,
+    control: TurnHandle,
 }
 
 /// The front end's control plane for running turns.
 #[derive(Clone, Default)]
-pub struct TurnControl {
+pub struct TurnHandle {
     state: Arc<Mutex<TurnState>>,
 }
 
@@ -69,22 +67,26 @@ struct TurnState {
     sender: Option<mpsc::Sender<()>>,
     /// Esc was pressed and we should attempt to cancel.
     cancelled: bool,
+    /// The running turn's command lever: cancelling kills a bash in flight.
+    token: CancelToken,
 }
 
-impl TurnControl {
+impl TurnHandle {
     /// The state under its lock.
     fn state(&self) -> MutexGuard<'_, TurnState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Cancel the turn by dropping the stream, keeping any partial answer.
+    /// Cancel the turn: kill any command it is running, drop the stream, and
+    /// keep any partial answer.
     ///
-    /// NOTE: this must wait until tool calls complete, and the provider will likely
-    /// take the cancelled turn to completion.
+    /// The provider will likely still take its side of the cancelled stream
+    /// to completion; the record here ends at the drop.
     #[inline]
     pub fn cancel(&self) {
         let mut state = self.state();
         state.cancelled = true;
+        state.token.cancel();
         if let Some(sender) = &mut state.sender {
             // A failed poke means one is already pending; the flag decides.
             let _ = sender.try_send(());
@@ -92,13 +94,14 @@ impl TurnControl {
     }
 
     /// Install `sender` as the next turn's lever, forgetting the last turn's
-    /// cancel, and report the turn's id.
-    fn claim(&self, sender: mpsc::Sender<()>) -> u64 {
+    /// cancel, and report the turn's id with the turn's fresh command lever.
+    fn claim(&self, sender: mpsc::Sender<()>) -> (u64, CancelToken) {
         let mut state = self.state();
         state.generation += 1;
         state.cancelled = false;
         state.sender = Some(sender);
-        state.generation
+        state.token = CancelToken::new();
+        (state.generation, state.token.clone())
     }
 
     /// Retire the lever, unless a newer turn already claimed it.
@@ -132,7 +135,6 @@ impl Agent {
         let config = OpenAIConfig::new()
             .with_api_base(base_url.into())
             .with_api_key(api_key.into());
-        let planning = policy.clone().read_only();
         Self {
             client: Client::with_config(config),
             model: model.into(),
@@ -140,9 +142,8 @@ impl Agent {
             max_rounds: MAX_TOOL_ROUNDS,
             mode: ChatMode::Default,
             writable: policy,
-            planning,
             runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
-            control: TurnControl::default(),
+            control: TurnHandle::default(),
         }
     }
 
@@ -163,10 +164,10 @@ impl Agent {
     }
 
     /// The policy the current mode runs tool calls under.
-    fn policy(&self) -> &Policy {
+    fn policy(&self) -> Policy {
         match self.mode {
-            ChatMode::Default => &self.writable,
-            ChatMode::Plan => &self.planning,
+            ChatMode::Default => self.writable.clone(),
+            ChatMode::Plan => self.writable.clone().read_only(),
         }
     }
 
@@ -183,7 +184,7 @@ impl Agent {
 
     /// The front end's lever on the running turn, for the pane to hold.
     #[inline]
-    pub fn control(&self) -> TurnControl {
+    pub fn handle(&self) -> TurnHandle {
         self.control.clone()
     }
 
@@ -214,11 +215,11 @@ impl Agent {
         // This turn's wake channel: the sender waits where Esc can reach it, and
         // the receiver races the stream inside the worker.
         let (esc_sender, receiver) = mpsc::channel(1);
-        let generation = self.control.claim(esc_sender);
+        let (generation, token) = self.control.claim(esc_sender);
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                agent.run(&transcript, receiver, &on_progress);
+                agent.run(&transcript, receiver, &token, &on_progress);
             }));
             // The turn is over: retire the lever unless a newer turn claimed it.
             agent.control.release(generation);
@@ -264,6 +265,7 @@ impl Agent {
         &self,
         transcript: &Transcript,
         mut cancel_rx: mpsc::Receiver<()>,
+        token: &CancelToken,
         on_progress: &F,
     ) {
         // Set once a cancel is consumed, so the rest of the turn's calls and rounds
@@ -466,6 +468,8 @@ impl Agent {
             }
 
             // Run the round's calls in order, then record the round as one group.
+            let policy = self.policy();
+            let tooling = tools::Tooling { policy: &policy, cancel: token };
             let mut exchanges = Vec::with_capacity(calls.len());
             // A call the harness cannot run ends the round, but is recorded with its
             // error so the round's earlier effects stay in the transcript.
@@ -477,7 +481,7 @@ impl Agent {
                     cancelled = true;
                     break;
                 }
-                match tools::execute(&call, self.policy(), on_progress) {
+                match tools::execute(&call, &tooling, on_progress) {
                     Ok(output) => exchanges.push((call, output)),
                     Err(error) => {
                         exchanges.push((call, format!("error: {error}")));
@@ -592,7 +596,8 @@ mod tests {
 
         // Plan: the workspace is not writable, the temp scratch alone is, and not edit
         agent.set_mode(ChatMode::Plan);
-        let writable = agent.policy().writable_roots();
+        let plan = agent.policy();
+        let writable = plan.writable_roots();
         assert_eq!(writable.len(), 1, "exactly the scratch root: {writable:?}");
         let scratch =
             std::fs::canonicalize(std::env::temp_dir()).expect("the temp dir canonicalizes");
@@ -618,11 +623,11 @@ mod tests {
     /// a stale release must not retire a newer turn's lever.
     #[test]
     fn turn_control_cancel_is_generation_owned() {
-        let control = TurnControl::default();
+        let control = TurnHandle::default();
 
         // Claiming resets the cancel and installs the wake sender.
         let (sender, mut rx) = mpsc::channel(1);
-        let first = control.claim(sender);
+        let (first, _) = control.claim(sender);
         assert!(!control.cancelled(&mut rx));
 
         // Cancel pokes the claimed sender; the drained flag decides.
@@ -631,7 +636,7 @@ mod tests {
 
         // A stale release must not retire the newer turn's lever.
         let (sender, _) = mpsc::channel(1);
-        let second = control.claim(sender);
+        let (second, _) = control.claim(sender);
         control.release(first);
         control.cancel();
         assert!(control.cancelled(&mut rx));
@@ -639,6 +644,23 @@ mod tests {
         // Retiring the right turn clears its cancel for the next one.
         control.release(second);
         assert!(!control.cancelled(&mut rx));
+    }
+
+    /// Cancelling a turn kills the commands of the turn that claimed the lever,
+    /// and only those: the next claim mints a fresh command lever.
+    #[test]
+    fn cancel_kills_the_claims_commands_and_no_one_elses() {
+        let control = TurnHandle::default();
+
+        let (sender, _) = mpsc::channel(1);
+        let (_, first) = control.claim(sender);
+        control.cancel();
+        assert!(first.cancelled());
+
+        // A fresh claim is not born cancelled: the prior cancel died with its turn.
+        let (sender, _) = mpsc::channel(1);
+        let (_, second) = control.claim(sender);
+        assert!(!second.cancelled());
     }
 
     /// A cancel mid-stream keeps the partial answer and ends the turn
@@ -664,23 +686,23 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let interrupt = {
             let log = log.clone();
-            let control = agent.control();
+            let handle = agent.handle();
             std::thread::spawn(move || {
                 while !log.lock().unwrap().iter().any(|entry| entry.contains(" a time")) {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                control.cancel();
+                handle.cancel();
             })
         };
 
         // Drive the generation as `spawn` would: claim, run, retire.
         let (sender, receiver) = mpsc::channel(1);
-        let control = agent.control();
-        let generation = control.claim(sender);
-        agent.run(&transcript, receiver, &|progress| {
+        let handle = agent.handle();
+        let (generation, token) = handle.claim(sender);
+        agent.run(&transcript, receiver, &token, &|progress| {
             log.lock().unwrap().push(format!("{progress:?}"));
         });
-        control.release(generation);
+        handle.release(generation);
         interrupt.join().expect("the interrupter exits");
 
         // The turn ends with exactly one terminal event: the cancel.
