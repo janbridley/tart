@@ -16,7 +16,7 @@ use ratatui::{Frame, symbols};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
-use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnControl, prompts};
+use tart_agents::{Agent, ChatMode, Progress, Transcript as Conversation, TurnHandle, prompts};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) use editor::{Editor, g_to_byte, graphemes};
@@ -192,7 +192,7 @@ pub struct Pane {
     /// turn's user message when the turn ends. Only one message is queued at a time.
     queued: Option<String>,
     /// The agent's turn lever: queueing a message cancels the running turn.
-    control: TurnControl,
+    control: TurnHandle,
 }
 
 impl Pane {
@@ -668,7 +668,7 @@ impl Pane {
     }
 
     /// Wire the pane to the agent's turn control.
-    pub fn set_control(&mut self, control: TurnControl) {
+    pub fn set_control(&mut self, control: TurnHandle) {
         self.control = control;
     }
 
