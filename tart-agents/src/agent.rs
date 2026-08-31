@@ -556,12 +556,8 @@ impl Agent {
     }
 }
 
-/// A failure message with the last skipped transport error, if any, appended.
 fn with_last_error(message: &str, last_error: Option<String>) -> String {
-    match last_error {
-        Some(error) => format!("{message}: {error}"),
-        None => message.to_string(),
-    }
+    last_error.map_or_else(|| message.to_string(), |error| format!("{message}: {error}"))
 }
 
 /// The most consecutive rounds a dropped stream retries before failing.
