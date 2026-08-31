@@ -167,7 +167,7 @@ impl Agents {
 
         let inner = Arc::clone(&self.inner);
         agent.spawn(&transcript, move |progress| {
-            // A terminal outcome is stored — and its waiter woken — before
+            // A terminal outcome is stored and its waiter woken before
             // the event forwards, so whoever acts on the event always finds
             // the outcome already registered.
             let outcome = match &progress {
