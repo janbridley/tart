@@ -156,10 +156,13 @@ pub(crate) fn edit() -> Tool {
 pub(crate) fn spawn() -> Tool {
     tool(
         "spawn",
-        "Start a subagent on a self-contained task and return at once. The subagent runs \
-        independently with your tools (minus spawning) and its final message becomes its \
-        report; it is injected into your next conversation turn, or read it sooner with \
-        wait. At most 8 subagents run at once",
+        "Spawn a subagent for a well-scoped task. Returns an id immediately; the subagent \
+        runs independently with your tools (minus spawning) and its final message becomes \
+        its report, delivered to you by `wait` or on its own in a later turn. Only call \
+        this tool for a concrete, bounded subtask that can run independently alongside \
+        useful local work; otherwise continue locally. Do not spawn subagents unless the \
+        user explicitly asks for subagents, delegation, or parallel agent work. At most 8 \
+        subagents run or await delivery at once",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -175,16 +178,17 @@ pub(crate) fn spawn() -> Tool {
 pub(crate) fn wait() -> Tool {
     tool(
         "wait",
-        "Block until a spawned subagent ends, returning its report (or its failure); \
-        timeout_ms (1000-300000, default 30000) bounds the wait, after which the \
-        subagent is reported still running. Waiting is the join point: wait on \
-        every subagent whose result you need before proceeding, or its report \
-        arrives on its own in a later turn",
+        "Wait for a subagent to reach a final status, returning its report; timeout_ms \
+        (1000-300000, default 30000) bounds the wait, and returns saying it is still \
+        running when timed out. Prefer longer waits to avoid busy polling. A finished \
+        subagent's report also arrives on its own in a later turn, so call this very \
+        sparingly: only when you need the result immediately for the next critical-path \
+        step and are blocked until it returns",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "id": {"type": "integer", "description": "The subagent's id, as `spawn` reported it"},
-                "timeout_ms": {"type": "integer", "description": "Milliseconds to block before reporting the subagent still running; default 30000"}
+                "timeout_ms": {"type": "integer", "description": "Milliseconds to block before reporting the subagent still running; default 30000. Prefer longer waits to avoid busy polling"}
             },
             "required": ["id"]
         }),
