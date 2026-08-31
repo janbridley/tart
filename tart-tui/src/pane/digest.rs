@@ -27,7 +27,7 @@ fn display_name(name: &str) -> String {
 
 /// One call's digest: the field that names what it did, or the raw arguments
 /// when they do not parse or the tool is unknown.
-fn argument(name: &str, raw: &str) -> String {
+pub(crate) fn argument(name: &str, raw: &str) -> String {
     serde_json::from_str::<Value>(raw)
         .ok()
         .and_then(|args| match name {
