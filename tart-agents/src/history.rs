@@ -47,13 +47,15 @@ impl Transcript {
     }
 
     /// A transcript opening with the tart system prompt, followed by the
-    /// agent's `instructions` as a second system message.
+    /// agent's `instructions` as a second system message, when non-empty.
     #[inline]
     pub fn with_instructions(instructions: String) -> anyhow::Result<Self> {
-        let transcript = Self::new()?;
-        transcript
-            .items()
-            .push(input_message(Role::System, instructions)?);
+        let mut transcript = Self::new()?;
+        if !instructions.is_empty() {
+            transcript
+                .items()
+                .push(input_message(Role::System, instructions)?);
+        }
         Ok(transcript)
     }
 
@@ -275,6 +277,16 @@ mod tests {
 
         assert_eq!(items[1]["role"], "system");
         assert_eq!(items[1]["content"], "be terse");
+    }
+
+    #[test]
+    fn empty_instructions_are_skipped() {
+        let transcript = Transcript::with_instructions(String::new()).unwrap();
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+
+        assert_eq!(items.as_array().unwrap().len(), 1);
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[0]["content"], SYSTEM);
     }
 
     /// A reminder trails the record on every request, once, and doesn't hit record.
