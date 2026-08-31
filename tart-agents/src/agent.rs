@@ -1,5 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use async_openai::{
     Client,
@@ -268,12 +269,14 @@ impl Agent {
         token: &CancelToken,
         on_progress: &F,
     ) {
-        // Set once a cancel is consumed, so the rest of the turn's calls and rounds
-        // skip without re-reading the channel.
-        let mut cancelled = false;
-        for _ in 0..self.max_rounds {
+        // Completed rounds so far: a dropped stream retries its round without
+        // counting it, so a flaky connection cannot burn the budget.
+        let mut round = 0;
+        // Consecutive dropped streams; any completed round resets it.
+        let mut retries = 0;
+        while round < self.max_rounds {
             // A cancelled generation stops before spending another request.
-            if cancelled || self.control.cancelled(&mut cancel_rx) {
+            if self.control.cancelled(&mut cancel_rx) {
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
             // The sandboxed trio less `edit` in plan mode, plus web tools if available
@@ -304,7 +307,13 @@ impl Agent {
             {
                 Ok(stream) => stream,
                 Err(error) => {
-                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                    // A request that never opened dropped the round before recording,
+                    // so we can retry it
+                    let reason = error.to_string();
+                    if retry_dropped(on_progress, &reason, &mut retries) {
+                        continue;
+                    }
+                    return terminate_and_log(on_progress, Progress::Failed(reason));
                 }
             };
 
@@ -331,9 +340,7 @@ impl Agent {
                             continue;
                         }
                         // Esc won: dropping the stream keeps what it streamed.
-                        if !answer.is_empty()
-                            && let Err(error) = transcript.push_assistant(answer.clone())
-                        {
+                        if let Err(error) = record_answer(transcript, &answer) {
                             return terminate_and_log(
                                 on_progress,
                                 Progress::Failed(error.to_string()),
@@ -432,31 +439,25 @@ impl Agent {
                 }
             }
 
-            if call_in_flight {
-                return terminate_and_log(
-                    on_progress,
-                    Progress::Failed(with_last_error(
-                        "stream ended mid tool call",
-                        last_error, // The stream ended mid tool call
-                    )),
+            // A stream that broke before completing its round dropped it -> retry.
+            if call_in_flight || !saw_output {
+                let reason = with_last_error(
+                    if call_in_flight {
+                        "stream ended mid tool call"
+                    } else {
+                        "stream ended without output"
+                    },
+                    last_error,
                 );
-            }
-
-            if !saw_output {
-                return terminate_and_log(
-                    on_progress,
-                    Progress::Failed(with_last_error(
-                        "stream ended without output",
-                        last_error, // Nothing arrived at all
-                    )),
-                );
+                if retry_dropped(on_progress, &reason, &mut retries) {
+                    continue;
+                }
+                return terminate_and_log(on_progress, Progress::Failed(reason));
             }
 
             // No calls pending: this round's answer is the turn's message.
             if calls.is_empty() {
-                if !answer.is_empty()
-                    && let Err(error) = transcript.push_assistant(answer.clone())
-                {
+                if let Err(error) = record_answer(transcript, &answer) {
                     return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
                 }
                 return terminate_and_log(
@@ -477,8 +478,7 @@ impl Agent {
             for call in calls {
                 // A cancelled turn skips its remaining calls; the one in
                 // flight finishes first.
-                if cancelled || self.control.cancelled(&mut cancel_rx) {
-                    cancelled = true;
+                if self.control.cancelled(&mut cancel_rx) {
                     break;
                 }
                 match tools::execute(&call, &tooling, on_progress) {
@@ -497,24 +497,24 @@ impl Agent {
             {
                 transcript.push_reasoning(item);
             }
-            if !answer.is_empty()
-                && let Err(error) = transcript.push_assistant(std::mem::take(&mut answer))
-            {
+            if let Err(error) = record_answer(transcript, &answer) {
                 return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
             }
             transcript.push_tool_round(exchanges);
-            if cancelled {
+            if self.control.cancelled(&mut cancel_rx) {
                 // The turn stops here, keeping the rounds recorded so far.
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
             if let Some(reason) = failure {
                 return terminate_and_log(on_progress, Progress::Failed(reason));
             }
+            // The round completed and is recorded; the next one starts fresh.
+            round += 1;
+            retries = 0;
         }
-        let rounds = self.max_rounds;
         terminate_and_log(
             on_progress,
-            Progress::Failed(format!("gave up after {rounds} tool rounds")),
+            Progress::Failed(format!("gave up after {round} tool rounds")),
         );
     }
 }
@@ -525,6 +525,41 @@ fn with_last_error(message: &str, last_error: Option<String>) -> String {
         Some(error) => format!("{message}: {error}"),
         None => message.to_string(),
     }
+}
+
+/// The most consecutive rounds a dropped stream retries before failing.
+const MAX_STREAM_RETRIES: usize = 3;
+
+/// The pause before retrying a dropped stream.
+#[cfg(not(test))]
+const RETRY_PAUSE: Duration = Duration::from_secs(1);
+/// A test's pause is nothing, so budget tests run in milliseconds.
+#[cfg(test)]
+const RETRY_PAUSE: Duration = Duration::from_millis(1);
+
+/// Count one dropped round, reporting the retry and pausing while one remains.
+///
+/// Returns whether the round should re-run. `false` means the caller fails the
+/// turn with the reason. A completed round resets the count, so three *consecutive*
+/// drops end the turn.
+fn retry_dropped<F: Fn(Progress)>(on_progress: &F, reason: &str, retries: &mut usize) -> bool {
+    *retries += 1;
+    if *retries > MAX_STREAM_RETRIES {
+        return false;
+    }
+    on_progress(Progress::Note(format!(
+        "{reason}; retry {retries}/{MAX_STREAM_RETRIES}"
+    )));
+    std::thread::sleep(RETRY_PAUSE);
+    true
+}
+
+/// Record the answer a round streamed, when it streamed one at all.
+fn record_answer(transcript: &Transcript, answer: &str) -> anyhow::Result<()> {
+    if answer.is_empty() {
+        return Ok(());
+    }
+    transcript.push_assistant(answer.to_string())
 }
 
 /// Deliver the generation's terminal event, mirroring its outcome to the debug lob.
@@ -719,6 +754,94 @@ mod tests {
         assert_eq!(items[2]["content"], "Once upon a time");
 
         server.join().expect("the server exits");
+    }
+
+    /// The retry budget: each drop reports its retry, and the fourth
+    /// consecutive one ends the turn instead.
+    #[test]
+    fn three_consecutive_drops_then_give_up() {
+        let notes = Mutex::new(Vec::new());
+        let mut retries = 0;
+        // Keep dropping until `retry_dropped` stops offering a retry.
+        while retry_dropped(
+            &|progress| {
+                if let Progress::Note(text) = progress {
+                    notes.lock().unwrap().push(text);
+                }
+            },
+            "stream ended without output",
+            &mut retries,
+        ) {}
+
+        let notes = notes.lock().unwrap();
+        assert_eq!(
+            *notes,
+            vec![
+                "stream ended without output; retry 1/3",
+                "stream ended without output; retry 2/3",
+                "stream ended without output; retry 3/3",
+            ],
+        );
+        // The count a completed round resets.
+        assert_eq!(retries, 4);
+    }
+
+    /// A stream that delivers nothing and closes drops its round; the retry
+    /// re-sends the request verbatim and the turn completes on the second one.
+    #[test]
+    fn a_dropped_stream_retries_its_round() {
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("tell me a story".to_string())
+            .expect("the user turn records");
+
+        // The first request answers with an empty stream that closes at once;
+        // the retried request gets the complete one, so only the retry ends
+        // the turn.
+        let server = std::thread::spawn(move || {
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let (mut stream, _) = listener.accept().expect("the first client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            drop(stream);
+            let (mut stream, _) = listener.accept().expect("the retried client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            let event = serde_json::to_string(&delta("Once upon a time")).expect("serializes");
+            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            let _ = stream.flush();
+        });
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (sender, receiver) = mpsc::channel(1);
+        let handle = agent.handle();
+        let (generation, token) = handle.claim(sender);
+        agent.run(&transcript, receiver, &token, &|progress| {
+            log.lock().unwrap().push(format!("{progress:?}"));
+        });
+        handle.release(generation);
+        server.join().expect("the server exits");
+
+        let log = log.lock().unwrap();
+        // The stall is visible as a note, and the retry completes the turn.
+        assert!(
+            log.iter().any(|entry| entry.contains("retry 1/3")),
+            "the retry is noted: {log:?}"
+        );
+        assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
+
+        // The dropped round recorded nothing: the answer is the only
+        // assistant item, exactly as a clean single-round turn would leave.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items.as_array().map(Vec::len), Some(3));
+        assert_eq!(items[2]["content"], "Once upon a time");
     }
 
     /// The loopback listener the worker test streams from, or `None` where the

@@ -47,4 +47,6 @@ pub enum Progress {
     Failed(String),
     /// The front end cancelled the turn and any partial answer that arrived is recorded
     Cancelled,
+    /// A transient bit of text that is *not* part of the session record.
+    Note(String),
 }

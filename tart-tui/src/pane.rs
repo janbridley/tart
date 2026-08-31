@@ -453,6 +453,8 @@ impl Pane {
             Progress::Usage { input, cached, output } => {
                 self.set_usage(*input, *cached, *output);
             }
+            // A transient note sits in the status line until sent.
+            Progress::Note(text) => self.note(text),
             // `Progress` is non-exhaustive; later variants need no handling yet.
             _ => {}
         }
