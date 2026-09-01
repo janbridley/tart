@@ -33,7 +33,7 @@ fn resolve(matches: &ArgMatches, home: Option<OsString>) -> anyhow::Result<PathB
 }
 
 fn command() -> Command {
-    Command::new("tart-tui")
+    Command::new("tart")
         .about("A terminal chat front end for the tart agent harness.")
         .arg(Arg::new("agents").long("agents").value_name("FILE").help(
             "TOML file describing the available agents [default: ~/.config/tart/providers.toml]",
