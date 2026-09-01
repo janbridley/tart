@@ -47,7 +47,7 @@ use tmux_override::{override_shift_up, restore_tmux};
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
-    let path = cli::agents_path();
+    let path = cli::agents_path()?;
     let config = config::Config::load(&path)?;
     let agent_config = config.default_agent()?;
     let label = agent_config.to_string();
