@@ -1,6 +1,4 @@
-# Needles reading a provider error as refused outright — auth, money,
-# moderation — so retrying is the backoff in front of the same death:
-# substrings of the lowercased error text, one per line, `#` comments aside.
+# Needles reading a provider error as refused outright (auth, money, moderation)
 
 unauthorized
 forbidden

@@ -226,6 +226,22 @@ impl Agent {
         self.effort = Some(effort);
     }
 
+    /// Swap the model, keeping its runtime, policies, subagents, and turn lever.
+    #[inline]
+    pub fn set_model<U: Into<String>, K: Into<String>, M: Into<String>>(
+        &mut self,
+        base_url: U,
+        api_key: K,
+        model: M,
+    ) {
+        let config = OpenAIConfig::new()
+            .with_api_base(base_url.into())
+            .with_api_key(api_key.into());
+        self.client = Client::with_config(config);
+        self.model = model.into();
+        self.effort = None;
+    }
+
     /// Run one generation on its own thread, reporting progress to `on_progress`.
     ///
     /// The worker records its turns (reasoning, tool exchanges, final answer) into the
@@ -641,6 +657,20 @@ mod tests {
         for thread in threads {
             thread.join().expect("a blocked thread comes back");
         }
+    }
+
+    /// `/model` swaps the endpoint and model, keeping the runtime, policies, and turn
+    #[test]
+    fn set_model_swaps_the_endpoint_and_resets_effort() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
+        agent.set_reasoning_effort(ReasoningEffort::High);
+
+        agent.set_model("https://api.deepseek.com", "key2", "glm-4-flash");
+        assert_eq!(agent.model, "glm-4-flash");
+        assert_eq!(agent.effort, None, "the previous agent's effort is left behind");
+        // The lever, runtime, and mode survive the swap.
+        assert_eq!(agent.mode(), ChatMode::Default);
     }
 
     /// Plan mode runs under the read-only twin of the Default policy and witholds

@@ -9,7 +9,8 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use itertools::Itertools;
 use serde::Deserialize;
-use tart_agents::ReasoningEffort;
+use tart_agents::sandbox::Policy;
+use tart_agents::{Agent, ReasoningEffort};
 
 /// A parsed agents file. `default_agent` picks the agent the TUI runs.
 #[derive(Debug)]
@@ -20,17 +21,16 @@ pub(crate) struct Config {
 }
 
 /// The agent the TUI wires into its loop, with its API key resolved.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ResolvedAgent {
-    /// The provider's display name; the table key when no label is set.
+    /// The provider's table key.
     pub(crate) provider: String,
+    /// The agent's name.
     pub(crate) name: String,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
-    /// Extra system prompt, appended after the built-in one.
-    pub(crate) instructions: Option<String>,
     /// The model's context window, for the status line's token gauge.
     pub(crate) context_tokens: Option<u64>,
 }
@@ -42,12 +42,39 @@ impl fmt::Display for ResolvedAgent {
     }
 }
 
+impl ResolvedAgent {
+    /// Consume the resolution and a Policy into the loop's agent.
+    pub(crate) fn into_agent(self, policy: Policy) -> Agent {
+        let mut agent = Agent::new(self.base_url, self.api_key, self.model, policy);
+        if let Some(effort) = self.effort {
+            agent = agent.reasoning_effort(effort);
+        }
+        agent
+    }
+}
+
+/// One row of the `/model` chooser: an agent as the picker lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentChoice {
+    /// The provider's table key, so a pick resolves back to its agent.
+    pub(crate) provider: String,
+    /// The agent's name, unique within its provider.
+    pub(crate) name: String,
+    /// The model id, making rows self-describing and searchable.
+    pub(crate) model: String,
+}
+
+/// The chooser row: "provider · agent · model", e.g. "zai · tart · glm-5.3".
+impl fmt::Display for AgentChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} · {} · {}", self.provider, self.name, self.model)
+    }
+}
+
 /// One provider table: a base URL, a credential, and the agents behind it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Provider {
-    /// Display label; defaults to the table key.
-    label: Option<String>,
     base_url: String,
     api_key: Auth,
     #[serde(default)]
@@ -79,7 +106,6 @@ struct AgentSpec {
     name: String,
     model: String,
     reasoning_effort: Option<ReasoningEffort>,
-    instructions: Option<String>,
     context_tokens: Option<u64>,
 }
 
@@ -118,33 +144,68 @@ impl Config {
 
     /// Resolve the default agent: look it up, obtain its API key.
     pub(crate) fn default_agent(&self) -> anyhow::Result<ResolvedAgent> {
-        let key = &self.default_agent.provider;
+        self.resolve(&self.default_agent.provider, &self.default_agent.name)
+    }
+
+    /// Look up the agent `name` under provider `key`, obtaining its API key:
+    /// the default agent's resolution, or a `/model` pick's.
+    pub(crate) fn resolve(&self, key: &str, name: &str) -> anyhow::Result<ResolvedAgent> {
         let provider = self.providers.get(key).ok_or_else(|| {
             let defined = self.providers.keys().map(String::as_str).join(", ");
-            anyhow::anyhow!(
-                "default_agent names provider '{key}', which is not defined (defined: {defined})"
-            )
+            anyhow::anyhow!("no provider named '{key}' is defined (defined: {defined})")
         })?;
-        let target = &self.default_agent.name;
-        let agent = provider
-            .agents
-            .iter()
-            .find(|a| &a.name == target)
-            .ok_or_else(|| {
-                let has = provider.agents.iter().map(|a| a.name.as_str()).join(", ");
-                anyhow::anyhow!("provider [{key}] has no agent named '{target}' (has: {has})")
-            })?;
+        let agent = provider.agents.iter().find(|a| a.name == name).ok_or_else(|| {
+            let has = provider.agents.iter().map(|a| a.name.as_str()).join(", ");
+            anyhow::anyhow!("provider [{key}] has no agent named '{name}' (has: {has})")
+        })?;
 
         Ok(ResolvedAgent {
-            provider: provider.label.as_deref().unwrap_or(key).to_owned(),
+            provider: key.to_owned(),
             name: agent.name.clone(),
             base_url: provider.base_url.clone(),
             api_key: resolve_api_key(key, &provider.api_key)?,
             model: agent.model.clone(),
             effort: agent.reasoning_effort.clone(),
-            instructions: agent.instructions.clone(),
             context_tokens: agent.context_tokens,
         })
+    }
+
+    /// Every defined agent, providers in table order: the rows `/model` lists.
+    ///
+    /// Providers without agents are skipped; their keys resolve nothing.
+    pub(crate) fn agents(&self) -> Vec<AgentChoice> {
+        self.providers
+            .iter()
+            .filter(|(_, provider)| !provider.agents.is_empty())
+            .flat_map(|(key, provider)| {
+                provider.agents.iter().map(move |agent| AgentChoice {
+                    provider: key.clone(),
+                    name: agent.name.clone(),
+                    model: agent.model.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Swap `agent` to the picked row and note it, or note why not. A pick
+    /// that fails to resolve leaves the running agent be.
+    pub(crate) fn swap(
+        &self,
+        choice: &AgentChoice,
+        agent: &mut Agent,
+        pane: &mut crate::pane::Pane,
+    ) {
+        match self.resolve(&choice.provider, &choice.name) {
+            Ok(next) => {
+                agent.set_model(next.base_url.clone(), next.api_key.clone(), next.model.clone());
+                if let Some(effort) = next.effort.clone() {
+                    agent.set_reasoning_effort(effort);
+                }
+                pane.set_context_tokens(next.context_tokens);
+                pane.note(format!("model: {next}"));
+            }
+            Err(error) => pane.note(error.to_string()),
+        }
     }
 }
 
@@ -195,7 +256,6 @@ provider = "zai"
 name = "tart"
 
 [zai]
-label = "z.ai"
 base_url = "https://api.z.ai/api/v1"
 api_key = ["echo", "secret-key"]
 
@@ -203,30 +263,57 @@ api_key = ["echo", "secret-key"]
 name = "tart"
 model = "glm-5.3"
 reasoning_effort = "high"
-instructions = "Write performant, safe code."
 "#;
 
     #[test]
     fn minimal_file_resolves_the_default_agent() {
         let agent = Config::parse(MINIMAL).unwrap().default_agent().unwrap();
 
-        assert_eq!(agent.to_string(), "z.ai · tart");
+        assert_eq!(agent.to_string(), "zai · tart");
         assert_eq!(agent.base_url, "https://api.z.ai/api/v1");
         assert_eq!(agent.api_key, "secret-key");
         assert_eq!(agent.model, "glm-5.3");
         assert_eq!(agent.effort, Some(ReasoningEffort::High));
-        assert_eq!(
-            agent.instructions.as_deref(),
-            Some("Write performant, safe code.")
-        );
     }
 
     #[test]
-    fn label_falls_back_to_the_table_key() {
-        let text = MINIMAL.replacen("\nlabel = \"z.ai\"\nbase_url", "\nbase_url", 1);
-        let agent = Config::parse(&text).unwrap().default_agent().unwrap();
+    fn a_label_key_is_an_error() {
+        // The table key is the provider's only name; `label` is not a field.
+        let text = format!(
+            "{MINIMAL}\n[weird]\nlabel = \"x\"\nbase_url = \"https://x.example\"\napi_key = \"PATH\"\n"
+        );
+        let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
-        assert_eq!(agent.to_string(), "zai · tart");
+        assert!(error.contains("label"), "{error}");
+    }
+
+    /// A resolution consumes into a runnable agent: the endpoint, key, model, & effort
+    #[test]
+    fn a_resolution_consumes_into_the_agent() {
+        let spec = Config::parse(MINIMAL).unwrap().default_agent().unwrap();
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+
+        // Constructing is the assertion: the effort wires through without error.
+        let _agent = spec.into_agent(policy);
+    }
+
+    /// The shipped example file parses and lists its agents: the spec and its
+    /// demonstration cannot drift apart. Compile-time `include_str!`, so the
+    /// test never depends on the working directory.
+    #[test]
+    fn the_example_config_parses() {
+        let config = Config::parse(include_str!("../../providers-example-config.toml"))
+            .expect("the example config is valid");
+
+        let rows = config.agents();
+        assert!(
+            rows.contains(&AgentChoice {
+                provider: "z.ai".to_string(),
+                name: "Coding Specialist".to_string(),
+                model: "glm-5.3".to_string(),
+            }),
+            "the quoted dotted key lists its agents: {rows:?}"
+        );
     }
 
     #[test]
@@ -321,14 +408,11 @@ instructions = "Write performant, safe code."
 
     #[test]
     fn unknown_agent_key_is_an_error() {
-        let text = MINIMAL.replacen(
-            "instructions = \"Write performant, safe code.\"",
-            "instruction = \"Write performant, safe code.\"",
-            1,
-        );
+        let text =
+            MINIMAL.replacen("reasoning_effort = \"high\"", "reasoning_efforts = \"high\"", 1);
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
-        assert!(error.contains("instruction"), "{error}");
+        assert!(error.contains("reasoning_efforts"), "{error}");
     }
 
     #[test]
@@ -394,5 +478,42 @@ instructions = "Write performant, safe code."
             .to_string();
 
         assert!(error.contains("TART_NO_SUCH_ENVIRONMENT_VARIABLE"), "{error}");
+    }
+
+    /// The `/model` rows: every agent across providers, providers in table
+    /// order, the label falling back to the table key.
+    #[test]
+    fn agents_list_every_defined_agent_in_provider_order() {
+        let text = format!(
+            "{MINIMAL}\n[deepseek]\nbase_url = \"https://api.deepseek.com\"\napi_key = \"PATH\"\n\
+             \n[[deepseek.agents]]\nname = \"Explore\"\nmodel = \"deepseek-v4-flash\"\n"
+        );
+        let agents = Config::parse(&text).unwrap().agents();
+
+        assert_eq!(
+            agents.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["deepseek · Explore · deepseek-v4-flash", "zai · tart · glm-5.3"],
+        );
+        // A row carries its table key and agent name, so a pick resolves back.
+        let pick = &agents[1];
+        assert_eq!((pick.provider.as_str(), pick.name.as_str()), ("zai", "tart"));
+    }
+
+    /// Resolution is not the default agent's alone: `/model` picks resolve too.
+    #[test]
+    fn resolve_finds_any_agent_not_just_the_default() {
+        let text = format!(
+            "{MINIMAL}\n[[zai.agents]]\nname = \"History Expert\"\nmodel = \"glm-5.3-flash\"\n\
+             reasoning_effort = \"low\"\n"
+        );
+        let config = Config::parse(&text).unwrap();
+        let agent = config.resolve("zai", "History Expert").unwrap();
+
+        assert_eq!(agent.to_string(), "zai · History Expert");
+        assert_eq!(agent.model, "glm-5.3-flash");
+        assert_eq!(agent.effort, Some(ReasoningEffort::Low));
+        assert_eq!(agent.provider, "zai");
+        // The default agent is still the default.
+        assert_eq!(config.default_agent().unwrap().name, "tart");
     }
 }

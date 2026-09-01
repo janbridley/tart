@@ -46,19 +46,6 @@ impl Transcript {
         })
     }
 
-    /// A transcript opening with the tart system prompt, followed by the
-    /// agent's `instructions` as a second system message, when non-empty.
-    #[inline]
-    pub fn with_instructions(instructions: String) -> anyhow::Result<Self> {
-        let transcript = Self::new()?;
-        if !instructions.is_empty() {
-            transcript
-                .items()
-                .push(input_message(Role::System, instructions)?);
-        }
-        Ok(transcript)
-    }
-
     /// A transcript over `items`, as a session file restored them.
     #[inline]
     pub(crate) fn from_items(items: Vec<InputItem>) -> Self {
@@ -270,29 +257,10 @@ mod tests {
         assert_eq!(items[0]["content"], SYSTEM);
     }
 
-    #[test]
-    fn instructions_follow_the_system_prompt() {
-        let transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-
-        assert_eq!(items[1]["role"], "system");
-        assert_eq!(items[1]["content"], "be terse");
-    }
-
-    #[test]
-    fn empty_instructions_are_skipped() {
-        let transcript = Transcript::with_instructions(String::new()).unwrap();
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-
-        assert_eq!(items.as_array().unwrap().len(), 1);
-        assert_eq!(items[0]["role"], "system");
-        assert_eq!(items[0]["content"], SYSTEM);
-    }
-
     /// A reminder trails the record on every request, once, and doesn't hit record.
     #[test]
     fn a_reminder_trails_the_record_once() {
-        let mut transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
+        let mut transcript = Transcript::new().unwrap();
         transcript.push_user("look at the auth flow".to_string()).unwrap();
 
         // Without a reminder the request is exactly the stored record.
@@ -472,8 +440,13 @@ mod tests {
 
     #[test]
     fn clear_keeps_only_the_leading_system_items() {
-        let transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
-        transcript.push_user("hello".to_string()).unwrap();
+        // A record restored from an older tart's session file may open with a
+        // second system item; the whole leading block survives a clear.
+        let transcript = Transcript::from_items(vec![
+            input_message(Role::System, SYSTEM.to_string()).unwrap(),
+            input_message(Role::System, "be terse".to_string()).unwrap(),
+            input_message(Role::User, "hello".to_string()).unwrap(),
+        ]);
         transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
         transcript.push_assistant("hi".to_string()).unwrap();
 
@@ -484,7 +457,7 @@ mod tests {
         assert_eq!(items[0]["content"], SYSTEM);
         assert_eq!(items[1]["content"], "be terse");
 
-        // Without instructions, only the prompt survives.
+        // Without a second item, only the prompt survives.
         let plain = Transcript::new().unwrap();
         plain.push_user("hello".to_string()).unwrap();
         plain.clear();
@@ -547,7 +520,7 @@ mod tests {
         use Progress::{Answer, Thinking, ToolOutput, ToolStart, User};
 
         // System items replay as nothing.
-        let transcript = Transcript::with_instructions("be terse".to_string()).unwrap();
+        let transcript = Transcript::new().unwrap();
         assert!(transcript.replay().is_empty());
 
         transcript.push_user("run it".to_string()).unwrap();

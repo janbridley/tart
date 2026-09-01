@@ -35,6 +35,16 @@ pub(crate) fn derive_query(editor: &Editor) -> Option<(String, usize)> {
     (word_start && inside).then(|| (word.to_string(), at))
 }
 
+/// Everything preceding a `/resume` or `/model` command, used to filter results.
+///
+/// `command` is the leading word, e.g. `"/resume"` or `"/model"`; the rest of
+/// the line is returned as the query, or `None` when the prefix isn't live.
+pub(crate) fn command_query(editor: &Editor, command: &str) -> Option<String> {
+    let line = &editor.lines[editor.line];
+    let rest = line.strip_prefix(command)?;
+    (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim_start().to_string())
+}
+
 /// The argument under the caret, as a file to complete.
 pub(crate) fn derive_argument(editor: &Editor) -> Option<(String, usize)> {
     let line = &editor.lines[editor.line];
@@ -323,11 +333,65 @@ pub(crate) fn update(popup: &mut Option<Popup>, query: Option<(String, usize)>, 
     match popup {
         // An unchanged query refilters nothing: set_query no-ops on it.
         Some(Popup::Files(p)) => p.set_query(query),
-        Some(Popup::Sessions(_)) | None if rearm => {
+        Some(Popup::Sessions(_) | Popup::Models(_)) | None if rearm => {
             *popup = Some(Popup::Files(FilePopup::complete(&query)));
         }
         _ => {}
     }
+}
+
+/// The `/resume` and `/model` choosers share this shape: a fuzzy `FilePopup` over rows.
+pub(crate) struct Picker<T> {
+    /// Fuzzy matcher and list machinery.
+    pub(crate) popup: FilePopup,
+    /// Rows paired with the values they select, for `selected` to recover.
+    picks: Vec<(T, String)>,
+}
+
+impl<T> Picker<T> {
+    /// A chooser over `picks`, listed by label and filtered by `query`.
+    pub(crate) fn from_picks(picks: Vec<(T, String)>, query: String) -> Self {
+        let rows = picks.iter().map(|(_, label)| label.clone()).collect();
+        Self {
+            popup: FilePopup::from_files(rows, query),
+            picks,
+        }
+    }
+
+    /// The pick behind the highlighted row, if any.
+    pub(crate) fn selected(&self) -> Option<&T> {
+        let row = self.popup.selected()?;
+        self.picks
+            .iter()
+            .find(|(_, label)| label == row)
+            .map(|(pick, _)| pick)
+    }
+
+    /// Move the highlight up one row.
+    pub(crate) fn select_prev(&mut self) {
+        self.popup.select_prev();
+    }
+
+    /// Move the highlight down one row.
+    pub(crate) fn select_next(&mut self) {
+        self.popup.select_next();
+    }
+
+    /// Point the picker at a new query, refiltering when it changed.
+    pub(crate) fn set_query(&mut self, query: String) {
+        self.popup.set_query(query);
+    }
+}
+
+/// Draw a picker's rows above `anchor`, titled `title` with the given hint.
+pub(crate) fn render_picker<T>(
+    picker: &mut Picker<T>,
+    frame: &mut Frame,
+    anchor: Rect,
+    title: &str,
+    hint: &str,
+) {
+    picker.popup.render(frame, anchor, title, hint);
 }
 
 #[cfg(test)]

@@ -41,32 +41,23 @@ use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
     ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
 };
+
 use tmux_override::{override_shift_up, restore_tmux};
 
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
     let path = cli::agents_path();
-    let agent_config = config::Config::load(&path)?.default_agent()?;
+    let config = config::Config::load(&path)?;
+    let agent_config = config.default_agent()?;
     let label = agent_config.to_string();
+    let context_tokens = agent_config.context_tokens;
     let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
-    let mut agent = Agent::new(
-        agent_config.base_url,
-        agent_config.api_key,
-        agent_config.model,
-        policy,
-    );
-    if let Some(effort) = agent_config.effort {
-        agent = agent.reasoning_effort(effort);
-    }
+    let mut agent = agent_config.into_agent(policy);
     let root = &SESSIONS_ROOT;
     let cwd = std::env::current_dir()?;
     let mut session = Session::start(root, &cwd);
-    // A fresh conversation opens on the configured prompt and instructions.
-    let transcript = match agent_config.instructions {
-        Some(instructions) => Transcript::with_instructions(instructions)?,
-        None => Transcript::new()?,
-    };
+    let transcript = Transcript::new()?;
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
@@ -80,10 +71,16 @@ fn main() -> anyhow::Result<()> {
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
     pane.set_control(agent.handle());
     pane.note(format!("tart · {label}"));
-    if let Some(tokens) = agent_config.context_tokens {
-        pane.set_context_tokens(tokens);
-    }
-    let result = run(&mut terminal, &mut agent, transcript, &mut session, &mut pane);
+    pane.set_context_tokens(context_tokens);
+    pane.set_models(config.agents());
+    let result = run(
+        &mut terminal,
+        &mut agent,
+        transcript,
+        &mut session,
+        &mut pane,
+        &config,
+    );
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
@@ -138,6 +135,7 @@ fn run(
     mut transcript: Transcript,
     session: &mut Session,
     pane: &mut Pane,
+    config: &config::Config,
 ) -> anyhow::Result<()> {
     // The sandbox's grant root, for deciding which mentions need attaching.
     let cwd = std::env::current_dir()?;
@@ -270,6 +268,15 @@ fn run(
                     _ if line.trim().starts_with("/resume") => {
                         pane.note("type /resume and pick a session as you type");
                     }
+                    // A submitted `/model` line means the chooser was closed;
+                    // it opens by itself while the line is being typed.
+                    _ if line
+                        .trim()
+                        .strip_prefix("/model")
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')) =>
+                    {
+                        pane.note("type /model and pick an agent as you type");
+                    }
                     // Set how hard the model reasons.
                     _ if let Some(arg) = line.trim().strip_prefix("/effort") => {
                         let arg = arg.trim();
@@ -288,7 +295,7 @@ fn run(
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ if line.trim().starts_with('/') => pane.note(format!(
-                        "unknown command {} · /clear /resume /plan /effort /agents /stop /perf /quit",
+                        "unknown command {} · /clear /resume /model /plan /effort /agents /stop /perf /quit",
                         line.split_whitespace().next().unwrap_or_default()
                     )),
                     _ => {
@@ -324,7 +331,10 @@ fn run(
                     }
                     // A file too damaged to open just puts the error into our pane.
                     Err(error) => pane.note(error.to_string()),
-                },
+                }
+                // An agent picked in the `/model` chooser: swap the endpoint,
+                // the model, and the effort for the next turn.
+                Some(PaneEvent::Model(choice)) => config.swap(&choice, agent, pane),
                 None => {}
             },
             Ok(Wake::Input(Event::Paste(text))) => pane.on_paste(&text),
@@ -428,8 +438,7 @@ fn on_main_event(
     Ok(())
 }
 
-/// Apply one child event: its box, its spend, and — once it has ended with no
-/// turn running — the delivery of its report.
+/// Apply one child event: its box, its spend, and, once it has ended, its report.
 fn on_child_event(
     pane: &mut Pane,
     agent: &Agent,
