@@ -151,18 +151,19 @@ pub(crate) fn edit() -> Tool {
     )
 }
 
-/// The spawn tool; only the main agent is offered it.
+/// The `spawn_agent` tool; only the main agent is offered it.
 #[must_use]
-pub(crate) fn spawn() -> Tool {
+pub(crate) fn spawn_agent() -> Tool {
     tool(
-        "spawn",
+        "spawn_agent",
         "Spawn a subagent for a well-scoped task. Returns an id immediately; the subagent \
-        runs independently with your tools (minus `spawn` and `wait`) and its final message \
-        becomes its report, delivered to you by `wait` or on its own in a later turn. Only \
-        call this tool for a concrete, bounded subtask that can run independently alongside \
-        useful local work; otherwise continue locally. Do not spawn subagents unless the \
-        user explicitly asks for subagents, delegation, or parallel agent work. At most 8 \
-        subagents run or await delivery at once",
+        runs independently with your tools (minus `spawn_agent` and `check_agent`) and its \
+        final message becomes its report, delivered to you as a message when it finishes. \
+        `check_agent` can check for it without blocking, but waiting is never required. \
+        Only call this tool for a concrete, bounded subtask that can run independently \
+        alongside useful local work; otherwise continue locally. Do not spawn subagents \
+        unless the user explicitly asks for subagents, delegation, or parallel agent work. \
+        At most 8 subagents run or await delivery at once",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -173,20 +174,19 @@ pub(crate) fn spawn() -> Tool {
     )
 }
 
-/// The wait tool; only the main agent is offered it.
+/// The `check_agent` tool; only the main agent is offered it.
 #[must_use]
-pub(crate) fn wait() -> Tool {
+pub(crate) fn check_agent() -> Tool {
     tool(
-        "wait",
-        "Wait for a subagent to reach a final status, returning its report; a wait \
-        blocks at most 30 seconds, then reports the subagent still running. A finished \
-        subagent's report also arrives on its own in a later turn, so call this very \
-        sparingly: only when you need the result immediately for the next critical-path \
-        step and are blocked until it returns",
+        "check_agent",
+        "Check one subagent's status without blocking. Returns its report when it has \
+        finished (claiming it, so it will not also arrive as a message), or says it is \
+        still running: in which case end the turn and let the report arrive on its own \
+        instead of polling. Check only when the very next step is blocked on the result and you are unsure whether the agent is making progress.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "The subagent's id, as `spawn` reported it"}
+                "id": {"type": "integer", "description": "The subagent's id, as `spawn_agent` reported it"}
             },
             "required": ["id"]
         }),
@@ -297,20 +297,20 @@ fn parse_spawn(arguments: &str) -> anyhow::Result<Spawn> {
     Ok(Spawn { task: string_field(&args, "task")? })
 }
 
-/// One parsed wait tool call.
+/// One parsed `check_agent` tool call.
 #[derive(Debug)]
-struct Wait {
-    /// The subagent to wait on, as `spawn` reported it.
+struct Check {
+    /// The subagent to check on, as `spawn_agent` reported it.
     id: u64,
 }
 
-/// Extract the fields from a wait tool call's JSON arguments.
-fn parse_wait(arguments: &str) -> anyhow::Result<Wait> {
+/// Extract the fields from a `check_agent` tool call's JSON arguments.
+fn parse_check(arguments: &str) -> anyhow::Result<Check> {
     let args = parse_arguments(arguments)?;
-    Ok(Wait {
+    Ok(Check {
         id: args["id"]
             .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("wait needs an integer 'id'"))?,
+            .ok_or_else(|| anyhow::anyhow!("check_agent needs an integer 'id'"))?,
     })
 }
 
@@ -336,14 +336,14 @@ pub(crate) fn execute<F: Fn(Progress)>(
         "search" => web::run_search(call, on_progress),
         "fetch" => web::run_fetch(call, on_progress),
         // The subagent pair, offered to spawning agents only.
-        "spawn" => run_spawn(call, tools, on_progress),
-        "wait" => run_wait(call, tools, on_progress),
+        "spawn_agent" => run_spawn_agent(call, tools, on_progress),
+        "check_agent" => run_check_agent(call, tools, on_progress),
         other => misuse(call, on_progress, &anyhow::anyhow!("unknown tool: {other}")),
     }
 }
 
 /// Fork a subagent on the task and return at once.
-fn run_spawn<F: Fn(Progress)>(
+fn run_spawn_agent<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
@@ -372,14 +372,14 @@ fn run_spawn<F: Fn(Progress)>(
     })
 }
 
-/// Run one wait tool call, blocking until the subagent ends or the wait gives up.
-fn run_wait<F: Fn(Progress)>(
+/// Run one `check_agent` tool call: an instant check, never a block.
+fn run_check_agent<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
-    let wait = match parse_wait(&call.arguments) {
-        Ok(wait) => wait,
+    let check = match parse_check(&call.arguments) {
+        Ok(check) => check,
         Err(error) => return misuse(call, on_progress, &error),
     };
     // As with spawn: a call a subagent was never offered is content, not failure.
@@ -387,12 +387,12 @@ fn run_wait<F: Fn(Progress)>(
         return misuse(
             call,
             on_progress,
-            &anyhow::anyhow!("subagents have nothing to wait on"),
+            &anyhow::anyhow!("subagents have no subagents to check on"),
         );
     };
-    let id = wait.id;
+    let id = check.id;
     traced(call, on_progress, || {
-        match agents.wait(AgentId::from(id), tools.cancel) {
+        match agents.claim(AgentId::from(id)) {
             // Attribute errors from children as the wait's own error, as we can't
             // distinguish the two (TODO: fix?).
             Ok(Some(outcome)) => {
@@ -400,7 +400,11 @@ fn run_wait<F: Fn(Progress)>(
                 (text.clone(), text, Some(0))
             }
             Ok(None) => {
-                let text = format!("subagent {id} is still running; wait again");
+                let text = format!(
+                    "subagent {id} is still running; its report arrives as a \
+                     message when it finishes, so end the turn rather than \
+                     waiting for a result"
+                );
                 (text.clone(), text, None)
             }
             Err(error) => (error.to_string(), error.to_string(), None),
@@ -442,7 +446,7 @@ pub(crate) struct Tooling<'a> {
     pub(crate) cancel: &'a CancelToken,
     /// The subagent registry, when this agent can spawn.
     pub(crate) agents: Option<&'a Agents>,
-    /// The agent whose turn this is: the template a `spawn` clones.
+    /// The agent whose turn this is: the template a `spawn_agent` clones.
     pub(crate) template: &'a Agent,
 }
 
@@ -1445,11 +1449,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_wait_takes_an_integer_id_and_rejects_anything_else() {
-        assert_eq!(parse_wait(r#"{"id":2}"#).unwrap().id, 2);
+    fn parse_check_takes_an_integer_id_and_rejects_anything_else() {
+        assert_eq!(parse_check(r#"{"id":2}"#).unwrap().id, 2);
 
-        let error = parse_wait(r#"{"id":"two"}"#).unwrap_err().to_string();
-        assert!(error.contains("wait needs an integer 'id'"), "{error}");
+        let error = parse_check(r#"{"id":"two"}"#).unwrap_err().to_string();
+        assert!(error.contains("check_agent needs an integer 'id'"), "{error}");
     }
 
     /// A `read` tool call for `path`, optionally bounded to a line range.

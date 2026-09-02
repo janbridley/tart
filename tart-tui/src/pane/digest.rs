@@ -11,18 +11,23 @@ const LINE_CAP: usize = 60;
 pub(crate) fn tool_header(name: &str, arguments: &[String]) -> String {
     let digest = match name {
         "read" | "edit" => group_paths(name, arguments),
+        "check_agent" => group_ids(arguments),
         _ => arguments.iter().map(|raw| argument(name, raw)).join(", "),
     };
     format!("{}({})", display_name(name), one_line(&digest))
 }
 
-/// The wire name as shown: its first ASCII letter uppercased, e.g. `Bash`.
+/// The wire name as shown: each underscore-separated word capitalized and
+/// spaced, e.g. `bash` -> `Bash`, `check_agent` -> `Check Agent`.
 fn display_name(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
+    name.split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            let first = chars.next().unwrap_or_default().to_ascii_uppercase();
+            format!("{first}{}", chars.as_str())
+        })
+        .join(" ")
 }
 
 /// One call's digest: the field that names what it did, or the raw arguments
@@ -34,9 +39,9 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
             "bash" => args["command"].as_str().map(str::to_string),
             "fetch" => args["url"].as_str().map(str::to_string),
             "read" | "edit" => args["path"].as_str().map(str::to_string),
-            // The subagent pair: the task spawned, and the id waited on.
-            "spawn" => args["task"].as_str().map(str::to_string),
-            "wait" => args["id"].as_u64().map(|id| id.to_string()),
+            // The subagent pair: the task spawned, and the id checked on.
+            "spawn_agent" => args["task"].as_str().map(str::to_string),
+            "check_agent" => args["id"].as_u64().map(|id| id.to_string()),
             "search" => args["query"].as_str().map(|query| {
                 let news = args["news"].as_bool() == Some(true);
                 format!("{query}{}", if news { " [news]" } else { "" })
@@ -76,6 +81,25 @@ fn group_paths(name: &str, arguments: &[String]) -> String {
             _ => coalesce(path, spans),
         })
         .chain(loose)
+        .join(", ")
+}
+
+/// A run of `check_agent` calls, each id named once with its repeat count
+/// from the second check on, in first-checked order.
+fn group_ids(arguments: &[String]) -> String {
+    let mut grouped: Vec<(String, usize)> = Vec::new();
+    for digest in arguments.iter().map(|raw| argument("check_agent", raw)) {
+        match grouped.iter_mut().find(|(known, _)| *known == digest) {
+            Some((_, count)) => *count += 1,
+            None => grouped.push((digest, 1)),
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(digest, count)| match count {
+            more @ 2.. => format!("{digest} × {more}"),
+            _ => digest,
+        })
         .join(", ")
 }
 
@@ -130,6 +154,13 @@ mod tests {
             ("edit", r#"{"path":"src/main.rs"}"#, "Edit(src/main.rs)"),
             ("fetch", r#"{"url":"http://x"}"#, "Fetch(http://x)"),
             ("search", r#"{"query":"rust regex"}"#, "Search(rust regex)"),
+            // The subagent pair: the task spawned, the id checked on.
+            (
+                "spawn_agent",
+                r#"{"task":"find the flaky test"}"#,
+                "Spawn Agent(find the flaky test)",
+            ),
+            ("check_agent", r#"{"id":2}"#, "Check Agent(2)"),
             // A news search tags its query; the rest of the arguments stay out.
             ("search", news, "Search(elections [news])"),
             // A read carries its bounds: whole-file, closed, or open at an end.
@@ -137,9 +168,10 @@ mod tests {
             ("read", a12, "Read(a.rs:1-2)"),
             ("read", r#"{"path":"a.rs","start_line":28}"#, "Read(a.rs:28-)"),
             ("read", r#"{"path":"a.rs","end_line":12}"#, "Read(a.rs:-12)"),
-            // Odd names keep their lead and an empty one stays empty.
+            // Odd names keep their lead and an empty one stays empty; an
+            // underscore names a word break.
             ("Bash", r#"{"command":"ls"}"#, r#"Bash({"command":"ls"})"#),
-            ("_private", r#"{"path":"src"}"#, r#"_private({"path":"src"})"#),
+            ("_private", r#"{"path":"src"}"#, r#"Private({"path":"src"})"#),
             ("", "loose", "(loose)"),
             // Unparseable arguments and missing fields degrade to the raw string.
             ("bash", "not json", "Bash(not json)"),
@@ -215,6 +247,24 @@ mod tests {
             ("edit", &[b, a, a], "Edit(b.rs, a.rs × 2)"),
             ("edit", &[x, b], "Edit(x.py, b.rs)"),
             ("edit", &[x, "not json"], "Edit(x.py, not json)"),
+            // Checks name each id once, counting repeats the same way, in
+            // first-checked order; unparsed arguments ride along raw.
+            (
+                "check_agent",
+                &[r#"{"id":1}"#, r#"{"id":1}"#, r#"{"id":1}"#],
+                "Check Agent(1 × 3)",
+            ),
+            (
+                "check_agent",
+                &[r#"{"id":2}"#, r#"{"id":1}"#, r#"{"id":2}"#],
+                "Check Agent(2 × 2, 1)",
+            ),
+            ("check_agent", &[r#"{"id":7}"#], "Check Agent(7)"),
+            (
+                "check_agent",
+                &[r#"{"id":1}"#, "not json"],
+                "Check Agent(1, not json)",
+            ),
         ];
         for &(name, raws, expected) in calls {
             let arguments = raws.iter().map(ToString::to_string).collect::<Vec<_>>();
