@@ -187,7 +187,7 @@ impl Agent {
             .chain(
                 self.subagents
                     .iter()
-                    .flat_map(|_| [tools::spawn(), tools::wait()]),
+                    .flat_map(|_| [tools::spawn_agent(), tools::check_agent()]),
             )
             .collect()
     }
@@ -669,8 +669,8 @@ mod tests {
         assert_eq!(agent.mode(), ChatMode::Default);
         assert!(!agent.policy().writable_roots().is_empty());
         assert!(names(&agent.tools_for()).contains(&"edit"));
-        assert!(names(&agent.tools_for()).contains(&"spawn"));
-        assert!(names(&agent.tools_for()).contains(&"wait"));
+        assert!(names(&agent.tools_for()).contains(&"spawn_agent"));
+        assert!(names(&agent.tools_for()).contains(&"check_agent"));
 
         // Plan: the workspace is not writable, the temp scratch alone is, and not edit
         agent.set_mode(ChatMode::Plan);
@@ -1000,25 +1000,21 @@ mod tests {
         server.join().expect("the server exits");
     }
 
-    /// A wait that gives up hands its receiver back, so a later wait on the
-    /// same child still blocks instead of erroring.
+    /// A claim on a running child answers "still running" at once, as often
+    /// as asked: nothing blocks, so nothing has to recover from blocking.
     #[test]
-    fn a_giving_up_wait_can_be_repeated() {
-        // A listener that never accepts holds the child mid-request, so it
-        // stays running through both waits; the cancelled token makes each
-        // wait give up at its first poll.
+    fn a_claim_on_a_running_child_is_instant_and_repeatable() {
         let Some(listener) = loopback() else { return };
         let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
         let address = listener.local_addr().expect("a bound address");
         let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
         let agents = Agents::new(|_, _| {});
-        let id = agents.spawn(&agent, "outlive the waits").unwrap();
-        let token = CancelToken::new();
-        token.cancel();
+        let id = agents.spawn(&agent, "outlive the claims").unwrap();
 
-        assert!(agents.wait(id, &token).unwrap().is_none());
-        // Before the hand-back the receiver was gone and this errored.
-        assert!(agents.wait(id, &token).unwrap().is_none());
+        // A listener that never accepts holds the child mid-request, so it
+        // stays running through every claim.
+        assert!(agents.claim(id).unwrap().is_none());
+        assert!(agents.claim(id).unwrap().is_none());
     }
 
     #[test]
@@ -1050,9 +1046,8 @@ mod tests {
         let id = agents
             .spawn(&agent, "find the flaky test")
             .expect("the registry has room");
-        let outcome = agents
-            .wait(id, &CancelToken::new())
-            .expect("the child is registered");
+        settled(&agents, id);
+        let outcome = agents.claim(id).expect("the child is registered");
         assert_eq!(outcome, Some(crate::Outcome::Done(Some("found it".to_string()))));
         server.join().expect("the server exits");
 
@@ -1066,13 +1061,41 @@ mod tests {
 
         // The delivered report is gone: one delivery, and the slot is freed.
         assert_eq!(agents.take_outcome(id), None);
-        // The second wait says where the report went, so the model never
+        // The second claim says where the report went, so the model never
         // reads a delivered report as a lost one.
         let delivered = agents
-            .wait(id, &CancelToken::new())
+            .claim(id)
             .expect_err("the report left with the first delivery")
             .to_string();
         assert!(delivered.contains("already delivered"), "{delivered}");
+    }
+
+    /// A delivered report leaves a marker: a later wait for that id says
+    /// the report was delivered, while a wait for an id that never ran says
+    /// so.
+    #[test]
+    fn markers_split_delivered_from_never_ran() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let agent = Agent::new("http://localhost:9", "key", "model", policy);
+        let agents = crate::Agents::new(|_, _| {});
+
+        let never = agents
+            .claim(crate::AgentId::from(99))
+            .expect_err("no such subagent")
+            .to_string();
+        assert!(never.contains("never ran"), "{never}");
+        assert!(!never.contains("already delivered"), "{never}");
+
+        // The unreachable endpoint fails the child fast; the claim delivers.
+        let id = agents.spawn(&agent, "task").expect("a slot is free");
+        settled(&agents, id);
+        agents
+            .claim(id)
+            .expect("the child ended")
+            .expect("a failed child still reports");
+        let delivered = agents.claim(id).expect_err("one delivery only").to_string();
+        assert!(delivered.contains("already delivered"), "{delivered}");
+        assert!(!delivered.contains("never ran"), "{delivered}");
     }
 
     #[test]
@@ -1088,10 +1111,10 @@ mod tests {
         assert!(agents.spawn(&agent, "task").is_err(), "the slots are full");
 
         // The unreachable endpoint fails each child fast (a test's retry
-        // pause is 1ms); waiting delivers the report and prunes the child.
-        let token = CancelToken::new();
+        // pause is 1ms); the claim delivers the report and prunes the child.
         for id in ids {
-            let outcome = agents.wait(id, &token).expect("the child ends");
+            settled(&agents, id);
+            let outcome = agents.claim(id).expect("the child ended");
             assert!(outcome.is_some(), "a failed child still reports: {outcome:?}");
             assert_eq!(agents.take_outcome(id), None, "one delivery only");
         }
@@ -1099,6 +1122,16 @@ mod tests {
         agents
             .spawn(&agent, "task")
             .expect("the slots freed with the reports");
+    }
+
+    /// Settle a child the way the front end does: poll its stored outcome
+    /// until the worker reports one, bounded so a stuck child fails the test.
+    fn settled(agents: &crate::Agents, id: crate::AgentId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while agents.outcome(id).is_none() {
+            assert!(std::time::Instant::now() < deadline, "the child ends");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// The loopback listener the worker test streams from, or `None` where denied
