@@ -17,13 +17,17 @@ pub(crate) fn tool_header(name: &str, arguments: &[String]) -> String {
     format!("{}({})", display_name(name), one_line(&digest))
 }
 
-/// The wire name as shown: its first ASCII letter uppercased, e.g. `Bash`.
+/// The wire name as shown: each underscore-separated word capitalized and
+/// spaced, e.g. `bash` -> `Bash`, `check_agent` -> `Check Agent`.
 fn display_name(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
+    name.split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            let first = chars.next().unwrap_or_default().to_ascii_uppercase();
+            format!("{first}{}", chars.as_str())
+        })
+        .join(" ")
 }
 
 /// One call's digest: the field that names what it did, or the raw arguments
