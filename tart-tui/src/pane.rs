@@ -1259,7 +1259,6 @@ mod tests {
 
     use super::*;
     use crate::testutil::{draw, draw_backgrounds, draw_styles};
-    use tart_agents::CancelToken;
     use tart_agents::sandbox::Policy;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -1452,9 +1451,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // A waited report is claimed by the wait so delivery never sees it.
-        let waited = registry.wait(one, &CancelToken::new()).unwrap();
-        assert!(waited.is_some(), "the stored outcome waits: {waited:?}");
+        // A requested report is claimed so delivery never sees it.
+        let claimed = registry.claim(one).unwrap();
+        assert!(claimed.is_some(), "the stored outcome waits: {claimed:?}");
 
         pane.report(one);
         pane.report(two);
