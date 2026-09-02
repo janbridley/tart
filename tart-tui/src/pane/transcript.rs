@@ -221,11 +221,12 @@ impl Transcript {
     }
 
     /// Record a tool invocation's start; it renders as a running header until
-    /// finished. A `read` or `edit` following its own kind merges into that
-    /// trailing finished box instead of stacking a fresh one. Otherwise the
-    /// call supersedes every finished box before it, folding each down to its
-    /// header line, and moves the thinking block below itself so the
-    /// chain-of-thought always renders under the tool boxes.
+    /// finished. A `read`, `edit`, or `check_agent` following its own kind
+    /// merges into that trailing finished box instead of stacking a fresh
+    /// one. Otherwise the call supersedes every finished box before it,
+    /// folding each down to its header line, and moves the thinking block
+    /// below itself so the chain-of-thought always renders under the tool
+    /// boxes.
     pub(crate) fn start_tool(&mut self, id: String, name: String, arguments: String) {
         if self.merge_into_tail(&id, &name, &arguments) {
             return;
@@ -305,7 +306,7 @@ impl Transcript {
         else {
             return false;
         };
-        if !matches!(name, "read" | "edit")
+        if !matches!(name, "read" | "edit" | "check_agent")
             || !matches!(&self.messages[index],
                 Entry::Tool(tool) if tool.name == name && !tool.running)
         {
@@ -621,6 +622,16 @@ mod tests {
         t.start_tool(id.to_string(), "read".to_string(), arguments.to_string());
     }
 
+    /// Start a pending `check_agent` invocation, as the pane would on a
+    /// `ToolStart`
+    fn start_check(t: &mut Transcript, id: &str, agent: u64) {
+        t.start_tool(
+            id.to_string(),
+            "check_agent".to_string(),
+            format!(r#"{{"id":{agent}}}"#),
+        );
+    }
+
     #[test]
     fn a_delivered_report_box_shows_success() {
         let mut t = Transcript::default();
@@ -783,6 +794,50 @@ mod tests {
         let rows = texts(t.rows());
         assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 3);
         assert!(rows.iter().any(|row| row.contains("● Bash(echo hi) …")));
+    }
+
+    /// A run of `check_agent` calls folds into one box whose header names
+    /// each id once with its repeat count.
+    #[test]
+    fn check_agent_runs_merge_with_counted_ids() {
+        let mut t = Transcript::default();
+        t.push(Line::from("❯ go"));
+        t.begin_response();
+
+        start_check(&mut t, "c0", 1);
+        t.finish_tool(
+            "c0",
+            "subagent 1 is still running; its report arrives as a message when it \
+             finishes, so end the turn rather than holding it for the result"
+                .to_string(),
+            None,
+        );
+        for call in ["c1", "c2"] {
+            start_check(&mut t, call, 1);
+            t.finish_tool(call, "subagent 1 is still running".to_string(), None);
+        }
+        start_check(&mut t, "c3", 2);
+        t.sync(60);
+        let rows = texts(t.rows());
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("Check Agent(")).count(),
+            1,
+            "one merged box: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("● Check Agent(1 × 3, 2)")),
+            "{rows:?}"
+        );
+        t.assert_rows_match_full_rewrap();
+
+        // The newest output lands on the merged box, as with reads and edits.
+        t.finish_tool("c3", "subagent 2 finished: done".to_string(), Some(0));
+        t.sync(60);
+        assert!(
+            texts(t.rows())
+                .iter()
+                .any(|row| row.contains("⎿ subagent 2 finished: done"))
+        );
     }
 
     #[test]
