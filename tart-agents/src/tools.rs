@@ -403,7 +403,7 @@ fn run_check_agent<F: Fn(Progress)>(
                 let text = format!(
                     "subagent {id} is still running; its report arrives as a \
                      message when it finishes, so end the turn rather than \
-                     holding it for the result"
+                     waiting for a result"
                 );
                 (text.clone(), text, None)
             }
