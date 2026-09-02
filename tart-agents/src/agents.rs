@@ -1,21 +1,17 @@
 //! The process's registry of conversations: the main turn's lever and its subagents.
+//!
+//! A finished report is injected into the conversation as a message by the frontend. A
+//! model without work to do ends its turn, and the report wakes the conversation.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
 
-use crate::{Agent, CancelToken, Progress, Transcript, TurnHandle};
+use crate::{Agent, Progress, Transcript, TurnHandle};
 
 /// The subagent preamble, opening the child's first user message ahead of its task
 const AGENT_PROMPT: &str = include_str!("data/AGENT.md");
-
-/// How often a bounded `wait` wakes to check its cancel token.
-const WAIT_POLL: Duration = Duration::from_millis(100);
-
-/// How long a `wait` blocks before reporting the child still running.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One conversation in the process: the main one, or a subagent it spawned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -25,7 +21,7 @@ pub struct AgentId(u64);
 pub const MAIN: AgentId = AgentId(0);
 
 impl AgentId {
-    /// The id's number, as `spawn` reports it and `wait` takes it.
+    /// The id's number, as `spawn_agent` reports it and `check_agent` takes it.
     #[inline]
     #[must_use]
     pub const fn id(&self) -> u64 {
@@ -94,10 +90,6 @@ struct Child {
     handle: TurnHandle,
     /// Its terminal result, once its worker reported one and until it is taken.
     outcome: Option<Outcome>,
-    /// Where `wait` blocks for the outcome; taken by the first waiter.
-    terminal: Option<Receiver<Outcome>>,
-    /// The terminal channel's sending end, through which the worker reports.
-    sender: Sender<Outcome>,
 }
 
 /// Every conversation's lever in one place, so one key cancels them all.
@@ -110,8 +102,10 @@ pub struct Agents {
 struct Inner {
     /// MAIN's lever, adopted by the front end.
     main: Mutex<Option<TurnHandle>>,
-    /// Every spawned child, whose outcomes are waiting for injection or `wait`
+    /// Every spawned child, whose outcomes are waiting for injection or `check_agent`
     children: Mutex<Vec<(AgentId, Child)>>,
+    /// A record of the IDs of agents that have completed.
+    delivered: Mutex<HashSet<AgentId>>,
     /// The next child's id.
     next: AtomicU64,
     /// Where every child's progress goes, tagged with its id.
@@ -127,6 +121,7 @@ impl Agents {
             inner: Arc::new(Inner {
                 main: Mutex::new(None),
                 children: Mutex::new(Vec::new()),
+                delivered: Mutex::new(HashSet::new()),
                 next: AtomicU64::new(1),
                 events: Box::new(events),
             }),
@@ -154,15 +149,12 @@ impl Agents {
         // The subagent preamble, then the task, as one user turn
         let transcript = Transcript::new()?;
         transcript.push_user(format!("{AGENT_PROMPT}\n\n{task}"))?;
-        let (sender, terminal) = mpsc::channel::<Outcome>();
         self.inner.lock_children().push((
             id,
             Child {
                 task: task.to_string(),
                 handle: agent.handle(),
                 outcome: None,
-                terminal: Some(terminal),
-                sender,
             },
         ));
         // The box opens before any child event can arrive, so the front end
@@ -179,14 +171,11 @@ impl Agents {
 
         let inner = Arc::clone(&self.inner);
         agent.spawn(&transcript, move |progress| {
-            // A terminal outcome is stored and its waiter woken before
-            // the event forwards, so whoever acts on the event always finds
-            // the outcome already registered.
+            // A terminal outcome is stored before the event forwards, so
+            // whoever acts on the event always finds the outcome already
+            // registered
             if let Some(outcome) = progress.outcome() {
-                inner.with_child(id, |child| {
-                    child.outcome = Some(outcome.clone());
-                    let _ = child.sender.send(outcome);
-                });
+                inner.with_child(id, |child| child.outcome = Some(outcome.clone()));
             }
             (inner.events)(id, progress);
         });
@@ -201,17 +190,22 @@ impl Agents {
     }
 
     /// Claim the subagent's terminal result, with the task it ran: the one
-    /// delivery of that report, removing the child from the registry. `None`
-    /// when no such child exists, it is still running, or its report was
-    /// already delivered: one answer for all three.
+    /// delivery of that report, removing the child from the registry but
+    /// leaving a marker behind. `None` when no such child exists, it is
+    /// still running, or its report was already delivered; the marker is
+    /// what lets [`Agents::wait`] tell the last from the first.
     #[inline]
     pub fn take_outcome(&self, id: AgentId) -> Option<(String, Outcome)> {
         let mut children = self.inner.lock_children();
         let index = children.iter().position(|(sid, _)| *sid == id)?;
         // Taking the outcome delivers it: the child leaves the registry,
-        // freeing its slot.
-        let outcome = children[index].1.outcome.take();
-        outcome.map(|outcome| (children.remove(index).1.task, outcome))
+        // freeing its slot, and the marker records the delivery. A child
+        // with no outcome yet is still running, and stays registered.
+        children[index].1.outcome.take().map(|outcome| {
+            self.inner.lock_delivered().insert(id);
+            let (_, child) = children.remove(index);
+            (child.task, outcome)
+        })
     }
 
     /// The running subagents, as (id, task) for listing.
@@ -225,56 +219,31 @@ impl Agents {
             .collect()
     }
 
-    /// Block until the subagent ends, [`WAIT_TIMEOUT`] passes, or `cancel` fires.
+    /// The subagent's report right now, claiming it when it has one:
+    /// `Ok(Some(outcome))` for a finished subagent (this is the report's one
+    /// delivery, so the front end will not also inject it), `Ok(None)` while
+    /// it is still running, and an error when no such subagent ever ran or
+    /// its report was already delivered.
     ///
-    /// The registry's lock is never held while blocked: Esc's
-    /// [`Agents::cancel_all`] must reach the child whose end is the wakeup,
-    /// and it takes the lock to find the child.
     #[inline]
-    pub fn wait(&self, id: AgentId, cancel: &CancelToken) -> anyhow::Result<Option<Outcome>> {
+    pub fn claim(&self, id: AgentId) -> anyhow::Result<Option<Outcome>> {
         // An ended, undelivered child answers at once.
         if let Some((_, outcome)) = self.take_outcome(id) {
             return Ok(Some(outcome));
         }
-        let receiver = self
-            .inner
-            .with_child(id, |child| child.terminal.take())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no subagent {id}: it never ran, or its report was already \
-                     delivered into the conversation"
-                )
-            })?
-            .ok_or_else(|| anyhow::anyhow!("subagent {id} is already being waited on"))?;
-        // Off the lock: the child's terminal event is the wakeup.
-        let deadline = Instant::now() + WAIT_TIMEOUT;
-        loop {
-            match receiver.recv_timeout(WAIT_POLL) {
-                Ok(_) => {
-                    // The worker stored the outcome before sending, so the
-                    // take succeeds unless the front end delivered first.
-                    return match self.take_outcome(id) {
-                        Some((_, outcome)) => Ok(Some(outcome)),
-                        None => anyhow::bail!(
-                            "subagent {id}'s report was already delivered into the \
-                             conversation; it arrives as an incoming message"
-                        ),
-                    };
-                }
-                // A wait that gives up hands the receiver back, so a later wait for the
-                // same child still works
-                Err(RecvTimeoutError::Timeout)
-                    if cancel.cancelled() || Instant::now() >= deadline =>
-                {
-                    self.inner.with_child(id, |child| child.terminal = Some(receiver));
-                    return Ok(None);
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("subagent {id} ended without a report");
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-            }
+        // No outcome to take: a registered child is still running; anything
+        // else never ran or was already delivered, and the marker says
+        // which.
+        if self.inner.with_child(id, |_| ()).is_some() {
+            return Ok(None);
         }
+        if self.inner.delivered(id) {
+            anyhow::bail!(
+                "subagent {id}'s report was already delivered into the \
+                 conversation; it arrives as an incoming message"
+            );
+        }
+        anyhow::bail!("no subagent {id}: it never ran")
     }
 
     /// Cancel one subagent.
@@ -295,6 +264,7 @@ impl Agents {
             handle.cancel();
         }
         self.inner.lock_children().clear();
+        self.inner.lock_delivered().clear();
     }
 
     /// Cancel every registered conversation: the main turn, and any children.
@@ -319,6 +289,16 @@ impl Inner {
     /// The registry's lock on its children.
     fn lock_children(&self) -> MutexGuard<'_, Vec<(AgentId, Child)>> {
         self.children.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The registry's lock on the delivered-id markers.
+    fn lock_delivered(&self) -> MutexGuard<'_, HashSet<AgentId>> {
+        self.delivered.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `id`'s report was already delivered.
+    fn delivered(&self, id: AgentId) -> bool {
+        self.lock_delivered().contains(&id)
     }
 
     /// Run `f` on the child `id`, under the registry's lock.
