@@ -29,7 +29,8 @@ pub enum Progress {
         id: String,
         /// The combined output, shown to the user.
         output: String,
-        /// The process exit code; `None` when no process ran (spawn error).
+        /// The process exit code; `None` when no process ran (malformed call or an
+        /// unknown tool).
         exit: Option<i32>,
     },
     /// One finished response's token usage, as the provider measured it.
