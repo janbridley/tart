@@ -182,7 +182,7 @@ pub(crate) fn check_agent() -> Tool {
         "Check one subagent's status without blocking. Returns its report when it has \
         finished (claiming it, so it will not also arrive as a message), or says it is \
         still running: in which case end the turn and let the report arrive on its own \
-        instead of polling. Check only when the very next step is blocked on the result",
+        instead of polling. Check only when the very next step is blocked on the result and you are unsure whether the agent is making progress.",
         serde_json::json!({
             "type": "object",
             "properties": {
