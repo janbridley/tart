@@ -17,7 +17,7 @@ pub enum Progress {
         /// The call's id, pairing the start with its eventual output.
         id: String,
         /// The tool's name on the wire: one of {`bash`, `read`, `edit`, `search`,
-        /// `fetch`, `spawn`, `wait`}, or `agent` for a subagent's box opener.
+        /// `fetch`, `spawn_agent`, `check_agent`}, or `agent` for a subagent's box opener.
         name: String,
         /// The call's raw JSON arguments, exactly as the provider sent them;
         /// a subagent's box opener carries its task text instead, there
