@@ -240,7 +240,10 @@ impl Agents {
             .inner
             .with_child(id, |child| child.terminal.take())
             .ok_or_else(|| {
-                anyhow::anyhow!("no subagent {id}, or its report was already delivered")
+                anyhow::anyhow!(
+                    "no subagent {id}: it never ran, or its report was already \
+                     delivered into the conversation"
+                )
             })?
             .ok_or_else(|| anyhow::anyhow!("subagent {id} is already being waited on"))?;
         // Off the lock: the child's terminal event is the wakeup.
@@ -252,7 +255,10 @@ impl Agents {
                     // take succeeds unless the front end delivered first.
                     return match self.take_outcome(id) {
                         Some((_, outcome)) => Ok(Some(outcome)),
-                        None => anyhow::bail!("subagent {id}'s report was already delivered"),
+                        None => anyhow::bail!(
+                            "subagent {id}'s report was already delivered into the \
+                             conversation; it arrives as an incoming message"
+                        ),
                     };
                 }
                 // A wait that gives up hands the receiver back, so a later wait for the
