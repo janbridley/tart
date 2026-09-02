@@ -284,21 +284,50 @@ fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
     })
 }
 
-/// Run one tool call under `policy`, report each step to `on_progress`, and return
-/// output to the model
+/// One parsed spawn tool call.
+#[derive(Debug)]
+struct Spawn {
+    /// The complete, self-contained task the subagent runs on.
+    task: String,
+}
+
+/// Extract the fields from a spawn tool call's JSON arguments.
+fn parse_spawn(arguments: &str) -> anyhow::Result<Spawn> {
+    let args = parse_arguments(arguments)?;
+    Ok(Spawn { task: string_field(&args, "task")? })
+}
+
+/// One parsed wait tool call.
+#[derive(Debug)]
+struct Wait {
+    /// The subagent to wait on, as `spawn` reported it.
+    id: u64,
+}
+
+/// Extract the fields from a wait tool call's JSON arguments.
+fn parse_wait(arguments: &str) -> anyhow::Result<Wait> {
+    let args = parse_arguments(arguments)?;
+    Ok(Wait {
+        id: args["id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("wait needs an integer 'id'"))?,
+    })
+}
+
+/// Run one tool call under `policy`, report each step to `on_progress`, and
+/// return its output to the model.
 ///
-/// Each tool announces itself with [`Progress::ToolStart`] once its arguments
-/// parse and always follows with a [`Progress::ToolOutput`] so the front end knows the
-/// task concluded.
+/// Each tool announces itself with [`Progress::ToolStart`] and always follows with
+/// a [`Progress::ToolOutput`] so the front end knows the task concluded. Malformed tool
+/// calls return their error as output.
 ///
 /// Tool *failures* (a non-zero exit, an edit that did not apply, or a command the
-/// sandbox denies) are not errors here: their output is content that the model
-/// should see.
+/// sandbox denies) are content that the model should see, and so is a *malformed call*.
 pub(crate) fn execute<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
-) -> anyhow::Result<String> {
+) -> String {
     match call.name.as_str() {
         "bash" => run_bash(call, tools, on_progress),
         "read" => run_read(call, tools, on_progress),
@@ -309,7 +338,7 @@ pub(crate) fn execute<F: Fn(Progress)>(
         // The subagent pair, offered to spawning agents only.
         "spawn" => run_spawn(call, tools, on_progress),
         "wait" => run_wait(call, tools, on_progress),
-        other => anyhow::bail!("unknown tool: {other}"),
+        other => misuse(call, on_progress, &anyhow::anyhow!("unknown tool: {other}")),
     }
 }
 
@@ -318,20 +347,29 @@ fn run_spawn<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
-) -> anyhow::Result<String> {
-    let task = string_field(&parse_arguments(&call.arguments)?, "task")?;
-    let Some(agents) = tools.agents else {
-        anyhow::bail!("subagents cannot spawn their own");
+) -> String {
+    let spawn = match parse_spawn(&call.arguments) {
+        Ok(spawn) => spawn,
+        Err(error) => return misuse(call, on_progress, &error),
     };
-    Ok(traced(call, on_progress, || {
-        match agents.spawn(tools.template, &task) {
+    // A subagent can still call a tool it was never offered, so this too is passed
+    // content for the model, not a harness failure.
+    let Some(agents) = tools.agents else {
+        return misuse(
+            call,
+            on_progress,
+            &anyhow::anyhow!("subagents cannot spawn their own"),
+        );
+    };
+    traced(call, on_progress, || {
+        match agents.spawn(tools.template, &spawn.task) {
             Ok(id) => {
-                let text = format!("started subagent {id}: {task}");
+                let text = format!("started subagent {id}: {}", spawn.task);
                 (text.clone(), text, Some(0))
             }
             Err(error) => (error.to_string(), error.to_string(), None),
         }
-    }))
+    })
 }
 
 /// Run one wait tool call, blocking until the subagent ends or the wait gives up.
@@ -339,18 +377,26 @@ fn run_wait<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
-) -> anyhow::Result<String> {
-    let args = parse_arguments(&call.arguments)?;
-    let id = args["id"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("wait needs an integer 'id'"))?;
-    let Some(agents) = tools.agents else {
-        anyhow::bail!("subagents have nothing to wait on");
+) -> String {
+    let wait = match parse_wait(&call.arguments) {
+        Ok(wait) => wait,
+        Err(error) => return misuse(call, on_progress, &error),
     };
-    Ok(traced(call, on_progress, || {
+    // As with spawn: a call a subagent was never offered is content, not failure.
+    let Some(agents) = tools.agents else {
+        return misuse(
+            call,
+            on_progress,
+            &anyhow::anyhow!("subagents have nothing to wait on"),
+        );
+    };
+    let id = wait.id;
+    traced(call, on_progress, || {
         match agents.wait(AgentId::from(id), tools.cancel) {
+            // Attribute errors from children as the wait's own error, as we can't
+            // distinguish the two (TODO: fix?).
             Ok(Some(outcome)) => {
-                let text = outcome.report();
+                let text = format!("subagent {id} finished: {}", outcome.report());
                 (text.clone(), text, Some(0))
             }
             Ok(None) => {
@@ -359,7 +405,7 @@ fn run_wait<F: Fn(Progress)>(
             }
             Err(error) => (error.to_string(), error.to_string(), None),
         }
-    }))
+    })
 }
 
 /// One finished process's combined streams: stdout then stderr, lossily decoded.
@@ -564,6 +610,19 @@ fn traced<F: Fn(Progress)>(
     result
 }
 
+/// A malformed call the model can fix returns its error as the call's output.
+///
+/// The parse helpers would rather error than invent defaults, and routing those errors
+/// through here keeps them content the model acts on and retries.
+fn misuse<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    on_progress: &F,
+    error: &anyhow::Error,
+) -> String {
+    let text = format!("error: {error}");
+    traced(call, on_progress, || (text.clone(), text, None))
+}
+
 /// Run one bash tool call under `tools`, reporting its steps to `on_progress`.
 ///
 /// A command that outlives its timeout is killed with everything it started.
@@ -573,13 +632,16 @@ fn run_bash<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
-) -> anyhow::Result<String> {
-    let bash = parse_bash(&call.arguments)?;
-    // A failure to launch comes back as an error string rather than a `Result`,
-    // so the output can be handed straight back to the model.
+) -> String {
+    let bash = match parse_bash(&call.arguments) {
+        Ok(bash) => bash,
+        Err(error) => return misuse(call, on_progress, &error),
+    };
+    // A failure to launch comes back as an error string, so the output can be
+    // handed straight back to the model.
     let mut sandboxed = tools.policy.command("/bin/bash");
     sandboxed.arg("-c").arg(&bash.command);
-    Ok(traced(call, on_progress, || {
+    traced(call, on_progress, || {
         // Decode the stream into output for the front and backends.
         match run_watched(&mut sandboxed, Some(bash.timeout), tools.cancel) {
             Ok(run) => {
@@ -604,7 +666,7 @@ fn run_bash<F: Fn(Progress)>(
                 (text.clone(), text, None)
             }
         }
-    }))
+    })
 }
 
 /// Run one command the user typed, with their privileges.
@@ -630,15 +692,18 @@ fn run_read<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
-) -> anyhow::Result<String> {
-    let read = parse_read(&call.arguments)?;
+) -> String {
+    let read = match parse_read(&call.arguments) {
+        Ok(read) => read,
+        Err(error) => return misuse(call, on_progress, &error),
+    };
     let mut command = tools.policy.command("/usr/bin/perl");
     command
         .arg("-e")
         .arg(numbered_read(read.start_line, read.end_line))
         .arg("--")
         .arg(&read.path);
-    Ok(traced(call, on_progress, || {
+    traced(call, on_progress, || {
         // A failure to launch comes back as an error string for the model to deal with.
         match &command.output() {
             Ok(spawned) => {
@@ -650,7 +715,7 @@ fn run_read<F: Fn(Progress)>(
                 (text.clone(), text, None)
             }
         }
-    }))
+    })
 }
 
 /// Run one edit tool call: report the target, apply it, and report the outcome.
@@ -662,12 +727,15 @@ fn run_edit<F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_>,
     on_progress: &F,
-) -> anyhow::Result<String> {
-    let edit = parse_edit(&call.arguments)?;
-    Ok(traced(call, on_progress, || {
+) -> String {
+    let edit = match parse_edit(&call.arguments) {
+        Ok(edit) => edit,
+        Err(error) => return misuse(call, on_progress, &error),
+    };
+    traced(call, on_progress, || {
         let (result, exit_code) = apply_edit(&edit, tools.policy);
         (result.clone(), result, exit_code)
-    }))
+    })
 }
 
 /// Apply one parsed edit under `policy`, returning outcome message and the exit code.
@@ -1126,8 +1194,7 @@ mod tests {
         let events = std::cell::RefCell::new(Vec::new());
         let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &tools, &|progress| {
             events.borrow_mut().push(progress);
-        })
-        .unwrap();
+        });
 
         assert_eq!(output, "hi\n");
         assert!(matches!(
@@ -1151,17 +1218,17 @@ mod tests {
 
         // The exit status reaches the model verbatim.
         assert_eq!(
-            execute(&bash_call(r#"{"command":"false"}"#), &tools, &|_| {}).unwrap(),
+            execute(&bash_call(r#"{"command":"false"}"#), &tools, &|_| {}),
             "[exit 1]"
         );
         assert_eq!(
-            execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}).unwrap(),
+            execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}),
             "done"
         );
     }
 
     #[test]
-    fn execute_rejects_unknown_tool_names() {
+    fn execute_answers_an_unknown_tool_with_output_not_failure() {
         let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
         let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
         let tools = Tooling {
@@ -1172,10 +1239,22 @@ mod tests {
         };
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
+        let events = std::cell::RefCell::new(Vec::new());
 
-        let error = execute(&call, &tools, &|_| {}).unwrap_err().to_string();
+        // Only the model can fix calling a tool that does not exist, so the
+        // error is its output
+        let output = execute(&call, &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
 
-        assert!(error.contains("unknown tool"), "{error}");
+        assert!(output.contains("error: unknown tool: rm"), "{output}");
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                Progress::ToolStart { name, .. },
+                Progress::ToolOutput { output, .. }
+            ] if name == "rm" && output.contains("unknown tool")
+        ));
     }
 
     /// A temporary file holding `contents`, removed when the guard drops.
@@ -1311,7 +1390,7 @@ mod tests {
                     agents: None,
                     template: &agent,
                 };
-                execute(&call, &tools, &|_| {}).unwrap()
+                execute(&call, &tools, &|_| {})
             })
         };
         let first = spawn_edit("UNO", "uno");
@@ -1352,6 +1431,25 @@ mod tests {
         let error = parse_read(r#"{"start_line":1}"#).unwrap_err().to_string();
 
         assert!(error.contains("missing 'path'"), "{error}");
+    }
+
+    #[test]
+    fn parse_spawn_takes_the_task_and_rejects_its_absence() {
+        assert_eq!(
+            parse_spawn(r#"{"task":"count the tests"}"#).unwrap().task,
+            "count the tests"
+        );
+
+        let error = parse_spawn("{}").unwrap_err().to_string();
+        assert!(error.contains("missing 'task'"), "{error}");
+    }
+
+    #[test]
+    fn parse_wait_takes_an_integer_id_and_rejects_anything_else() {
+        assert_eq!(parse_wait(r#"{"id":2}"#).unwrap().id, 2);
+
+        let error = parse_wait(r#"{"id":"two"}"#).unwrap_err().to_string();
+        assert!(error.contains("wait needs an integer 'id'"), "{error}");
     }
 
     /// A `read` tool call for `path`, optionally bounded to a line range.
@@ -1420,8 +1518,7 @@ mod tests {
 
         let whole = execute(&read_call(file.path(), None, None), &tools, &|progress| {
             events.borrow_mut().push(progress);
-        })
-        .unwrap();
+        });
 
         assert!(whole.starts_with("     1\tline 1\n"), "{whole}");
         assert!(whole.ends_with("    30\tline 30\n"), "{whole}");
@@ -1442,8 +1539,7 @@ mod tests {
         events.borrow_mut().clear();
         let range = execute(&read_call(file.path(), Some(10), Some(12)), &tools, &|progress| {
             events.borrow_mut().push(progress);
-        })
-        .unwrap();
+        });
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
         assert!(matches!(
             events.borrow().as_slice(),
@@ -1458,12 +1554,46 @@ mod tests {
                         .to_string()
         ));
 
-        let tail = execute(&read_call(file.path(), Some(28), None), &tools, &|_| {}).unwrap();
+        let tail = execute(&read_call(file.path(), Some(28), None), &tools, &|_| {});
         assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
         assert_eq!(tail.lines().count(), 3);
 
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
-        let absent = execute(&read_call(&missing, None, None), &tools, &|_| {}).unwrap();
+        let absent = execute(&read_call(&missing, None, None), &tools, &|_| {});
         assert!(absent.contains("No such file or directory"), "{absent}");
+    }
+
+    #[test]
+    fn a_malformed_call_is_output_not_failure() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
+        };
+        let call = FunctionToolCall {
+            namespace: None,
+            name: "read".to_string(),
+            arguments: r#"{"start_line": 1}"#.to_string(),
+            call_id: "call_0".to_string(),
+            id: Some("item_0".to_string()),
+            status: None,
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let output = execute(&call, &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
+
+        assert!(output.contains("error: tool call missing 'path'"), "{output}");
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                Progress::ToolStart { name, .. },
+                Progress::ToolOutput { output, .. }
+            ] if name == "read" && output.contains("missing 'path'")
+        ));
     }
 }

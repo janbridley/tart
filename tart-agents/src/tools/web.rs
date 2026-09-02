@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_openai::types::responses::{FunctionToolCall, Tool};
 
 use super::{
-    CancelToken, WatchedRun, combined_output, command_text, parse_arguments, run_watched,
+    CancelToken, WatchedRun, combined_output, command_text, misuse, parse_arguments, run_watched,
     string_field, timeout_text, tool, traced,
 };
 use crate::Progress;
@@ -268,12 +268,12 @@ fn ddgs_args(search: &Search, results: &Path) -> Vec<OsString> {
 ///
 /// As with bash, a failure (no CLI, a rate-limited backend, a timeout) is
 /// content for the model, not an error.
-pub(super) fn run_search<F: Fn(Progress)>(
-    call: &FunctionToolCall,
-    on_progress: &F,
-) -> anyhow::Result<String> {
-    let search = parse_search(&call.arguments)?;
-    Ok(traced(call, on_progress, || {
+pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
+    let search = match parse_search(&call.arguments) {
+        Ok(search) => search,
+        Err(error) => return misuse(call, on_progress, &error),
+    };
+    traced(call, on_progress, || {
         let Some(binary) = search_binary() else {
             let text = "search: no ddgs CLI found; install one with `uv tool install ddgs` \
                         or point TART_SEARCH_BIN at it"
@@ -307,7 +307,7 @@ pub(super) fn run_search<F: Fn(Progress)>(
                 }
             },
         }
-    }))
+    })
 }
 
 /// Reject URLs that are not plain public web addresses.
@@ -475,12 +475,12 @@ fn fetch_args(fetch: &Fetch, url: &str) -> Vec<OsString> {
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
 /// Like `search` this runs outside the sandbox.
-pub(super) fn run_fetch<F: Fn(Progress)>(
-    call: &FunctionToolCall,
-    on_progress: &F,
-) -> anyhow::Result<String> {
-    let fetch = parse_fetch(&call.arguments)?;
-    Ok(traced(call, on_progress, || {
+pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
+    let fetch = match parse_fetch(&call.arguments) {
+        Ok(fetch) => fetch,
+        Err(error) => return misuse(call, on_progress, &error),
+    };
+    traced(call, on_progress, || {
         let Some(binary) = fetch_binary() else {
             let text = format!("fetch: no curl found at {FETCH_DEFAULT}; set TART_FETCH_BIN");
             return (text.clone(), text, None);
@@ -519,7 +519,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(
                 (command_text(&text, output.status), text, exit)
             }
         }
-    }))
+    })
 }
 
 /// Split curl's final-URL trailer off a captured raw fetch, when present.
@@ -952,8 +952,7 @@ mod tests {
 
         let output = execute(&request, &tools, &|progress| {
             events.borrow_mut().push(progress);
-        })
-        .unwrap();
+        });
 
         assert!(
             output.contains("results for \"rust programming language\""),
@@ -993,8 +992,7 @@ mod tests {
 
         let output = execute(&request, &tools, &|progress| {
             events.borrow_mut().push(progress);
-        })
-        .unwrap();
+        });
 
         assert!(output.contains("Example Domain"), "{output}");
         assert!(matches!(

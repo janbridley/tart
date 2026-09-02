@@ -278,8 +278,9 @@ impl Agent {
     /// could happen more than once per round) the round's reasoning, any text
     /// it streamed alongside the calls, the calls, and their outputs are
     /// recorded in the shared transcript and the next round continues from
-    /// there. The final answer is recorded on completion, so later turns replay
-    /// the whole exchange. The generation ends after at
+    /// there. Failed tool calls record an error as its output, which the next round
+    /// answers like any other. The final answer is recorded on completion, so later
+    /// turns replay the whole exchange. The generation ends after at
     /// most `max_rounds` rounds, always with exactly one terminal event:
     /// [`Progress::Done`] with the final answer (`None` if nothing arrived), or
     /// [`Progress::Failed`] on a request error, an explicit error or incomplete event,
@@ -525,31 +526,16 @@ impl Agent {
                 template: self,
             };
             let mut exchanges = Vec::with_capacity(calls.len());
-            // A call the harness cannot run ends the round, but is recorded with its
-            // error so the round's earlier effects stay in the transcript.
-            let mut failure: Option<String> = None;
             for call in calls {
                 // A cancelled turn skips its remaining calls; the one in
                 // flight finishes first.
                 if self.control.cancelled(&mut cancel_rx) {
                     break;
                 }
-                match tools::execute(&call, &tooling, on_progress) {
-                    Ok(output) => {
-                        let bounded = bounded_for_history(&call.name, &output, on_progress);
-                        exchanges.push((call, bounded));
-                    }
-                    Err(error) => {
-                        let bounded = bounded_for_history(
-                            &call.name,
-                            &format!("error: {error}"),
-                            on_progress,
-                        );
-                        exchanges.push((call, bounded));
-                        failure = Some(error.to_string());
-                        break;
-                    }
-                }
+                // Tool calls exit with errors/denial text/parse failures if they fail
+                let output = tools::execute(&call, &tooling, on_progress);
+                let bounded = bounded_for_history(&call.name, &output, on_progress);
+                exchanges.push((call, bounded));
             }
             // A round cut short before its first executed call records no
             // reasoning: without its calls the item would dangle in the replay.
@@ -565,9 +551,6 @@ impl Agent {
             if self.control.cancelled(&mut cancel_rx) {
                 // The turn stops here, keeping the rounds recorded so far.
                 return terminate_and_log(on_progress, Progress::Cancelled);
-            }
-            if let Some(reason) = failure {
-                return terminate_and_log(on_progress, Progress::Failed(reason));
             }
             // The round completed and is recorded; the next one starts fresh.
             round += 1;
@@ -622,7 +605,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use async_openai::types::responses::ResponseTextDeltaEvent;
+    use async_openai::types::responses::{ResponseOutputItemDoneEvent, ResponseTextDeltaEvent};
     use std::io::{Read, Write};
 
     /// `Agent::new` must install a TLS crypto provider before building its
@@ -874,6 +857,149 @@ mod tests {
         assert_eq!(items[2]["content"], "Once upon a time");
     }
 
+    #[test]
+    fn a_malformed_call_does_not_end_the_turn() {
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("read something".to_string())
+            .expect("the user turn records");
+
+        // The first round calls read with no path; the second, having seen the
+        // call's error as its output, answers instead.
+        let server = std::thread::spawn(move || {
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let (mut stream, _) = listener.accept().expect("the first client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            let event = serde_json::to_string(&call_done(0)).expect("serializes");
+            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            let _ = stream.flush();
+            drop(stream);
+            let (mut stream, _) = listener.accept().expect("the second client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            let event = serde_json::to_string(&delta("recovered")).expect("serializes");
+            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            let _ = stream.flush();
+        });
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (sender, receiver) = mpsc::channel(1);
+        let handle = agent.handle();
+        let (generation, token) = handle.claim(sender);
+        agent.run(&transcript, receiver, &token, &|progress| {
+            log.lock().unwrap().push(format!("{progress:?}"));
+        });
+        handle.release(generation);
+
+        // The turn completes: no failure, one terminal event, and it is Done.
+        // Asserted before joining the server so a regression fails here
+        // instead of hanging on an accept that never comes.
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().all(|entry| !entry.starts_with("Failed")),
+            "the malformed call must not fail the turn: {log:?}"
+        );
+        assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
+
+        // The malformed call and its error stayed in the record, so the next
+        // request — and a resumed session — replay them.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().expect("the record is a list of items");
+        assert_eq!(items.len(), 5, "system, user, call, output, answer: {items:?}");
+        assert_eq!(items[2]["name"], "read");
+        assert!(
+            items[3]["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("missing 'path'")),
+            "the call's error is its output: {}",
+            items[3]["output"]
+        );
+        assert_eq!(items[4]["content"], "recovered");
+        server.join().expect("the server exits");
+    }
+
+    /// The round's remaining calls still run after a malformed one: the old
+    /// loop broke the round on a call it could not run, and this pins that a
+    /// misuse output ends no round and skips no sibling call.
+    #[test]
+    fn the_rounds_remaining_calls_run_after_a_malformed_one() {
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("read something".to_string())
+            .expect("the user turn records");
+
+        // One round carries two malformed read calls; the next round answers.
+        let server = std::thread::spawn(move || {
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let (mut stream, _) = listener.accept().expect("the first client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            for event in [call_done(0), call_done(1)] {
+                let event = serde_json::to_string(&event).expect("serializes");
+                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            }
+            let _ = stream.flush();
+            drop(stream);
+            let (mut stream, _) = listener.accept().expect("the second client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            let event = serde_json::to_string(&delta("both answered")).expect("serializes");
+            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            let _ = stream.flush();
+        });
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (sender, receiver) = mpsc::channel(1);
+        let handle = agent.handle();
+        let (generation, token) = handle.claim(sender);
+        agent.run(&transcript, receiver, &token, &|progress| {
+            log.lock().unwrap().push(format!("{progress:?}"));
+        });
+        handle.release(generation);
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().all(|entry| !entry.starts_with("Failed")),
+            "neither malformed call fails the turn: {log:?}"
+        );
+        assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
+
+        // Both calls ran and recorded, each with its error as its output.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().expect("the record is a list of items");
+        assert_eq!(
+            items.len(),
+            7,
+            "system, user, two calls, two outputs, answer: {items:?}"
+        );
+        assert_eq!(items[2]["call_id"], "call_0");
+        assert_eq!(items[3]["call_id"], "call_1");
+        for output in [4, 5] {
+            assert!(
+                items[output]["output"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("missing 'path'")),
+                "the call's error is its output: {}",
+                items[output]["output"]
+            );
+        }
+        assert_eq!(items[6]["content"], "both answered");
+        server.join().expect("the server exits");
+    }
+
     /// A wait that gives up hands its receiver back, so a later wait on the
     /// same child still blocks instead of erroring.
     #[test]
@@ -940,7 +1066,13 @@ mod tests {
 
         // The delivered report is gone: one delivery, and the slot is freed.
         assert_eq!(agents.take_outcome(id), None);
-        assert!(agents.wait(id, &CancelToken::new()).is_err());
+        // The second wait says where the report went, so the model never
+        // reads a delivered report as a lost one.
+        let delivered = agents
+            .wait(id, &CancelToken::new())
+            .expect_err("the report left with the first delivery")
+            .to_string();
+        assert!(delivered.contains("already delivered"), "{delivered}");
     }
 
     #[test]
@@ -995,6 +1127,25 @@ mod tests {
             content_index: 0,
             delta: text.to_string(),
             logprobs: None,
+        })
+    }
+
+    /// An output-item-done event carrying one finished function call: the
+    /// shape a provider streams when the model calls a tool. This one calls
+    /// `read` without the required `path`; `index` keeps concurrent calls'
+    /// ids distinct.
+    fn call_done(index: usize) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+            sequence_number: index as u64,
+            output_index: index as u32,
+            item: OutputItem::FunctionCall(FunctionToolCall {
+                namespace: None,
+                name: "read".to_string(),
+                arguments: r#"{"start_line": 1}"#.to_string(),
+                call_id: format!("call_{index}"),
+                id: Some(format!("item_{index}")),
+                status: None,
+            }),
         })
     }
 
