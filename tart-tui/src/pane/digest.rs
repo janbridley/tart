@@ -87,31 +87,19 @@ fn group_paths(name: &str, arguments: &[String]) -> String {
 /// A run of `check_agent` calls, each id named once with its repeat count
 /// from the second check on, in first-checked order.
 fn group_ids(arguments: &[String]) -> String {
-    let mut grouped: Vec<(u64, usize)> = Vec::new();
-    let mut loose: Vec<String> = Vec::new();
-    for raw in arguments {
-        let Some(id) = serde_json::from_str::<Value>(raw)
-            .ok()
-            .and_then(|args| args["id"].as_u64())
-        else {
-            loose.push(raw.clone());
-            continue;
-        };
-        match grouped.iter_mut().find(|(known, _)| *known == id) {
+    let mut grouped: Vec<(String, usize)> = Vec::new();
+    for digest in arguments.iter().map(|raw| argument("check_agent", raw)) {
+        match grouped.iter_mut().find(|(known, _)| *known == digest) {
             Some((_, count)) => *count += 1,
-            None => grouped.push((id, 1)),
+            None => grouped.push((digest, 1)),
         }
     }
     grouped
         .into_iter()
-        .map(|(id, count)| {
-            if count > 1 {
-                format!("{id} × {count}")
-            } else {
-                id.to_string()
-            }
+        .map(|(digest, count)| match count {
+            more @ 2.. => format!("{digest} × {more}"),
+            _ => digest,
         })
-        .chain(loose)
         .join(", ")
 }
 
@@ -170,9 +158,9 @@ mod tests {
             (
                 "spawn_agent",
                 r#"{"task":"find the flaky test"}"#,
-                "Spawn_agent(find the flaky test)",
+                "Spawn Agent(find the flaky test)",
             ),
-            ("check_agent", r#"{"id":2}"#, "Check_agent(2)"),
+            ("check_agent", r#"{"id":2}"#, "Check Agent(2)"),
             // A news search tags its query; the rest of the arguments stay out.
             ("search", news, "Search(elections [news])"),
             // A read carries its bounds: whole-file, closed, or open at an end.
@@ -180,9 +168,10 @@ mod tests {
             ("read", a12, "Read(a.rs:1-2)"),
             ("read", r#"{"path":"a.rs","start_line":28}"#, "Read(a.rs:28-)"),
             ("read", r#"{"path":"a.rs","end_line":12}"#, "Read(a.rs:-12)"),
-            // Odd names keep their lead and an empty one stays empty.
+            // Odd names keep their lead and an empty one stays empty; an
+            // underscore names a word break.
             ("Bash", r#"{"command":"ls"}"#, r#"Bash({"command":"ls"})"#),
-            ("_private", r#"{"path":"src"}"#, r#"_private({"path":"src"})"#),
+            ("_private", r#"{"path":"src"}"#, r#"Private({"path":"src"})"#),
             ("", "loose", "(loose)"),
             // Unparseable arguments and missing fields degrade to the raw string.
             ("bash", "not json", "Bash(not json)"),
@@ -263,18 +252,18 @@ mod tests {
             (
                 "check_agent",
                 &[r#"{"id":1}"#, r#"{"id":1}"#, r#"{"id":1}"#],
-                "Check_agent(1 × 3)",
+                "Check Agent(1 × 3)",
             ),
             (
                 "check_agent",
                 &[r#"{"id":2}"#, r#"{"id":1}"#, r#"{"id":2}"#],
-                "Check_agent(2 × 2, 1)",
+                "Check Agent(2 × 2, 1)",
             ),
-            ("check_agent", &[r#"{"id":7}"#], "Check_agent(7)"),
+            ("check_agent", &[r#"{"id":7}"#], "Check Agent(7)"),
             (
                 "check_agent",
                 &[r#"{"id":1}"#, "not json"],
-                "Check_agent(1, not json)",
+                "Check Agent(1, not json)",
             ),
         ];
         for &(name, raws, expected) in calls {
