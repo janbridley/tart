@@ -11,6 +11,7 @@ const LINE_CAP: usize = 60;
 pub(crate) fn tool_header(name: &str, arguments: &[String]) -> String {
     let digest = match name {
         "read" | "edit" => group_paths(name, arguments),
+        "check_agent" => group_ids(arguments),
         _ => arguments.iter().map(|raw| argument(name, raw)).join(", "),
     };
     format!("{}({})", display_name(name), one_line(&digest))
@@ -34,9 +35,9 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
             "bash" => args["command"].as_str().map(str::to_string),
             "fetch" => args["url"].as_str().map(str::to_string),
             "read" | "edit" => args["path"].as_str().map(str::to_string),
-            // The subagent pair: the task spawned, and the id waited on.
-            "spawn" => args["task"].as_str().map(str::to_string),
-            "wait" => args["id"].as_u64().map(|id| id.to_string()),
+            // The subagent pair: the task spawned, and the id checked on.
+            "spawn_agent" => args["task"].as_str().map(str::to_string),
+            "check_agent" => args["id"].as_u64().map(|id| id.to_string()),
             "search" => args["query"].as_str().map(|query| {
                 let news = args["news"].as_bool() == Some(true);
                 format!("{query}{}", if news { " [news]" } else { "" })
@@ -74,6 +75,37 @@ fn group_paths(name: &str, arguments: &[String]) -> String {
             "edit" if spans.len() > 1 => format!("{path} × {}", spans.len()),
             "edit" => path.clone(),
             _ => coalesce(path, spans),
+        })
+        .chain(loose)
+        .join(", ")
+}
+
+/// A run of `check_agent` calls, each id named once with its repeat count
+/// from the second check on, in first-checked order.
+fn group_ids(arguments: &[String]) -> String {
+    let mut grouped: Vec<(u64, usize)> = Vec::new();
+    let mut loose: Vec<String> = Vec::new();
+    for raw in arguments {
+        let Some(id) = serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|args| args["id"].as_u64())
+        else {
+            loose.push(raw.clone());
+            continue;
+        };
+        match grouped.iter_mut().find(|(known, _)| *known == id) {
+            Some((_, count)) => *count += 1,
+            None => grouped.push((id, 1)),
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(id, count)| {
+            if count > 1 {
+                format!("{id} × {count}")
+            } else {
+                id.to_string()
+            }
         })
         .chain(loose)
         .join(", ")
@@ -130,6 +162,13 @@ mod tests {
             ("edit", r#"{"path":"src/main.rs"}"#, "Edit(src/main.rs)"),
             ("fetch", r#"{"url":"http://x"}"#, "Fetch(http://x)"),
             ("search", r#"{"query":"rust regex"}"#, "Search(rust regex)"),
+            // The subagent pair: the task spawned, the id checked on.
+            (
+                "spawn_agent",
+                r#"{"task":"find the flaky test"}"#,
+                "Spawn_agent(find the flaky test)",
+            ),
+            ("check_agent", r#"{"id":2}"#, "Check_agent(2)"),
             // A news search tags its query; the rest of the arguments stay out.
             ("search", news, "Search(elections [news])"),
             // A read carries its bounds: whole-file, closed, or open at an end.
@@ -215,6 +254,24 @@ mod tests {
             ("edit", &[b, a, a], "Edit(b.rs, a.rs × 2)"),
             ("edit", &[x, b], "Edit(x.py, b.rs)"),
             ("edit", &[x, "not json"], "Edit(x.py, not json)"),
+            // Checks name each id once, counting repeats the same way, in
+            // first-checked order; unparsed arguments ride along raw.
+            (
+                "check_agent",
+                &[r#"{"id":1}"#, r#"{"id":1}"#, r#"{"id":1}"#],
+                "Check_agent(1 × 3)",
+            ),
+            (
+                "check_agent",
+                &[r#"{"id":2}"#, r#"{"id":1}"#, r#"{"id":2}"#],
+                "Check_agent(2 × 2, 1)",
+            ),
+            ("check_agent", &[r#"{"id":7}"#], "Check_agent(7)"),
+            (
+                "check_agent",
+                &[r#"{"id":1}"#, "not json"],
+                "Check_agent(1, not json)",
+            ),
         ];
         for &(name, raws, expected) in calls {
             let arguments = raws.iter().map(ToString::to_string).collect::<Vec<_>>();
