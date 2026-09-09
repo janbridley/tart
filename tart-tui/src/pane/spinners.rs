@@ -27,7 +27,7 @@ const SAND: [u8; 35] = [
 fn sand(i: usize) -> char {
     braille(SAND[i])
 }
-/// Three-pip spinner that walks up and down the character.
+/// A wave of one to four pips that climbs the cell and mirrors back down.
 #[inline]
 fn climb(i: usize) -> char {
     const T: [u8; 6] = [0x01, 0x01, 0x09, 0x19, 0x1A, 0x12];
@@ -36,7 +36,7 @@ fn climb(i: usize) -> char {
     braille(x ^ (((x ^ x >> 3) & 7) * 9 * u8::from(i >= 15)))
 }
 
-/// Four-pip snake moving clockwise around the character.
+/// Three-pip snake moving clockwise around the character.
 #[inline]
 fn snake(i: usize) -> char {
     const PATH: [u8; 8] = [0, 3, 4, 1, 2, 5, 7, 6];
@@ -55,7 +55,7 @@ fn counter(i: usize) -> char {
     braille((i & 0x87 | i >> 1 & 0x38 | (i & 8) << 3) as u8)
 }
 
-/// A four-pip comet bouncing back and forth along the top of the character.
+/// A three-pip comet bouncing back and forth along the top of the character.
 #[inline]
 fn bounce(i: usize) -> char {
     let head = i.min(14 - i);
