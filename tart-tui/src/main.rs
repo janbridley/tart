@@ -16,8 +16,10 @@ mod file_mentions;
 mod keybinds;
 mod pane;
 mod perf;
+mod recorded;
 mod session_picker;
 mod tmux_override;
+mod turn_picker;
 
 #[cfg(test)]
 mod testutil;
@@ -37,6 +39,7 @@ use ratatui::text::Span;
 
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
+use recorded::MANUAL_AT;
 use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
     ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
@@ -70,6 +73,7 @@ fn main() -> anyhow::Result<()> {
     let mut pane = Pane::default();
     pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
     pane.set_control(agent.handle());
+    pane.set_conversation(&transcript);
     pane.note(format!("tart · {label}"));
     pane.set_context_tokens(context_tokens);
     pane.set_models(config.agents());
@@ -119,8 +123,7 @@ fn effort_of(name: &str) -> Option<ReasoningEffort> {
 /// output cannot close it early.
 fn manual_message(command: &str, framed: &str) -> String {
     format!(
-        "I ran this command myself, outside the sandbox:\n\n\
-         ````console\n$ {command}\n{}\n````",
+        "{MANUAL_AT}\n\n````console\n$ {command}\n{}\n````",
         framed.trim_end()
     )
 }
@@ -268,6 +271,11 @@ fn run(
                     _ if line.trim().starts_with("/resume") => {
                         pane.note("type /resume and pick a session as you type");
                     }
+                    // A submitted `/rewind` line means the chooser was closed;
+                    // it opens by itself while the line is being typed.
+                    _ if line.trim().starts_with("/rewind") => {
+                        pane.note("type /rewind and pick a turn as you type");
+                    }
                     // A submitted `/model` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
                     _ if line
@@ -295,7 +303,7 @@ fn run(
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ if line.trim().starts_with('/') => pane.note(format!(
-                        "unknown command {} · /clear /resume /model /plan /effort /agents /stop /perf /quit",
+                        "unknown command {} · /clear /rewind /resume /model /plan /effort /agents /stop /perf /quit",
                         line.split_whitespace().next().unwrap_or_default()
                     )),
                     _ => {
@@ -314,6 +322,8 @@ fn run(
                         let history = restored.replay();
                         *session = resumed;
                         transcript = restored;
+                        // The pane's rewind chooser follows the new record.
+                        pane.set_conversation(&transcript);
                         // The restored record carries no reminder; plan mode
                         // outlives a resume, so re-arm it on the new transcript.
                         transcript
@@ -331,6 +341,26 @@ fn run(
                     }
                     // A file too damaged to open just puts the error into our pane.
                     Err(error) => pane.note(error.to_string()),
+                }
+                Some(PaneEvent::Rewind { start, draft }) => {
+                    // The abandoned tail's subagents die with it, reports included
+                    agents.clear();
+                    transcript.rewind(start);
+                    session.reset();
+                    pane.clear();
+                    pane.extend(transcript.replay());
+                    // Attachments are cut back to the line the user typed, so
+                    // a resubmit does not attach them twice.
+                    pane.set_draft(attachments::strip_attachments(&draft));
+                    // The restored draft is the turn the numbering continues from
+                    pane.note(if draft.is_empty() {
+                        "rewound to start of session · new session from here".to_string()
+                    } else {
+                        format!(
+                            "rewound to turn {} · new session from here",
+                            transcript.user_turns().len() + 1
+                        )
+                    });
                 }
                 // An agent picked in the `/model` chooser: swap the endpoint,
                 // the model, and the effort for the next turn.
