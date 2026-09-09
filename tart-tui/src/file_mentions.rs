@@ -35,10 +35,10 @@ pub(crate) fn derive_query(editor: &Editor) -> Option<(String, usize)> {
     (word_start && inside).then(|| (word.to_string(), at))
 }
 
-/// Everything preceding a `/resume` or `/model` command, used to filter results.
+/// Everything preceding a `/resume`, `/rewind`, or `/model` command, used to filter results.
 ///
-/// `command` is the leading word, e.g. `"/resume"` or `"/model"`; the rest of
-/// the line is returned as the query, or `None` when the prefix isn't live.
+/// `command` is the leading word, e.g. `"/resume"`; the rest of the line is
+/// returned as the query, or `None` when the prefix isn't live.
 pub(crate) fn command_query(editor: &Editor, command: &str) -> Option<String> {
     let line = &editor.lines[editor.line];
     let rest = line.strip_prefix(command)?;
@@ -333,14 +333,14 @@ pub(crate) fn update(popup: &mut Option<Popup>, query: Option<(String, usize)>, 
     match popup {
         // An unchanged query refilters nothing: set_query no-ops on it.
         Some(Popup::Files(p)) => p.set_query(query),
-        Some(Popup::Sessions(_) | Popup::Models(_)) | None if rearm => {
+        Some(Popup::Sessions(_) | Popup::Models(_) | Popup::Turns(_)) | None if rearm => {
             *popup = Some(Popup::Files(FilePopup::complete(&query)));
         }
         _ => {}
     }
 }
 
-/// The `/resume` and `/model` choosers share this shape: a fuzzy `FilePopup` over rows.
+/// Fuzzy `FilePopup`  over rows for`/resume`, `/rewind`, and `/model` choosers.
 pub(crate) struct Picker<T> {
     /// Fuzzy matcher and list machinery.
     pub(crate) popup: FilePopup,

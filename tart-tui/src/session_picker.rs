@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::file_mentions::{Picker, command_query};
-use crate::pane::Editor;
+use crate::pane::{Editor, ellipsize};
 use tart_agents::session;
 
 /// `/resume` typeahead over one project's sessions: the rows it lists and the
@@ -18,23 +18,12 @@ fn label(path: &Path, opening: &str) -> String {
     let opening = if opening.is_empty() {
         "(no messages)".to_string()
     } else {
-        capped(opening)
+        ellipsize(opening, 60)
     };
     format!("{stamp}  {opening}")
 }
 
-/// `text` capped at 60 characters, plus an ellipsis when it runs past.
-fn capped(text: &str) -> String {
-    let mut capped = text.chars().take(60).collect::<String>();
-    if text.chars().nth(60).is_some() {
-        capped.push('…');
-    }
-    capped
-}
-
-/// Open the session chooser over `project`'s sessions in `root`, filtered by
-/// `query`: the rows paired with the path each selects, or `None` when there
-/// are no sessions to show.
+/// Open the session chooser over `project`'s sessions in `root`, filtered by `query`.
 pub(crate) fn session_picker(
     root: &Path,
     project: &Path,
