@@ -15,7 +15,7 @@ use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
 use crate::{
-    Agents, CancelToken, MAX_TOOL_ROUNDS, Progress, Transcript, debug, errors, sandbox::Policy,
+    Agents, CancelToken, Progress, Transcript, debug, errors, max_tool_rounds, sandbox::Policy,
     tools,
 };
 
@@ -145,7 +145,7 @@ impl Agent {
             client: Client::with_config(config),
             model: model.into(),
             effort: None,
-            max_rounds: MAX_TOOL_ROUNDS,
+            max_rounds: max_tool_rounds(),
             mode: ChatMode::Default,
             writable: policy,
             runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
 
         // The malformed call and its error stayed in the record, so the next
-        // request — and a resumed session — replay them.
+        // request and a resumed session replay them.
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         let items = items.as_array().expect("the record is a list of items");
         assert_eq!(items.len(), 5, "system, user, call, output, answer: {items:?}");

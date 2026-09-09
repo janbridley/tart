@@ -58,12 +58,37 @@ impl Transcript {
     /// Drop the conversation, keeping the leading system items.
     #[inline]
     pub fn clear(&self) {
+        self.rewind(0);
+    }
+
+    /// Cut the record back to `start`, not including the system prompt.
+    #[inline]
+    pub fn rewind(&self, start: usize) {
         let mut items = self.items();
         let systems = items
             .iter()
             .take_while(|item| matches!(item, InputItem::EasyMessage(m) if m.role == Role::System))
             .count();
-        items.truncate(systems);
+        items.truncate(start.max(systems));
+    }
+
+    /// The user messages in the record, oldest first, each with the index its turn begins at.
+    #[inline]
+    #[must_use]
+    pub fn user_turns(&self) -> Vec<(usize, String)> {
+        self.items()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                InputItem::EasyMessage(message) => match (&message.role, &message.content) {
+                    (Role::User, EasyInputContent::Text(text)) => Some((index, text.clone())),
+                    // Prompts, answers, and the content lists this harness doesn't save
+                    // acan be skipped, we wil lnever rewind to them
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     /// Record the user's turn.
@@ -464,6 +489,29 @@ mod tests {
         let items = serde_json::to_value(plain.request_items()).unwrap();
         assert_eq!(items.as_array().unwrap().len(), 1);
         assert_eq!(items[0]["content"], SYSTEM);
+    }
+
+    /// A rewind cuts the record back to the turn it names, response and all.
+    #[test]
+    fn rewind_keeps_the_prefix_before_the_cut() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("one".to_string()).unwrap();
+        transcript.push_assistant("1".to_string()).unwrap();
+        transcript.push_user("two".to_string()).unwrap();
+        transcript.push_reasoning(reasoning_item());
+        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
+        transcript.push_assistant("2".to_string()).unwrap();
+
+        transcript.rewind(transcript.user_turns()[1].0);
+
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 3, "system, then the first turn only");
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"], "one");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"], "1");
     }
 
     #[test]

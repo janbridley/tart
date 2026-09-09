@@ -7,6 +7,7 @@ use itertools::Itertools;
 use tart_agents::{CONTENT_CAP, head_cap};
 
 use crate::file_mentions;
+use crate::recorded::ATTACHMENTS_AT;
 
 /// The `@path` tokens in a submitted line, as the typeahead would complete them
 fn mentions(line: &str) -> Vec<String> {
@@ -94,12 +95,18 @@ pub(crate) fn attach_mentions(line: &str, cwd: &Path) -> (String, Vec<String>) {
     if blocks.is_empty() {
         return (line.to_string(), notes);
     }
-    let message = format!(
-        "{line}\n\nAttached from outside the sandbox: your tools cannot read or \
-         edit these, so work from the contents below.\n\n{}\n",
-        blocks.join("\n\n")
-    );
+    let message = format!("{line}{ATTACHMENTS_AT}{}\n", blocks.join("\n\n"));
     (message, notes)
+}
+
+/// The user's original line, cut back out of a message [`attach_mentions`] recorded.
+///
+/// The goal is for rewinding to restore the message but not its attachments, otherwise
+/// the model would get two copies on re-submit.
+pub(crate) fn strip_attachments(message: &str) -> &str {
+    message
+        .split_once(ATTACHMENTS_AT)
+        .map_or(message, |(line, _)| line)
 }
 
 #[cfg(test)]
