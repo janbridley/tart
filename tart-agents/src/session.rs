@@ -663,6 +663,43 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&abandoned).unwrap(), was);
     }
 
+    /// A rewind abandons the file like a clear does, but the next record is seeded with
+    /// the preserved prefix from the pre-rewind session
+    #[test]
+    fn a_rewind_starts_a_fresh_file_from_the_kept_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let project = Path::new("/tmp/proj");
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("one".to_string()).unwrap();
+        transcript.push_assistant("1".to_string()).unwrap();
+        transcript.push_user("two".to_string()).unwrap();
+        transcript.push_assistant("2".to_string()).unwrap();
+        let mut session = Session::start(root.path(), project);
+        session.record(&transcript).unwrap();
+        let abandoned = session.path.clone().unwrap();
+        let was = std::fs::read_to_string(&abandoned).unwrap();
+
+        // The `/rewind` flow: the record cuts back to a turn's start, and
+        // the session forgets its file.
+        transcript.rewind(transcript.user_turns()[1].0);
+        session.reset();
+        transcript.push_user("twice".to_string()).unwrap();
+        transcript.push_assistant("again".to_string()).unwrap();
+        session.record(&transcript).unwrap();
+
+        let fresh = session.path.clone().unwrap();
+        assert_ne!(fresh, abandoned);
+        let (resumed, mut resumed_session) = Session::open(root.path(), project, &fresh).unwrap();
+        // The fresh file holds the system prompt, the kept turn, and the new
+        // one: everything the rewound conversation continued from.
+        assert_eq!(resumed.request_items(), transcript.request_items());
+        resumed.push_user("three".to_string()).unwrap();
+        resumed_session.record(&resumed).unwrap();
+        // Five lines seeded the file; the resumed turn appends the sixth.
+        assert_eq!(line_count(&fresh), 6, "the fresh session appends from there");
+        assert_eq!(std::fs::read_to_string(&abandoned).unwrap(), was);
+    }
+
     #[test]
     fn unused_bumps_a_suffix_on_collision() {
         let dir = tempfile::tempdir().unwrap();
