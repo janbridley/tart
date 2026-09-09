@@ -4,6 +4,7 @@ mod copy;
 mod digest;
 mod editor;
 mod markdown;
+mod spinners;
 mod transcript;
 mod wrap;
 
@@ -62,11 +63,6 @@ const PLAN_RULE: Color = Color::Yellow;
 
 /// The copy cursor and the editor caret are the cell under them, inverted.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
-
-/// Frames for the statusline spinner.
-const SPINNER_FRAMES: [&str; 6] = ["·  ", "·· ", "···", " ··", "  ·", "   "];
-/// Milliseconds per spinner frame.
-const SPINNER_MS: u128 = 200;
 
 /// Key results the pane cannot handle itself.
 #[derive(Debug, PartialEq)]
@@ -180,6 +176,8 @@ pub struct Pane {
     /// Enter keeps the draft while set, and the status rule's spinner runs
     /// off the elapsed time for a steady frame rate.
     spin: Option<Instant>,
+    /// The subagents with a box open, one per spinner slot.
+    slots: [Option<(AgentId, Instant)>; spinners::AGENTS.len()],
     /// The composer's mode: ordinary chat, `!` commands, or plan mode.
     mode: Mode,
     /// A plan has landed in plan mode, so Enter would approve it.
@@ -562,6 +560,13 @@ impl Pane {
 
     /// Open a subagent's running box on its task; see [`Transcript::start_agent`].
     pub fn start_agent(&mut self, id: AgentId, arguments: &str) {
+        // A returning id keeps its slot; a new one takes the first free slot.
+        let taken = |slot: &Option<(AgentId, Instant)>| slot.is_some_and(|(sid, _)| sid == id);
+        if !self.slots.iter().any(taken)
+            && let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none())
+        {
+            *slot = Some((id, Instant::now()));
+        }
         self.transcript.start_agent(id.tag(), arguments.to_string());
     }
 
@@ -572,6 +577,14 @@ impl Pane {
 
     /// Resolve the subagent's box with its report; see [`Transcript::finish_tool`].
     pub fn finish_agent(&mut self, id: AgentId, output: String, exit: Option<i32>) {
+        // The slot frees for the next arrival, wherever the agent sat.
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|(sid, _)| sid == id))
+        {
+            *slot = None;
+        }
         self.finish_tool(&id.tag(), output, exit);
     }
 
@@ -629,14 +642,26 @@ impl Pane {
         Some(parts.join(" · "))
     }
 
-    /// The status rule's current spinner frame, or None while idle: it spins
-    /// for a generating turn first, then for a manual command.
+    /// The status rule's current spinner frame, or None while idle.
     fn spinner(&self) -> Option<&'static str> {
-        let started = self
-            .spin
-            .or_else(|| self.manual.as_ref().map(|manual| manual.started))?;
-        let elapsed = started.elapsed().as_millis();
-        Some(SPINNER_FRAMES[(elapsed / SPINNER_MS) as usize % SPINNER_FRAMES.len()])
+        let started = self.spin.or(self.manual.as_ref().map(|manual| manual.started))?;
+        Some(spinners::main_dots(started.elapsed().as_millis()))
+    }
+
+    /// The bottom rule's right-aligned block while subagents run.
+    ///
+    /// One cell per slot up to the highest occupied one, so each set of agent
+    /// dispatches is grouped fairly naturally. Once later agents start to exit, the
+    /// space is cleared for the next round of launches.
+    fn agent_block(&self) -> Option<String> {
+        let slots = &self.slots[..=self.slots.iter().rposition(Option::is_some)?];
+        let cells: Vec<char> = slots
+            .iter()
+            .zip(spinners::AGENTS)
+            .rev()
+            .map(|(occ, table)| occ.map_or(' ', |(_, at)| table.frame(at.elapsed().as_millis())))
+            .collect();
+        Some(format!("[{}]", cells.iter().join(" ")))
     }
 
     /// The bottom rule's badge while a manual command runs: `! <command>`.
@@ -683,6 +708,7 @@ impl Pane {
         self.queued.clear();
         self.reports.clear();
         self.plan_ready = false;
+        self.slots = Default::default();
     }
 
     /// Update the `/perf` stats line; `None` restores the bottom rule.
@@ -1136,7 +1162,15 @@ impl Pane {
                 .manual_command_badge(bar_bottom.width)
                 .or_else(|| self.plan_badge(bar_bottom.width))
                 .or_else(|| self.status_text());
-            status_rule(buf, bar_bottom, status.as_deref(), self.spinner());
+            // One spinner per running subagent, each on its slot's table.
+            let agents = self.agent_block();
+            status_rule(
+                buf,
+                bar_bottom,
+                status.as_deref(),
+                self.spinner(),
+                agents.as_deref(),
+            );
         }
         // A manual command in flight or the `!` mode colors the frame around
         // the composer magenta; plan mode colors it yellow.
@@ -1263,8 +1297,15 @@ pub(crate) fn ellipsize(text: &str, budget: usize) -> String {
 
 /// A full-width dim rule row with the status badge set into it:
 /// `───[ status ]─────…`; while generating, a spinner takes the leading
-/// dashes: `···[ status ]─────…`.
-fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>, spinner: Option<&str>) {
+/// dashes: `···[ status ]─────…`, and running subagents take a block off the
+/// right edge: `···[ status ]────[⠁ ⠋ ⢄]`.
+fn status_rule(
+    buf: &mut Buffer,
+    area: Rect,
+    status: Option<&str>,
+    spinner: Option<&str>,
+    agents: Option<&str>,
+) {
     rule(buf, area);
     // The bar can be parked past the last row.
     if area.y >= buf.area.height {
@@ -1273,14 +1314,23 @@ fn status_rule(buf: &mut Buffer, area: Rect, status: Option<&str>, spinner: Opti
     if let Some(spinner) = spinner {
         buf.set_stringn(area.x, area.y, spinner, 3, DIM_STYLE);
     }
-    if let Some(status) = status {
+    // The agent block hugs the right edge with a two-cell margin, and the
+    // status shrinks to the width left between it and the spinner. The
+    // spinner frames are single-cell, so the character count is the width.
+    let mut block = 0;
+    if let Some(agents) = agents {
+        block = agents.chars().count() as u16;
         buf.set_stringn(
-            area.x + 3,
+            area.x + area.width.saturating_sub(block),
             area.y,
-            format!("[ {status} ]"),
-            area.width.saturating_sub(3) as usize,
+            agents,
+            block as usize,
             DIM_STYLE,
         );
+    }
+    if let Some(status) = status {
+        let budget = area.width.saturating_sub(3 + block) as usize;
+        buf.set_stringn(area.x + 3, area.y, format!("[ {status} ]"), budget, DIM_STYLE);
     }
 }
 
@@ -1326,6 +1376,84 @@ mod tests {
 
     fn render(pane: &mut Pane, size: (u16, u16)) -> String {
         draw(|frame, area| pane.render(frame, area), size)
+    }
+
+    #[test]
+    fn the_agent_block_is_right_aligned_on_its_bracket() {
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        status_rule(&mut buf, area, Some("1.2k in"), Some("·· "), Some("[⠁ ⠋ ⢄]"));
+        let cells: Vec<(u16, char)> = (0..area.width)
+            .filter_map(|x| buf[(x, 0)].symbol().chars().next().map(|c| (x, c)))
+            .collect();
+        // `]` on the last cell, `[` exactly the block's width from it.
+        assert_eq!(cells.last(), Some(&(19, ']')), "{cells:?}");
+        assert_eq!(cells[13], (13, '['), "{cells:?}");
+    }
+
+    #[test]
+    fn agents_take_slots_in_order_and_reuse_freed_ones() {
+        let mut pane = Pane::default();
+        for id in 0..3 {
+            pane.start_agent(AgentId::from(id), "task");
+        }
+        for (_, started) in pane.slots.iter_mut().flatten() {
+            *started -= std::time::Duration::from_millis(50);
+        }
+        // Fresh cycles: every slot shows its table's first frame, highest
+        // slot leftmost.
+        let first = |slot: usize| spinners::AGENTS[slot].frame(0);
+        assert_eq!(
+            pane.agent_block().unwrap(),
+            format!("[{} {} {}]", first(2), first(1), first(0))
+        );
+
+        // The earliest agent (slot 0, nearest the bracket) finishes: its slot
+        // holds its width as a blank and the others keep their cells.
+        pane.finish_agent(AgentId::from(0), "done".into(), Some(0));
+        let holed = pane.agent_block().unwrap();
+        assert_eq!(holed, format!("[{} {}  ]", first(2), first(1)));
+
+        // A new arrival fills the hole in place, again without moving anyone.
+        pane.start_agent(AgentId::from(9), "late");
+        let refilled = pane.agent_block().unwrap();
+        assert_eq!(refilled, format!("[{} {} {}]", first(2), first(1), first(0)));
+        assert_eq!(holed.find(first(1)), refilled.find(first(1)));
+
+        // The last of them leaves and the block goes with it.
+        for id in [1, 2, 9] {
+            pane.finish_agent(AgentId::from(id), String::new(), None);
+        }
+        assert_eq!(pane.agent_block(), None);
+    }
+
+    #[test]
+    fn a_full_block_shrugs_off_a_ninth_agent() {
+        let mut pane = Pane::default();
+        for id in 0..8 {
+            pane.start_agent(AgentId::from(id), "task");
+        }
+        pane.start_agent(AgentId::from(8), "one too many");
+        let block = pane.agent_block().unwrap();
+        // Eight frames, nine separators and brackets: no ninth glyph.
+        assert_eq!(block.chars().count(), 2 * 8 + 1, "{block}");
+    }
+
+    #[test]
+    fn the_top_slot_finishing_moves_nothing_below_it() {
+        let mut pane = Pane::default();
+        for id in 0..3 {
+            pane.start_agent(AgentId::from(id), "task");
+        }
+        let first = |slot: usize| spinners::AGENTS[slot].frame(0);
+        let before = pane.agent_block().unwrap();
+        // Slot 2 is the block's leftmost glyph; losing it must not move
+        // slots 1 and 0, whose offsets from the `]` are fixed.
+        pane.finish_agent(AgentId::from(2), "done".into(), Some(0));
+        let after = pane.agent_block().unwrap();
+        let tail = format!("{} {}]", first(1), first(0));
+        assert_eq!(after, format!("[{tail}"));
+        assert!(before.ends_with(&tail), "{before} vs {tail}");
     }
 
     /// Type `text` into the pane, one plain keypress per character.
