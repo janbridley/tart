@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
 
         // The malformed call and its error stayed in the record, so the next
-        // request — and a resumed session — replay them.
+        // request and a resumed session replay them.
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         let items = items.as_array().expect("the record is a list of items");
         assert_eq!(items.len(), 5, "system, user, call, output, answer: {items:?}");
