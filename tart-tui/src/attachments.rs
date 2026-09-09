@@ -7,9 +7,7 @@ use itertools::Itertools;
 use tart_agents::{CONTENT_CAP, head_cap};
 
 use crate::file_mentions;
-
-/// Where the attachments [`attach_mentions`] appends begin in a recorded message.
-const ATTACHMENTS_AT: &str = "\n\nAttached from outside the sandbox: your tools cannot read or edit these, so work from the contents below.\n\n";
+use crate::recorded::ATTACHMENTS_AT;
 
 /// The `@path` tokens in a submitted line, as the typeahead would complete them
 fn mentions(line: &str) -> Vec<String> {

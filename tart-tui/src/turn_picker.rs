@@ -1,19 +1,10 @@
 //! Rewind-point picker, triggered via `/rewind`.
 
-use tart_agents::{Transcript as Conversation, prompts};
+use tart_agents::Transcript as Conversation;
 
 use crate::file_mentions::Picker;
-use crate::pane::{REPORTS_AT, ellipsize};
-
-/// How the messages the harness records on the user's behalf open: a manual
-/// command's echo, a subagent report delivery, and the plan approval, recorded
-/// verbatim. None is a line the user typed, so none has a turn to restore.
-const SYNTHETIC: [&str; 3] = [crate::MANUAL_AT, REPORTS_AT, prompts::PLAN_APPROVAL];
-
-/// Whether `text` is one the harness recorded, not one the user typed.
-fn synthetic(text: &str) -> bool {
-    SYNTHETIC.iter().any(|opening| text.starts_with(opening))
-}
+use crate::pane::ellipsize;
+use crate::recorded::synthetic;
 
 /// One turn's row: its number, counted from the session's first, beside its
 /// opening line capped with an ellipsis.
