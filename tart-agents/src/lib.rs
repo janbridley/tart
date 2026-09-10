@@ -36,6 +36,12 @@ pub fn max_tool_rounds() -> usize {
         .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
 }
 
+/// Recover the content of a mutex, poisoned or otherwise.
+#[inline]
+pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The round cap when `TART_MAX_TOOL_ROUNDS` is unset or invalid.
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 4096;
 
