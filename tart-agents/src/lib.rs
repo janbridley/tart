@@ -9,6 +9,7 @@ mod progress;
 pub mod prompts;
 pub mod session;
 mod tools;
+pub mod usage;
 
 #[cfg(target_os = "macos")]
 pub mod sandbox;
