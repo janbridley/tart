@@ -9,6 +9,7 @@ use crate::locked;
 
 use anyhow::Context;
 use async_openai::types::responses::ResponseUsage;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::debug;
@@ -19,7 +20,7 @@ use crate::session::slug;
 static SESSION: Mutex<Option<String>> = Mutex::new(None);
 
 /// One response's five token counts, as the provider measured them.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TokenUsage {
     /// All input tokens, cache included.
     pub(crate) input: u64,
@@ -91,7 +92,7 @@ impl Ledger {
             .create(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        let line = format!("{}\n", entry.json());
+        let line = format!("{}\n", serde_json::to_string(entry)?);
         file.write_all(line.as_bytes())
             .with_context(|| format!("writing {}", path.display()))
     }
@@ -147,9 +148,9 @@ pub(crate) fn clear_session() {
 }
 
 /// One ledger entry: a billed response and everything it bills against.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LedgerEntry {
-    /// The agent tag: `"main"` or `"child"`.
+    /// The agent tag: `"main"`, or `"child-N"` for the Nth subagent.
     pub(crate) agent: String,
     /// The model that burned the tokens.
     pub(crate) model: String,
@@ -159,49 +160,15 @@ pub(crate) struct LedgerEntry {
     pub(crate) project: String,
     /// When the entry was billed, `YYYY-MM-DD HH:MM:SS` UTC.
     pub(crate) stamp: String,
-    /// The usage itself.
+    /// The usage itself, flattened into the entry's own keys.
+    #[serde(flatten)]
     pub(crate) usage: TokenUsage,
 }
 
 impl LedgerEntry {
-    /// The entry's JSON object, every key alphabetized in.
-    fn json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "agent": self.agent,
-            "cached": self.usage.cached,
-            "input": self.usage.input,
-            "model": self.model,
-            "output": self.usage.output,
-            "project": self.project,
-            "reasoning": self.usage.reasoning,
-            "session": self.session,
-            "stamp": self.stamp,
-            "total": self.usage.total,
-        })
-    }
-
-    /// The entry one ledger line held, if valid.
-    ///
-    /// This is the inverse of [`LedgerEntry::json`].
+    /// The entry one ledger line held, when it is shaped like one.
     fn parse(line: &str) -> Option<LedgerEntry> {
-        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
-        Some(LedgerEntry {
-            agent: entry.get("agent")?.as_str()?.to_string(),
-            model: entry.get("model")?.as_str()?.to_string(),
-            session: entry
-                .get("session")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            project: entry.get("project")?.as_str()?.to_string(),
-            stamp: entry.get("stamp")?.as_str()?.to_string(),
-            usage: TokenUsage {
-                input: entry.get("input")?.as_u64()?,
-                cached: entry.get("cached")?.as_u64()?,
-                output: entry.get("output")?.as_u64()?,
-                reasoning: entry.get("reasoning")?.as_u64()?,
-                total: entry.get("total")?.as_u64()?,
-            },
-        })
+        serde_json::from_str(line).ok()
     }
 }
 
@@ -289,10 +256,10 @@ pub(crate) mod tests {
         let ledger = ledger_root();
         let path = ledger.0.path().join("usage.jsonl");
         set_session("20260910-091422".to_string());
-        sample_usage().bill("child", "glm-4.7");
+        sample_usage().bill("child-2", "glm-4.7");
 
         let entry = Ledger::entries().last().expect("the entry landed");
-        assert_eq!(entry.agent, "child");
+        assert_eq!(entry.agent, "child-2");
         assert_eq!(entry.model, "glm-4.7");
         assert_eq!(entry.session.as_deref(), Some("20260910-091422"));
         assert_eq!(entry.usage, sample_usage());
@@ -367,5 +334,44 @@ pub(crate) mod tests {
         let _held = held_for_test();
         set_session("slot".to_string());
         assert_eq!(session().as_deref(), Some("slot"));
+    }
+
+    /// A sample entry, as one billed round writes it.
+    fn sample_entry() -> LedgerEntry {
+        LedgerEntry {
+            agent: "child-2".to_string(),
+            model: "glm-5.3".to_string(),
+            session: Some("20260910-091422".to_string()),
+            project: "Users-jenna-github-tart".to_string(),
+            stamp: "2026-09-10 09:14:22".to_string(),
+            usage: sample_usage(),
+        }
+    }
+
+    #[test]
+    fn a_line_is_flat_and_round_trips() {
+        let entry = sample_entry();
+        let line = serde_json::to_string(&entry).unwrap();
+
+        // The five counts ride at the top level, not nested under `usage`:
+        // the flattened shape every ledger file already holds.
+        assert!(line.contains(r#""input":9001"#), "{line}");
+        assert!(!line.contains(r#""usage""#), "no nested object: {line}");
+        assert_eq!(LedgerEntry::parse(&line), Some(entry));
+    }
+
+    #[test]
+    fn a_row_written_by_the_old_hand_rolled_shape_still_parses() {
+        // Byte-for-byte what the pre-derive writer produced, including the
+        // alphabetized keys and the null session.
+        let line = r#"{"agent":"main","cached":8214,"input":9001,"model":"glm-5.3","output":512,"project":"Users-jenna-github-tart","reasoning":96,"session":null,"stamp":"2026-09-10 09:14:22","total":9513}"#;
+
+        let entry = LedgerEntry::parse(line).expect("an existing row parses");
+
+        assert_eq!(entry.agent, "main");
+        assert_eq!(entry.session, None, "a null session reads as absent");
+        assert_eq!(entry.usage, sample_usage());
+        // And a mistyped field still reads as no entry, never damage.
+        assert_eq!(LedgerEntry::parse(&line.replace("9001", "\"many\"")), None);
     }
 }
