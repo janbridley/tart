@@ -10,7 +10,9 @@ use anyhow::Context;
 use async_openai::types::responses::{InputItem, Item, Role};
 use time::OffsetDateTime;
 
-use crate::Transcript;
+use crate::history::{LineMetadata, RecordLine, Transcript, stamp_utc_at};
+#[cfg(not(test))]
+use crate::usage;
 
 pub static SESSIONS_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
     let home = std::env::var_os("HOME")
@@ -54,24 +56,28 @@ impl Session {
     #[inline]
     pub fn open(root: &Path, project: &Path, path: &Path) -> anyhow::Result<(Transcript, Self)> {
         let mut loaded = load(path)?;
-        if loaded.items.is_empty() {
+        if loaded.lines.is_empty() {
             anyhow::bail!("session file {} has no items", path.display());
         }
         // Try and trim a broken transcript into one we can send back to a provider.
-        let recorded = loaded.items.len();
-        trim_unpaired(&mut loaded.items);
+        let recorded = loaded.lines.len();
+        trim_unpaired(&mut loaded.lines);
         // Rewrite the file ONLY if its damaged or missing entries
-        if loaded.damaged || loaded.items.len() != recorded {
-            rewrite(path, &loaded.items)?;
+        if loaded.damaged || loaded.lines.len() != recorded {
+            rewrite(path, &loaded.lines)?;
         }
-        let written = loaded.items.len();
-        let transcript = Transcript::from_items(loaded.items);
+        let written = loaded.lines.len();
+        let transcript = Transcript::from_lines(loaded.lines);
         let session = Self {
             root: root.to_path_buf(),
             project: project.to_path_buf(),
             path: Some(path.to_path_buf()),
             written,
         };
+        // Tests hold the ledger's session slot themselves; production names
+        // the live session here so rows self-tag without agent plumbing.
+        #[cfg(not(test))]
+        usage::set_session(session.stem());
         Ok((transcript, session))
     }
 
@@ -86,9 +92,13 @@ impl Session {
     pub fn record(&mut self, transcript: &Transcript) -> anyhow::Result<()> {
         // A cleared record can end before the flushed prefix; flush from there.
         self.written = self.written.min(transcript.len());
-        let fresh = transcript.items_after(self.written);
+        let fresh = transcript.recorded_after(self.written);
         // If the session is empty (no user input), we don't need to save a record.
-        if self.path.is_none() && !fresh.iter().any(is_user_message) {
+        if self.path.is_none()
+            && !fresh
+                .iter()
+                .any(|line| matches!(&line.item, InputItem::EasyMessage(m) if m.role == Role::User))
+        {
             return Ok(());
         }
         let path = if let Some(path) = &self.path {
@@ -96,8 +106,10 @@ impl Session {
         } else {
             let dir = self.dir();
             fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let path = unused(&dir, &stamp());
+            let path = unused(&dir, &stamp_at(OffsetDateTime::now_utc()));
             self.path = Some(path.clone());
+            #[cfg(not(test))]
+            usage::set_session(self.stem());
             path
         };
         let mut file = OpenOptions::new()
@@ -105,11 +117,22 @@ impl Session {
             .create(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        for item in &fresh {
-            write_line(&mut file, &path, item)?;
+        let moment = OffsetDateTime::now_utc();
+        for line in &fresh {
+            write_line(&mut file, &path, line, moment)?;
         }
         self.written += fresh.len();
         Ok(())
+    }
+
+    /// The live file's stem, the ledger's tag for this session's rounds.
+    #[inline]
+    #[must_use]
+    pub fn stem(&self) -> String {
+        self.path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned())
     }
 
     /// Forget the current file; the next record starts a fresh session.
@@ -117,19 +140,16 @@ impl Session {
     pub fn reset(&mut self) {
         self.path = None;
         self.written = 0;
+        #[cfg(not(test))]
+        usage::clear_session();
     }
 }
 
 /// The per-project directory name for `path`: separators become `-`.
-fn slug(path: &Path) -> String {
+pub(crate) fn slug(path: &Path) -> String {
     let text = path.to_string_lossy();
     let stripped = text.strip_prefix('/').unwrap_or(&text);
     stripped.replace('/', "-")
-}
-
-/// Whether the item records something the user said.
-fn is_user_message(item: &InputItem) -> bool {
-    matches!(item, InputItem::EasyMessage(message) if message.role == Role::User)
 }
 
 /// Enumerate the project's session files, newest first, each paired with the
@@ -162,49 +182,45 @@ pub fn list(root: &Path, project: &Path) -> anyhow::Result<Vec<(PathBuf, String)
 }
 
 /// The first line of the session in `path`'s opening user message, or empty
-/// when it never got one
+/// when it never got one.
 fn opening(path: &Path) -> String {
-    // The lines are scanned, not slurped: a session's first message is at the
-    // top of a file that can be long.
     std::fs::File::open(path)
-        .map(|file| {
+        .ok()
+        .and_then(|file| {
             std::io::BufReader::new(file)
                 .lines()
                 .map_while(Result::ok)
                 .find_map(|line| first_user_text(&line))
         })
-        .ok()
-        .flatten()
-        .map_or_else(String::new, |text| {
-            text.split_once('\n')
-                .map_or(text.as_str(), |(line, _)| line)
-                .to_string()
-        })
+        .unwrap_or_default()
 }
 
-/// The content of the first user message in one JSONL item line, if it is one.
+/// The first line of the first user message in one JSONL item line, if it is
+/// one.
 fn first_user_text(line: &str) -> Option<String> {
     let item: serde_json::Value = serde_json::from_str(line).ok()?;
-    (item["role"] == "user").then(|| item["content"].as_str().map(str::to_string))?
+    let text = (item["role"] == "user").then(|| item["content"].as_str())??;
+    Some(text.split_once('\n').map_or(text, |(line, _)| line).to_string())
 }
 
-/// A session file as [`load`] read it: its items, and whether it held damage.
+/// A session file as [`load`] read it: its lines, and whether it held damage
+/// past them.
 struct Loaded {
-    /// Every item up to the first damaged line.
-    items: Vec<InputItem>,
-    /// Whether the file continues past that prefix: a torn final write or an
-    /// unparseable line ends the record early.
+    /// Every line up to the first damaged one.
+    lines: Vec<RecordLine>,
+    /// A torn final write or an unparseable line ends the record early.
     damaged: bool,
 }
 
 /// The items in a session file, stopping at the first damaged line.
 ///
 /// The file is left exactly as it lies; [`Session::open`] decides whether the
-/// damage is worth a rewrite.
+/// damage is worth a rewrite. A `timestamp` or `usage` sibling of the wrong
+/// type or shape is treated as absent.
 fn load(path: &Path) -> anyhow::Result<Loaded> {
     let text =
         fs::read_to_string(path).with_context(|| format!("reading session {}", path.display()))?;
-    let mut items = Vec::new();
+    let mut lines = Vec::new();
     let mut good = 0;
     for line in text.split_inclusive('\n') {
         // A final line without its newline is a torn write.
@@ -215,75 +231,102 @@ fn load(path: &Path) -> anyhow::Result<Loaded> {
             good += line.len();
             continue;
         }
-        match serde_json::from_str::<InputItem>(line) {
-            Ok(item) => {
-                items.push(item);
-                good += line.len();
-            }
-            Err(_) => break,
-        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            break;
+        };
+        let meta = peel(&value);
+        let Ok(item) = serde_json::from_value(value) else {
+            break;
+        };
+        lines.push(RecordLine { item, meta });
+        good += line.len();
     }
-    Ok(Loaded { items, damaged: good < text.len() })
+    Ok(Loaded { lines, damaged: good < text.len() })
 }
 
-/// Rewrite `path` with exactly `items`, one JSON line each.
-///
-/// The only rewrite there is: [`Session::open`] repairs a file that held damage
-/// or orphaned calls here, once, and every write after it appends.
-fn rewrite(path: &Path, items: &[InputItem]) -> anyhow::Result<()> {
+/// The metadata sibling a session line carried: its `timestamp` as written,
+/// absent when missing or malformed.
+fn peel(value: &serde_json::Value) -> LineMetadata {
+    LineMetadata {
+        timestamp: value
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// Rewrite `path` with exactly `lines`, keeping each line's recorded metadata.
+fn rewrite(path: &Path, lines: &[RecordLine]) -> anyhow::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .truncate(true)
         .create(true)
         .open(path)
         .with_context(|| format!("rewriting session {}", path.display()))?;
-    for item in items {
-        write_line(&mut file, path, item)?;
+    let moment = OffsetDateTime::now_utc();
+    for line in lines {
+        write_line(&mut file, path, line, moment)?;
     }
     Ok(())
 }
 
-/// Append `item` to `file` as one JSON line, whatever is being written.
+/// Append `line` to `file` as one JSON line: the recorded stamp or one minted
+/// at `moment`.
 ///
 /// One write per line: a crash tears at most the last line.
-fn write_line(file: &mut fs::File, path: &Path, item: &InputItem) -> anyhow::Result<()> {
-    let line = serde_json::to_string(item)?;
-    writeln!(file, "{line}").with_context(|| format!("writing {}", path.display()))
+fn write_line(
+    file: &mut fs::File,
+    path: &Path,
+    line: &RecordLine,
+    moment: OffsetDateTime,
+) -> anyhow::Result<()> {
+    let text = line_of(line, moment)?;
+    let text = format!("{text}\n");
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
-/// Drop trailing calls whose outputs never arrived.
-fn trim_unpaired(items: &mut Vec<InputItem>) {
-    let answered: HashSet<&str> = items
+/// The JSON line `line` writes: its item's serialization with the recorded
+/// stamp or one minted at `moment`, each key alphabetized in.
+fn line_of(line: &RecordLine, moment: OffsetDateTime) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(&line.item)?;
+    let object = value
+        .as_object_mut()
+        .context("an item serializes as a JSON object")?;
+    let stamp = line
+        .meta
+        .timestamp
+        .clone()
+        .unwrap_or_else(|| stamp_utc_at(moment));
+    object.insert("timestamp".to_string(), serde_json::Value::String(stamp));
+    Ok(serde_json::to_string(&value)?)
+}
+
+/// Drop trailing calls whose outputs never arrived, metadata with them.
+fn trim_unpaired(lines: &mut Vec<RecordLine>) {
+    let answered: HashSet<String> = lines
         .iter()
-        .filter_map(|item| match item {
-            InputItem::Item(Item::FunctionCallOutput(output)) => Some(output.call_id.as_str()),
+        .filter_map(|line| match &line.item {
+            InputItem::Item(Item::FunctionCallOutput(output)) => Some(output.call_id.clone()),
             _ => None,
         })
         .collect();
-    let trailing = items.iter().rev().take_while(|item| {
-        matches!(item, InputItem::Item(Item::FunctionCall(call)) if !answered.contains(call.call_id.as_str()))
-    }).count();
-    items.truncate(items.len() - trailing);
+    while let Some(RecordLine {
+        item: InputItem::Item(Item::FunctionCall(call)),
+        ..
+    }) = lines.last()
+    {
+        if answered.contains(call.call_id.as_str()) {
+            break;
+        }
+        lines.pop();
+    }
 }
 
-/// The moment as `YYYYMMDD-HHMMSS` UTC.
+/// The moment as `YYYYMMDD-HHMMSS` UTC, the session filename.
 #[inline]
 fn stamp_at(moment: OffsetDateTime) -> String {
-    format!(
-        "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        moment.year(),
-        u8::from(moment.month()),
-        moment.day(),
-        moment.hour(),
-        moment.minute(),
-        moment.second()
-    )
-}
-
-/// The current instant as [`stamp_at`] renders it, the session filename.
-#[inline]
-fn stamp() -> String {
-    stamp_at(OffsetDateTime::now_utc())
+    stamp_utc_at(moment).replace(['-', ':'], "").replace(' ', "-")
 }
 
 /// The first unused `stem.jsonl` in `dir`, bumping a numeric suffix on collision.
@@ -315,7 +358,7 @@ mod tests {
         std::fs::read_to_string(path).unwrap().lines().count()
     }
 
-    /// Write `transcript`'s items to `path`, one JSON line each, as `record` does.
+    /// Write `transcript`'s items to `path`, one JSON line each.
     fn write_session(path: &Path, transcript: &Transcript) {
         let mut text = String::new();
         for item in transcript.request_items() {
@@ -323,6 +366,37 @@ mod tests {
             text.push('\n');
         }
         std::fs::write(path, text).unwrap();
+    }
+
+    /// The parsed lines of a session file, in order.
+    fn parsed_lines(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn is_stamp(stamp: &str) -> bool {
+        const SHAPE: &[u8] = b"0000-00-00 00:00:00";
+        stamp.len() == SHAPE.len()
+            && stamp.bytes().zip(SHAPE).all(|(byte, shape)| match shape {
+                b'0' => byte.is_ascii_digit(),
+                _ => byte == *shape,
+            })
+    }
+
+    fn all_stamped(stamps: &[Option<String>]) -> bool {
+        stamps.iter().all(|stamp| stamp.as_deref().is_some_and(is_stamp))
+    }
+
+    /// The `timestamp` each of a file's lines carries, in order: the
+    /// production peel, so a test cannot disagree with the reader.
+    fn stamps(path: &Path) -> Vec<Option<String>> {
+        parsed_lines(path)
+            .iter()
+            .map(|line| peel(line).timestamp)
+            .collect()
     }
 
     #[test]
@@ -335,19 +409,135 @@ mod tests {
         assert_eq!(slug(Path::new("relative/dir")), "relative-dir");
     }
 
-    /// [`stamp_at`](super::stamp_at) for a moment `seconds` after the epoch.
-    fn stamp_unix(seconds: i64) -> String {
-        stamp_at(OffsetDateTime::from_unix_timestamp(seconds).unwrap())
+    /// The moment `seconds` after the epoch.
+    fn unix(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(seconds).unwrap()
     }
 
     #[test]
     fn stamps_are_calendar_dates_that_sort_chronologically() {
-        assert_eq!(stamp_unix(0), "19700101-000000");
-        assert_eq!(stamp_unix(86_400), "19700102-000000");
+        assert_eq!(stamp_at(unix(0)), "19700101-000000");
+        assert_eq!(stamp_at(unix(86_400)), "19700102-000000");
         // A leap day renders zero-padded
-        assert_eq!(stamp_unix(951_782_400), "20000229-000000");
-        assert_eq!(stamp_unix(951_782_405), "20000229-000005");
-        assert!(stamp_unix(951_782_399) < stamp_unix(951_782_400));
+        assert_eq!(stamp_at(unix(951_782_400)), "20000229-000000");
+        assert_eq!(stamp_at(unix(951_782_405)), "20000229-000005");
+        assert!(stamp_at(unix(951_782_399)) < stamp_at(unix(951_782_400)));
+    }
+
+    #[test]
+    fn utc_stamps_are_human_dates_that_sort_chronologically() {
+        assert_eq!(stamp_utc_at(unix(0)), "1970-01-01 00:00:00");
+        assert_eq!(stamp_utc_at(unix(86_400)), "1970-01-02 00:00:00");
+        // A leap day renders zero-padded, every field in place
+        assert_eq!(stamp_utc_at(unix(951_782_400)), "2000-02-29 00:00:00");
+        assert_eq!(stamp_utc_at(unix(951_782_405)), "2000-02-29 00:00:05");
+        assert!(stamp_utc_at(unix(951_782_399)) < stamp_utc_at(unix(951_782_400)));
+    }
+
+    #[test]
+    fn recorded_lines_carry_their_own_stamps() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+        let file = session.path.clone().unwrap();
+
+        // Every line is stamped with the moment of its recording.
+        let recorded = stamps(&file);
+        assert!(all_stamped(&recorded));
+        assert_eq!(recorded.len(), 3);
+        assert!(recorded.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        // The next turn's flush carries its own lines' stamps.
+        transcript.push_user("again".to_string()).unwrap();
+        transcript.push_assistant("there".to_string()).unwrap();
+        session.record(&transcript).unwrap();
+        assert_eq!(stamps(&file).len(), 5);
+    }
+
+    #[test]
+    fn recorded_stamps_stay_off_the_resumed_request() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+
+        let (resumed, _) = Session::open(
+            root.path(),
+            Path::new("/tmp/proj"),
+            &session.path.clone().unwrap(),
+        )
+        .unwrap();
+
+        // A key scan of the request: the stamp dies at parse, so no provider
+        // ever sees it, while the record keeps it, ready to write back.
+        for item in resumed.request_items() {
+            assert!(serde_json::to_value(item).unwrap().get("timestamp").is_none());
+        }
+        let lines = resumed.recorded_after(0);
+        assert!(lines.iter().all(|line| line.meta.timestamp.is_some()));
+    }
+
+    #[test]
+    fn mixed_format_files_merge_cleanly() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy.jsonl");
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        write_session(&legacy, &transcript);
+
+        // A new turn recorded onto an old file: the old lines stay as they
+        // were, the new ones are stamped, and one file holds both.
+        let (resumed, mut session) =
+            Session::open(root.path(), Path::new("/tmp/other"), &legacy).unwrap();
+        resumed.push_user("again".to_string()).unwrap();
+        resumed.push_assistant("ok".to_string()).unwrap();
+        session.record(&resumed).unwrap();
+
+        let stamps = stamps(&legacy);
+        assert_eq!(
+            stamps[..3],
+            [None, None, None],
+            "the legacy lines load metadata-free"
+        );
+        assert!(all_stamped(&stamps[3..]));
+        let (reopened, _) = Session::open(root.path(), Path::new("/tmp/other"), &legacy).unwrap();
+        assert_eq!(reopened.request_items().len(), 5);
+    }
+
+    #[test]
+    fn malformed_siblings_are_absent_not_damage() {
+        let root = tempfile::tempdir().unwrap();
+        let mangled = root.path().join("mangled.jsonl");
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        write_session(&mangled, &transcript);
+        // A numeric timestamp and a string usage are ignored, not fatal.
+        let extra = concat!(
+            r#"{"content":"run it","role":"user","timestamp":123,"usage":"lots","type":"message"}"#,
+            "\n"
+        );
+        std::fs::write(&mangled, std::fs::read_to_string(&mangled).unwrap() + extra).unwrap();
+
+        let (resumed, _) = Session::open(root.path(), Path::new("/tmp/other"), &mangled).unwrap();
+
+        assert_eq!(resumed.request_items().len(), 3);
+        let lines = resumed.recorded_after(0);
+        assert_eq!(
+            lines[2].meta,
+            LineMetadata::default(),
+            "the mangled siblings vanish"
+        );
+        assert!(
+            std::fs::read_to_string(&mangled)
+                .unwrap()
+                .contains(r#""timestamp":123"#)
+        );
     }
 
     #[test]
@@ -454,47 +644,63 @@ mod tests {
 
         let loaded = load(&torn).unwrap();
 
-        assert_eq!(loaded.items.len(), 2);
+        assert_eq!(loaded.lines.len(), 2);
         assert!(loaded.damaged, "the torn tail is damage past the prefix");
         assert_eq!(std::fs::read_to_string(&torn).unwrap(), ripped);
     }
 
-    /// A file that is both torn and orphaned is repaired by the one rewrite:
-    /// the good prefix minus its unpaired calls, byte for byte, with nothing
-    /// appended over the damage afterwards.
     #[test]
-    fn a_torn_and_orphaned_file_is_repaired_by_one_rewrite() {
+    fn damaged_tails_end_the_record_and_orphans_are_trimmed() {
         let root = tempfile::tempdir().unwrap();
         let both = root.path().join("both.jsonl");
         let transcript = Transcript::new().unwrap();
         transcript.push_user("run it".to_string()).unwrap();
-        write_session(&both, &transcript);
-        let call = FunctionToolCall {
-            namespace: None,
-            name: "bash".to_string(),
-            arguments: r#"{"command":"ls"}"#.to_string(),
-            call_id: "call_0".to_string(),
-            id: None,
-            status: None,
-        };
-        let orphan = format!(
-            "{}\n",
-            serde_json::to_string(&InputItem::Item(Item::FunctionCall(call))).unwrap()
-        );
-        let torn = std::fs::read_to_string(&both).unwrap() + &orphan + r#"{"type":"me"#;
-        std::fs::write(&both, torn).unwrap();
+        // A stamped record, distinct originals, so preservation shows.
+        let moment = OffsetDateTime::from_unix_timestamp(1_000_000_000).unwrap();
+        let originals = ["2026-09-09 10:00:00", "2026-09-09 10:00:07"];
+        let mut stamped = String::new();
+        for (index, line) in transcript.recorded_after(0).iter().enumerate() {
+            let mut line = line.clone();
+            line.meta = LineMetadata {
+                timestamp: Some(originals[index].to_string()),
+            };
+            stamped.push_str(&line_of(&line, moment).unwrap());
+            stamped.push('\n');
+        }
+        // A well-formed but unpaired trailing call, and a torn tail after it.
+        let orphan = line_of(
+            &RecordLine {
+                item: InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                    namespace: None,
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                    call_id: "call_0".to_string(),
+                    id: None,
+                    status: None,
+                })),
+                meta: LineMetadata {
+                    timestamp: Some("2026-09-09 10:00:09".to_string()),
+                },
+            },
+            moment,
+        )
+        .unwrap();
+        std::fs::write(&both, format!("{stamped}{orphan}\n{{\"type\":\"me")).unwrap();
 
         let (resumed, mut session) =
             Session::open(root.path(), Path::new("/tmp/other"), &both).unwrap();
 
-        // The record keeps the paired prefix: the system prompt and the turn.
         assert_eq!(resumed.request_items().len(), 2);
-        let mut expected = String::new();
-        for item in resumed.request_items() {
-            expected.push_str(&serde_json::to_string(&item).unwrap());
-            expected.push('\n');
-        }
-        assert_eq!(std::fs::read_to_string(&both).unwrap(), expected);
+        let after = std::fs::read_to_string(&both).unwrap();
+        assert_eq!(after.lines().count(), 2, "system and turn only: {after}");
+        assert!(after.ends_with('\n'), "every line is terminated");
+        assert!(!after.contains("function_call"), "the orphan is gone: {after}");
+        assert!(!after.contains("10:00:09"), "its metadata dies with it");
+        assert_eq!(
+            stamps(&both),
+            vec![Some(originals[0].to_string()), Some(originals[1].to_string())],
+            "the repair preserves the recorded stamps"
+        );
 
         // The repaired session appends from there like any other.
         resumed.push_user("again".to_string()).unwrap();
@@ -502,69 +708,6 @@ mod tests {
         session.record(&resumed).unwrap();
         let (reopened, _) = Session::open(root.path(), Path::new("/tmp/other"), &both).unwrap();
         assert_eq!(reopened.request_items().len(), 4);
-    }
-
-    #[test]
-    fn damaged_tails_end_the_record_and_orphans_are_trimmed() {
-        let root = tempfile::tempdir().unwrap();
-
-        // A torn final line ends the record, and the file is rewritten as possible
-        let torn = root.path().join("torn.jsonl");
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("hello".to_string()).unwrap();
-        write_session(&torn, &transcript);
-        let ripped = std::fs::read_to_string(&torn).unwrap() + r#"{"type":"message","role":"ass"#;
-        std::fs::write(&torn, ripped).unwrap();
-        let (resumed, _) = Session::open(root.path(), Path::new("/tmp/other"), &torn).unwrap();
-        assert_eq!(resumed.request_items().len(), 2);
-        let after = std::fs::read_to_string(&torn).unwrap();
-        assert_eq!(after.lines().count(), 2);
-        assert!(after.ends_with('\n'));
-
-        // A well-formed but unpaired trailing call is trimmed from the record
-        // *and* the file, so recording a new turn cannot strand it mid-file.
-        let orphan = root.path().join("orphan.jsonl");
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("run it".to_string()).unwrap();
-        write_session(&orphan, &transcript);
-        let call = FunctionToolCall {
-            namespace: None,
-            name: "bash".to_string(),
-            arguments: r#"{"command":"ls"}"#.to_string(),
-            call_id: "call_0".to_string(),
-            id: None,
-            status: None,
-        };
-        let line = format!(
-            "{}\n",
-            serde_json::to_string(&InputItem::Item(Item::FunctionCall(call))).unwrap()
-        );
-        std::fs::write(&orphan, std::fs::read_to_string(&orphan).unwrap() + &line).unwrap();
-        let (resumed, mut session) =
-            Session::open(root.path(), Path::new("/tmp/other"), &orphan).unwrap();
-        assert_eq!(
-            serde_json::to_value(resumed.request_items())
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        assert!(
-            !std::fs::read_to_string(&orphan)
-                .unwrap()
-                .contains("function_call")
-        );
-        resumed.push_user("again".to_string()).unwrap();
-        resumed.push_assistant("ok".to_string()).unwrap();
-        session.record(&resumed).unwrap();
-        let (reopened, _) = Session::open(root.path(), Path::new("/tmp/other"), &orphan).unwrap();
-        assert!(
-            !serde_json::to_value(reopened.request_items())
-                .unwrap()
-                .to_string()
-                .contains("function_call")
-        );
     }
 
     #[test]
@@ -661,6 +804,10 @@ mod tests {
         assert_ne!(fresh, abandoned);
         assert_eq!(line_count(&fresh), 3, "the fresh file holds the new turn only");
         assert_eq!(std::fs::read_to_string(&abandoned).unwrap(), was);
+
+        let fresh_stamps = stamps(&fresh);
+        assert_eq!(fresh_stamps[0], stamps(&abandoned)[0]);
+        assert!(all_stamped(&fresh_stamps[1..]));
     }
 
     /// A rewind abandons the file like a clear does, but the next record is seeded with
@@ -693,6 +840,17 @@ mod tests {
         // The fresh file holds the system prompt, the kept turn, and the new
         // one: everything the rewound conversation continued from.
         assert_eq!(resumed.request_items(), transcript.request_items());
+
+        // The kept prefix re-flushes with its ORIGINAL stamps.
+        let abandoned_stamps = stamps(&abandoned);
+        let fresh_stamps = stamps(&fresh);
+        assert_eq!(
+            fresh_stamps[..3],
+            abandoned_stamps[..3],
+            "kept lines keep their stamps"
+        );
+        assert!(all_stamped(&fresh_stamps[3..]));
+
         resumed.push_user("three".to_string()).unwrap();
         resumed_session.record(&resumed).unwrap();
         // Five lines seeded the file; the resumed turn appends the sixth.
@@ -708,5 +866,37 @@ mod tests {
         let next = unused(dir.path(), "20260101-000000");
 
         assert_eq!(next, dir.path().join("20260101-000000-2.jsonl"));
+    }
+
+    #[test]
+    fn the_resumed_stem_finds_its_ledger_gauge() {
+        let _held = crate::usage::tests::held_for_test();
+        let _ledger = crate::usage::tests::ledger_root();
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+
+        // What the `/resume` chooser derives: the file's stem.
+        let stem = session.stem();
+        let from_path = session
+            .path
+            .as_ref()
+            .unwrap()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(stem, from_path, "the tag is the name the chooser shows");
+
+        // The round the resumed conversation last billed under that tag.
+        crate::usage::set_session(stem);
+        crate::usage::tests::sample_usage().bill(crate::usage::MAIN_AGENT, "m");
+        assert_eq!(
+            crate::usage::Ledger::gauge_for(&from_path),
+            Some((9001, 8214, 512)),
+            "a resume finds the gauge its own session billed"
+        );
     }
 }

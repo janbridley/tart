@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{Agent, Progress, Transcript, TurnHandle};
 
@@ -145,7 +145,7 @@ impl Agents {
         // The child's own lever, with fresh state: MAIN's generation guard
         // must never retire the child's wake sender, nor the child's retire
         // MAIN's.
-        let agent = template.child();
+        let agent = template.child().identify(id);
         // The subagent preamble, then the task, as one user turn
         let transcript = Transcript::new()?;
         transcript.push_user(format!("{AGENT_PROMPT}\n\n{task}"))?;
@@ -281,19 +281,19 @@ impl Agents {
 
     /// The registry's lock on MAIN's lever.
     fn lock_main(&self) -> MutexGuard<'_, Option<TurnHandle>> {
-        self.inner.main.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::locked(&self.inner.main)
     }
 }
 
 impl Inner {
     /// The registry's lock on its children.
     fn lock_children(&self) -> MutexGuard<'_, Vec<(AgentId, Child)>> {
-        self.children.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::locked(&self.children)
     }
 
     /// The registry's lock on the delivered-id markers.
     fn lock_delivered(&self) -> MutexGuard<'_, HashSet<AgentId>> {
-        self.delivered.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::locked(&self.delivered)
     }
 
     /// Whether `id`'s report was already delivered.

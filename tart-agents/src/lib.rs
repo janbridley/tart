@@ -9,6 +9,7 @@ mod progress;
 pub mod prompts;
 pub mod session;
 mod tools;
+pub mod usage;
 
 #[cfg(target_os = "macos")]
 pub mod sandbox;
@@ -34,6 +35,12 @@ pub fn max_tool_rounds() -> usize {
         .and_then(|rounds| rounds.parse().ok())
         .filter(|&rounds| rounds > 0)
         .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
+}
+
+/// Recover the content of a mutex, poisoned or otherwise.
+#[inline]
+pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The round cap when `TART_MAX_TOOL_ROUNDS` is unset or invalid.

@@ -1946,6 +1946,7 @@ dependencies = [
  "macro_rules_attribute",
  "nix",
  "rustls",
+ "serde",
  "serde_json",
  "tempfile",
  "time",

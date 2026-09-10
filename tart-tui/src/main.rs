@@ -43,6 +43,7 @@ use recorded::MANUAL_AT;
 use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
     ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
+    usage::Ledger,
 };
 
 use tmux_override::{override_shift_up, restore_tmux};
@@ -338,6 +339,12 @@ fn run(
                         );
                         pane.note(format!("resumed {name}"));
                         pane.extend(history);
+                        // Usage gauge restores with the conversation.
+                        if let Some((input, cached, output)) =
+                            Ledger::gauge_for(&name)
+                        {
+                            pane.extend([Progress::Usage { input, cached, output }]);
+                        }
                     }
                     // A file too damaged to open just puts the error into our pane.
                     Err(error) => pane.note(error.to_string()),

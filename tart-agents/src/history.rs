@@ -1,14 +1,56 @@
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_openai::types::responses::{
     EasyInputContent, EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam,
     FunctionToolCall, InputItem, Item, ReasoningItem, ReasoningItemContent, Role,
 };
 
+use time::OffsetDateTime;
+
 use crate::Progress;
 
 /// The system prompt for *tart*, included in every conversation.
 const SYSTEM: &str = include_str!("data/SYSTEM.md");
+
+/// The moment as `YYYY-MM-DD HH:MM:SS` UTC, fixed-width and lexically
+/// sortable: the stamp a line records itself under.
+#[inline]
+pub(crate) fn stamp_utc_at(moment: OffsetDateTime) -> String {
+    let (y, m, d) = (moment.year(), u8::from(moment.month()), moment.day());
+    let (hr, min, sec) = (moment.hour(), moment.minute(), moment.second());
+    format!("{y:04}-{m:02}-{d:02} {hr:02}:{min:02}:{sec:02}")
+}
+
+/// One session line's durable metadata, preserved by every rewrite.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LineMetadata {
+    /// When the line was first written, `YYYY-MM-DD HH:MM:SS` UTC; minted at
+    /// write time when absent.
+    pub(crate) timestamp: Option<String>,
+}
+
+/// One recorded item and the metadata its session line carries.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RecordLine {
+    /// The item itself, as the record and a request send it.
+    pub(crate) item: InputItem,
+    /// The metadata its session line writes beside it.
+    pub(crate) meta: LineMetadata,
+}
+
+impl RecordLine {
+    /// One line as the record appends it, stamped with the moment it is
+    /// recorded.
+    #[inline]
+    fn fresh(item: InputItem) -> Self {
+        Self {
+            item,
+            meta: LineMetadata {
+                timestamp: Some(stamp_utc_at(OffsetDateTime::now_utc())),
+            },
+        }
+    }
+}
 
 /// An append-only conversation record for one tart session.
 ///
@@ -17,8 +59,8 @@ const SYSTEM: &str = include_str!("data/SYSTEM.md");
 /// back into the model and the conversation continues.
 #[derive(Clone, Debug)]
 pub struct Transcript {
-    /// Every item, oldest first, starting with the system prompt.
-    items: Arc<Mutex<Vec<InputItem>>>,
+    /// The lines, oldest first, opening with the system prompt.
+    lines: Arc<Mutex<Vec<RecordLine>>>,
     /// A mode reminder appended to the end of the input at request time.
     ///
     /// This is designed to mirror Codex's instruction handling, as we can't
@@ -29,28 +71,28 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// The record under its lock.
-    ///
-    /// If a worker panics mid turn and poisons the lock, we recover the original record
-    /// rather than killing the session.
-    fn items(&self) -> MutexGuard<'_, Vec<InputItem>> {
-        self.items.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The lines under their lock, poison recovered as [`crate::locked`] does.
+    fn lines(&self) -> MutexGuard<'_, Vec<RecordLine>> {
+        crate::locked(&self.lines)
     }
 
     /// A transcript opening with the tart system prompt.
     #[inline]
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            items: Arc::new(Mutex::new(vec![input_message(Role::System, SYSTEM.to_string())?])),
+            lines: Arc::new(Mutex::new(vec![RecordLine {
+                item: input_message(Role::System, SYSTEM.to_string())?,
+                meta: LineMetadata::default(),
+            }])),
             reminder: None,
         })
     }
 
-    /// A transcript over `items`, as a session file restored them.
+    /// A transcript over `lines`, as a session file restored them.
     #[inline]
-    pub(crate) fn from_items(items: Vec<InputItem>) -> Self {
+    pub(crate) fn from_lines(lines: Vec<RecordLine>) -> Self {
         Self {
-            items: Arc::new(Mutex::new(items)),
+            lines: Arc::new(Mutex::new(lines)),
             reminder: None,
         }
     }
@@ -64,26 +106,29 @@ impl Transcript {
     /// Cut the record back to `start`, not including the system prompt.
     #[inline]
     pub fn rewind(&self, start: usize) {
-        let mut items = self.items();
-        let systems = items
+        let mut lines = self.lines();
+        let systems = lines
             .iter()
-            .take_while(|item| matches!(item, InputItem::EasyMessage(m) if m.role == Role::System))
+            .take_while(
+                |line| matches!(&line.item, InputItem::EasyMessage(m) if m.role == Role::System),
+            )
             .count();
-        items.truncate(start.max(systems));
+        lines.truncate(start.max(systems));
     }
 
     /// The user messages in the record, oldest first, each with the index its turn begins at.
     #[inline]
     #[must_use]
     pub fn user_turns(&self) -> Vec<(usize, String)> {
-        self.items()
+        self.lines()
             .iter()
+            .map(|line| &line.item)
             .enumerate()
             .filter_map(|(index, item)| match item {
                 InputItem::EasyMessage(message) => match (&message.role, &message.content) {
                     (Role::User, EasyInputContent::Text(text)) => Some((index, text.clone())),
-                    // Prompts, answers, and the content lists this harness doesn't save
-                    // acan be skipped, we wil lnever rewind to them
+                    // Prompts, answers, and content lists the harness never
+                    // rewinds to can be skipped
                     _ => None,
                 },
                 _ => None,
@@ -94,15 +139,28 @@ impl Transcript {
     /// Record the user's turn.
     #[inline]
     pub fn push_user(&self, text: String) -> anyhow::Result<()> {
-        self.items().push(input_message(Role::User, text)?);
+        self.push(input_message(Role::User, text)?);
         Ok(())
     }
 
     /// Record the assistant's final answer for the current turn.
     #[inline]
     pub fn push_assistant(&self, text: String) -> anyhow::Result<()> {
-        self.items().push(input_message(Role::Assistant, text)?);
+        self.push(input_message(Role::Assistant, text)?);
         Ok(())
+    }
+
+    /// Record the answer a round streamed, when it streamed one at all.
+    pub(crate) fn push_answer(&self, answer: &str) -> anyhow::Result<()> {
+        if answer.is_empty() {
+            return Ok(());
+        }
+        self.push_assistant(answer.to_string())
+    }
+
+    /// Append one item, stamped with the moment of its recording.
+    fn push(&self, item: InputItem) {
+        self.lines().push(RecordLine::fresh(item));
     }
 
     /// Record the reasoning that preceded a round's tool calls.
@@ -110,12 +168,12 @@ impl Transcript {
     /// This is critical for `DeepSeek`'s thinking mode, which breaks on concurrent tool
     /// calls without it.
     pub(crate) fn push_reasoning(&self, item: ReasoningItem) {
-        self.items().push(InputItem::Item(item.into()));
+        self.push(InputItem::Item(item.into()));
     }
 
     /// Record one round of tool exchanges.
     pub(crate) fn push_tool_round(&self, round: Vec<(FunctionToolCall, String)>) {
-        let mut items = self.items();
+        let mut lines = self.lines();
         let mut outputs = Vec::with_capacity(round.len());
         for (call, output) in round {
             outputs.push(FunctionCallOutputItemParam {
@@ -124,14 +182,13 @@ impl Transcript {
                 id: None,
                 status: None,
             });
-            items.push(InputItem::Item(Item::FunctionCall(call)));
+            lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCall(call))));
         }
-        items.extend(
-            outputs
-                .into_iter()
-                .map(Item::FunctionCallOutput)
-                .map(InputItem::Item),
-        );
+        for output in outputs {
+            lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCallOutput(
+                output,
+            ))));
+        }
     }
 
     /// Append `text` to the end of the input on every subsequent request, or clear with `None`.
@@ -152,19 +209,18 @@ impl Transcript {
     #[inline]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.items().len()
+        self.lines().len()
     }
 
-    /// The stored items from `start` on, oldest first, as `Session` persists
-    /// and replays.
+    /// The stored items and their metadata from `start` on, oldest first.
     ///
-    /// A cursor read: only the tail past what a session has already flushed is
-    /// cloned, so recording a turn costs its new lines, not the whole record.
+    /// A cursor read: only the tail past what a session has already flushed
+    /// is cloned, each item paired with the metadata its session line carries.
     /// A `start` past the end yields nothing.
     #[inline]
     #[must_use]
-    pub(crate) fn items_after(&self, start: usize) -> Vec<InputItem> {
-        self.items().get(start..).map_or_else(Vec::new, ToOwned::to_owned)
+    pub(crate) fn recorded_after(&self, start: usize) -> Vec<RecordLine> {
+        self.lines().get(start..).map_or_else(Vec::new, ToOwned::to_owned)
     }
 
     /// The input items for the next request: the stored record with the
@@ -172,9 +228,11 @@ impl Transcript {
     #[inline]
     #[must_use]
     pub(crate) fn request_items(&self) -> Vec<InputItem> {
-        let mut items = self.items().clone();
-        items.extend(self.reminder.clone());
-        items
+        self.lines()
+            .iter()
+            .map(|line| line.item.clone())
+            .chain(self.reminder.clone())
+            .collect()
     }
 
     /// The progress stream that renders this record, in live order, for replay.
@@ -182,9 +240,9 @@ impl Transcript {
     /// Tool exchanges replay headers only, with coloring skipped for simplicity.
     #[inline]
     pub fn replay(&self) -> Vec<Progress> {
-        let items = self.items();
-        items
+        self.lines()
             .iter()
+            .map(|line| &line.item)
             .chain(self.reminder.as_ref())
             .flat_map(Self::replay_events)
             .collect()
@@ -207,11 +265,10 @@ impl Transcript {
                     .flatten()
                     .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
                     .collect();
-                if text.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Progress::Thinking(text)]
-                }
+                (!text.is_empty())
+                    .then_some(Progress::Thinking(text))
+                    .into_iter()
+                    .collect()
             }
             InputItem::Item(Item::FunctionCall(call)) => {
                 // Just show the header, exits/output are not super necessary
@@ -248,6 +305,34 @@ mod tests {
 
     use super::*;
     use async_openai::types::responses::{ReasoningItemContent, ReasoningTextContent};
+
+    impl Transcript {
+        /// A transcript over `items`, as a session file restored them: the
+        /// lines arrive metadata-free, so a record seeded this way mints
+        /// stamps at its next write. Resume restores full lines with
+        /// [`Transcript::from_lines`].
+        #[inline]
+        fn from_items(items: Vec<InputItem>) -> Self {
+            Self::from_lines(
+                items
+                    .into_iter()
+                    .map(|item| RecordLine { item, meta: LineMetadata::default() })
+                    .collect(),
+            )
+        }
+
+        /// The stored items from `start` on, oldest first, as tests replay
+        /// them; [`Session`](crate::Session) reads the same tail as lines,
+        /// metadata attached, in [`Transcript::recorded_after`].
+        #[inline]
+        #[must_use]
+        fn items_after(&self, start: usize) -> Vec<InputItem> {
+            self.recorded_after(start)
+                .into_iter()
+                .map(|line| line.item)
+                .collect()
+        }
+    }
 
     /// A finished `bash` call, as the agent loop would reconstruct it.
     fn bash_call() -> FunctionToolCall {
@@ -414,6 +499,22 @@ mod tests {
         assert_eq!(items[3]["output"], "one\n");
         assert_eq!(items[4]["type"], "function_call_output");
         assert_eq!(items[4]["output"], "two\n");
+    }
+
+    #[test]
+    fn push_answer_records_only_real_answers() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+
+        transcript.push_answer("").unwrap();
+        assert_eq!(
+            transcript.request_items().len(),
+            2,
+            "an empty answer records nothing"
+        );
+
+        transcript.push_answer("hi").unwrap();
+        assert_eq!(transcript.request_items().len(), 3);
     }
 
     #[test]
