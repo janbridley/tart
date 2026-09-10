@@ -1,5 +1,5 @@
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_openai::{
     Client,
@@ -14,9 +14,10 @@ use futures::channel::mpsc;
 use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
+use crate::usage::TokenUsage;
 use crate::{
-    Agents, CancelToken, Progress, Transcript, debug, errors, max_tool_rounds, sandbox::Policy,
-    tools,
+    AgentId, Agents, CancelToken, MAIN, Progress, Transcript, debug, errors, max_tool_rounds,
+    sandbox::Policy, tools,
 };
 
 /// The session's collaboration mode, mirroring Codex's `ModeKind`.
@@ -56,6 +57,8 @@ pub struct Agent {
     subagents: Option<Arc<Agents>>,
     /// The front end's lever on the running turn (cancel).
     control: TurnHandle,
+    /// This agent's conversation: MAIN, or the subagent's registry id.
+    id: AgentId,
 }
 
 /// The front end's control plane for running turns.
@@ -80,7 +83,7 @@ struct TurnState {
 impl TurnHandle {
     /// The state under its lock.
     fn state(&self) -> MutexGuard<'_, TurnState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::locked(&self.state)
     }
 
     /// Cancel the turn: kill any command it is running, drop the stream, and
@@ -151,6 +154,7 @@ impl Agent {
             runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
             subagents: None,
             control: TurnHandle::default(),
+            id: MAIN,
         }
     }
 
@@ -192,12 +196,32 @@ impl Agent {
             .collect()
     }
 
-    /// A child agent: this agent's model and policy, with no subagent recursion.
+    /// Name this agent's conversation, as a spawned subagent's registry id.
+    #[inline]
+    pub(crate) fn identify(mut self, id: AgentId) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// Clone this agent as a spawned subagent of itself: a fresh lever, no
+    /// registry of its own, and its registry id still to name.
     pub(crate) fn child(&self) -> Self {
         let mut child = self.clone();
         child.control = TurnHandle::default();
         child.subagents = None;
         child
+    }
+
+    /// The ledger's tag for this agent: `"main"`, or `"child-N"` for the
+    /// Nth subagent the session spawned.
+    #[inline]
+    #[must_use]
+    fn agent_tag(&self) -> String {
+        if self.id == MAIN {
+            "main".to_string()
+        } else {
+            format!("child-{}", self.id)
+        }
     }
 
     /// Arm the subagent tools with a registry, for the front end's agent.
@@ -382,7 +406,7 @@ impl Agent {
                             continue;
                         }
                         // Esc won: dropping the stream keeps what it streamed.
-                        if let Err(error) = record_answer(transcript, &answer) {
+                        if let Err(error) = transcript.push_answer(&answer) {
                             return terminate_and_log(
                                 on_progress,
                                 Progress::Failed(error.to_string()),
@@ -426,12 +450,14 @@ impl Agent {
                     Ok(ResponseStreamEvent::ResponseCompleted(completed)) => {
                         // A completed response is output even when it holds no items.
                         saw_output = true;
-                        if let Some(usage) = completed.response.usage {
-                            on_progress(Progress::Usage {
-                                input: u64::from(usage.input_tokens),
-                                cached: u64::from(usage.input_tokens_details.cached_tokens),
-                                output: u64::from(usage.output_tokens),
-                            });
+                        if let Some(spend) =
+                            completed.response.usage.as_ref().map(TokenUsage::extract)
+                        {
+                            // The bill lands whatever happens to the round
+                            // after this.
+                            spend.bill(&self.agent_tag(), &self.model);
+                            let (input, cached, output) = spend.gauge();
+                            on_progress(Progress::Usage { input, cached, output });
                         }
                     }
                     Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
@@ -506,7 +532,7 @@ impl Agent {
 
             // No calls pending: this round's answer is the turn's message.
             if calls.is_empty() {
-                if let Err(error) = record_answer(transcript, &answer) {
+                if let Err(error) = transcript.push_answer(&answer) {
                     return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
                 }
                 return terminate_and_log(
@@ -539,15 +565,19 @@ impl Agent {
             }
             // A round cut short before its first executed call records no
             // reasoning: without its calls the item would dangle in the replay.
-            if !exchanges.is_empty()
-                && let Some(item) = reasoning
-            {
-                transcript.push_reasoning(item);
+            if exchanges.is_empty() {
+                if let Err(error) = transcript.push_answer(&answer) {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
+            } else {
+                if let Some(item) = reasoning {
+                    transcript.push_reasoning(item);
+                }
+                if let Err(error) = transcript.push_answer(&answer) {
+                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
+                }
+                transcript.push_tool_round(exchanges);
             }
-            if let Err(error) = record_answer(transcript, &answer) {
-                return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-            }
-            transcript.push_tool_round(exchanges);
             if self.control.cancelled(&mut cancel_rx) {
                 // The turn stops here, keeping the rounds recorded so far.
                 return terminate_and_log(on_progress, Progress::Cancelled);
@@ -579,14 +609,6 @@ fn bounded_for_history<F: Fn(Progress)>(name: &str, output: &str, on_progress: &
     capped
 }
 
-/// Record the answer a round streamed, when it streamed one at all.
-fn record_answer(transcript: &Transcript, answer: &str) -> anyhow::Result<()> {
-    if answer.is_empty() {
-        return Ok(());
-    }
-    transcript.push_assistant(answer.to_string())
-}
-
 /// Deliver the generation's terminal event, mirroring its outcome to the debug lob.
 fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
     debug::log("generation outcome", || match &event {
@@ -605,6 +627,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use crate::usage::tests::sample_usage;
     use async_openai::types::responses::{ResponseOutputItemDoneEvent, ResponseTextDeltaEvent};
     use std::io::{Read, Write};
 
@@ -695,6 +718,21 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn drive(agent: &Agent, transcript: &Transcript) -> Vec<String> {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (sender, receiver) = mpsc::channel(1);
+        let handle = agent.handle();
+        let (generation, token) = handle.claim(sender);
+        agent.run(transcript, receiver, &token, &|progress| {
+            log.lock().unwrap().push(format!("{progress:?}"));
+        });
+        handle.release(generation);
+        Arc::try_unwrap(log)
+            .expect("the sole owner")
+            .into_inner()
+            .unwrap()
     }
 
     /// Claiming installs the wake sender and retires the last turn's cancel;
@@ -832,17 +870,9 @@ mod tests {
             let _ = stream.flush();
         });
 
-        let log = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (sender, receiver) = mpsc::channel(1);
-        let handle = agent.handle();
-        let (generation, token) = handle.claim(sender);
-        agent.run(&transcript, receiver, &token, &|progress| {
-            log.lock().unwrap().push(format!("{progress:?}"));
-        });
-        handle.release(generation);
+        let log = drive(&agent, &transcript);
         server.join().expect("the server exits");
 
-        let log = log.lock().unwrap();
         // The stall is visible as a note, and the retry completes the turn.
         assert!(
             log.iter().any(|entry| entry.contains("retry 1/4")),
@@ -889,19 +919,11 @@ mod tests {
             let _ = stream.flush();
         });
 
-        let log = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (sender, receiver) = mpsc::channel(1);
-        let handle = agent.handle();
-        let (generation, token) = handle.claim(sender);
-        agent.run(&transcript, receiver, &token, &|progress| {
-            log.lock().unwrap().push(format!("{progress:?}"));
-        });
-        handle.release(generation);
+        let log = drive(&agent, &transcript);
 
         // The turn completes: no failure, one terminal event, and it is Done.
         // Asserted before joining the server so a regression fails here
         // instead of hanging on an accept that never comes.
-        let log = log.lock().unwrap();
         assert!(
             log.iter().all(|entry| !entry.starts_with("Failed")),
             "the malformed call must not fail the turn: {log:?}"
@@ -961,16 +983,8 @@ mod tests {
             let _ = stream.flush();
         });
 
-        let log = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (sender, receiver) = mpsc::channel(1);
-        let handle = agent.handle();
-        let (generation, token) = handle.claim(sender);
-        agent.run(&transcript, receiver, &token, &|progress| {
-            log.lock().unwrap().push(format!("{progress:?}"));
-        });
-        handle.release(generation);
+        let log = drive(&agent, &transcript);
 
-        let log = log.lock().unwrap();
         assert!(
             log.iter().all(|entry| !entry.starts_with("Failed")),
             "neither malformed call fails the turn: {log:?}"
@@ -1068,6 +1082,46 @@ mod tests {
             .expect_err("the report left with the first delivery")
             .to_string();
         assert!(delivered.contains("already delivered"), "{delivered}");
+    }
+
+    /// A subagent's completed round bills the ledger as a child row: the hard
+    /// requirement, pinned end to end through the real spawn path.
+    #[test]
+    fn a_subagents_round_bills_as_a_child() {
+        let Some(listener) = loopback() else { return };
+        let _held = crate::usage::tests::held_for_test();
+        let _ledger = crate::usage::tests::ledger_root();
+        crate::usage::set_session("child-ledger".to_string());
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let agents = crate::Agents::new(|_, _| ());
+
+        // The child's one round answers, bills, and the stream ends.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the child connects");
+            read_request(&mut stream);
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            for event in [delta("found it"), completed(&sample_usage())] {
+                let event = serde_json::to_string(&event).expect("a stream event serializes");
+                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            }
+            let _ = stream.flush();
+        });
+
+        let id = agents
+            .spawn(&agent, "find the flaky test")
+            .expect("room for a child");
+        settled(&agents, id);
+        server.join().expect("the server exits");
+
+        let row = crate::usage::Ledger::last_entry().expect("the child's round billed");
+        assert_eq!(row.agent, format!("child-{}", id.id()), "the row names the child");
+        assert_eq!(row.session.as_deref(), Some("child-ledger"));
+        assert_eq!(row.usage, sample_usage());
     }
 
     /// A delivered report leaves a marker: a later wait for that id says
@@ -1180,6 +1234,82 @@ mod tests {
                 status: None,
             }),
         })
+    }
+
+    /// A `response.completed` event whose response burned `spend` tokens.
+    fn completed(spend: &TokenUsage) -> ResponseStreamEvent {
+        let event = serde_json::json!({
+            "sequence_number": 1,
+            "response": {
+                "created_at": 0,
+                "id": "resp_0",
+                "model": "model",
+                "object": "response",
+                "output": [],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": spend.input,
+                    "input_tokens_details": { "cached_tokens": spend.cached },
+                    "output_tokens": spend.output,
+                    "output_tokens_details": { "reasoning_tokens": spend.reasoning },
+                    "total_tokens": spend.total,
+                }
+            }
+        });
+        ResponseStreamEvent::ResponseCompleted(
+            serde_json::from_value(event).expect("a completed event parses"),
+        )
+    }
+
+    #[test]
+    fn a_completed_round_bills_the_ledger() {
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("hello".to_string())
+            .expect("the user turn records");
+        let _held = crate::usage::tests::held_for_test();
+        let _ledger = crate::usage::tests::ledger_root();
+        crate::usage::set_session("ledgered".to_string());
+
+        // One round answers, bills, and the stream ends: the turn completes.
+        let server = std::thread::spawn(move || {
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let (mut stream, _) = listener.accept().expect("the client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            for event in [delta("hi there"), completed(&sample_usage())] {
+                let event = serde_json::to_string(&event).expect("a stream event serializes");
+                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            }
+            let _ = stream.flush();
+        });
+
+        let log = drive(&agent, &transcript);
+
+        // The turn completes, and the gauge saw the round's bill.
+        assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
+        assert_eq!(
+            log.iter().filter(|entry| entry.starts_with("Usage")).count(),
+            1,
+            "the completed round reports its usage once: {log:?}"
+        );
+
+        // The answer is recorded, and the round's bill landed in the ledger:
+        // one row, tagged for this agent, session, and model.
+        let lines = transcript.recorded_after(0);
+        assert_eq!(lines.len(), 3);
+        let row = crate::usage::Ledger::last_entry().expect("the round billed");
+        assert_eq!(row.agent, "main");
+        assert_eq!(row.model, "model");
+        assert_eq!(row.session.as_deref(), Some("ledgered"));
+        assert_eq!(row.usage, crate::usage::tests::sample_usage());
+        server.join().expect("the server exits");
     }
 
     /// Answer one `/responses` request with `events` as `text/event-stream`,
