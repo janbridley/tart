@@ -14,7 +14,7 @@ use futures::channel::mpsc;
 use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
-use crate::usage::TokenUsage;
+use crate::usage::{MAIN_AGENT, TokenUsage};
 use crate::{
     AgentId, Agents, CancelToken, MAIN, Progress, Transcript, debug, errors, max_tool_rounds,
     sandbox::Policy, tools,
@@ -218,7 +218,7 @@ impl Agent {
     #[must_use]
     fn agent_tag(&self) -> String {
         if self.id == MAIN {
-            "main".to_string()
+            MAIN_AGENT.to_string()
         } else {
             format!("child-{}", self.id)
         }
