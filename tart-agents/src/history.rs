@@ -16,21 +16,9 @@ const SYSTEM: &str = include_str!("data/SYSTEM.md");
 /// sortable: the stamp a line records itself under.
 #[inline]
 pub(crate) fn stamp_utc_at(moment: OffsetDateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        moment.year(),
-        u8::from(moment.month()),
-        moment.day(),
-        moment.hour(),
-        moment.minute(),
-        moment.second()
-    )
-}
-
-/// The current instant as [`stamp_utc_at`] renders it.
-#[inline]
-fn now_stamp() -> String {
-    stamp_utc_at(OffsetDateTime::now_utc())
+    let (y, m, d) = (moment.year(), u8::from(moment.month()), moment.day());
+    let (hr, min, sec) = (moment.hour(), moment.minute(), moment.second());
+    format!("{y:04}-{m:02}-{d:02} {hr:02}:{min:02}:{sec:02}")
 }
 
 /// One session line's durable metadata, preserved by every rewrite.
@@ -48,6 +36,20 @@ pub(crate) struct RecordLine {
     pub(crate) item: InputItem,
     /// The metadata its session line writes beside it.
     pub(crate) meta: LineMetadata,
+}
+
+impl RecordLine {
+    /// One line as the record appends it, stamped with the moment it is
+    /// recorded.
+    #[inline]
+    fn fresh(item: InputItem) -> Self {
+        Self {
+            item,
+            meta: LineMetadata {
+                timestamp: Some(stamp_utc_at(OffsetDateTime::now_utc())),
+            },
+        }
+    }
 }
 
 /// An append-only conversation record for one tart session.
@@ -69,10 +71,7 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// The lines under their lock.
-    ///
-    /// If a worker panics mid turn and poisons the lock, we recover the original record
-    /// rather than killing the session.
+    /// The lines under their lock, poison recovered as [`crate::locked`] does.
     fn lines(&self) -> MutexGuard<'_, Vec<RecordLine>> {
         crate::locked(&self.lines)
     }
@@ -128,8 +127,8 @@ impl Transcript {
             .filter_map(|(index, item)| match item {
                 InputItem::EasyMessage(message) => match (&message.role, &message.content) {
                     (Role::User, EasyInputContent::Text(text)) => Some((index, text.clone())),
-                    // Prompts, answers, and the content lists this harness doesn't save
-                    // acan be skipped, we wil lnever rewind to them
+                    // Prompts, answers, and content lists the harness never
+                    // rewinds to can be skipped
                     _ => None,
                 },
                 _ => None,
@@ -161,10 +160,7 @@ impl Transcript {
 
     /// Append one item, stamped with the moment of its recording.
     fn push(&self, item: InputItem) {
-        self.lines().push(RecordLine {
-            item,
-            meta: LineMetadata { timestamp: Some(now_stamp()) },
-        });
+        self.lines().push(RecordLine::fresh(item));
     }
 
     /// Record the reasoning that preceded a round's tool calls.
@@ -186,16 +182,12 @@ impl Transcript {
                 id: None,
                 status: None,
             });
-            lines.push(RecordLine {
-                item: InputItem::Item(Item::FunctionCall(call)),
-                meta: LineMetadata { timestamp: Some(now_stamp()) },
-            });
+            lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCall(call))));
         }
         for output in outputs {
-            lines.push(RecordLine {
-                item: InputItem::Item(Item::FunctionCallOutput(output)),
-                meta: LineMetadata { timestamp: Some(now_stamp()) },
-            });
+            lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCallOutput(
+                output,
+            ))));
         }
     }
 
@@ -236,9 +228,11 @@ impl Transcript {
     #[inline]
     #[must_use]
     pub(crate) fn request_items(&self) -> Vec<InputItem> {
-        let mut items: Vec<_> = self.lines().iter().map(|line| line.item.clone()).collect();
-        items.extend(self.reminder.clone());
-        items
+        self.lines()
+            .iter()
+            .map(|line| line.item.clone())
+            .chain(self.reminder.clone())
+            .collect()
     }
 
     /// The progress stream that renders this record, in live order, for replay.
@@ -271,11 +265,10 @@ impl Transcript {
                     .flatten()
                     .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
                     .collect();
-                if text.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Progress::Thinking(text)]
-                }
+                (!text.is_empty())
+                    .then_some(Progress::Thinking(text))
+                    .into_iter()
+                    .collect()
             }
             InputItem::Item(Item::FunctionCall(call)) => {
                 // Just show the header, exits/output are not super necessary
