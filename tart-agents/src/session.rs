@@ -867,4 +867,36 @@ mod tests {
 
         assert_eq!(next, dir.path().join("20260101-000000-2.jsonl"));
     }
+
+    #[test]
+    fn the_resumed_stem_finds_its_ledger_gauge() {
+        let _held = crate::usage::tests::held_for_test();
+        let _ledger = crate::usage::tests::ledger_root();
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+
+        // What the `/resume` chooser derives: the file's stem.
+        let stem = session.stem();
+        let from_path = session
+            .path
+            .as_ref()
+            .unwrap()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(stem, from_path, "the tag is the name the chooser shows");
+
+        // The round the resumed conversation last billed under that tag.
+        crate::usage::set_session(stem);
+        crate::usage::tests::sample_usage().bill(crate::usage::MAIN_AGENT, "m");
+        assert_eq!(
+            crate::usage::Ledger::gauge_for(&from_path),
+            Some((9001, 8214, 512)),
+            "a resume finds the gauge its own session billed"
+        );
+    }
 }
