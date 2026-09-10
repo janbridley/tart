@@ -74,6 +74,23 @@ model responses with coloring and proper markdown styling, including nice table 
 The style for this is kept in [`markdown.rs`](./tart-tui/src/pane/markdown.rs), and can
 be extended or restyled as desired.
 
+## Accounting and Usage Analysis
+
+*tart* keeps a ledger of token outputs in `~/.config/tart/usage.jsonl`, which can be
+parsed with tools like `jq` to analyze total expenditures. The following is one example
+of such an approach, which can of course be tailored to your specific needs.
+
+```bash
+jq -s 'group_by(.model)
+  | map({model: .[0].model,
+         rows: length,
+         uncached_input: ((map(.input)|add) - (map(.cached)|add)),
+         cache_served: (map(.cached)|add),
+         output: (map(.output)|add),
+         reasoning_within_output: (map(.reasoning)|add),
+         total: (map(.total)|add)})' ~/.config/tart/usage.jsonl
+```
+
 ## Package Structure
 
 Internally, we use an agent harness package structure similar to the one
