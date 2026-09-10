@@ -1,7 +1,7 @@
 //! Append-only ledger of token usage per model and session.
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, Write as _};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -18,6 +18,9 @@ use crate::session::slug;
 
 /// The live session's file stem, as [`crate::Session`] last named it.
 static SESSION: Mutex<Option<String>> = Mutex::new(None);
+
+/// The ledger's `agent` tag for the main conversation's rows.
+pub(crate) const MAIN_AGENT: &str = "main";
 
 /// One response's five token counts, as the provider measured them.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -97,28 +100,29 @@ impl Ledger {
             .with_context(|| format!("writing {}", path.display()))
     }
 
-    /// The ledger's entries, oldest first
+    /// The ledger's entries, oldest first.
     ///
-    /// Malformed lines are ignored to prevent corruption on crash.
+    /// A row that cannot be read (e.g. bad bytes, malformed JSON) is skipped.
     fn entries() -> impl Iterator<Item = LedgerEntry> {
-        let file =
-            std::fs::File::open(Self::path().unwrap_or_else(|| PathBuf::from("/dev/null"))).ok();
-        let lines = file.map_or_else(Vec::new, |file| {
-            std::io::BufReader::new(file)
-                .lines()
-                .map_while(Result::ok)
-                .collect::<Vec<_>>()
-        });
-        lines.into_iter().filter_map(|line| LedgerEntry::parse(&line))
+        let text = Self::path()
+            .and_then(|path| std::fs::read(path).ok())
+            .map_or_else(String::new, |bytes| String::from_utf8_lossy(&bytes).into_owned());
+        text.lines()
+            .filter_map(LedgerEntry::parse)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
-    /// The gauge's counts for the newest entry billed for `stem`, when there
-    /// is one: `(input, cached, output)`.
+    /// The gauge's counts for the newest entry the main conversation billed for
+    /// `stem`, when there is one: `(input, cached, output)`.
+    ///
+    /// Subagent rows are skipped: a child bills under the same session but its
+    /// usage feeds the child badge, never the conversation's gauge.
     #[must_use]
     #[inline]
     pub fn gauge_for(stem: &str) -> Option<(u64, u64, u64)> {
         Self::entries()
-            .filter(|entry| entry.session.as_deref() == Some(stem))
+            .filter(|entry| entry.agent == MAIN_AGENT && entry.session.as_deref() == Some(stem))
             .map(|entry| entry.usage.gauge())
             .last()
     }
@@ -373,5 +377,70 @@ pub(crate) mod tests {
         assert_eq!(entry.usage, sample_usage());
         // And a mistyped field still reads as no entry, never damage.
         assert_eq!(LedgerEntry::parse(&line.replace("9001", "\"many\"")), None);
+    }
+
+    #[test]
+    fn gauge_for_ignores_subagent_rows() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+
+        set_session("shared".to_string());
+        sample_usage().bill(MAIN_AGENT, "m");
+        TokenUsage {
+            input: 7,
+            cached: 8,
+            output: 9,
+            reasoning: 1,
+            total: 42,
+        }
+        .bill("child-2", "m");
+
+        assert_eq!(
+            Ledger::gauge_for("shared"),
+            Some((9001, 8214, 512)),
+            "the child's newer row is not the conversation's gauge"
+        );
+
+        // Child rows only: no gauge at all, never a child's numbers.
+        set_session("child-only".to_string());
+        TokenUsage {
+            input: 1,
+            cached: 2,
+            output: 3,
+            reasoning: 4,
+            total: 5,
+        }
+        .bill("child-1", "m");
+        assert_eq!(Ledger::gauge_for("child-only"), None);
+    }
+
+    #[test]
+    fn a_row_after_bad_bytes_is_still_read() {
+        use std::io::Write as _;
+
+        let _held = held_for_test();
+        let ledger = ledger_root();
+        let path = ledger.0.path().join("usage.jsonl");
+        set_session("bad-bytes".to_string());
+        sample_usage().bill(MAIN_AGENT, "m");
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"\xff\xfe not utf-8\n").unwrap();
+        drop(file);
+        TokenUsage {
+            input: 1,
+            cached: 2,
+            output: 3,
+            reasoning: 4,
+            total: 5,
+        }
+        .bill(MAIN_AGENT, "m");
+
+        assert_eq!(Ledger::entries().count(), 2, "both good rows are read");
+        assert_eq!(
+            Ledger::gauge_for("bad-bytes"),
+            Some((1, 2, 3)),
+            "the row past the bad bytes is the newest"
+        );
     }
 }
