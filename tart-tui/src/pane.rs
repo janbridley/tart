@@ -648,6 +648,11 @@ impl Pane {
         Some(spinners::main_dots(started.elapsed().as_millis()))
     }
 
+    /// Whether the frame still needs updates as time passes.
+    pub fn animating(&self) -> bool {
+        self.spin.is_some() || self.manual.is_some() || self.slots.iter().any(Option::is_some)
+    }
+
     /// The bottom rule's right-aligned block while subagents run.
     ///
     /// One cell per slot up to the highest occupied one, so each set of agent
@@ -2659,6 +2664,27 @@ mod tests {
 
         pane.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert!(render(&mut pane, (40, 12)).contains("Thinking"));
+    }
+
+    #[test]
+    fn animating_tracks_live_work_only() {
+        let mut pane = Pane::default();
+        assert!(!pane.animating(), "a fresh pane has nothing animating");
+
+        pane.set_generating(true);
+        assert!(pane.animating(), "the main turn's spinner runs");
+        pane.set_generating(false);
+        assert!(!pane.animating(), "the turn's end stops the timer");
+
+        pane.manual_running(Some("cargo test".to_string()));
+        assert!(pane.animating(), "a manual command's spinner runs");
+        pane.manual_done("done").unwrap();
+        assert!(!pane.animating(), "the manual command's end stops the timer");
+
+        pane.start_agent(AgentId::from(0), "task");
+        assert!(pane.animating(), "a subagent's slot spinner runs");
+        pane.finish_agent(AgentId::from(0), String::new(), None);
+        assert!(!pane.animating(), "the slot frees with the subagent");
     }
 
     /// The answer's markdown palette lands on screen: an H3 bold, inline code
