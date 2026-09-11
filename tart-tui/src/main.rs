@@ -183,7 +183,13 @@ fn run(
         } else {
             pane.set_perf(None);
         }
-        match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
+        // Wait for the next event to apply, or skip redraw if there's nothing to do.
+        let woke = if pane.animating() {
+            wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS))
+        } else {
+            wake_receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        };
+        match woke {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
                 // Esc with nothing open aborts whatever is in flight.
