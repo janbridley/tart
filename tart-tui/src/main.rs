@@ -192,9 +192,10 @@ fn run(
         match woke {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
-                // Esc with nothing open aborts whatever is in flight.
+                // Esc with nothing open aborts the main turn or the manual command.
+                // Subagents stay running unless `/stop`
                 Some(PaneEvent::Cancel) => {
-                    agents.cancel_all();
+                    agents.cancel_main();
                     // Esc also cancels a plan switch still waiting for the turn.
                     pending_plan = None;
                     if let Some(token) = &manual_cancel {
