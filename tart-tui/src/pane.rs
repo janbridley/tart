@@ -1678,6 +1678,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_rewind_rearms_the_running_agent_boxes() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let agent = Agent::new("http://127.0.0.1:1", "key", "model", policy);
+        let fresh = Conversation::new().unwrap();
+        let (wake, _wake_receiver) = std::sync::mpsc::channel();
+        let registry = Agents::new(|_, _| {});
+        let mut pane = Pane::default();
+
+        let id = registry.spawn(&agent, "map the module").unwrap();
+        pane.start_agent(id, "map the module");
+        assert!(pane.agent_block().is_some());
+
+        pane.clear();
+        assert_eq!(pane.agent_block(), None);
+        for (id, task) in registry.running() {
+            pane.start_agent(id, &task);
+        }
+        assert!(pane.agent_block().is_some());
+
+        registry.cancel(id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while registry.outcome(id).is_none() {
+            assert!(std::time::Instant::now() < deadline, "the child ends");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        pane.report(id);
+        pane.finish_agent(id, "cancelled".to_string(), None);
+        assert_eq!(pane.agent_block(), None, "the re-opened box resolved");
+        assert!(pane.deliver_reports(&registry, &agent, &fresh, &wake).unwrap());
+        assert!(pane.is_generating(), "the report started a turn");
+        let recorded = fresh.replay();
+        let Some(Progress::User(text)) = recorded.last() else {
+            panic!("the report recorded one user message: {recorded:?}");
+        };
+        assert!(text.contains("Subagent 1 finished (map the module)"), "{text}");
+    }
+
     /// The requeue echoes the queued message like a submitted one, retiring
     /// the interrupted response's thinking run, records it as the next user
     /// message, and starts the next turn.
