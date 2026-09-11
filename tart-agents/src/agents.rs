@@ -128,7 +128,7 @@ impl Agents {
         }
     }
 
-    /// Register MAIN's lever, so [`Agents::cancel_all`] reaches the main turn.
+    /// Register MAIN's lever, so [`Agents::cancel_main`] reaches the main turn.
     #[inline]
     pub fn adopt(&self, handle: TurnHandle) {
         *self.lock_main() = Some(handle);
@@ -267,14 +267,11 @@ impl Agents {
         self.inner.lock_delivered().clear();
     }
 
-    /// Cancel every registered conversation: the main turn, and any children.
+    /// Cancel MAIN, leaving subagents running. Use `/stop` to kill all.
     #[inline]
-    pub fn cancel_all(&self) {
-        // Every lever is cloned out from under the locks; cancelling takes
-        // each handle's own lock.
-        let mut handles = self.inner.handles();
-        handles.extend(self.lock_main().clone());
-        for handle in handles {
+    pub fn cancel_main(&self) {
+        // The lever is cloned out from under the lock; cancelling takes the lock back
+        if let Some(handle) = self.lock_main().clone() {
             handle.cancel();
         }
     }
@@ -315,5 +312,40 @@ impl Inner {
             .iter()
             .map(|(_, child)| child.handle.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::sandbox::Policy;
+
+    #[test]
+    fn cancel_main_leaves_the_children_running() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let template = Agent::new("http://127.0.0.1:1", "key", "model", policy);
+        let registry = Agents::new(|_, _| ());
+        registry.adopt(TurnHandle::default());
+        let id = registry.spawn(&template, "probe").expect("the child spawns");
+
+        // The main lever flips while the child runs on: a child cancelled by
+        // the same stroke would store its outcome well inside the grace.
+        registry.cancel_main();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            registry.running(),
+            vec![(id, "probe".to_string())],
+            "the main cancel left the child running"
+        );
+
+        // `/stop` still ends it: the child's own lever works.
+        registry.cancel(id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while registry.outcome(id).is_none() {
+            assert!(std::time::Instant::now() < deadline, "the child ends");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

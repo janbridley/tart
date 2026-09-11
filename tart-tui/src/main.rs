@@ -192,9 +192,10 @@ fn run(
         match woke {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
-                // Esc with nothing open aborts whatever is in flight.
+                // Esc with nothing open aborts the main turn or the manual command.
+                // Subagents stay running unless `/stop`
                 Some(PaneEvent::Cancel) => {
-                    agents.cancel_all();
+                    agents.cancel_main();
                     // Esc also cancels a plan switch still waiting for the turn.
                     pending_plan = None;
                     if let Some(token) = &manual_cancel {
@@ -356,24 +357,33 @@ fn run(
                     Err(error) => pane.note(error.to_string()),
                 }
                 Some(PaneEvent::Rewind { start, draft }) => {
-                    // The abandoned tail's subagents die with it, reports included
-                    agents.clear();
+                    // Abandoned subagents survive into the new session
                     transcript.rewind(start);
                     session.reset();
                     pane.clear();
                     pane.extend(transcript.replay());
+                    let running = agents.running();
+                    for (id, task) in &running {
+                        pane.start_agent(*id, task);
+                    }
                     // Attachments are cut back to the line the user typed, so
                     // a resubmit does not attach them twice.
                     pane.set_draft(attachments::strip_attachments(&draft));
                     // The restored draft is the turn the numbering continues from
-                    pane.note(if draft.is_empty() {
+                    let base = if draft.is_empty() {
                         "rewound to start of session · new session from here".to_string()
                     } else {
                         format!(
                             "rewound to turn {} · new session from here",
                             transcript.user_turns().len() + 1
                         )
-                    });
+                    };
+                    let suffix = match running.len() {
+                        0 => String::new(),
+                        1 => " · 1 subagent still running".to_string(),
+                        n => format!(" · {n} subagents still running"),
+                    };
+                    pane.note(format!("{base}{suffix}"));
                 }
                 // An agent picked in the `/model` chooser: swap the endpoint,
                 // the model, and the effort for the next turn.
