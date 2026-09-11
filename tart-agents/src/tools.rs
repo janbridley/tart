@@ -40,7 +40,7 @@ pub const CONTENT_CAP: usize = 64 * 1024;
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// The front end's control for a running manual command.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CancelToken {
     /// Set by `cancel`, watched by the runner's watchdog.
     cancelled: Arc<AtomicBool>,
@@ -157,7 +157,8 @@ pub(crate) fn spawn_agent() -> Tool {
     tool(
         "spawn_agent",
         "Spawn a subagent for a well-scoped task. Returns an id immediately; the subagent \
-        runs independently with your tools (minus `spawn_agent` and `check_agent`) and its \
+        runs independently with your tools (minus `spawn_agent`, `check_agent`, \
+        `steer_agent`, and `cancel_agent`) and its \
         final message becomes its report, delivered to you as a message when it finishes. \
         `check_agent` can check for it without blocking, but waiting is never required. \
         Only call this tool for a concrete, bounded subtask that can run independently \
@@ -183,6 +184,42 @@ pub(crate) fn check_agent() -> Tool {
         finished (claiming it, so it will not also arrive as a message), or says it is \
         still running: in which case end the turn and let the report arrive on its own \
         instead of polling. Check only when the very next step is blocked on the result and you are unsure whether the agent is making progress.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "The subagent's id, as `spawn_agent` reported it"}
+            },
+            "required": ["id"]
+        }),
+    )
+}
+
+/// The `steer_agent` tool; only the main agent is offered it.
+#[must_use]
+pub(crate) fn steer_agent() -> Tool {
+    tool(
+        "steer_agent",
+        "Send a course correction to a running subagent: it lands in the subagent's \
+        conversation at its next round boundary, alongside whatever it is doing. Use it \
+        when priorities change mid-task; the subagent keeps its history and continues.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "The subagent's id, as `spawn_agent` reported it"},
+                "text": {"type": "string", "description": "The correction: short, concrete, self-contained"}
+            },
+            "required": ["id", "text"]
+        }),
+    )
+}
+
+/// The `cancel_agent` tool; only the main agent is offered it.
+#[must_use]
+pub(crate) fn cancel_agent() -> Tool {
+    tool(
+        "cancel_agent",
+        "Cancel one running subagent: it stops at its next round boundary, keeping what \
+        it recorded. Prefer steering over cancelling; cancel when the task is moot.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -335,9 +372,11 @@ pub(crate) fn execute<F: Fn(Progress)>(
         // The unsandboxed pair: they need the network the sandbox denies.
         "search" => web::run_search(call, on_progress),
         "fetch" => web::run_fetch(call, on_progress),
-        // The subagent pair, offered to spawning agents only.
+        // The subagent tools, offered to spawning agents only.
         "spawn_agent" => run_spawn_agent(call, tools, on_progress),
         "check_agent" => run_check_agent(call, tools, on_progress),
+        "steer_agent" => run_steer_agent(call, tools, on_progress),
+        "cancel_agent" => run_cancel_agent(call, tools, on_progress),
         other => misuse(call, on_progress, &anyhow::anyhow!("unknown tool: {other}")),
     }
 }
@@ -409,6 +448,83 @@ fn run_check_agent<F: Fn(Progress)>(
             }
             Err(error) => (error.to_string(), error.to_string(), None),
         }
+    })
+}
+
+/// Run one `steer_agent` tool call: a course correction, delivered at once.
+fn run_steer_agent<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    tools: &Tooling<'_>,
+    on_progress: &F,
+) -> String {
+    let args = match parse_arguments(&call.arguments) {
+        Ok(args) => args,
+        Err(error) => return misuse(call, on_progress, &error),
+    };
+    let id = args.get("id").and_then(serde_json::Value::as_u64);
+    let text = args
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let (Some(id), Some(text)) = (id, text) else {
+        return misuse(
+            call,
+            on_progress,
+            &anyhow::anyhow!("steer_agent needs an integer id and a text"),
+        );
+    };
+    // As with `spawn_agent`: a call a subagent was never offered is
+    // content, not failure.
+    let Some(agents) = tools.agents else {
+        return misuse(
+            call,
+            on_progress,
+            &anyhow::anyhow!("subagents cannot steer their own"),
+        );
+    };
+    traced(call, on_progress, || {
+        match agents.steer(AgentId::from(id), &text) {
+            Ok(()) => {
+                let reply = format!("steered subagent {id}: {text}");
+                (reply.clone(), reply, Some(0))
+            }
+            Err(error) => (error.to_string(), error.to_string(), None),
+        }
+    })
+}
+
+/// Run one `cancel_agent` tool call: one gated cancellation.
+fn run_cancel_agent<F: Fn(Progress)>(
+    call: &FunctionToolCall,
+    tools: &Tooling<'_>,
+    on_progress: &F,
+) -> String {
+    let args = match parse_arguments(&call.arguments) {
+        Ok(args) => args,
+        Err(error) => return misuse(call, on_progress, &error),
+    };
+    let Some(id) = args.get("id").and_then(serde_json::Value::as_u64) else {
+        return misuse(
+            call,
+            on_progress,
+            &anyhow::anyhow!("cancel_agent needs an integer id"),
+        );
+    };
+    // As with `spawn_agent`: a call a subagent was never offered is
+    // content, not failure.
+    let Some(agents) = tools.agents else {
+        return misuse(
+            call,
+            on_progress,
+            &anyhow::anyhow!("subagents have no subagents to cancel"),
+        );
+    };
+    traced(call, on_progress, || match agents.cancel(AgentId::from(id)) {
+        Ok(()) => {
+            let reply = format!("cancelled subagent {id}");
+            (reply.clone(), reply, Some(0))
+        }
+        Err(error) => (error.to_string(), error.to_string(), None),
     })
 }
 

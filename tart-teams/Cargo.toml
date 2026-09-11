@@ -1,0 +1,13 @@
+[package]
+name = "tart-teams"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The team's channels (0.5.16, released 2026-07-06); `crossbeam-utils` was
+# already in the workspace lock, so this adds one package.
+[dependencies]
+crossbeam-channel = "0.5.16"
+
+[lints]
+workspace = true

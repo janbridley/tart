@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# The type-checked team: steering and cancellation between MAIN and children.
+tart-teams = { path = "../tart-teams" }
 anyhow = "1.0.104"
 # rustls-no-provider keeps aws-lc-rs provider out of our dependency chain and speed up
 # compiles. We directly depend on rustls to get the required components.

@@ -8,6 +8,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use tart_teams::{ChildId, Lead, Team};
+
 use crate::{Agent, Progress, Transcript, TurnHandle};
 
 /// The subagent preamble, opening the child's first user message ahead of its task
@@ -86,6 +88,8 @@ pub const AGENT_TOOL: &str = "agent";
 struct Child {
     /// The task it was given, for its box and its injection message.
     task: String,
+    /// Its id in the team: steering and cancellation route through it.
+    team: ChildId,
     /// Its lever: cancelling reaches its stream and its commands.
     handle: TurnHandle,
     /// Its terminal result, once its worker reported one and until it is taken.
@@ -108,6 +112,10 @@ struct Inner {
     delivered: Mutex<HashSet<AgentId>>,
     /// The next child's id.
     next: AtomicU64,
+    /// The team every child is enrolled in.
+    team: Team,
+    /// The team's one lead handle: the registry speaks for MAIN.
+    lead: Lead,
     /// Where every child's progress goes, tagged with its id.
     events: Box<dyn Fn(AgentId, Progress) + Send + Sync>,
 }
@@ -117,18 +125,23 @@ impl Agents {
     /// with the child's id.
     #[inline]
     pub fn new<F: Fn(AgentId, Progress) + Send + Sync + 'static>(events: F) -> Self {
+        // Open policy reproduces the old semantics exactly: the front end may
+        // cancel any child. The knobs exist for when that should tighten.
+        let (team, lead) = Team::new(tart_teams::Permissions::open());
         Self {
             inner: Arc::new(Inner {
                 main: Mutex::new(None),
                 children: Mutex::new(Vec::new()),
                 delivered: Mutex::new(HashSet::new()),
                 next: AtomicU64::new(1),
+                team,
+                lead,
                 events: Box::new(events),
             }),
         }
     }
 
-    /// Register MAIN's lever, so [`Agents::cancel_all`] reaches the main turn.
+    /// Register MAIN's lever, so [`Agents::cancel_main`] reaches the main turn.
     #[inline]
     pub fn adopt(&self, handle: TurnHandle) {
         *self.lock_main() = Some(handle);
@@ -145,6 +158,8 @@ impl Agents {
         // The child's own lever, with fresh state: MAIN's generation guard
         // must never retire the child's wake sender, nor the child's retire
         // MAIN's.
+        let child = self.inner.team.spawn_child();
+        let team_id = child.id();
         let agent = template.child().identify(id);
         // The subagent preamble, then the task, as one user turn
         let transcript = Transcript::new()?;
@@ -153,6 +168,7 @@ impl Agents {
             id,
             Child {
                 task: task.to_string(),
+                team: team_id,
                 handle: agent.handle(),
                 outcome: None,
             },
@@ -170,7 +186,7 @@ impl Agents {
         );
 
         let inner = Arc::clone(&self.inner);
-        agent.spawn(&transcript, move |progress| {
+        agent.spawn(&transcript, Some(child), move |progress| {
             // A terminal outcome is stored before the event forwards, so
             // whoever acts on the event always finds the outcome already
             // registered
@@ -246,36 +262,57 @@ impl Agents {
         anyhow::bail!("no subagent {id}: it never ran")
     }
 
-    /// Cancel one subagent.
+    /// Steer one subagent mid-flight: the correction lands in the child's
+    /// conversation at its next round boundary.
     #[inline]
-    pub fn cancel(&self, id: AgentId) {
-        // The lever is cloned out from under the lock; cancelling takes the
-        // handle's own lock.
-        if let Some(handle) = self.inner.with_child(id, |child| child.handle.clone()) {
-            handle.cancel();
-        }
+    pub fn steer(&self, id: AgentId, text: &str) -> anyhow::Result<()> {
+        let Some(team_id) = self.inner.with_child(id, |child| child.team) else {
+            anyhow::bail!("no subagent {id}: it never ran or has already finished");
+        };
+        self.inner
+            .lead
+            .steer(team_id, text)
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
+    /// Cancel one subagent, through the team: the policy gate decides, and
+    /// only a delivered cancellation pulls the lever.
+    #[inline]
+    pub fn cancel(&self, id: AgentId) -> anyhow::Result<()> {
+        let Some(team_id) = self.inner.with_child(id, |child| child.team) else {
+            anyhow::bail!("no subagent {id}: it never ran or has already finished");
+        };
+        self.inner.cancel_one(id, team_id)
     }
 
     /// Cancel every child and forget them: the conversation they belonged to
     /// is gone, and no report may follow it into the next one.
     #[inline]
     pub fn clear(&self) {
-        for handle in self.inner.handles() {
-            handle.cancel();
+        for (id, team_id) in self.inner.roster() {
+            let _ = self.inner.cancel_one(id, team_id);
         }
         self.inner.lock_children().clear();
         self.inner.lock_delivered().clear();
     }
 
-    /// Cancel every registered conversation: the main turn, and any children.
+    /// Cancel the main turn only: the children keep working, and their
+    /// reports still arrive. Esc during a turn is about MAIN's turn, not
+    /// the team's.
+    #[inline]
+    pub fn cancel_main(&self) {
+        if let Some(main) = self.lock_main().clone() {
+            main.cancel();
+        }
+    }
+
+    /// Cancel every registered conversation: the main turn, and any children
+    /// (the whole team must stop).
     #[inline]
     pub fn cancel_all(&self) {
-        // Every lever is cloned out from under the locks; cancelling takes
-        // each handle's own lock.
-        let mut handles = self.inner.handles();
-        handles.extend(self.lock_main().clone());
-        for handle in handles {
-            handle.cancel();
+        self.cancel_main();
+        for (id, team_id) in self.inner.roster() {
+            let _ = self.inner.cancel_one(id, team_id);
         }
     }
 
@@ -296,6 +333,28 @@ impl Inner {
         crate::locked(&self.delivered)
     }
 
+    /// The registered children, as (registry id, team id).
+    fn roster(&self) -> Vec<(AgentId, ChildId)> {
+        self.lock_children()
+            .iter()
+            .map(|(id, child)| (*id, child.team))
+            .collect()
+    }
+
+    /// One cancellation through the team: the gate decides, and only a
+    /// delivered envelope pulls the lever, so policy is never bypassed.
+    fn cancel_one(&self, id: AgentId, team_id: ChildId) -> anyhow::Result<()> {
+        self.lead
+            .cancel(team_id, "cancelled")
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // The lever is cloned out from under the lock; cancelling takes the
+        // handle's own lock.
+        if let Some(handle) = self.with_child(id, |child| child.handle.clone()) {
+            handle.cancel();
+        }
+        Ok(())
+    }
+
     /// Whether `id`'s report was already delivered.
     fn delivered(&self, id: AgentId) -> bool {
         self.lock_delivered().contains(&id)
@@ -307,13 +366,5 @@ impl Inner {
             .iter_mut()
             .find(|(sid, _)| *sid == id)
             .map(|(_, child)| f(child))
-    }
-
-    /// Every child's lever, cloned out from under the lock.
-    fn handles(&self) -> Vec<TurnHandle> {
-        self.lock_children()
-            .iter()
-            .map(|(_, child)| child.handle.clone())
-            .collect()
     }
 }

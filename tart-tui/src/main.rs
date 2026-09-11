@@ -186,9 +186,10 @@ fn run(
         match wake_receiver.recv_timeout(Duration::from_millis(DRAW_INTERVAL_MS)) {
             Ok(Wake::Input(Event::Key(key))) => match pane.on_key(key) {
                 Some(PaneEvent::Quit) => quit = true,
-                // Esc with nothing open aborts whatever is in flight.
+                // Esc with nothing open aborts whatever is in flight: the
+                // main turn only, never the team; children keep working.
                 Some(PaneEvent::Cancel) => {
-                    agents.cancel_all();
+                    agents.cancel_main();
                     // Esc also cancels a plan switch still waiting for the turn.
                     pending_plan = None;
                     if let Some(token) = &manual_cancel {
@@ -247,7 +248,10 @@ fn run(
                     _ if let Some(arg) = line.trim().strip_prefix("/stop") => {
                         match arg.trim().parse::<u64>() {
                             Ok(id) => {
-                                agents.cancel(AgentId::from(id));
+                                // A refused cancellation (policy, or the
+                                // child already gone) is dropped here; the
+                                // note still reports the stop as sent.
+                                let _ = agents.cancel(AgentId::from(id));
                                 pane.note(format!("stop sent to subagent {id}"));
                             }
                             Err(_) => pane.note("usage: /stop <id> · /agents to list"),

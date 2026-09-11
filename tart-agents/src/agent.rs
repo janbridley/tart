@@ -1,5 +1,5 @@
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use async_openai::{
     Client,
@@ -10,15 +10,17 @@ use async_openai::{
     },
 };
 use futures::StreamExt;
-use futures::channel::mpsc;
 use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
 use crate::usage::{MAIN_AGENT, TokenUsage};
 use crate::{
-    AgentId, Agents, CancelToken, MAIN, Progress, Transcript, debug, errors, max_tool_rounds,
-    sandbox::Policy, tools,
+    AgentId, Agents, MAIN, Progress, Transcript, debug, errors, max_tool_rounds, sandbox::Policy,
+    tools,
 };
+use turn::Turn;
+mod turn;
+pub use turn::TurnHandle;
 
 /// The session's collaboration mode, mirroring Codex's `ModeKind`.
 ///
@@ -59,74 +61,6 @@ pub struct Agent {
     control: TurnHandle,
     /// This agent's conversation: MAIN, or the subagent's registry id.
     id: AgentId,
-}
-
-/// The front end's control plane for running turns.
-#[derive(Clone, Default)]
-pub struct TurnHandle {
-    state: Arc<Mutex<TurnState>>,
-}
-
-/// The turn control state, under one lock.
-#[derive(Default)]
-struct TurnState {
-    /// Which turn owns the lever; a finishing worker retires only its own.
-    generation: u64,
-    /// The running turn's wake sender, where pokes reach it.
-    sender: Option<mpsc::Sender<()>>,
-    /// Esc was pressed and we should attempt to cancel.
-    cancelled: bool,
-    /// The running turn's command lever: cancelling kills a bash in flight.
-    token: CancelToken,
-}
-
-impl TurnHandle {
-    /// The state under its lock.
-    fn state(&self) -> MutexGuard<'_, TurnState> {
-        crate::locked(&self.state)
-    }
-
-    /// Cancel the turn: kill any command it is running, drop the stream, and
-    /// keep any partial answer.
-    ///
-    /// The provider will likely still take its side of the cancelled stream
-    /// to completion; the record here ends at the drop.
-    #[inline]
-    pub fn cancel(&self) {
-        let mut state = self.state();
-        state.cancelled = true;
-        state.token.cancel();
-        if let Some(sender) = &mut state.sender {
-            // A failed poke means one is already pending; the flag decides.
-            let _ = sender.try_send(());
-        }
-    }
-
-    /// Install `sender` as the next turn's lever, forgetting the last turn's
-    /// cancel, and report the turn's id with the turn's fresh command lever.
-    fn claim(&self, sender: mpsc::Sender<()>) -> (u64, CancelToken) {
-        let mut state = self.state();
-        state.generation += 1;
-        state.cancelled = false;
-        state.sender = Some(sender);
-        state.token = CancelToken::new();
-        (state.generation, state.token.clone())
-    }
-
-    /// Retire the lever, unless a newer turn already claimed it.
-    fn release(&self, generation: u64) {
-        let mut state = self.state();
-        if state.generation == generation {
-            state.sender = None;
-            state.cancelled = false;
-        }
-    }
-
-    /// Whether the front end cancelled the turn: pokes only wake a parked wait
-    fn cancelled(&self, cancel_rx: &mut mpsc::Receiver<()>) -> bool {
-        while cancel_rx.try_recv().is_ok() {}
-        self.state().cancelled
-    }
 }
 
 impl Agent {
@@ -188,11 +122,14 @@ impl Agent {
             .into_iter()
             .chain((self.mode == ChatMode::Default).then_some(tools::edit()))
             .chain([tools::search(), tools::fetch()].into_iter().flatten())
-            .chain(
-                self.subagents
-                    .iter()
-                    .flat_map(|_| [tools::spawn_agent(), tools::check_agent()]),
-            )
+            .chain(self.subagents.iter().flat_map(|_| {
+                [
+                    tools::spawn_agent(),
+                    tools::check_agent(),
+                    tools::steer_agent(),
+                    tools::cancel_agent(),
+                ]
+            }))
             .collect()
     }
 
@@ -269,24 +206,29 @@ impl Agent {
     /// Run one generation on its own thread, reporting progress to `on_progress`.
     ///
     /// The worker records its turns (reasoning, tool exchanges, final answer) into the
-    /// shared transcript as it goes. Exactly one terminal event ([`Progress::Done`],
-    /// [`Progress::Failed`], or [`Progress::Cancelled`]) is delivered, even if the
-    /// worker panics.
+    /// shared transcript as it goes. A `team` handle, when one is given, drains
+    /// steering and cancellation into the transcript between rounds. Exactly one
+    /// terminal event ([`Progress::Done`], [`Progress::Failed`], or
+    /// [`Progress::Cancelled`]) is delivered, even if the worker panics.
     #[inline]
-    pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
+    pub fn spawn<F: Fn(Progress) + Send + 'static>(
+        &self,
+        transcript: &Transcript,
+        team: Option<tart_teams::Child>,
+        on_progress: F,
+    ) {
         let agent = self.clone();
         let transcript = transcript.clone();
-        // This turn's wake channel: the sender waits where Esc can reach it, and
-        // the receiver races the stream inside the worker.
-        let (esc_sender, receiver) = mpsc::channel(1);
-        let (generation, token) = self.control.claim(esc_sender);
+        // The turn's control plane, armed: its wake channel waits where Esc
+        // can reach it, and its command lever is fresh.
+        let mut turn = Turn::claim(&self.control);
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                agent.run(&transcript, receiver, &token, &on_progress);
+                agent.run(&transcript, team.as_ref(), &mut turn, &on_progress);
             }));
             // The turn is over: retire the lever unless a newer turn claimed it.
-            agent.control.release(generation);
+            turn.retire();
             if outcome.is_err() {
                 terminate_and_log(
                     &on_progress,
@@ -329,8 +271,8 @@ impl Agent {
     fn run<F: Fn(Progress)>(
         &self,
         transcript: &Transcript,
-        mut cancel_rx: mpsc::Receiver<()>,
-        token: &CancelToken,
+        team: Option<&tart_teams::Child>,
+        turn: &mut Turn,
         on_progress: &F,
     ) {
         // Completed rounds so far: a dropped stream retries its round without
@@ -340,11 +282,19 @@ impl Agent {
         let mut retries = 0;
         'round: while round < self.max_rounds {
             // A cancelled generation stops before spending another request.
-            if self.control.cancelled(&mut cancel_rx) {
+            if turn.cancelled() {
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
+            // The team inbox drains between rounds: each message becomes
+            // part of the next request's input, and a cancellation ends the
+            // turn exactly as the front end's Esc would.
+            if let Some(team) = team
+                && let Some(terminal) = drain_team(team, transcript, on_progress)
+            {
+                return terminate_and_log(on_progress, terminal);
+            }
             // The sandboxed trio less `edit` in plan mode, plus web tools if
-            // available, plus the subagent pair for a spawning agent.
+            // available, plus the subagent tools for a spawning agent.
             let definitions = self.tools_for();
             let request = match CreateResponseArgs::default()
                 .model(self.model.as_str())
@@ -399,10 +349,10 @@ impl Agent {
             // Race the stream against Esc pokes; a won cancel returns and
             // drops the stream, keeping whatever it streamed
             loop {
-                let item = match self.runtime.block_on(select(stream.next(), cancel_rx.next())) {
+                let item = match self.runtime.block_on(select(stream.next(), turn.wakes().next())) {
                     Either::Right(_) => {
                         // A stale poke only wakes the wait: the flag decides.
-                        if !self.control.cancelled(&mut cancel_rx) {
+                        if !turn.cancelled() {
                             continue;
                         }
                         // Esc won: dropping the stream keeps what it streamed.
@@ -545,9 +495,10 @@ impl Agent {
 
             // Run the round's calls in order, then record the round as one group.
             let policy = self.policy();
+            let token = turn.token().clone();
             let tooling = tools::Tooling {
                 policy: &policy,
-                cancel: token,
+                cancel: &token,
                 agents: self.subagents.as_deref(),
                 template: self,
             };
@@ -555,7 +506,7 @@ impl Agent {
             for call in calls {
                 // A cancelled turn skips its remaining calls; the one in
                 // flight finishes first.
-                if self.control.cancelled(&mut cancel_rx) {
+                if turn.cancelled() {
                     break;
                 }
                 // Tool calls exit with errors/denial text/parse failures if they fail
@@ -578,7 +529,7 @@ impl Agent {
                 }
                 transcript.push_tool_round(exchanges);
             }
-            if self.control.cancelled(&mut cancel_rx) {
+            if turn.cancelled() {
                 // The turn stops here, keeping the rounds recorded so far.
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
@@ -591,6 +542,35 @@ impl Agent {
             Progress::Failed(format!("gave up after {round} tool rounds")),
         );
     }
+}
+
+/// Drain the team inbox between rounds: the lead's correction (or a peer's
+/// note) records as the child's next user item, joining the next request's
+/// input. The terminal event, when a message ends the turn.
+fn drain_team(
+    team: &tart_teams::Child,
+    transcript: &Transcript,
+    on_progress: &impl Fn(Progress),
+) -> Option<Progress> {
+    while let Ok(envelope) = team.inbox().try_recv() {
+        let (note, steered) = match envelope.message {
+            tart_teams::Message::Steer(text) => {
+                (format!("COURSE CORRECTION FROM THE LEAD: {text}"), Some(text))
+            }
+            tart_teams::Message::Data(text) => {
+                (format!("NOTE FROM AGENT {}: {text}", envelope.from), None)
+            }
+            tart_teams::Message::Cancel(_) => return Some(Progress::Cancelled),
+            _ => continue,
+        };
+        if let Err(error) = transcript.push_user(note) {
+            return Some(Progress::Failed(error.to_string()));
+        }
+        if let Some(text) = steered {
+            on_progress(Progress::Note(format!("steered: {text}")));
+        }
+    }
+    None
 }
 
 fn with_last_error(message: &str, last_error: Option<String>) -> String {
@@ -626,10 +606,14 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    use futures::channel::mpsc;
+
     use super::*;
     use crate::usage::tests::sample_usage;
     use async_openai::types::responses::{ResponseOutputItemDoneEvent, ResponseTextDeltaEvent};
-    use std::io::{Read, Write};
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -688,7 +672,7 @@ mod tests {
         agent.set_subagents(Arc::new(Agents::new(|_, _| ())));
 
         // Default: the granted roots are writable, and `edit` is offered alongside the
-        // subagent pair only a spawning agent gets.
+        // subagent tools only a spawning agent gets.
         assert_eq!(agent.mode(), ChatMode::Default);
         assert!(!agent.policy().writable_roots().is_empty());
         assert!(names(&agent.tools_for()).contains(&"edit"));
@@ -720,15 +704,17 @@ mod tests {
             .collect()
     }
 
-    fn drive(agent: &Agent, transcript: &Transcript) -> Vec<String> {
+    fn drive(
+        team: Option<&tart_teams::Child>,
+        agent: &Agent,
+        transcript: &Transcript,
+    ) -> Vec<String> {
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (sender, receiver) = mpsc::channel(1);
-        let handle = agent.handle();
-        let (generation, token) = handle.claim(sender);
-        agent.run(transcript, receiver, &token, &|progress| {
+        let mut turn = Turn::claim(&agent.handle());
+        agent.run(transcript, team, &mut turn, &|progress| {
             log.lock().unwrap().push(format!("{progress:?}"));
         });
-        handle.release(generation);
+        turn.retire();
         Arc::try_unwrap(log)
             .expect("the sole owner")
             .into_inner()
@@ -812,13 +798,11 @@ mod tests {
         };
 
         // Drive the generation as `spawn` would: claim, run, retire.
-        let (sender, receiver) = mpsc::channel(1);
-        let handle = agent.handle();
-        let (generation, token) = handle.claim(sender);
-        agent.run(&transcript, receiver, &token, &|progress| {
+        let mut turn = Turn::claim(&agent.handle());
+        agent.run(&transcript, None, &mut turn, &|progress| {
             log.lock().unwrap().push(format!("{progress:?}"));
         });
-        handle.release(generation);
+        turn.retire();
         interrupt.join().expect("the interrupter exits");
 
         // The turn ends with exactly one terminal event: the cancel.
@@ -835,6 +819,100 @@ mod tests {
         assert_eq!(items[2]["content"], "Once upon a time");
 
         server.join().expect("the server exits");
+    }
+
+    /// `cancel_main` reaches MAIN's adopted lever alone: the registry's
+    /// children keep working.
+    #[test]
+    fn cancel_main_reaches_only_the_main_lever() {
+        let agents = Arc::new(Agents::new(|_, _| ()));
+        let handle = TurnHandle::default();
+        let (sender, mut rx) = mpsc::channel(1);
+        handle.claim(sender);
+        agents.adopt(handle.clone());
+        agents.cancel_main();
+        assert!(handle.cancelled(&mut rx), "MAIN's lever is pulled");
+    }
+
+    /// The round-boundary drain folds steering into the child's transcript,
+    /// notes it in the child's box, and ends the turn on a cancellation.
+    #[test]
+    fn team_drains_steering_and_cancellation_into_the_transcript() {
+        let (team, lead) = tart_teams::Team::new(tart_teams::Permissions::open());
+        let child = team.spawn_child();
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("the task".to_string())
+            .expect("the user turn records");
+        let noted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let noted = Arc::clone(&noted);
+            move |progress: Progress| {
+                if let Progress::Note(text) = progress {
+                    noted.lock().unwrap().push(text);
+                }
+            }
+        };
+
+        // A steer records the correction and notes it in the child's box.
+        lead.steer(child.id(), "focus on the ledger").expect("delivers");
+        assert!(drain_team(&child, &transcript, &sink).is_none());
+        let items = serde_json::to_string(&transcript.request_items()).unwrap();
+        assert!(
+            items.contains("COURSE CORRECTION FROM THE LEAD: focus on the ledger"),
+            "the steer is part of the child's conversation: {items}"
+        );
+        assert_eq!(noted.lock().unwrap().len(), 1);
+
+        // A peer's note records without a box event, and a cancellation ends
+        // the turn.
+        lead.broadcast(&tart_teams::Message::Cancel("wrap up".into()));
+        assert!(matches!(
+            drain_team(&child, &transcript, &sink),
+            Some(Progress::Cancelled)
+        ));
+    }
+
+    /// A child steered before its turn sees the correction folded into its
+    /// first request by the round-boundary drain.
+    #[test]
+    fn a_steered_child_sees_the_correction_before_its_first_round() {
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("do the work".to_string())
+            .expect("the user turn records");
+
+        // Steered before the turn runs, the correction is folded into the
+        // first request by the round-boundary drain.
+        let (team, lead) = tart_teams::Team::new(tart_teams::Permissions::open());
+        let child = team.spawn_child();
+        lead.steer(child.id(), "focus on the ledger")
+            .expect("the steer delivers");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the client arrives");
+            read_request(&mut stream);
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            let event = serde_json::to_string(&delta("done")).expect("serializes");
+            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            let _ = stream.flush();
+        });
+
+        let log = drive(Some(&child), &agent, &transcript);
+        server.join().expect("the server exits");
+        assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
+        let items = serde_json::to_string(&transcript.request_items()).unwrap();
+        assert!(
+            items.contains("COURSE CORRECTION FROM THE LEAD: focus on the ledger"),
+            "the steer is part of the child's conversation: {items}"
+        );
     }
 
     /// A stream that delivers nothing and closes drops its round; the retry
@@ -870,7 +948,7 @@ mod tests {
             let _ = stream.flush();
         });
 
-        let log = drive(&agent, &transcript);
+        let log = drive(None, &agent, &transcript);
         server.join().expect("the server exits");
 
         // The stall is visible as a note, and the retry completes the turn.
@@ -919,7 +997,7 @@ mod tests {
             let _ = stream.flush();
         });
 
-        let log = drive(&agent, &transcript);
+        let log = drive(None, &agent, &transcript);
 
         // The turn completes: no failure, one terminal event, and it is Done.
         // Asserted before joining the server so a regression fails here
@@ -983,7 +1061,7 @@ mod tests {
             let _ = stream.flush();
         });
 
-        let log = drive(&agent, &transcript);
+        let log = drive(None, &agent, &transcript);
 
         assert!(
             log.iter().all(|entry| !entry.starts_with("Failed")),
@@ -1290,7 +1368,7 @@ mod tests {
             let _ = stream.flush();
         });
 
-        let log = drive(&agent, &transcript);
+        let log = drive(None, &agent, &transcript);
 
         // The turn completes, and the gauge saw the round's bill.
         assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
