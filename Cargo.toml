@@ -50,6 +50,15 @@ needless_pass_by_ref_mut = "warn"
 [profile.dev]
 debug = "line-tables-only"
 
+# Take extra time to compile but minimize binary size.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [profile.rel-dev]
 inherits = "release"
 incremental = true
+lto = "off"
+codegen-units = 16
+strip = "none"
