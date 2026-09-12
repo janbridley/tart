@@ -82,12 +82,27 @@ fn thinking_lines(raw: &str, shown: bool) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// What a finished box keeps of its output once its turn ends.
+/// Maximum number of bytes a single line in the excerpt will keep.
+const EXCERPT_LINE_CAP: usize = 2 * 1024;
+
+/// One kept line, byte-bounded: over the cap it keeps its head, marked cut.
+fn capped_line(line: &str) -> String {
+    const CUT: &str = " …[line cut]";
+    if line.len() <= EXCERPT_LINE_CAP {
+        return line.to_owned();
+    }
+    // Cut short of the cap by the marker's length, so the result fits the cap exactly
+    let end = line.floor_char_boundary(EXCERPT_LINE_CAP - CUT.len());
+    format!("{}{CUT}", &line[..end])
+}
+
 fn folded_excerpt(output: &str) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let limit = TOOL_HEAD + TOOL_TAIL;
     if lines.len() <= limit {
-        return output.to_owned();
+        let mut kept = lines.iter().map(|line| capped_line(line)).join("\n");
+        kept.push('\n');
+        return kept;
     }
     // One head line short of the fold width, so folding the excerpt again
     // hides nothing: head, the count the full fold would have shown, tail.
@@ -96,9 +111,9 @@ fn folded_excerpt(output: &str) -> String {
     let marker = format!("… +{} lines", lines.len() - limit);
     let mut kept = head
         .iter()
-        .copied()
-        .chain(std::iter::once(marker.as_str()))
-        .chain(tail.iter().copied())
+        .map(|line| capped_line(line))
+        .chain(std::iter::once(marker))
+        .chain(tail.iter().map(|line| capped_line(line)))
         .join("\n");
     kept.push('\n');
     kept
@@ -271,6 +286,9 @@ impl Transcript {
                 && !tool.is_agent()
             {
                 tool.superseded = true;
+                // A superseded box renders its header only from here on, so we can drop
+                // its output content
+                tool.output = None;
             }
         }
         self.messages.push(Entry::Tool(ToolCall {
@@ -489,6 +507,18 @@ impl Transcript {
         }
     }
 
+    /// Bytes of output text the boxes still hold (test instrumentation).
+    #[cfg(test)]
+    pub(crate) fn stored_output_bytes(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|entry| match entry {
+                Entry::Tool(tool) => tool.output.as_ref().map_or(0, String::len),
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Replace every finished box's output with its folded excerpt.
     ///
     /// While the turn runs, boxes hold their full output so we can expand what just
@@ -694,6 +724,69 @@ mod tests {
         let rows = texts(&t.rows);
         assert!(rows.iter().any(|row| row.contains("short")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("output")), "{rows:?}");
+    }
+
+    #[test]
+    fn one_huge_line_cannot_defeat_the_excerpt() {
+        let mut t = Transcript::default();
+        start_bash(&mut t, "call_0");
+        t.finish_tool("call_0", "x".repeat(10 * 1024 * 1024), Some(0));
+        t.excerpt_finished_outputs();
+        assert!(
+            t.stored_output_bytes() < 8 * EXCERPT_LINE_CAP,
+            "a single line must not survive whole: {}",
+            t.stored_output_bytes()
+        );
+        t.toggle_expand();
+        t.sync(40);
+        assert!(
+            texts(&t.rows).iter().any(|row| row.contains("…[line cut]")),
+            "{:?}",
+            texts(&t.rows)
+        );
+    }
+
+    #[test]
+    fn the_sweep_leaves_folded_rows_until_the_next_rebuild() {
+        let mut t = Transcript::default();
+        start_bash(&mut t, "call_0");
+        let mut long = String::new();
+        for i in 0..20 {
+            let _ = writeln!(long, "line {i}");
+        }
+        t.finish_tool("call_0", long, Some(0));
+        t.sync(40);
+        // The full-output fold shows three head lines: line 2 is the third.
+        assert!(texts(&t.rows).iter().any(|row| row.contains("line 2")));
+        t.excerpt_finished_outputs();
+        t.sync(40);
+        // Nothing rewound: the stale fold is still on screen.
+        assert!(texts(&t.rows).iter().any(|row| row.contains("line 2")));
+        // A width change rebuilds, and the excerpt takes over.
+        t.sync(60);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("… +15 lines")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("line 2")), "{rows:?}");
+    }
+
+    /// Sweeping twice changes nothing: the excerpt is a fixed point.
+    #[test]
+    fn the_sweep_is_idempotent() {
+        let mut t = Transcript::default();
+        start_bash(&mut t, "call_0");
+        let mut long = String::new();
+        for i in 0..20 {
+            let _ = writeln!(long, "line {i}");
+        }
+        t.finish_tool("call_0", long, Some(0));
+        t.excerpt_finished_outputs();
+        let once = t.stored_output_bytes();
+        t.excerpt_finished_outputs();
+        assert_eq!(t.stored_output_bytes(), once);
+        t.sync(60);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("… +15 lines")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("+19")), "{rows:?}");
     }
 
     fn start_bash(t: &mut Transcript, id: &str) {
