@@ -82,6 +82,28 @@ fn thinking_lines(raw: &str, shown: bool) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// What a finished box keeps of its output once its turn ends.
+fn folded_excerpt(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let limit = TOOL_HEAD + TOOL_TAIL;
+    if lines.len() <= limit {
+        return output.to_owned();
+    }
+    // One head line short of the fold width, so folding the excerpt again
+    // hides nothing: head, the count the full fold would have shown, tail.
+    let head = &lines[..TOOL_HEAD - 1];
+    let tail = &lines[lines.len() - TOOL_TAIL..];
+    let marker = format!("… +{} lines", lines.len() - limit);
+    let mut kept = head
+        .iter()
+        .copied()
+        .chain(std::iter::once(marker.as_str()))
+        .chain(tail.iter().copied())
+        .join("\n");
+    kept.push('\n');
+    kept
+}
+
 /// One tool invocation, updated in place when its output arrives.
 #[derive(Clone)]
 struct ToolCall {
@@ -467,6 +489,23 @@ impl Transcript {
         }
     }
 
+    /// Replace every finished box's output with its folded excerpt.
+    ///
+    /// While the turn runs, boxes hold their full output so we can expand what just
+    ///  happened; once it ends, call this function so the pane keeps only what the fold
+    /// can show.
+    pub(crate) fn excerpt_finished_outputs(&mut self) {
+        for entry in &mut self.messages {
+            if let Entry::Tool(tool) = entry
+                && !tool.running
+                && !tool.is_agent()
+                && let Some(output) = &tool.output
+            {
+                tool.output = Some(folded_excerpt(output));
+            }
+        }
+    }
+
     /// Retire the previous turn's thinking block, keeping its answers.
     pub(crate) fn begin_response(&mut self) {
         self.messages
@@ -609,6 +648,54 @@ mod tests {
     use super::*;
 
     /// Start a pending `bash` invocation, as the pane would on a `ToolStart`
+    #[test]
+    fn a_live_turn_keeps_the_full_output() {
+        let mut t = Transcript::default();
+        start_bash(&mut t, "call_0");
+        let mut long = String::new();
+        for i in 0..20 {
+            let _ = writeln!(long, "line {i}");
+        }
+        t.finish_tool("call_0", long, Some(0));
+        t.toggle_expand();
+        t.sync(40);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("line 10")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("line 19")), "{rows:?}");
+    }
+
+    #[test]
+    fn the_turns_end_keeps_only_the_excerpt() {
+        let mut t = Transcript::default();
+        start_bash(&mut t, "call_0");
+        let mut long = String::new();
+        for i in 0..20 {
+            let _ = writeln!(long, "line {i}");
+        }
+        t.finish_tool("call_0", long, Some(0));
+        t.excerpt_finished_outputs();
+
+        t.toggle_expand();
+        t.sync(40);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("… +15 lines")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("line 19")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("line 10")), "{rows:?}");
+    }
+
+    #[test]
+    fn short_outputs_pass_through_the_sweep() {
+        let mut t = Transcript::default();
+        start_bash(&mut t, "call_0");
+        t.finish_tool("call_0", "short\noutput\n".to_string(), Some(0));
+        t.excerpt_finished_outputs();
+        t.toggle_expand();
+        t.sync(40);
+        let rows = texts(&t.rows);
+        assert!(rows.iter().any(|row| row.contains("short")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("output")), "{rows:?}");
+    }
+
     fn start_bash(t: &mut Transcript, id: &str) {
         t.start_tool(
             id.to_string(),

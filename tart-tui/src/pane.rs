@@ -724,6 +724,9 @@ impl Pane {
     /// Mark the model busy; Enter keeps the draft instead of submitting it.
     pub fn set_generating(&mut self, generating: bool) {
         self.spin = generating.then(Instant::now);
+        if !generating {
+            self.transcript.excerpt_finished_outputs();
+        }
     }
 
     /// Take a submitted line into the conversation: attach outside-sandbox
