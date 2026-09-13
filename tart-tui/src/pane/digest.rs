@@ -1,10 +1,32 @@
 //! Formatting tool-calls nicely for the TUI.
 
+use std::sync::LazyLock;
+
 use itertools::Itertools;
 use serde_json::Value;
 
 /// The most characters one line keeps before the ellipsis.
 const LINE_CAP: usize = 60;
+
+/// `cd <dir> && ` prefixes are stripped from the output of shell commands.
+static CWD_CD_PREFIXES: LazyLock<Vec<String>> = LazyLock::new(|| match std::env::current_dir() {
+    Ok(dir) => ["", "\"", "'"]
+        .into_iter()
+        .map(|quote| format!("cd {quote}{}{quote} && ", dir.display()))
+        .collect(),
+    Err(_) => Vec::new(),
+});
+
+/// A bash call's command with a leading `cd` into `pwd` dropped for clarity.
+fn preprocess_bash_command(command: &str) -> String {
+    CWD_CD_PREFIXES
+        .iter()
+        .find_map(|prefix| command.strip_prefix(prefix.as_str()))
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(command)
+        .to_string()
+}
 
 /// The box header for a run of calls to one tool: the display name, then the
 /// calls' digests joined with `", "`, capped to one line.
@@ -36,7 +58,7 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
     serde_json::from_str::<Value>(raw)
         .ok()
         .and_then(|args| match name {
-            "bash" => args["command"].as_str().map(str::to_string),
+            "bash" => args["command"].as_str().map(preprocess_bash_command),
             "fetch" => args["url"].as_str().map(str::to_string),
             "read" | "edit" => args["path"].as_str().map(str::to_string),
             // The subagent pair: the task spawned, and the id checked on.
@@ -284,5 +306,20 @@ mod tests {
             tool_header("bash", &[r#"{"command":"echo hi\necho bye"}"#.to_string()]),
             "Bash(echo hi)"
         );
+    }
+
+    #[test]
+    fn bash_digests_drop_the_cwd_cd() {
+        let cwd = std::env::current_dir().expect("valid").display().to_string();
+        let bash = |command: &str| {
+            let raw = serde_json::json!({ "command": command }).to_string();
+            tool_header("bash", &[raw])
+        };
+        assert_eq!(bash(&format!("cd {cwd} && cargo test")), "Bash(cargo test)");
+        assert_eq!(bash(&format!("cd {cwd} &&  ls")), "Bash(ls)");
+        assert_eq!(bash(&format!("cd \"{cwd}\" && make")), "Bash(make)");
+        assert_eq!(bash(&format!("cd '{cwd}' && make check")), "Bash(make check)");
+        assert_eq!(bash("cd /tmp && ls"), "Bash(cd /tmp && ls)");
+        assert_eq!(bash(&format!("cd {cwd}")), format!("Bash(cd {cwd})"));
     }
 }
