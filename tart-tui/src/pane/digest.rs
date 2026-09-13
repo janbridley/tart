@@ -18,13 +18,14 @@ static CWD_CD_PREFIXES: LazyLock<Vec<String>> = LazyLock::new(|| match std::env:
 });
 
 /// A bash call's command with a leading `cd` into `pwd` dropped for clarity.
-fn preprocessed_bash_command(command: &str) -> &str {
+fn preprocess_bash_command(command: &str) -> String {
     CWD_CD_PREFIXES
         .iter()
         .find_map(|prefix| command.strip_prefix(prefix.as_str()))
         .map(str::trim_start)
         .filter(|rest| !rest.is_empty())
         .unwrap_or(command)
+        .to_string()
 }
 
 /// The box header for a run of calls to one tool: the display name, then the
@@ -57,9 +58,7 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
     serde_json::from_str::<Value>(raw)
         .ok()
         .and_then(|args| match name {
-            "bash" => args["command"]
-                .as_str()
-                .map(|command| preprocessed_bash_command(command).to_string()),
+            "bash" => args["command"].as_str().map(preprocess_bash_command),
             "fetch" => args["url"].as_str().map(str::to_string),
             "read" | "edit" => args["path"].as_str().map(str::to_string),
             // The subagent pair: the task spawned, and the id checked on.
