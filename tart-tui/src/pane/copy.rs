@@ -29,6 +29,14 @@ impl CopyCursor {
     }
 }
 
+/// The scrollback state frozen when entering copy-mode.
+pub(crate) struct Frozen {
+    /// Width the rows are wrapped at; a change rewraps them in place.
+    pub(crate) width: usize,
+    /// The frozen wrapped rows.
+    pub(crate) rows: Vec<Line<'static>>,
+}
+
 /// The cursor after one key step, clamped to the transcript edges.
 pub(crate) fn moved(rows: &[Line<'static>], cursor: CopyCursor, key: KeyCode) -> CopyCursor {
     if rows.is_empty() {

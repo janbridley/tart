@@ -34,9 +34,9 @@ use crate::file_mentions::{self, FilePopup, Picker, render_picker};
 use crate::recorded::REPORTS_AT;
 use crate::session_picker::{derive_query as session_query, session_picker};
 use crate::turn_picker::rewind_picker;
-use copy::{CopyCursor, clamp_cell, moved, window_top};
+use copy::{CopyCursor, Frozen, clamp_cell, moved, window_top};
 use transcript::Transcript;
-use wrap::wrap_draft;
+use wrap::{wrap_draft, wrap_lines};
 
 pub const PROMPT: &str = "❯ ";
 /// Cells before the editor starts (the prompt symbol's width).
@@ -158,6 +158,8 @@ pub struct Pane {
     transcript: Transcript,
     /// A `CopyCursor` in copymode, or `None` otherwise.
     copy: Option<CopyCursor>,
+    /// The frozen rows copy mode scrolls; `Some` exactly while `copy` is enabled.
+    frozen: Option<Frozen>,
     /// The `@file` typeahead or a `/command` chooser, while one is present
     popup: Option<Popup>,
     /// Where `/resume` lists sessions from: the sessions root and project.
@@ -352,9 +354,10 @@ impl Pane {
     fn route(&mut self, key: KeyEvent) -> Option<PaneEvent> {
         // Copy mode takes every key first, so the draft is immutable while scrolling
         if let Some(cursor) = self.copy {
+            let rows = self.frozen_rows();
             match key.code {
                 // q or Esc leaves copy mode.
-                KeyCode::Char('q' | 'Q') | KeyCode::Esc => self.copy = None,
+                KeyCode::Char('q' | 'Q') | KeyCode::Esc => self.leave_copy(),
                 // Space (unconditionally) begins a selection at the current position
                 KeyCode::Char(' ') => {
                     self.copy = Some(CopyCursor {
@@ -365,14 +368,14 @@ impl Pane {
                 // Enter copies the selection to clipboard and exits copy mode.
                 KeyCode::Enter => {
                     let text = Selection::between(cursor.anchor, (cursor.row, cursor.col))
-                        .map(|selection| selection.text(self.transcript.rows()))
+                        .map(|selection| selection.text(rows))
                         .filter(|text| !text.is_empty());
-                    self.copy = None;
+                    self.leave_copy();
                     if let Some(text) = text {
                         return Some(PaneEvent::Copy(text));
                     }
                 }
-                _ => self.copy = Some(moved(self.transcript.rows(), cursor, key.code)),
+                _ => self.copy = Some(moved(rows, cursor, key.code)),
             }
             return None;
         }
@@ -439,9 +442,7 @@ impl Pane {
                     return Some(PaneEvent::Cancel);
                 }
             }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.copy = Some(CopyCursor::enter(self.transcript.rows().len()));
-            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.enter_copy(),
             // Shift+Tab toggles plan mode. Plain terminals send BackTab; a
             // kitty-enhanced one sends Tab with SHIFT, so both are valid.
             KeyCode::BackTab if !matches!(self.mode, Mode::Bang) => return Some(PaneEvent::Plan),
@@ -496,7 +497,31 @@ impl Pane {
 
     /// Close the file popup, else leave copy mode. Returns whether anything was closed.
     pub fn escape(&mut self) -> bool {
-        self.popup.take().is_some() || self.copy.take().is_some()
+        let copy = self.copy.is_some();
+        self.leave_copy();
+        self.popup.take().is_some() || copy
+    }
+
+    /// Enter copy mode over a frozen snapshot of the wrapped rows.
+    fn enter_copy(&mut self) {
+        let frozen = Frozen {
+            width: self.transcript.width(),
+            rows: self.transcript.rows().to_vec(),
+        };
+        self.copy = Some(CopyCursor::enter(frozen.rows.len()));
+        self.frozen = Some(frozen);
+    }
+
+    /// Leave copy mode, dropping the snapshot; the next render thaws to the live pane.
+    fn leave_copy(&mut self) {
+        self.copy = None;
+        self.frozen = None;
+    }
+
+    /// The rows copy mode navigates: the frozen snapshot, never the live ones.
+    fn frozen_rows(&self) -> &[Line<'static>] {
+        debug_assert!(self.frozen.is_some(), "copy mode without a snapshot");
+        self.frozen.as_ref().map_or(&[], |frozen| &frozen.rows)
     }
 
     /// Paint one event into the tui
@@ -1129,8 +1154,20 @@ impl Pane {
     ) {
         // Queued snippet reads the queue before `sync` borrows the transcript
         let queued = self.queued_text(bar_top.width);
-        // Wrap only what is new at an unchanged width, or rewrap if width changed.
-        let rows = self.transcript.sync(area.width as usize);
+        // Copy mode paints its frozen snapshot; a resize rewraps it in place,
+        // and the live transcript syncs again once the mode exits.
+        let width = area.width as usize;
+        let rows = match self.frozen.as_mut() {
+            Some(frozen) => {
+                if frozen.width != width {
+                    frozen.rows = wrap_lines(&frozen.rows, width);
+                    frozen.width = width;
+                }
+                &frozen.rows
+            }
+            // Wrap only what is new at an unchanged width, or rewrap if width changed.
+            None => self.transcript.sync(width),
+        };
         // Clamp to the wrapped rows, moving the cursor to (0, 0) when empty.
         if let Some(cursor) = &mut self.copy {
             (cursor.row, cursor.col) = clamp_cell(rows, cursor.row, cursor.col);
@@ -2529,13 +2566,92 @@ mod tests {
         assert!(pane.copy.expect("copy cursor").row > 10);
         pane.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)); // eaten
         pane.on_key(key(KeyCode::PageUp, KeyModifiers::NONE));
+        let scrolled_to = pane.copy.expect("copy mode").row;
 
         render(&mut pane, (80, 24)); // grow
         let cursor = pane.copy.expect("resize left copy mode");
-        assert_eq!(cursor.row, pane.transcript.rows().len() - 1, "not clamped");
+        let frozen = pane.frozen.as_ref().expect("resize dropped the snapshot");
+        assert_eq!(frozen.width, 80, "snapshot not rewrapped");
+        assert_eq!(cursor.row, scrolled_to, "not clamped");
 
         assert!(pane.escape());
         assert!(render(&mut pane, (40, 10)).contains("❯ ")); // live again
+    }
+
+    #[test]
+    fn copy_mode_freezes_the_view_until_exited() {
+        let mut pane = Pane::default();
+        for i in 0..40 {
+            pane.push(Line::from(format!("message {i}")));
+        }
+        render(&mut pane, (40, 24));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        for _ in 0..15 {
+            pane.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        }
+        let at = pane.copy.expect("copy mode").row;
+        pane.apply(&Progress::Answer("brand new tail".to_string()));
+        let screen = render(&mut pane, (40, 24));
+        assert!(!screen.contains("brand new tail"), "{screen}");
+        assert_eq!(pane.copy.expect("still frozen").row, at);
+
+        pane.on_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(pane.copy.is_none());
+        assert!(render(&mut pane, (40, 24)).contains("brand new tail"));
+    }
+
+    #[test]
+    fn copy_mode_keeps_output_the_live_view_superseded() {
+        let mut pane = Pane::default();
+        pane.extend([
+            Progress::ToolStart {
+                id: "1".to_string(),
+                name: "bash".to_string(),
+                arguments: "ls".to_string(),
+            },
+            Progress::ToolOutput {
+                id: "1".to_string(),
+                output: "old output".to_string(),
+                exit: Some(0),
+            },
+        ]);
+        render(&mut pane, (60, 24));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        pane.extend([Progress::ToolStart {
+            id: "2".to_string(),
+            name: "bash".to_string(),
+            arguments: "pwd".to_string(),
+        }]);
+        assert!(render(&mut pane, (60, 24)).contains("old output"));
+
+        pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        let live = render(&mut pane, (60, 24));
+        assert!(!live.contains("old output"), "{live}");
+        assert!(live.contains("Bash(pwd)"), "{live}");
+    }
+
+    #[test]
+    fn copy_mode_selection_survives_a_narrowing_resize() {
+        let mut pane = Pane::default();
+        pane.push(Line::from("aaaa bbbb cccc dddd eeee"));
+        render(&mut pane, (60, 8));
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // enter at (0, 0)
+        pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // anchor
+        pane.on_key(key(KeyCode::End, KeyModifiers::NONE)); // to the row end
+
+        render(&mut pane, (8, 8)); // narrow: the row wraps into several
+        let cursor = pane.copy.expect("resize left copy mode");
+        let frozen = pane.frozen.as_ref().expect("resize dropped the snapshot");
+        assert!(cursor.row < frozen.rows.len(), "row out of bounds");
+        assert!(
+            cursor.col < frozen.rows[cursor.row].width().max(1),
+            "col out of bounds"
+        );
+
+        assert!(matches!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Copy(_))
+        ));
     }
 
     /// Space anchors, movement reshapes, Enter ships the selection out and
