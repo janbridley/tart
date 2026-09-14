@@ -132,3 +132,59 @@ impl Tui {
         pane
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
+    use super::*;
+
+    /// A providers file whose key resolves without the environment.
+    fn providers(dir: &std::path::Path) -> std::path::PathBuf {
+        let file = dir.join("providers.toml");
+        std::fs::write(
+            &file,
+            "[default_agent]\nprovider = \"zai\"\nname = \"a\"\n\
+             \n[zai]\nbase_url = \"http://localhost:9\"\napi_key = [\"echo\", \"k\"]\n\
+             \n[[zai.agents]]\nname = \"a\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        file
+    }
+
+    /// The chat command line builds a chat `Tui`: the agent in Chat mode, the
+    /// CHAT project, and the minimal prompt opening the record.
+    #[test]
+    fn a_chat_cli_builds_a_chat_tui() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = cli::Cli {
+            agents: providers(dir.path()),
+            chat: true,
+        };
+
+        let tui = Tui::try_from(&cli).unwrap();
+
+        assert_eq!(tui.agent.mode(), ChatMode::Chat);
+        assert_eq!(tui.project, PathBuf::from(CHAT_PROJECT));
+        let items = serde_json::to_value(tui.transcript.request_items()).unwrap();
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[0]["content"], prompts::CHAT);
+    }
+
+    /// The bare command line stays the coding kind.
+    #[test]
+    fn a_bare_cli_builds_a_coding_tui() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = cli::Cli {
+            agents: providers(dir.path()),
+            chat: false,
+        };
+
+        let tui = Tui::try_from(&cli).unwrap();
+
+        assert_eq!(tui.agent.mode(), ChatMode::Default);
+        assert_eq!(tui.project, std::env::current_dir().unwrap());
+        let items = serde_json::to_value(tui.transcript.request_items()).unwrap();
+        assert_ne!(items[0]["content"], prompts::CHAT);
+    }
+}

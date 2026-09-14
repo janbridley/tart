@@ -233,7 +233,7 @@ impl Transcript {
     /// reminder, when one is set, appended after it.
     #[inline]
     #[must_use]
-    pub(crate) fn request_items(&self) -> Vec<InputItem> {
+    pub fn request_items(&self) -> Vec<InputItem> {
         self.lines()
             .iter()
             .map(|line| line.item.clone())

@@ -425,9 +425,12 @@ mod tests {
         let mut session = Session::start(root.path(), Path::new(CHAT_PROJECT));
         session.record(&transcript).unwrap();
 
-        let (resumed, _) =
-            Session::open(root.path(), Path::new(CHAT_PROJECT), &session.path.clone().unwrap())
-                .unwrap();
+        let (resumed, _) = Session::open(
+            root.path(),
+            Path::new(CHAT_PROJECT),
+            &session.path.clone().unwrap(),
+        )
+        .unwrap();
 
         let items = serde_json::to_value(resumed.request_items()).unwrap();
         assert_eq!(items[0]["role"], "system");

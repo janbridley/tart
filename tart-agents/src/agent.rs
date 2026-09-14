@@ -5,8 +5,8 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::responses::{
-        CreateResponseArgs, FunctionToolCall, InputParam, OutputItem, Reasoning, ReasoningEffort,
-        ReasoningItem, ResponseStreamEvent, Tool,
+        CreateResponse, CreateResponseArgs, FunctionToolCall, InputItem, InputParam, OutputItem,
+        Reasoning, ReasoningEffort, ReasoningItem, ResponseStreamEvent, Tool,
     },
 };
 use futures::StreamExt;
@@ -212,6 +212,27 @@ impl Agent {
         self
     }
 
+    /// The round's request: the model, the effort, the record, and the tools if present
+    fn request(
+        &self,
+        items: Vec<InputItem>,
+        definitions: Vec<Tool>,
+    ) -> Result<CreateResponse, async_openai::error::OpenAIError> {
+        // The builder's setters borrow it, so chain off the binding.
+        let mut args = CreateResponseArgs::default();
+        args.model(self.model.as_str())
+            .stream(true)
+            .reasoning(Reasoning {
+                effort: self.effort.clone(),
+                summary: None,
+            })
+            .input(InputParam::Items(items));
+        if !definitions.is_empty() {
+            args.tools(definitions);
+        }
+        args.build()
+    }
+
     /// Clone this agent as a spawned subagent of itself: a fresh lever, no
     /// registry of its own, and its registry id still to name.
     pub(crate) fn child(&self) -> Self {
@@ -356,21 +377,7 @@ impl Agent {
             // available, plus the subagent pair for a spawning agent.
             let definitions = self.tools_for();
             let items = transcript.request_items();
-            let mut request_args = CreateResponseArgs::default();
-            request_args
-                .model(self.model.as_str())
-                .stream(true)
-                .reasoning(Reasoning {
-                    effort: self.effort.clone(),
-                    summary: None,
-                })
-                .input(InputParam::Items(items));
-            // An empty list (chat mode with no web binaries) omits the field:
-            // several backends reject `"tools": []`.
-            if !definitions.is_empty() {
-                request_args.tools(definitions);
-            }
-            let request = match request_args.build() {
+            let request = match self.request(items, definitions) {
                 Ok(request) => request,
                 Err(error) => {
                     return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
@@ -644,6 +651,23 @@ mod tests {
     use crate::usage::tests::sample_usage;
     use async_openai::types::responses::{ResponseOutputItemDoneEvent, ResponseTextDeltaEvent};
     use std::io::{Read, Write};
+
+    #[test]
+    fn the_request_omits_an_empty_tools_list() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let agent = Agent::new("http://localhost:9", "key", "model", policy);
+
+        let bare = serde_json::to_value(agent.request(Vec::new(), Vec::new()).unwrap()).unwrap();
+        assert!(bare.get("tools").is_none(), "no tools, no field: {bare}");
+
+        let armed =
+            serde_json::to_value(agent.request(Vec::new(), vec![tools::bash()]).unwrap()).unwrap();
+        assert_eq!(
+            armed["tools"].as_array().map(Vec::len),
+            Some(1),
+            "the offered tool rides along: {armed}"
+        );
+    }
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
