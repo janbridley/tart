@@ -276,21 +276,17 @@ fn run(
                     }
                     // A submitted `/resume` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
-                    _ if line.trim().starts_with("/resume") => {
+                    _ if file_mentions::is_command(line.trim(), "/resume") => {
                         pane.note("type /resume and pick a session as you type");
                     }
                     // A submitted `/rewind` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
-                    _ if line.trim().starts_with("/rewind") => {
+                    _ if file_mentions::is_command(line.trim(), "/rewind") => {
                         pane.note("type /rewind and pick a turn as you type");
                     }
                     // A submitted `/model` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
-                    _ if line
-                        .trim()
-                        .strip_prefix("/model")
-                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')) =>
-                    {
+                    _ if file_mentions::is_command(line.trim(), "/model") => {
                         pane.note("type /model and pick an agent as you type");
                     }
                     // Set how hard the model reasons.

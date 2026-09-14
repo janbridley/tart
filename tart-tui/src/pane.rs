@@ -30,13 +30,15 @@ pub(crate) use editor::{Editor, g_to_byte, graphemes};
 use crate::attachments;
 use crate::clipboard::Selection;
 use crate::config::AgentChoice;
-use crate::file_mentions::{self, FilePopup, Picker, render_picker};
+use crate::file_mentions::{self, FilePopup, Picker};
 use crate::recorded::REPORTS_AT;
 use crate::session_picker::{derive_query as session_query, session_picker};
 use crate::turn_picker::rewind_picker;
-use copy::{CopyCursor, clamp_cell, moved, window_top};
+use copy::{CopyCursor, clamp_cell, window_top};
 use transcript::Transcript;
 use wrap::wrap_draft;
+
+pub(crate) use wrap::grapheme_width;
 
 pub const PROMPT: &str = "❯ ";
 /// Cells before the editor starts (the prompt symbol's width).
@@ -128,6 +130,54 @@ pub(crate) enum Popup {
     Models(Picker<AgentChoice>),
     /// The `/rewind` chooser over this conversation's user turns.
     Turns(Picker<(usize, String)>),
+}
+
+impl Popup {
+    /// Arrows move the highlight; whether Tab/Enter accepts.
+    fn key(&mut self, code: KeyCode) -> bool {
+        match self {
+            Popup::Files(popup) => match code {
+                KeyCode::Up => popup.select_prev(),
+                KeyCode::Down => popup.select_next(),
+                _ => {}
+            },
+            // The typed choosers all key alike.
+            Popup::Sessions(picker) => Self::chooser_key(picker, code),
+            Popup::Models(picker) => Self::chooser_key(picker, code),
+            Popup::Turns(picker) => Self::chooser_key(picker, code),
+        }
+        matches!(code, KeyCode::Tab | KeyCode::Enter)
+    }
+
+    /// Arrows move a typed chooser's highlight.
+    fn chooser_key<T>(picker: &mut Picker<T>, code: KeyCode) {
+        match code {
+            KeyCode::Up => picker.select_prev(),
+            KeyCode::Down => picker.select_next(),
+            _ => {}
+        }
+    }
+
+    /// Draw the popup above `anchor`, titled for its chooser; `bang` swaps the typeahead.
+    fn render(&mut self, frame: &mut Frame, anchor: Rect, bang: bool) {
+        let hint = if bang {
+            "↑↓ select · Tab insert · Esc close"
+        } else {
+            "↑↓ select · Tab/Enter insert · Esc close"
+        };
+        match self {
+            Popup::Files(popup) => popup.render(frame, anchor, "files", hint),
+            Popup::Sessions(picker) => {
+                picker.render(frame, anchor, "sessions", "↑↓ select · Enter resume · Esc close");
+            }
+            Popup::Models(picker) => {
+                picker.render(frame, anchor, "models", "↑↓ select · Enter switch · Esc close");
+            }
+            Popup::Turns(picker) => {
+                picker.render(frame, anchor, "rewind", "↑↓ select · Enter rewind · Esc close");
+            }
+        }
+    }
 }
 
 /// One finished response's token usage, as shown on the status line.
@@ -275,31 +325,11 @@ impl Pane {
 
     /// One key the open popup owns: arrows move the highlight, Tab/Enter accepts.
     fn popup_key(&mut self, key: KeyEvent) -> Option<PaneEvent> {
-        let accept = match self.popup.as_mut()? {
-            Popup::Files(popup) => {
-                match key.code {
-                    KeyCode::Up => popup.select_prev(),
-                    KeyCode::Down => popup.select_next(),
-                    _ => {}
-                }
-                matches!(key.code, KeyCode::Tab | KeyCode::Enter)
-            }
-            // The typed choosers all key alike: see [`Pane::chooser_key`].
-            Popup::Sessions(picker) => Self::chooser_key(picker, key.code),
-            Popup::Models(picker) => Self::chooser_key(picker, key.code),
-            Popup::Turns(picker) => Self::chooser_key(picker, key.code),
-        };
-        accept.then(|| self.accept_popup()).flatten()
-    }
-
-    /// One key a typed chooser owns: arrows move its highlight, Tab/Enter accepts.
-    fn chooser_key<T>(picker: &mut Picker<T>, code: KeyCode) -> bool {
-        match code {
-            KeyCode::Up => picker.select_prev(),
-            KeyCode::Down => picker.select_next(),
-            _ => {}
-        }
-        matches!(code, KeyCode::Tab | KeyCode::Enter)
+        self.popup
+            .as_mut()?
+            .key(key.code)
+            .then(|| self.accept_popup())
+            .flatten()
     }
 
     /// Close the open popup and apply its highlighted row.
@@ -372,7 +402,7 @@ impl Pane {
                         return Some(PaneEvent::Copy(text));
                     }
                 }
-                _ => self.copy = Some(moved(self.transcript.rows(), cursor, key.code)),
+                _ => self.copy = Some(cursor.moved(self.transcript.rows(), key.code)),
             }
             return None;
         }
@@ -380,15 +410,28 @@ impl Pane {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
                 KeyCode::Char('u') => self.clear_prompt(),
-                // To the line start / end, as readline
+                // The rendered row's edges, crossing onto the neighboring row
+                // when already at one.
                 KeyCode::Char('a') => self.prompt.home(),
                 KeyCode::Char('e') => self.prompt.end(),
+                // ⌃Y steps the draft back one edit group
+                KeyCode::Char('y') => self.prompt.undo(),
                 // Toggle the thinking run's visibility (only in normal mode)
                 KeyCode::Char('t') => self.transcript.toggle_thinking(),
                 // Toggle expanding the tool outputs' collapsed middles
                 KeyCode::Char('o') => self.transcript.toggle_expand(),
                 _ => {}
             }
+            return None;
+        }
+        // A queued message claims Option+Up before the draft jump, moving
+        // the queue into the composer for editing; Enter re-queues the edited
+        // draft as a new message.
+        if key.code == KeyCode::Up
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && !self.queued.is_empty()
+        {
+            self.spill_queued();
             return None;
         }
         // macOS word/line bindings (Option/Cmd + arrows/Backspace); unclaimed
@@ -405,15 +448,6 @@ impl Pane {
         if self.popup.is_some() && !key.modifiers.contains(KeyModifiers::ALT) && claimed {
             return self.popup_key(key);
         }
-        // Option+Up moves the queued messages into the composer for editing.
-        // Enter re-queues the edited draft as a new message.
-        if key.code == KeyCode::Up
-            && key.modifiers.contains(KeyModifiers::ALT)
-            && !self.queued.is_empty()
-        {
-            self.spill_queued();
-            return None;
-        }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
             // Classify manual commands BEFORE queueing
@@ -425,6 +459,7 @@ impl Pane {
                 if !text.trim().is_empty() && !text.trim().starts_with('/') {
                     self.queue_message(text);
                     self.clear_prompt();
+                    self.prompt.forget_undo();
                 }
             }
             KeyCode::Enter => return self.submit(),
@@ -845,7 +880,7 @@ impl Pane {
             .map(|(id, task, outcome)| {
                 format!(
                     "Subagent {id} finished ({}):\n\n{}",
-                    ellipsize(&task, 60),
+                    clip_line(&task, ONE_LINE_CAP),
                     outcome.report()
                 )
             })
@@ -942,11 +977,10 @@ impl Pane {
         }
         let bang = matches!(self.mode, Mode::Bang);
         // A submitted command leaves `!` mode; a planning message keeps planning.
-        if bang {
-            self.mode = Mode::Default;
-        }
+        self.leave_bang();
         self.plan_ready = false;
         self.prompt.clear();
+        self.prompt.forget_undo();
         if bang {
             // A command's echo waits for its run: what the transcript shows
             // and what it records both land with the framed output.
@@ -965,13 +999,19 @@ impl Pane {
     /// exactly like the prompt row that launched it.
     fn echo_styled(&mut self, glyph: &'static str, style: Style, text: &str) {
         let mut rows = text.split('\n');
-        self.transcript.push(Line::from(vec![
-            Span::styled(glyph, style),
-            Span::raw(rows.next().unwrap_or_default().to_string()),
-        ]));
+        self.transcript.blank();
+        self.transcript.push_hanging(
+            Line::from(vec![
+                Span::styled(glyph, style),
+                Span::raw(rows.next().unwrap_or_default().to_string()),
+            ]),
+            GUTTER as usize,
+        );
         for continuation in rows {
-            self.transcript.push(Line::from(format!("  {continuation}")));
+            self.transcript
+                .push_hanging(Line::from(format!("  {continuation}")), GUTTER as usize);
         }
+        self.transcript.blank();
     }
 
     /// Mark a manual command in flight: the frame holds the bang styling and
@@ -999,6 +1039,11 @@ impl Pane {
     /// Empty the draft, leaving the manual-command mode with it.
     fn clear_prompt(&mut self) {
         self.prompt.clear();
+        self.leave_bang();
+    }
+
+    /// Submitted command, cleared draft, or an empty draft's backspace leaves bang mode
+    fn leave_bang(&mut self) {
         if matches!(self.mode, Mode::Bang) {
             self.mode = Mode::Default;
         }
@@ -1022,11 +1067,10 @@ impl Pane {
         let (prompt_height, layout) = if self.copy.is_some() {
             (1, None)
         } else {
-            let layout = wrap_draft(
-                &self.prompt.lines,
-                (self.prompt.line, self.prompt.g),
-                area.width.saturating_sub(GUTTER) as usize,
-            );
+            let width = area.width.saturating_sub(GUTTER) as usize;
+            // Row-wise motion (arrows, Cmd+←/→) wraps exactly like the paint.
+            self.prompt.width = width;
+            let layout = wrap_draft(&self.prompt.lines, (self.prompt.line, self.prompt.g), width);
             (layout.rows.len().min(cap).max(1) as u16, Some(layout))
         };
         let [transcript, bar_top, prompt_area, bar_bottom] = Layout::vertical([
@@ -1083,39 +1127,10 @@ impl Pane {
             prompt_area.x + GUTTER + col,
             prompt_area.y + (layout.caret_row - top) as u16,
         );
-        if let Some(cell) = buf.cell_mut(pos) {
-            cell.set_style(CURSOR_STYLE);
-        }
-        // The popup overlays the transcript, anchored above the top rule..
-        let hint = if matches!(self.mode, Mode::Bang) {
-            "↑↓ select · Tab insert · Esc close"
-        } else {
-            "↑↓ select · Tab/Enter insert · Esc close"
-        };
-        match self.popup.as_mut() {
-            Some(Popup::Files(popup)) => popup.render(frame, bar_top, "files", hint),
-            Some(Popup::Sessions(picker)) => render_picker(
-                picker,
-                frame,
-                bar_top,
-                "sessions",
-                "↑↓ select · Enter to resume · Esc to close popup",
-            ),
-            Some(Popup::Models(picker)) => render_picker(
-                picker,
-                frame,
-                bar_top,
-                "models",
-                "↑↓ select · Enter to switch · Esc to close popup",
-            ),
-            Some(Popup::Turns(picker)) => render_picker(
-                picker,
-                frame,
-                bar_top,
-                "rewind",
-                "↑↓ select · Enter to rewind · Esc to close popup",
-            ),
-            None => {}
+        invert(buf, pos);
+        // The popup overlays the transcript, anchored above the top rule.
+        if let Some(popup) = self.popup.as_mut() {
+            popup.render(frame, bar_top, matches!(self.mode, Mode::Bang));
         }
     }
 
@@ -1150,9 +1165,7 @@ impl Pane {
                 selection.paint(buf, rows, area, top, shown);
             }
             let pos = (area.x + cursor.col as u16, area.y + (cursor.row - top) as u16);
-            if let Some(cell) = buf.cell_mut(pos) {
-                cell.set_style(CURSOR_STYLE);
-            }
+            invert(buf, pos);
         }
         queued_rule(buf, bar_top, queued.as_deref());
         if let Some(perf) = &self.perf {
@@ -1252,7 +1265,18 @@ impl BufRows for Buffer {
     }
 }
 
-/// A full-width dim rule row, drawn cell by cell.
+/// Whether a rule row at `area` still lands on the buffer.
+fn on_screen(buf: &Buffer, area: Rect) -> bool {
+    area.y < buf.area.height
+}
+
+/// Invert the cell style at `pos`: the caret's paint.
+fn invert(buf: &mut Buffer, pos: (u16, u16)) {
+    if let Some(cell) = buf.cell_mut(pos) {
+        cell.set_style(CURSOR_STYLE);
+    }
+}
+
 fn rule(buf: &mut Buffer, area: Rect) {
     for col in area.columns() {
         if let Some(cell) = buf.cell_mut((col.x, area.y)) {
@@ -1276,20 +1300,16 @@ fn token_count(tokens: u64) -> String {
 }
 
 /// One grapheme's width in cells, never zero.
-fn cell_width(grapheme: &str) -> usize {
-    Span::raw(grapheme).width().max(1)
-}
-
 /// `text` as-is when it fits `budget` cells, else its clipped start and an ellipsis
-pub(crate) fn ellipsize(text: &str, budget: usize) -> String {
-    if text.graphemes(true).map(cell_width).sum::<usize>() <= budget {
+fn ellipsize(text: &str, budget: usize) -> String {
+    if text.graphemes(true).map(grapheme_width).sum::<usize>() <= budget {
         return text.to_string();
     }
     // One cell stays free so a cut always shows its ellipsis.
     let mut cut: String = text
         .graphemes(true)
         .scan(0, |used, grapheme| {
-            let spent = cell_width(grapheme);
+            let spent = grapheme_width(grapheme);
             (*used + spent < budget).then(|| {
                 *used += spent;
                 grapheme
@@ -1298,6 +1318,15 @@ pub(crate) fn ellipsize(text: &str, budget: usize) -> String {
         .collect();
     cut.push('…');
     cut
+}
+
+/// The cells a picker row or tool header keeps of a message's first line.
+pub(crate) const ONE_LINE_CAP: usize = 60;
+
+/// The first line of `text`, capped with an ellipsis to `budget` cells.
+pub(crate) fn clip_line(text: &str, budget: usize) -> String {
+    let line = text.split('\n').next().unwrap_or_default();
+    ellipsize(line, budget)
 }
 
 /// A full-width dim rule row with the status badge set into it:
@@ -1313,7 +1342,7 @@ fn status_rule(
 ) {
     rule(buf, area);
     // The bar can be parked past the last row.
-    if area.y >= buf.area.height {
+    if !on_screen(buf, area) {
         return;
     }
     if let Some(spinner) = spinner {
@@ -1357,7 +1386,7 @@ fn queued_rule(buf: &mut Buffer, area: Rect, text: Option<&str>) {
     rule(buf, area);
     let Some(text) = text else { return };
     // The bar can be parked past the last row.
-    if area.y >= buf.area.height {
+    if !on_screen(buf, area) {
         return;
     }
     let line = Line::from(Span::styled(text, DIM_STYLE));
@@ -1377,6 +1406,23 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn setup_tests() -> (Pane, Agent, Conversation, Sender<Wake>, Agents) {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let agent = Agent::new("http://127.0.0.1:1", "key", "model", policy);
+        let transcript = Conversation::new().unwrap();
+        let (wake, _wake_receiver) = std::sync::mpsc::channel();
+        (Pane::default(), agent, transcript, wake, Agents::new(|_, _| {}))
+    }
+
+    /// Poll the registry until every `id` has an outcome.
+    fn await_outcome(agents: &Agents, ids: &[AgentId]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ids.iter().any(|id| agents.outcome(*id).is_none()) {
+            assert!(std::time::Instant::now() < deadline, "the children end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn render(pane: &mut Pane, size: (u16, u16)) -> String {
@@ -1622,13 +1668,91 @@ mod tests {
     }
 
     #[test]
-    fn reports_deliver_together_as_one_framed_message() {
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
-        let agent = Agent::new("http://127.0.0.1:1", "key", "model", policy);
-        let transcript = Conversation::new().unwrap();
-        let (wake, _wake_receiver) = std::sync::mpsc::channel();
-        let registry = Agents::new(|_, _| {});
+    fn undo_forgets_a_submitted_draft() {
         let mut pane = Pane::default();
+        for c in "hello".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Submit("hello".to_string()))
+        );
+        pane.on_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(pane.prompt.text(), "");
+    }
+
+    #[test]
+    fn row_edges_follow_the_rendered_row() {
+        let mut pane = Pane::default();
+        for c in "hello world".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        render(&mut pane, (8, 10)); // rows "hello " / "world"
+        for (home, end) in [
+            (
+                key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            ),
+            (
+                key(KeyCode::Home, KeyModifiers::NONE),
+                key(KeyCode::End, KeyModifiers::NONE),
+            ),
+        ] {
+            pane.prompt.g = 3;
+            pane.on_key(home);
+            assert_eq!(pane.prompt.g, 0);
+            pane.prompt.g = 8;
+            pane.on_key(end);
+            assert_eq!(pane.prompt.g, 11); // the "world" row's end
+
+            // Already at an edge, the jump crosses onto the neighboring row...
+            pane.prompt.g = 6; // the "world" row's first cell
+            pane.on_key(home);
+            assert_eq!(pane.prompt.g, 0);
+            pane.prompt.g = 5; // the "hello " row's last boundary
+            pane.on_key(end);
+            assert_eq!(pane.prompt.g, 11);
+            // ...and holds still at the draft's outer edges.
+            pane.prompt.g = 0;
+            pane.on_key(home);
+            assert_eq!(pane.prompt.g, 0);
+            pane.prompt.g = 11;
+            pane.on_key(end);
+            assert_eq!(pane.prompt.g, 11);
+        }
+    }
+
+    #[test]
+    fn control_y_and_arrows_follow_the_wrapped_draft() {
+        let mut pane = Pane::default();
+        for c in "hello world".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.on_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(pane.prompt.text(), "");
+        pane.on_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL)); // a no-op
+        assert_eq!(pane.prompt.text(), "");
+
+        // Six prompt cells wrap "hello world" into the rows "hello " / "world".
+        for c in "hello world".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        render(&mut pane, (8, 10));
+        pane.prompt.g = 3;
+        pane.on_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL)); // the row's end
+        assert_eq!(pane.prompt.g, 5); // before the space the row kept
+        pane.on_key(key(KeyCode::Down, KeyModifiers::SUPER)); // the draft's end
+        assert_eq!(pane.prompt.g, 11);
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SUPER)); // the draft's start
+        assert_eq!(pane.prompt.g, 0);
+        pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to (0, 1)
+        pane.on_key(key(KeyCode::Down, KeyModifiers::NONE)); // a row down, column kept
+        assert_eq!(pane.prompt.g, 7);
+    }
+
+    #[test]
+    fn reports_deliver_together_as_one_framed_message() {
+        let (mut pane, agent, transcript, wake, registry) = setup_tests();
 
         // Two children end at once, cancelled rather than retried: the
         // endpoint is unreachable and the retry backoff would outlast the
@@ -1637,11 +1761,7 @@ mod tests {
         let two = registry.spawn(&agent, "fix the docs").unwrap();
         registry.cancel(one);
         registry.cancel(two);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while registry.outcome(one).is_none() || registry.outcome(two).is_none() {
-            assert!(std::time::Instant::now() < deadline, "the children end");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        await_outcome(&registry, &[one, two]);
 
         // A requested report is claimed so delivery never sees it.
         let claimed = registry.claim(one).unwrap();
@@ -1899,10 +2019,7 @@ mod tests {
     /// front end to apply when the turn ends.
     #[test]
     fn mid_turn_plan_switches_wait_for_the_turn() {
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
-        let mut agent = Agent::new("http://127.0.0.1:1", "key", "model", policy);
-        let mut conversation = Conversation::new().unwrap();
-        let mut pane = Pane::default();
+        let (mut pane, mut agent, mut conversation, _wake, _registry) = setup_tests();
         pane.set_generating(true);
 
         let deferred = pane.set_plan(&mut agent, &mut conversation, true).unwrap();
@@ -1964,6 +2081,7 @@ mod tests {
             pane.transcript.message_texts(),
             [
                 format!("! {}", "x".repeat(60)),
+                String::new(),
                 "[exit 1]".to_string(),
                 "boom".to_string()
             ]
@@ -2004,7 +2122,7 @@ mod tests {
         );
         assert_eq!(
             pane.transcript.message_texts(),
-            ["! cargo build", "  cargo test", "done"]
+            ["! cargo build", "  cargo test", "", "done"]
         );
     }
 
@@ -2343,10 +2461,14 @@ mod tests {
     #[test]
     fn echo_renders_the_prompt_and_indents_continuations() {
         let mut pane = Pane::default();
+        pane.push(Line::from("banner"));
 
         pane.echo("first\nsecond");
 
-        assert_eq!(pane.transcript.message_texts(), ["❯ first", "  second"]);
+        assert_eq!(
+            pane.transcript.message_texts(),
+            ["banner", "", "❯ first", "  second", ""]
+        );
     }
 
     /// A `/resume` line opens the session chooser; Enter swaps to the picked
@@ -2738,7 +2860,7 @@ mod tests {
         ]);
         let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
         let rows: Vec<&str> = styles.lines().collect();
-        assert!(rows[1].starts_with("BBBB"), "the H3 is bold: {styles}");
+        assert!(rows[2].starts_with("BBBB"), "the H3 is bold: {styles}");
         assert!(
             styles.contains("yyyyyyyyyy"),
             "inline code is light yellow: {styles}"

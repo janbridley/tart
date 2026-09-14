@@ -561,7 +561,7 @@ impl Blocks {
         let mut widths = vec![0_usize; columns];
         for row in std::iter::once(&head).chain(&rows) {
             for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cell_width(cell));
+                widths[i] = widths[i].max(spans_width(cell));
             }
         }
         // Bound the table to the current pane width, shrinking widest columns first
@@ -642,7 +642,7 @@ impl Blocks {
 }
 
 /// A cell's width in terminal cells.
-fn cell_width(cell: &[Span<'static>]) -> usize {
+fn spans_width(cell: &[Span<'static>]) -> usize {
     cell.iter().map(Span::width).sum()
 }
 
@@ -656,7 +656,7 @@ fn cell_lines(cell: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>>
 
 /// One cell padded to its column's width and alignment.
 fn pad_cell(mut cell: Vec<Span<'static>>, width: usize, align: Alignment) -> Vec<Span<'static>> {
-    let fill = width.saturating_sub(cell_width(&cell));
+    let fill = width.saturating_sub(spans_width(&cell));
     let (left, right) = match align {
         Alignment::Left | Alignment::None => (0, fill),
         Alignment::Right => (fill, 0),

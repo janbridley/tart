@@ -29,46 +29,39 @@ impl CopyCursor {
     }
 }
 
-/// The cursor after one key step, clamped to the transcript edges.
-pub(crate) fn moved(rows: &[Line<'static>], cursor: CopyCursor, key: KeyCode) -> CopyCursor {
-    if rows.is_empty() {
-        return CopyCursor { row: 0, col: 0, ..cursor };
-    }
-    let last = rows.len() - 1;
-    let mut c = cursor;
-    // Rows can shrink between renders (a restyling append rewinds the
-    // segment), so the cursor clamps before it moves.
-    c.row = c.row.min(last);
-    match key {
-        KeyCode::Up => c.row = c.row.saturating_sub(1),
-        KeyCode::Down => c.row = (c.row + 1).min(last),
-        KeyCode::Left => {
-            if c.col > 0 {
-                c.col -= 1;
-            } else if c.row > 0 {
-                c.row -= 1;
-                c.col = rows[c.row].width().saturating_sub(1);
-            }
+impl CopyCursor {
+    /// The cursor after one key step, clamped to the transcript edges.
+    pub(crate) fn moved(self, rows: &[Line<'static>], key: KeyCode) -> CopyCursor {
+        if rows.is_empty() {
+            return CopyCursor { row: 0, col: 0, ..self };
         }
-        KeyCode::Right => {
-            if c.col + 1 < rows[c.row].width() {
-                c.col += 1;
-            } else if c.row < last {
-                c.row += 1;
-                c.col = 0;
+        let last = rows.len() - 1;
+        let mut c = self;
+        // Rows can shrink between renders, so the cursor clamps before it moves.
+        c.row = c.row.min(last);
+        match key {
+            KeyCode::Up => c.row = c.row.saturating_sub(1),
+            KeyCode::Down => c.row = (c.row + 1).min(last),
+            // Left and Right join across rows:
+            // To the row above's last cell, and to the the row below's first.
+            KeyCode::Left if c.col > 0 => c.col -= 1,
+            KeyCode::Left if c.row > 0 => {
+                (c.row, c.col) = (c.row - 1, rows[c.row - 1].width().saturating_sub(1));
             }
+            KeyCode::Right if c.col + 1 < rows[c.row].width() => c.col += 1,
+            KeyCode::Right if c.row < last => (c.row, c.col) = (c.row + 1, 0),
+            KeyCode::PageUp => c.row = c.row.saturating_sub(c.visible.max(1)),
+            KeyCode::PageDown => c.row = (c.row + c.visible.max(1)).min(last),
+            KeyCode::Home => c.row = 0,
+            KeyCode::End => c.row = last,
+            _ => return self,
         }
-        KeyCode::PageUp => c.row = c.row.saturating_sub(c.visible.max(1)),
-        KeyCode::PageDown => c.row = (c.row + c.visible.max(1)).min(last),
-        KeyCode::Home => c.row = 0,
-        KeyCode::End => c.row = last,
-        _ => return cursor,
+        c.col = c.col.min(rows[c.row].width().saturating_sub(1));
+        c
     }
-    c.col = c.col.min(rows[c.row].width().saturating_sub(1));
-    c
 }
 
-/// First transcript row to render, used to anchor the prompt viewport.
+/// First transcript row to render, used to anchor a viewport.
 pub(crate) fn window_top(rows_len: usize, visible: usize, anchor: Option<(usize, usize)>) -> usize {
     let max_top = rows_len.saturating_sub(visible);
     anchor.map_or(max_top, |(row, top)| {
@@ -107,15 +100,15 @@ mod tests {
             top: 0,
             visible: 2,
         };
-        assert_eq!(moved(&rows, cur(0, 0), KeyCode::Right), cur(0, 1));
-        assert_eq!(moved(&rows, cur(1, 0), KeyCode::Left), cur(0, 2)); // wraps
-        assert_eq!(moved(&rows, cur(1, 0), KeyCode::PageUp), cur(0, 0));
-        assert_eq!(moved(&rows, cur(0, 0), KeyCode::PageDown), cur(1, 0));
-        assert_eq!(moved(&rows, cur(1, 0), KeyCode::Char('x')), cur(1, 0));
+        assert_eq!(cur(0, 0).moved(&rows, KeyCode::Right), cur(0, 1));
+        assert_eq!(cur(1, 0).moved(&rows, KeyCode::Left), cur(0, 2)); // wraps
+        assert_eq!(cur(1, 0).moved(&rows, KeyCode::PageUp), cur(0, 0));
+        assert_eq!(cur(0, 0).moved(&rows, KeyCode::PageDown), cur(1, 0));
+        assert_eq!(cur(1, 0).moved(&rows, KeyCode::Char('x')), cur(1, 0));
 
         // A move reshapes a selection; it never drops the anchor.
         let mut anchored = cur(0, 0);
         anchored.anchor = Some((1, 1));
-        assert_eq!(moved(&rows, anchored, KeyCode::Right).anchor, Some((1, 1)));
+        assert_eq!(anchored.moved(&rows, KeyCode::Right).anchor, Some((1, 1)));
     }
 }

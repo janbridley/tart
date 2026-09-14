@@ -10,7 +10,7 @@ use crate::testutil::texts;
 
 use super::digest::{child_call, tool_header};
 use super::markdown;
-use super::wrap::wrap_lines;
+use super::wrap::{wrap_hanging, wrap_lines};
 use super::{DIM_STYLE, HIGHLIGHT_STYLE};
 
 /// Stands in for a hidden thinking run.
@@ -49,7 +49,7 @@ impl Entry {
     /// The display lines the entry renders as. Stale entries render immediately
     fn lines(&self, expanded: bool, thinking: bool) -> Vec<Line<'static>> {
         match self {
-            Self::Text(line) => vec![line.clone()],
+            Self::Text(line, _) => vec![line.clone()],
             Self::Tool(tool) => tool.lines(expanded),
             Self::Answer { raw, width, lines } => {
                 if *width == 0 {
@@ -177,7 +177,8 @@ impl ToolCall {
 /// answer, or the turn's thinking block.
 #[derive(Clone)]
 enum Entry {
-    Text(Line<'static>),
+    /// A committed line, and the indent its wrapped continuation rows hang at.
+    Text(Line<'static>, usize),
     Tool(ToolCall),
     /// The model's answer text, rendered as markdown by `sync`.
     Answer {
@@ -217,7 +218,21 @@ pub(crate) struct Transcript {
 impl Transcript {
     /// Append a committed line.
     pub(crate) fn push(&mut self, line: impl Into<Line<'static>>) {
-        self.messages.push(Entry::Text(line.into()));
+        self.push_hanging(line, 0);
+    }
+
+    /// Append a committed line whose wrapped continuation rows hang `indent` cells in.
+    pub(crate) fn push_hanging(&mut self, line: impl Into<Line<'static>>, indent: usize) {
+        self.messages.push(Entry::Text(line.into(), indent));
+    }
+
+    /// Append a blank row, unless the log is empty or already ends on one.
+    pub(crate) fn blank(&mut self) {
+        let ends_blank =
+            matches!(self.messages.last(), Some(Entry::Text(line, _)) if line.width() == 0);
+        if !self.messages.is_empty() && !ends_blank {
+            self.push(Line::from(""));
+        }
     }
 
     /// Record a tool invocation's start; it renders as a running header until
@@ -516,7 +531,8 @@ impl Transcript {
             Entry::Answer { lines, .. } if width > 0 => lines.clone(),
             Entry::Answer { lines, .. } => wrap_lines(lines, width),
             Entry::Thinking { raw } => wrap_lines(&thinking_lines(raw, self.show_thinking), width),
-            entry => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
+            Entry::Text(line, indent) => wrap_hanging(line, width, *indent),
+            entry @ Entry::Tool(_) => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
         };
         if separated {
             self.folds.push(wrapped.len() + 1);
@@ -564,7 +580,7 @@ impl Transcript {
         self.messages
             .iter()
             .flat_map(|entry| match entry {
-                Entry::Text(line) => vec![line_text(line)],
+                Entry::Text(line, _) => vec![line_text(line)],
                 Entry::Answer { raw, .. } => {
                     markdown::render(raw, 0).iter().map(line_text).collect()
                 }
@@ -607,6 +623,13 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+
+    #[test]
+    fn wrapped_prompts_hang_under_the_gutter() {
+        let mut t = Transcript::default();
+        t.push_hanging(Line::from("❯ one two three four five six"), 2);
+        assert_eq!(texts(t.sync(14)), ["❯ one two ", "  three four ", "  five six"]);
+    }
 
     /// Start a pending `bash` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {
@@ -1145,45 +1168,42 @@ and the analytics dashboard rewrite.\n\n\
         for i in 0..5 {
             transcript.push(Line::from(format!("message {i} aaaa bbbb cccc dddd")));
         }
-        let assert_fresh = |transcript: &Transcript| {
-            transcript.assert_rows_match_full_rewrap();
-        };
         transcript.sync(20);
         assert_eq!(transcript.cache, (20, 5));
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
 
         transcript.push(Line::from("tail")); // between renders
         transcript.sync(20);
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
 
         transcript.sync(80); // width change rebuilds
         assert_eq!(transcript.cache, (80, 6));
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
 
         transcript.append("streaming aaaa bbbb"); // glued run
         transcript.sync(80);
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
         transcript.append(" cccc dddd");
         transcript.sync(80);
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
 
         // Tool boxes mutate mid-log: the running header, then the finished block.
         start_bash(&mut transcript, "call_0");
         transcript.sync(80);
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
         transcript.finish_tool("call_0", "one\ntwo\nthree\n".to_string(), Some(0));
         transcript.sync(80);
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
         transcript.toggle_expand();
         transcript.sync(80);
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
 
         transcript.clear(); // hidden pane: re-push to the same count
         for i in 0..6 {
             transcript.push(Line::from(format!("fresh {i}")));
         }
         transcript.sync(80);
-        assert_fresh(&transcript);
+        transcript.assert_rows_match_full_rewrap();
         assert!(!texts(&transcript.rows).iter().any(|row| row.contains("aaaa")));
     }
 
@@ -1191,62 +1211,59 @@ and the analytics dashboard rewrite.\n\n\
     fn wrap_cache_matches_a_full_rewrap_while_hidden() {
         let mut t = Transcript::default();
         assert!(!t.show_thinking, "thinking starts hidden");
-        let assert_fresh = |t: &Transcript| {
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), t.cache.0)));
-        };
 
         t.push(Line::from("❯ echo"));
         t.begin_response();
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.append_thinking("hmm aaaa bbbb");
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.append_thinking(" cccc dddd"); // glued
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.append_thinking("line two\nline three");
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.append("the answer aaaa bbbb");
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
 
         // A tool box lands after the answer, finishes, and round-two reasoning
         // splices back above both.
         start_bash(&mut t, "c0");
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.finish_tool("c0", "out aaaa".to_string(), Some(0));
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.append_thinking(" mid");
         t.sync(20);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
 
         t.sync(80); // width change rebuilds
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.append_thinking(" late"); // splices above the answer
         t.sync(80);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
 
         t.toggle_thinking(); // reveal
         t.sync(80);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.append_thinking(" more");
         t.sync(80);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.toggle_thinking(); // and hide again
         t.sync(80);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
 
         t.begin_response(); // retirement drains the run
         t.sync(80);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
 
         t.clear();
         t.sync(80);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
     }
 
     #[test]
@@ -1468,15 +1485,12 @@ and the analytics dashboard rewrite.\n\n\
     #[test]
     fn new_calls_fold_finished_boxes_to_their_headers() {
         let mut t = Transcript::default();
-        let assert_fresh = |t: &Transcript| {
-            t.assert_rows_match_full_rewrap();
-        };
         t.push(Line::from("❯ run it"));
         t.begin_response();
         start_bash(&mut t, "call_0");
         t.finish_tool("call_0", "one\ntwo\nthree\n".to_string(), Some(0));
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         assert!(texts(&t.rows).iter().any(|row| row.contains("⎿ one")));
 
         // The second call folds the first: only the two headers render.
@@ -1486,7 +1500,7 @@ and the analytics dashboard rewrite.\n\n\
             r#"{"command":"ls -la"}"#.to_string(),
         );
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         let rows = texts(&t.rows);
         assert!(rows.iter().any(|row| row.contains("● Bash(echo hi)")));
         assert!(rows.iter().any(|row| row.contains("● Bash(ls -la) …")));
@@ -1499,7 +1513,7 @@ and the analytics dashboard rewrite.\n\n\
             Some(0),
         );
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         let rows = texts(&t.rows);
         assert!(rows.iter().any(|row| row.contains("⎿ out aaaa")));
         assert!(!rows.iter().any(|row| row.contains("⎿ dddd")));
@@ -1508,13 +1522,13 @@ and the analytics dashboard rewrite.\n\n\
         // Ctrl+O expands the standing box only; the folded one stays a header.
         t.toggle_expand();
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         let rows = texts(&t.rows);
         assert!(rows.iter().any(|row| row.contains("⎿ dddd")));
         assert!(!rows.iter().any(|row| row.contains("⎿ one")));
         t.toggle_expand();
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         assert!(!texts(&t.rows).iter().any(|row| row.contains("⎿ dddd")));
     }
 
@@ -1550,9 +1564,6 @@ and the analytics dashboard rewrite.\n\n\
     #[test]
     fn thinking_rides_below_tool_boxes() {
         let mut t = Transcript::default();
-        let assert_fresh = |t: &Transcript| {
-            assert_eq!(texts(&t.rows), texts(&wrap_lines(&t.visible_lines(), t.cache.0)));
-        };
         t.push(Line::from("❯ go"));
         t.begin_response();
         t.append_thinking("t1\n");
@@ -1560,7 +1571,7 @@ and the analytics dashboard rewrite.\n\n\
         start_bash(&mut t, "call_0");
         t.finish_tool("call_0", "out\n".to_string(), Some(0));
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         // t1 rotated below the box when the call started, placeholder and all.
         assert_eq!(t.message_texts(), ["❯ go", "a1", "t1"]);
         assert!(texts(&t.rows).iter().any(|row| row.contains("Thinking")));
@@ -1568,7 +1579,7 @@ and the analytics dashboard rewrite.\n\n\
         t.append_thinking("t2"); // extends the run below the box
         start_bash(&mut t, "call_1"); // a second box stacks above the run
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         assert_eq!(t.message_texts(), ["❯ go", "a1", "t1", "t2"]);
         // Every header must precede the placeholder in the rendered rows.
         let rows = texts(&t.rows);
@@ -1584,12 +1595,12 @@ and the analytics dashboard rewrite.\n\n\
 
         t.toggle_thinking();
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.toggle_expand();
         t.sync(40);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
         t.sync(80);
-        assert_fresh(&t);
+        t.assert_rows_match_full_rewrap();
     }
 
     #[test]

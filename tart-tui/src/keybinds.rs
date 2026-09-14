@@ -1,5 +1,5 @@
 //! macOS-style editor keybinds: word moves (Option+←/→), word delete
-//! (Option+Backspace), and line jumps (Cmd+←/→/Backspace).
+//! (Option+Backspace), line delete (Cmd+Backspace), and draft jumps (Cmd+↑/↓).
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
@@ -63,6 +63,7 @@ impl Editor {
     pub(crate) fn delete_word(&mut self) {
         let start = self.prev_word_start(self.g);
         if start < self.g {
+            self.checkpoint(false);
             let line = &mut self.lines[self.line];
             line.replace_range(g_to_byte(line, start)..g_to_byte(line, self.g), "");
             self.g = start;
@@ -71,9 +72,24 @@ impl Editor {
 
     /// Cmd+Backspace: delete from the caret to the line start.
     pub(crate) fn delete_to_line_start(&mut self) {
-        let line = &mut self.lines[self.line];
-        line.replace_range(..g_to_byte(line, self.g), "");
+        if self.g > 0 {
+            self.checkpoint(false);
+            let line = &mut self.lines[self.line];
+            line.replace_range(..g_to_byte(line, self.g), "");
+            self.g = 0;
+        }
+    }
+
+    /// Cmd+↑: to the very start of the draft.
+    pub(crate) fn draft_home(&mut self) {
+        self.line = 0;
         self.g = 0;
+    }
+
+    /// Cmd+↓: to the very end of the draft.
+    pub(crate) fn draft_end(&mut self) {
+        self.line = self.lines.len() - 1;
+        self.g = self.line_len();
     }
 }
 
@@ -84,14 +100,16 @@ pub(crate) fn mac_modifiers(prompt: &mut Editor, key: &KeyEvent) -> bool {
             KeyCode::Left => prompt.word_left(),
             KeyCode::Right => prompt.word_right(),
             KeyCode::Backspace => prompt.delete_word(),
+            KeyCode::Up => prompt.draft_home(),
+            KeyCode::Down => prompt.draft_end(),
             _ => return false,
         }
         return true;
     }
     if key.modifiers.contains(KeyModifiers::SUPER) {
         match key.code {
-            KeyCode::Left => prompt.home(),
-            KeyCode::Right => prompt.end(),
+            KeyCode::Up => prompt.draft_home(),
+            KeyCode::Down => prompt.draft_end(),
             KeyCode::Backspace => prompt.delete_to_line_start(),
             _ => return false,
         }
@@ -163,7 +181,7 @@ mod tests {
     }
 
     /// Only Option+arrows/Backspace are claimed; option-chars fall through, and
-    /// the Command bindings map to line jumps.
+    /// the Command bindings map to word moves and draft jumps.
     #[test]
     fn modifier_routing() {
         let mut e = editor("a b", 0, 3);
@@ -177,11 +195,7 @@ mod tests {
             &KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)
         ));
 
-        assert!(mac_modifiers(
-            &mut e,
-            &KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER)
-        ));
-        assert_eq!(e.g, 0);
+        e.g = 0;
         // At the line start a Cmd+Backspace deletes nothing; from the end it
         // clears the line.
         assert!(mac_modifiers(
@@ -189,14 +203,24 @@ mod tests {
             &KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)
         ));
         assert_eq!(e.text(), "a b");
-        assert!(mac_modifiers(
-            &mut e,
-            &KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER)
-        ));
+        e.g = e.line_len();
         assert!(mac_modifiers(
             &mut e,
             &KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)
         ));
         assert_eq!(e.text(), "");
+    }
+
+    /// Cmd+↑/↓ span the whole draft, however the terminal reports the
+    /// modifiers; row edges live in `Pane::route`.
+    #[test]
+    fn cmd_arrows_span_the_draft() {
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::ALT] {
+            let mut e = editor("hello world\nsecond", 0, 3);
+            assert!(mac_modifiers(&mut e, &KeyEvent::new(KeyCode::Down, modifier)));
+            assert_eq!((e.line, e.g), (1, 6)); // the draft's end
+            assert!(mac_modifiers(&mut e, &KeyEvent::new(KeyCode::Up, modifier)));
+            assert_eq!((e.line, e.g), (0, 0)); // the draft's start
+        }
     }
 }

@@ -5,8 +5,7 @@ use std::sync::LazyLock;
 use itertools::Itertools;
 use serde_json::Value;
 
-/// The most characters one line keeps before the ellipsis.
-const LINE_CAP: usize = 60;
+use super::{ONE_LINE_CAP, clip_line};
 
 /// `cd <dir> && ` prefixes are stripped from the output of shell commands.
 static CWD_CD_PREFIXES: LazyLock<Vec<String>> = LazyLock::new(|| match std::env::current_dir() {
@@ -36,7 +35,7 @@ pub(crate) fn tool_header(name: &str, arguments: &[String]) -> String {
         "check_agent" => group_ids(arguments),
         _ => arguments.iter().map(|raw| argument(name, raw)).join(", "),
     };
-    format!("{}({})", display_name(name), one_line(&digest))
+    format!("{}({})", display_name(name), clip_line(&digest, ONE_LINE_CAP))
 }
 
 /// The wire name as shown: each underscore-separated word capitalized and
@@ -152,15 +151,6 @@ fn span((start, end): (u64, u64)) -> String {
 /// One child-agent tool call as it reads inside the agent box's header.
 pub(crate) fn child_call(name: &str, raw: &str) -> String {
     format!("{}({})", display_name(name), argument(name, raw))
-}
-
-/// The first line of `text`, capped with an ellipsis.
-fn one_line(text: &str) -> String {
-    let line = text.split('\n').next().unwrap_or_default();
-    match line.char_indices().nth(LINE_CAP) {
-        Some((cut, _)) => format!("{}…", &line[..cut]),
-        None => line.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -298,9 +288,11 @@ mod tests {
     /// a multi-line digest keeps its first line only.
     #[test]
     fn headers_cap_to_one_line() {
+        // The clip reserves one cell for its ellipsis, so a 60-cell cap
+        // keeps 59 characters.
         assert_eq!(
             tool_header("bash", &[format!(r#"{{"command":"{}"}}"#, "x".repeat(90))]),
-            format!("Bash({}…)", "x".repeat(LINE_CAP))
+            format!("Bash({}…)", "x".repeat(ONE_LINE_CAP - 1))
         );
         assert_eq!(
             tool_header("bash", &[r#"{"command":"echo hi\necho bye"}"#.to_string()]),

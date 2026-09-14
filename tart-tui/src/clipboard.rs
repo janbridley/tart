@@ -3,13 +3,14 @@
 
 use std::io;
 
+use crate::pane::grapheme_width;
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::execute;
 use itertools::Itertools;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The selection band's background.
@@ -94,8 +95,8 @@ fn row_slice(row: &Line<'static>, a: usize, b: usize) -> String {
     let mut out = String::new();
     let mut col = 0;
     for g in row.spans.iter().flat_map(|s| s.content.graphemes(true)) {
-        let w = Span::raw(g).width();
-        if col <= b && col + w.max(1) > a {
+        let w = grapheme_width(g);
+        if col <= b && col + w > a {
             out.push_str(g);
         }
         col += w;
