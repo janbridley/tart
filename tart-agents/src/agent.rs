@@ -5,8 +5,8 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::responses::{
-        CreateResponseArgs, FunctionToolCall, InputParam, OutputItem, Reasoning, ReasoningEffort,
-        ReasoningItem, ResponseStreamEvent, Tool,
+        CreateResponse, CreateResponseArgs, FunctionToolCall, InputItem, InputParam, OutputItem,
+        Reasoning, ReasoningEffort, ReasoningItem, ResponseStreamEvent, Tool,
     },
 };
 use futures::StreamExt;
@@ -33,6 +33,10 @@ pub enum ChatMode {
     Default,
     /// Plan mode: research and plan, blocking writes to the working directory.
     Plan,
+    /// Chat mode: no shell and no filesystem access, web tools only. Sessions
+    /// run under [`Policy::no_access`] and the sandboxed tools are denied at
+    /// execution, not merely withheld from the offered list.
+    Chat,
 }
 
 /// A Responses-API model configured to run the tart tool loop.
@@ -179,11 +183,16 @@ impl Agent {
         match self.mode {
             ChatMode::Default => self.writable.clone(),
             ChatMode::Plan => self.writable.clone().read_only(),
+            ChatMode::Chat => Policy::no_access(),
         }
     }
 
-    /// The tools this agent offers the model. Plan mode withholds the `edit` tool.
+    /// The tools this agent offers the model. Plan mode withholds the `edit`
+    /// tool; chat mode offers the web pair alone, if their binaries exist.
     fn tools_for(&self) -> Vec<Tool> {
+        if self.mode == ChatMode::Chat {
+            return [tools::search(), tools::fetch()].into_iter().flatten().collect();
+        }
         [tools::bash(), tools::read()]
             .into_iter()
             .chain((self.mode == ChatMode::Default).then_some(tools::edit()))
@@ -201,6 +210,27 @@ impl Agent {
     pub(crate) fn identify(mut self, id: AgentId) -> Self {
         self.id = id;
         self
+    }
+
+    /// The round's request: the model, the effort, the record, and the tools if present
+    fn request(
+        &self,
+        items: Vec<InputItem>,
+        definitions: Vec<Tool>,
+    ) -> Result<CreateResponse, async_openai::error::OpenAIError> {
+        // The builder's setters borrow it, so chain off the binding.
+        let mut args = CreateResponseArgs::default();
+        args.model(self.model.as_str())
+            .stream(true)
+            .reasoning(Reasoning {
+                effort: self.effort.clone(),
+                summary: None,
+            })
+            .input(InputParam::Items(items));
+        if !definitions.is_empty() {
+            args.tools(definitions);
+        }
+        args.build()
     }
 
     /// Clone this agent as a spawned subagent of itself: a fresh lever, no
@@ -346,17 +376,8 @@ impl Agent {
             // The sandboxed trio less `edit` in plan mode, plus web tools if
             // available, plus the subagent pair for a spawning agent.
             let definitions = self.tools_for();
-            let request = match CreateResponseArgs::default()
-                .model(self.model.as_str())
-                .stream(true)
-                .reasoning(Reasoning {
-                    effort: self.effort.clone(),
-                    summary: None,
-                })
-                .input(InputParam::Items(transcript.request_items()))
-                .tools(definitions)
-                .build()
-            {
+            let items = transcript.request_items();
+            let request = match self.request(items, definitions) {
                 Ok(request) => request,
                 Err(error) => {
                     return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
@@ -631,6 +652,23 @@ mod tests {
     use async_openai::types::responses::{ResponseOutputItemDoneEvent, ResponseTextDeltaEvent};
     use std::io::{Read, Write};
 
+    #[test]
+    fn the_request_omits_an_empty_tools_list() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let agent = Agent::new("http://localhost:9", "key", "model", policy);
+
+        let bare = serde_json::to_value(agent.request(Vec::new(), Vec::new()).unwrap()).unwrap();
+        assert!(bare.get("tools").is_none(), "no tools, no field: {bare}");
+
+        let armed =
+            serde_json::to_value(agent.request(Vec::new(), vec![tools::bash()]).unwrap()).unwrap();
+        assert_eq!(
+            armed["tools"].as_array().map(Vec::len),
+            Some(1),
+            "the offered tool rides along: {armed}"
+        );
+    }
+
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
     #[test]
@@ -677,6 +715,9 @@ mod tests {
         assert_eq!(agent.effort, None, "the previous agent's effort is left behind");
         // The lever, runtime, and mode survive the swap.
         assert_eq!(agent.mode(), ChatMode::Default);
+        agent.set_mode(ChatMode::Chat);
+        agent.set_model("https://api.deepseek.com", "key2", "glm-4-flash");
+        assert_eq!(agent.mode(), ChatMode::Chat, "a /model swap keeps chat mode");
     }
 
     /// Plan mode runs under the read-only twin of the Default policy and witholds
@@ -707,6 +748,28 @@ mod tests {
         let offered = names(&plan_tools);
         assert!(!offered.contains(&"edit"));
         assert!(offered.contains(&"read") && offered.contains(&"bash"));
+    }
+
+    #[test]
+    fn chat_mode_offers_only_the_web_tools_under_an_empty_policy() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
+        agent.set_subagents(Arc::new(Agents::new(|_, _| ())));
+
+        agent.set_mode(ChatMode::Chat);
+        let chat_tools = agent.tools_for();
+        let offered = names(&chat_tools);
+        for withheld in ["bash", "read", "edit", "spawn_agent", "check_agent"] {
+            assert!(!offered.contains(&withheld), "chat offers no {withheld}");
+        }
+        assert!(
+            offered.iter().all(|name| ["search", "fetch"].contains(name)),
+            "nothing beyond the web pair: {offered:?}"
+        );
+        assert!(
+            agent.policy().writable_roots().is_empty(),
+            "chat grants no roots at all"
+        );
     }
 
     /// The names of the function tools among `definitions`.

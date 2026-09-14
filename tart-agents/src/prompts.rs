@@ -15,6 +15,9 @@ pub const PLAN_REMINDER: &str = include_str!("data/PLAN.md");
 pub const PLAN_APPROVAL: &str = "The plan above is approved: implement it now. Edit files \
      as needed, follow the numbered steps in order, and say what changed when you finish.";
 
+/// The system prompt for `--chat` sessions.
+pub const CHAT: &str = include_str!("data/CHAT.md");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -27,5 +30,13 @@ mod tests {
             "the reminder names the contract"
         );
         assert!(PLAN_APPROVAL.contains("approved"));
+        assert!(
+            CHAT.contains("no shell and no filesystem"),
+            "chat owns its limits"
+        );
+        assert!(
+            !CHAT.contains("spawn_agent"),
+            "the minimal prompt does not advertise withheld tools"
+        );
     }
 }

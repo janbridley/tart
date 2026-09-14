@@ -16,7 +16,7 @@ pub mod sandbox;
 
 pub use history::Transcript;
 pub use progress::Progress;
-pub use session::{SESSIONS_ROOT, Session};
+pub use session::{CHAT_PROJECT, SESSIONS_ROOT, Session};
 
 pub use agent::{Agent, ChatMode, TurnHandle};
 pub use agents::{AGENT_TOOL, AgentId, Agents, MAIN, MAX_SUBAGENTS, Outcome};

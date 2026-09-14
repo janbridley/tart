@@ -12,10 +12,13 @@ use serde::Deserialize;
 use tart_agents::sandbox::Policy;
 use tart_agents::{Agent, ReasoningEffort};
 
-/// A parsed agents file. `default_agent` picks the agent the TUI runs.
+/// A parsed agents file. `default_agent` picks the agent the TUI runs;
+/// `chat_agent` optionally picks a different one for `--chat` sessions.
 #[derive(Debug)]
 pub(crate) struct Config {
-    default_agent: DefaultAgent,
+    default_agent: AgentRef,
+    /// The `[chat_agent]` pick, when the section is present.
+    chat_agent: Option<AgentRef>,
     /// Provider tables by their TOML key, sorted for deterministic errors.
     providers: BTreeMap<String, Provider>,
 }
@@ -95,7 +98,7 @@ enum Auth {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DefaultAgent {
+struct AgentRef {
     provider: String,
     name: String,
 }
@@ -125,9 +128,16 @@ impl Config {
         let mut table = toml::from_str::<toml::Table>(text)?;
         let default_agent = match table.remove("default_agent") {
             Some(value) => {
-                DefaultAgent::deserialize(value).context("invalid [default_agent] section")?
+                AgentRef::deserialize(value).context("invalid [default_agent] section")?
             }
             None => bail!("missing required [default_agent] section"),
+        };
+        // Optional: the chat pick, absent when `--chat` runs the default.
+        let chat_agent = match table.remove("chat_agent") {
+            Some(value) => {
+                Some(AgentRef::deserialize(value).context("invalid [chat_agent] section")?)
+            }
+            None => None,
         };
         let mut providers = BTreeMap::new();
         for (key, value) in table {
@@ -139,12 +149,21 @@ impl Config {
 
             providers.insert(key, provider);
         }
-        Ok(Self { default_agent, providers })
+        Ok(Self { default_agent, chat_agent, providers })
     }
 
     /// Resolve the default agent: look it up, obtain its API key.
     pub(crate) fn default_agent(&self) -> anyhow::Result<ResolvedAgent> {
         self.resolve(&self.default_agent.provider, &self.default_agent.name)
+    }
+
+    /// Resolve the agent chat sessions run: the `[chat_agent]` pick when the
+    /// section is present, the default agent otherwise.
+    pub(crate) fn chat_agent(&self) -> anyhow::Result<ResolvedAgent> {
+        match &self.chat_agent {
+            Some(pick) => self.resolve(&pick.provider, &pick.name),
+            None => self.default_agent(),
+        }
     }
 
     /// Look up the agent `name` under provider `key`, obtaining its API key:
@@ -314,6 +333,13 @@ reasoning_effort = "high"
             }),
             "the quoted dotted key lists its agents: {rows:?}"
         );
+
+        assert_eq!(config.default_agent.provider, "z.ai");
+        assert_eq!(config.default_agent.name, "Coding Specialist");
+        assert_eq!(
+            config.chat_agent.as_ref().map(|pick| pick.name.as_str()),
+            Some("History Expert")
+        );
     }
 
     #[test]
@@ -322,6 +348,63 @@ reasoning_effort = "high"
         let error = Config::parse(text).unwrap_err().to_string();
 
         assert!(error.contains("default_agent"), "{error}");
+    }
+
+    /// The `[chat_agent]` section picks the agent `--chat` runs, leaving the
+    /// default for coding sessions.
+    #[test]
+    fn chat_agent_section_selects_the_chat_agent() {
+        let text = r#"
+[default_agent]
+provider = "zai"
+name = "Coder"
+
+[chat_agent]
+provider = "zai"
+name = "Chatty"
+
+[zai]
+base_url = "https://api.z.ai/api/v1"
+api_key = ["echo", "secret-key"]
+
+[[zai.agents]]
+name = "Coder"
+model = "glm-5.3"
+
+[[zai.agents]]
+name = "Chatty"
+model = "glm-4-flash"
+"#;
+        let config = Config::parse(text).unwrap();
+
+        assert_eq!(config.default_agent().unwrap().name, "Coder");
+        assert_eq!(config.default_agent().unwrap().model, "glm-5.3");
+        assert_eq!(config.chat_agent().unwrap().name, "Chatty");
+        assert_eq!(config.chat_agent().unwrap().model, "glm-4-flash");
+    }
+
+    /// Without the section, chat runs the default agent.
+    #[test]
+    fn chat_agent_falls_back_to_the_default() {
+        let config = Config::parse(MINIMAL).unwrap();
+
+        assert_eq!(
+            config.chat_agent().unwrap().name,
+            config.default_agent().unwrap().name
+        );
+    }
+
+    /// The section is validated like the default's: a typo'd field is named.
+    #[test]
+    fn a_malformed_chat_agent_section_is_an_error() {
+        let text = format!("{MINIMAL}\n[chat_agent]\nproviders = \"zai\"\nname = \"tart\"\n");
+        let error = format!(
+            "{:#}",
+            Config::parse(&text).expect_err("the section does not parse")
+        );
+
+        assert!(error.contains("chat_agent"), "{error}");
+        assert!(error.contains("providers"), "{error}");
     }
 
     #[test]

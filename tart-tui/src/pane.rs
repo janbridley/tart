@@ -212,6 +212,8 @@ pub struct Pane {
     popup: Option<Popup>,
     /// Where `/resume` lists sessions from: the sessions root and project.
     session_dir: Option<(PathBuf, PathBuf)>,
+    /// Whether this pane runs in chat mode, where plan mode does not exist.
+    chat: bool,
     /// The conversation `/rewind` lists turns from; re-pointed on a `/resume`
     conversation: Option<Conversation>,
     /// The agents `/model` lists, from the agents file.
@@ -479,10 +481,13 @@ impl Pane {
             }
             // Shift+Tab toggles plan mode. Plain terminals send BackTab; a
             // kitty-enhanced one sends Tab with SHIFT, so both are valid.
-            KeyCode::BackTab if !matches!(self.mode, Mode::Bang) => return Some(PaneEvent::Plan),
+            KeyCode::BackTab if !matches!(self.mode, Mode::Bang) && !self.chat => {
+                return Some(PaneEvent::Plan);
+            }
             KeyCode::Tab
                 if key.modifiers.contains(KeyModifiers::SHIFT)
-                    && !matches!(self.mode, Mode::Bang) =>
+                    && !matches!(self.mode, Mode::Bang)
+                    && !self.chat =>
             {
                 return Some(PaneEvent::Plan);
             }
@@ -654,6 +659,11 @@ impl Pane {
         self.session_dir = Some((root, project));
     }
 
+    /// Mark the pane as running in chat mode, where plan mode does not exist.
+    pub fn set_chat(&mut self, chat: bool) {
+        self.chat = chat;
+    }
+
     /// Name the conversation `/rewind` picks rewind points from.
     pub fn set_conversation(&mut self, conversation: &Conversation) {
         self.conversation = Some(conversation.clone());
@@ -821,6 +831,11 @@ impl Pane {
         conversation: &mut Conversation,
         on: bool,
     ) -> anyhow::Result<Option<bool>> {
+        if self.chat {
+            // Chat mode has no plan to make: nothing to research read-only.
+            self.note("plan mode is unavailable in chat");
+            return Ok(None);
+        }
         if self.is_generating() {
             self.note(if on {
                 "plan mode will be enabled next turn: Esc to cancel"
@@ -1976,6 +1991,30 @@ mod tests {
         // In `!` mode the Tab family stays with completion.
         pane.on_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
         assert_eq!(pane.on_key(key(KeyCode::BackTab, KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn chat_mode_ignores_the_plan_keys() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
+        agent.set_mode(ChatMode::Chat);
+        let mut conversation = Conversation::new().unwrap();
+        let mut pane = Pane::default();
+        pane.set_chat(true);
+
+        assert_eq!(pane.on_key(key(KeyCode::BackTab, KeyModifiers::NONE)), None);
+        assert_eq!(pane.on_key(key(KeyCode::Tab, KeyModifiers::SHIFT)), None);
+        assert!(
+            pane.set_plan(&mut agent, &mut conversation, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!pane.is_plan());
+        assert_eq!(agent.mode(), ChatMode::Chat, "the refusal leaves the mode be");
+
+        // Approve stays out of reach too: plan mode was never entered.
+        pane.set_plan_ready(true);
+        assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
     }
 
     /// Enter on an empty draft approves a landed plan; a draft submits as an

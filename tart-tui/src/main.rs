@@ -13,6 +13,7 @@ mod cli;
 mod clipboard;
 mod config;
 mod file_mentions;
+mod init;
 mod keybinds;
 mod pane;
 mod perf;
@@ -37,13 +38,13 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
+use init::Tui;
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use recorded::MANUAL_AT;
 use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
-    ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
-    usage::Ledger,
+    ReasoningEffort, Session, Transcript, manual_command, prompts, usage::Ledger,
 };
 
 use tmux_override::{override_shift_up, restore_tmux};
@@ -51,46 +52,40 @@ use tmux_override::{override_shift_up, restore_tmux};
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
-    let path = cli::agents_path()?;
-    let config = config::Config::load(&path)?;
-    let agent_config = config.default_agent()?;
-    let label = agent_config.to_string();
-    let context_tokens = agent_config.context_tokens;
-    let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
-    let mut agent = agent_config.into_agent(policy);
-    let root = &SESSIONS_ROOT;
-    let cwd = std::env::current_dir()?;
-    let mut session = Session::start(root, &cwd);
-    let transcript = Transcript::new()?;
+    let mut tui = Tui::try_from(&cli::Cli::parse()?)?;
     install_panic_hook();
-    let mut terminal = ratatui::try_init()?;
+    let (mut terminal, _tmux) = enter_terminal()?;
+    let mut pane = tui.open_pane();
+    let result = run(
+        &mut terminal,
+        &mut tui.agent,
+        tui.transcript,
+        &mut tui.session,
+        &mut pane,
+        &tui.config,
+    );
+    leave_terminal(&mut terminal)?;
+    result
+}
+
+/// Enter the alternate screen with bracketed paste and disambiguated escape codes on.
+fn enter_terminal() -> anyhow::Result<(DefaultTerminal, Option<tmux_override::TmuxGuard>)> {
+    let terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
     execute!(
         stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     // The alternate screen is live, so the conditional rebind takes effect.
-    let _tmux = override_shift_up();
-    let mut pane = Pane::default();
-    pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
-    pane.set_control(agent.handle());
-    pane.set_conversation(&transcript);
-    pane.note(format!("tart · {label}"));
-    pane.set_context_tokens(context_tokens);
-    pane.set_models(config.agents());
-    let result = run(
-        &mut terminal,
-        &mut agent,
-        transcript,
-        &mut session,
-        &mut pane,
-        &config,
-    );
+    Ok((terminal, override_shift_up()))
+}
+
+/// Leave the alternate screen, restoring the terminal modes and the cursor.
+fn leave_terminal(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
-    terminal.show_cursor()?;
-    result
+    Ok(terminal.show_cursor()?)
 }
 
 /// Leave a normal terminal (and the tmux binding restored) even on panic.
@@ -166,7 +161,10 @@ fn run(
             let _ = sender.send(Wake::Generation(id, progress));
         }
     });
-    agent.set_subagents(std::sync::Arc::new(agents.clone()));
+    // Chat mode leaves the subagent tools unarmed: no `set_subagents`.
+    if agent.mode() != ChatMode::Chat {
+        agent.set_subagents(std::sync::Arc::new(agents.clone()));
+    }
     agents.adopt(agent.handle());
     // A manual command's cancel lever, held while one runs; Esc and quit set it.
     let mut manual_cancel: Option<CancelToken> = None;
@@ -226,13 +224,15 @@ fn run(
                 // Enter approved the drafted plan: leave plan mode and start
                 // the implementing turn, which may now write.
                 Some(PaneEvent::Approve) => {
-                    pane.set_mode(Mode::Default);
-                    agent.set_mode(ChatMode::Default);
-                    transcript.set_reminder(None)?;
-                    pane.note("plan approved · implementing");
-                    pane.echo(prompts::PLAN_APPROVAL);
-                    transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
-                    pane.start_turn(agent, &transcript, &wake);
+                    if agent.mode() != ChatMode::Chat {
+                        pane.set_mode(Mode::Default);
+                        agent.set_mode(ChatMode::Default);
+                        transcript.set_reminder(None)?;
+                        pane.note("plan approved · implementing");
+                        pane.echo(prompts::PLAN_APPROVAL);
+                        transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
+                        pane.start_turn(agent, &transcript, &wake);
+                    }
                 }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     // Clear the display and the model's memory of the session
@@ -306,10 +306,17 @@ fn run(
                         let on = !pane.is_plan();
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
-                    _ if line.trim().starts_with('/') => pane.note(format!(
-                        "unknown command {} · /clear /rewind /resume /model /plan /effort /agents /stop /perf /quit",
-                        line.split_whitespace().next().unwrap_or_default()
-                    )),
+                    _ if line.trim().starts_with('/') => {
+                        let commands = if agent.mode() == ChatMode::Chat {
+                            "/clear /rewind /resume /model /effort /perf /quit"
+                        } else {
+                            "/clear /rewind /resume /model /plan /effort /agents /stop /perf /quit"
+                        };
+                        pane.note(format!(
+                            "unknown command {} · {commands}",
+                            line.split_whitespace().next().unwrap_or_default()
+                        ));
+                    }
                     _ => {
                         // A queued message drains into the record ahead of the
                         // fresh submit, joining its turn.
@@ -343,15 +350,13 @@ fn run(
                         pane.note(format!("resumed {name}"));
                         pane.extend(history);
                         // Usage gauge restores with the conversation.
-                        if let Some((input, cached, output)) =
-                            Ledger::gauge_for(&name)
-                        {
+                        if let Some((input, cached, output)) = Ledger::gauge_for(&name) {
                             pane.extend([Progress::Usage { input, cached, output }]);
                         }
                     }
                     // A file too damaged to open just puts the error into our pane.
                     Err(error) => pane.note(error.to_string()),
-                }
+                },
                 Some(PaneEvent::Rewind { start, draft }) => {
                     // Abandoned subagents survive into the new session
                     transcript.rewind(start);
