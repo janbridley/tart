@@ -178,17 +178,17 @@ impl Editor {
         }
     }
 
-    /// To the start of the rendered row (Cmd+Left).
+    /// To the start of the rendered row (⌃A).
     pub(crate) fn row_home(&mut self) {
         self.sweep(false);
     }
 
-    /// To the end of the rendered row (Cmd+Right).
+    /// To the end of the rendered row (⌃E).
     pub(crate) fn row_end(&mut self) {
         self.sweep(true);
     }
 
-    /// To the rendered row's start (Cmd+Left), stepping up to the previous
+    /// To the rendered row's start (⌃A), stepping up to the previous
     /// row's start when the caret already sits there, as readline does.
     pub(crate) fn home(&mut self) {
         let at = (self.line, self.g);
@@ -199,7 +199,7 @@ impl Editor {
         }
     }
 
-    /// To the rendered row's end (Cmd+Right), stepping down to the next row's
+    /// To the rendered row's end (⌃E), stepping down to the next row's
     /// end when the caret already sits there, as readline does.
     pub(crate) fn end(&mut self) {
         let at = (self.line, self.g);
