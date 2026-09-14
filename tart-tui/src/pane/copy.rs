@@ -50,22 +50,14 @@ impl CopyCursor {
         match key {
             KeyCode::Up => c.row = c.row.saturating_sub(1),
             KeyCode::Down => c.row = (c.row + 1).min(last),
-            KeyCode::Left => {
-                if c.col > 0 {
-                    c.col -= 1;
-                } else if c.row > 0 {
-                    c.row -= 1;
-                    c.col = rows[c.row].width().saturating_sub(1);
-                }
+            // Left and Right join across rows:
+            // To the row above's last cell, and to the the row below's first.
+            KeyCode::Left if c.col > 0 => c.col -= 1,
+            KeyCode::Left if c.row > 0 => {
+                (c.row, c.col) = (c.row - 1, rows[c.row - 1].width().saturating_sub(1));
             }
-            KeyCode::Right => {
-                if c.col + 1 < rows[c.row].width() {
-                    c.col += 1;
-                } else if c.row < last {
-                    c.row += 1;
-                    c.col = 0;
-                }
-            }
+            KeyCode::Right if c.col + 1 < rows[c.row].width() => c.col += 1,
+            KeyCode::Right if c.row < last => (c.row, c.col) = (c.row + 1, 0),
             KeyCode::PageUp => c.row = c.row.saturating_sub(c.visible.max(1)),
             KeyCode::PageDown => c.row = (c.row + c.visible.max(1)).min(last),
             KeyCode::Home => c.row = 0,
