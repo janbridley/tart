@@ -872,7 +872,7 @@ impl Pane {
             .map(|(id, task, outcome)| {
                 format!(
                     "Subagent {id} finished ({}):\n\n{}",
-                    ellipsize(&task, 60),
+                    clip_line(&task, ONE_LINE_CAP),
                     outcome.report()
                 )
             })
@@ -1333,6 +1333,15 @@ pub(crate) fn ellipsize(text: &str, budget: usize) -> String {
         .collect();
     cut.push('…');
     cut
+}
+
+/// The cells a picker row or tool header keeps of a message's first line.
+pub(crate) const ONE_LINE_CAP: usize = 60;
+
+/// The first line of `text`, capped with an ellipsis to `budget` cells.
+pub(crate) fn clip_line(text: &str, budget: usize) -> String {
+    let line = text.split('\n').next().unwrap_or_default();
+    ellipsize(line, budget)
 }
 
 /// A full-width dim rule row with the status badge set into it:

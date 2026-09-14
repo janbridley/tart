@@ -3,7 +3,7 @@
 use tart_agents::Transcript as Conversation;
 
 use crate::file_mentions::Picker;
-use crate::pane::ellipsize;
+use crate::pane::{ONE_LINE_CAP, clip_line};
 use crate::recorded::synthetic;
 
 /// One turn's row: its number, counted from the session's first, beside its
@@ -13,8 +13,7 @@ use crate::recorded::synthetic;
 /// [`Picker::selected`] recovers the pick behind a row; they join the fuzzy
 /// query too, so digits alone find their turn.
 fn label(number: usize, text: &str) -> String {
-    let opening = text.split_once('\n').map_or(text, |(line, _)| line);
-    format!("{number}  {}", ellipsize(opening, 60))
+    format!("{number}  {}", clip_line(text, ONE_LINE_CAP))
 }
 
 /// Open the rewind chooser over `conversation`'s user turns, filtered by `query`.

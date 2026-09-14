@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::file_mentions::{Picker, command_query};
-use crate::pane::{Editor, ellipsize};
+use crate::pane::{Editor, ONE_LINE_CAP, clip_line};
 use tart_agents::session;
 
 /// `/resume` typeahead over one project's sessions: the rows it lists and the
@@ -18,7 +18,7 @@ fn label(path: &Path, opening: &str) -> String {
     let opening = if opening.is_empty() {
         "(no messages)".to_string()
     } else {
-        ellipsize(opening, 60)
+        clip_line(opening, ONE_LINE_CAP)
     };
     format!("{stamp}  {opening}")
 }
