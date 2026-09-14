@@ -1072,6 +1072,26 @@ mod tests {
         );
     }
 
+    /// The no-access policy cannot even read the working directory: chat's
+    /// commands would find nothing there, let alone write it. Live: reaching
+    /// `sandbox-exec` is the only proof the zero-root profile applies cleanly.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn no_access_denies_reading_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "secret").unwrap();
+        let out = Policy::no_access()
+            .command("/bin/cat")
+            .arg(&probe)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "cat read the file the policy never granted"
+        );
+    }
+
     /// An excluded `.git` stays readable but rejects writes.
     #[apply(skip_unless_live!)]
     #[test]

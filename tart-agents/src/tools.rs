@@ -1311,6 +1311,33 @@ mod tests {
         }
     }
 
+    /// The name guard denies `spawn_agent` even with a registry armed: the
+    /// denial must not depend on the tools happening to be unarmed. Live-safe:
+    /// the guard fires before the registry is touched.
+    #[test]
+    fn chat_mode_denies_spawn_even_when_armed() {
+        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let mut agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        agent.set_mode(ChatMode::Chat);
+        let agents = Agents::new(|_, _| ());
+        agent.set_subagents(std::sync::Arc::new(agents.clone()));
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+            agents: Some(&agents),
+            template: &agent,
+        };
+        let mut call = bash_call(r#"{"task":"do things"}"#);
+        call.name = "spawn_agent".to_string();
+
+        let output = execute(&call, &tools, &|_| {});
+
+        assert!(
+            output.contains("error: the spawn_agent tool is not available in chat mode"),
+            "{output}"
+        );
+    }
+
     /// A temporary file holding `contents`, removed when the guard drops.
     fn scratch(contents: &str) -> tempfile::NamedTempFile {
         use std::io::Write as _;

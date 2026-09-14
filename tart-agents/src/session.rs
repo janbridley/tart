@@ -415,6 +415,25 @@ mod tests {
         assert_eq!(slug(Path::new(CHAT_PROJECT)), "CHAT");
     }
 
+    /// A chat session resumes with its own stored system prompt: the minimal
+    /// CHAT preamble, not the agentic one.
+    #[test]
+    fn chat_sessions_round_trip_their_system_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new_with(crate::prompts::CHAT).unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new(CHAT_PROJECT));
+        session.record(&transcript).unwrap();
+
+        let (resumed, _) =
+            Session::open(root.path(), Path::new(CHAT_PROJECT), &session.path.clone().unwrap())
+                .unwrap();
+
+        let items = serde_json::to_value(resumed.request_items()).unwrap();
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[0]["content"], crate::prompts::CHAT);
+    }
+
     /// A chat session records under `<root>/CHAT/`, its own directory.
     #[test]
     fn chat_sessions_live_under_their_own_directory() {
