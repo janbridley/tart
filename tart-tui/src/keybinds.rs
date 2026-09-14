@@ -63,7 +63,7 @@ impl Editor {
     pub(crate) fn delete_word(&mut self) {
         let start = self.prev_word_start(self.g);
         if start < self.g {
-            self.checkpoint(false); // no word above, no step
+            self.checkpoint(false);
             let line = &mut self.lines[self.line];
             line.replace_range(g_to_byte(line, start)..g_to_byte(line, self.g), "");
             self.g = start;
@@ -72,8 +72,8 @@ impl Editor {
 
     /// Cmd+Backspace: delete from the caret to the line start.
     pub(crate) fn delete_to_line_start(&mut self) {
-        self.checkpoint(false);
         if self.g > 0 {
+            self.checkpoint(false);
             let line = &mut self.lines[self.line];
             line.replace_range(..g_to_byte(line, self.g), "");
             self.g = 0;
