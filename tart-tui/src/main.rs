@@ -108,6 +108,7 @@ fn effort_of(name: &str) -> Option<ReasoningEffort> {
         "medium" => Some(ReasoningEffort::Medium),
         "high" => Some(ReasoningEffort::High),
         "xhigh" => Some(ReasoningEffort::Xhigh),
+        "max" => Some(ReasoningEffort::Max),
         _ => None,
     }
 }
@@ -298,7 +299,9 @@ fn run(
                                 pane.note(format!("reasoning effort: {arg}"));
                             }
                             // Bare and unknown arguments both show the usage.
-                            None => pane.note("usage: /effort none|minimal|low|medium|high|xhigh"),
+                            None => {
+                                pane.note("usage: /effort none|minimal|low|medium|high|xhigh|max");
+                            }
                         }
                     }
                     // Toggle plan mode: read-only research and planning.

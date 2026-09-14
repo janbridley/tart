@@ -482,11 +482,12 @@ model = "glm-4-flash"
 
     #[test]
     fn bad_reasoning_effort_is_an_error() {
-        let text = MINIMAL.replacen("reasoning_effort = \"high\"", "reasoning_effort = \"max\"", 1);
+        let text =
+            MINIMAL.replacen("reasoning_effort = \"high\"", "reasoning_effort = \"extreme\"", 1);
         // `{:#}` walks anyhow's cause chain; `to_string` shows only the context.
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
-        assert!(error.contains("max"), "{error}");
+        assert!(error.contains("extreme"), "{error}");
     }
 
     #[test]
