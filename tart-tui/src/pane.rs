@@ -994,12 +994,16 @@ impl Pane {
     fn echo_styled(&mut self, glyph: &'static str, style: Style, text: &str) {
         let mut rows = text.split('\n');
         self.transcript.blank();
-        self.transcript.push(Line::from(vec![
-            Span::styled(glyph, style),
-            Span::raw(rows.next().unwrap_or_default().to_string()),
-        ]));
+        self.transcript.push_hanging(
+            Line::from(vec![
+                Span::styled(glyph, style),
+                Span::raw(rows.next().unwrap_or_default().to_string()),
+            ]),
+            GUTTER as usize,
+        );
         for continuation in rows {
-            self.transcript.push(Line::from(format!("  {continuation}")));
+            self.transcript
+                .push_hanging(Line::from(format!("  {continuation}")), GUTTER as usize);
         }
         self.transcript.blank();
     }

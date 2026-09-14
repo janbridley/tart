@@ -10,7 +10,7 @@ use crate::testutil::texts;
 
 use super::digest::{child_call, tool_header};
 use super::markdown;
-use super::wrap::wrap_lines;
+use super::wrap::{wrap_hanging, wrap_lines};
 use super::{DIM_STYLE, HIGHLIGHT_STYLE};
 
 /// Stands in for a hidden thinking run.
@@ -49,7 +49,7 @@ impl Entry {
     /// The display lines the entry renders as. Stale entries render immediately
     fn lines(&self, expanded: bool, thinking: bool) -> Vec<Line<'static>> {
         match self {
-            Self::Text(line) => vec![line.clone()],
+            Self::Text(line, _) => vec![line.clone()],
             Self::Tool(tool) => tool.lines(expanded),
             Self::Answer { raw, width, lines } => {
                 if *width == 0 {
@@ -177,7 +177,8 @@ impl ToolCall {
 /// answer, or the turn's thinking block.
 #[derive(Clone)]
 enum Entry {
-    Text(Line<'static>),
+    /// A committed line, and the indent its wrapped continuation rows hang at.
+    Text(Line<'static>, usize),
     Tool(ToolCall),
     /// The model's answer text, rendered as markdown by `sync`.
     Answer {
@@ -217,13 +218,18 @@ pub(crate) struct Transcript {
 impl Transcript {
     /// Append a committed line.
     pub(crate) fn push(&mut self, line: impl Into<Line<'static>>) {
-        self.messages.push(Entry::Text(line.into()));
+        self.push_hanging(line, 0);
+    }
+
+    /// Append a committed line whose wrapped continuation rows hang `indent` cells in.
+    pub(crate) fn push_hanging(&mut self, line: impl Into<Line<'static>>, indent: usize) {
+        self.messages.push(Entry::Text(line.into(), indent));
     }
 
     /// Append a blank row, unless the log is empty or already ends on one.
     pub(crate) fn blank(&mut self) {
         let ends_blank =
-            matches!(self.messages.last(), Some(Entry::Text(line)) if line.width() == 0);
+            matches!(self.messages.last(), Some(Entry::Text(line, _)) if line.width() == 0);
         if !self.messages.is_empty() && !ends_blank {
             self.push(Line::from(""));
         }
@@ -525,7 +531,8 @@ impl Transcript {
             Entry::Answer { lines, .. } if width > 0 => lines.clone(),
             Entry::Answer { lines, .. } => wrap_lines(lines, width),
             Entry::Thinking { raw } => wrap_lines(&thinking_lines(raw, self.show_thinking), width),
-            entry => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
+            Entry::Text(line, indent) => wrap_hanging(line, width, *indent),
+            entry @ Entry::Tool(_) => wrap_lines(&entry.lines(expanded, self.show_thinking), width),
         };
         if separated {
             self.folds.push(wrapped.len() + 1);
@@ -573,7 +580,7 @@ impl Transcript {
         self.messages
             .iter()
             .flat_map(|entry| match entry {
-                Entry::Text(line) => vec![line_text(line)],
+                Entry::Text(line, _) => vec![line_text(line)],
                 Entry::Answer { raw, .. } => {
                     markdown::render(raw, 0).iter().map(line_text).collect()
                 }
@@ -616,6 +623,13 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+
+    #[test]
+    fn wrapped_prompts_hang_under_the_gutter() {
+        let mut t = Transcript::default();
+        t.push_hanging(Line::from("❯ one two three four five six"), 2);
+        assert_eq!(texts(t.sync(14)), ["❯ one two ", "  three four ", "  five six"]);
+    }
 
     /// Start a pending `bash` invocation, as the pane would on a `ToolStart`
     fn start_bash(t: &mut Transcript, id: &str) {

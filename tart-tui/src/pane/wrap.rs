@@ -136,6 +136,43 @@ pub(crate) fn wrap_lines(messages: &[Line<'static>], width: usize) -> Vec<Line<'
     wrapper.rows
 }
 
+/// Wrap one line whose continuation rows hang `indent` cells in, keeping the indent.
+pub(crate) fn wrap_hanging(
+    line: &Line<'static>,
+    width: usize,
+    indent: usize,
+) -> Vec<Line<'static>> {
+    let (lead, rest) = split_line(line, indent);
+    let mut rows = wrap_lines(std::slice::from_ref(&rest), width.saturating_sub(indent).max(1));
+    let mut first = lead;
+    first.spans.extend(rows.remove(0).spans);
+    rows.insert(0, first);
+    for row in &mut rows[1..] {
+        row.spans.insert(0, Span::raw(" ".repeat(indent)));
+    }
+    rows
+}
+
+/// Split `line` after its first `at` cells into its lead and the rest, keeping style.
+fn split_line(line: &Line<'static>, at: usize) -> (Line<'static>, Line<'static>) {
+    let mut lead = Line::default().style(line.style);
+    let mut rest = Line::default().style(line.style);
+    let mut cells = 0;
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        for grapheme in span.content.graphemes(true) {
+            // A wide grapheme at the boundary rides `rest` so it doesn't get split
+            if cells + grapheme_width(grapheme) <= at {
+                cells += grapheme_width(grapheme);
+                lead.spans.push_merged(grapheme, style);
+            } else {
+                rest.spans.push_merged(grapheme, style);
+            }
+        }
+    }
+    (lead, rest)
+}
+
 /// The draft wrapped for display, plus the caret's cell in it.
 pub(crate) struct PromptLayout {
     pub(crate) rows: Vec<Line<'static>>,
@@ -191,6 +228,25 @@ mod tests {
         assert_eq!(wrap("aaa\u{a0}bbb", 4), ["aaa\u{a0}", "bbb"]);
         assert_eq!(wrap("aa\tbb", 5), ["aa   ", "bb"]);
         assert_eq!(wrap("a\rb", 10), ["ab"]);
+    }
+
+    #[test]
+    fn continuation_rows_hang_under_the_gutter() {
+        let rows = wrap_hanging(&Line::from("❯ one two three four five six"), 14, 2);
+        assert_eq!(texts(&rows), ["❯ one two ", "  three four ", "  five six"]);
+        // No indent: exactly what `wrap_lines` would produce.
+        assert_eq!(
+            texts(&wrap_hanging(&Line::from("ab cd".to_string()), 2, 0)),
+            texts(&wrap_lines(&[Line::from("ab cd".to_string())], 2))
+        );
+    }
+
+    #[test]
+    fn every_continuation_row_hangs_whatever_the_break_path() {
+        let rows = wrap_hanging(&Line::from("❯ one two xyzzy"), 10, 2);
+        assert_eq!(texts(&rows), ["❯ one two ", "  xyzzy"]);
+        let rows = wrap_hanging(&Line::from("❯ aaaaaa bbbbbbbbbbbb"), 8, 2);
+        assert_eq!(texts(&rows), ["❯ aaaaaa", "  bbbbbb", "  bbbbbb"]);
     }
 
     #[test]
