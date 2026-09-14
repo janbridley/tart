@@ -484,6 +484,18 @@ fn cancel_text(text: &str) -> String {
 
 /// Keep the first `cap` bytes of `text`, suffixing a marker when it cut: an
 /// attached file reads from the top, where its interesting part usually is.
+///
+/// ```
+/// use tart_agents::head_cap;
+///
+/// assert_eq!(head_cap("hi\n", 10), "hi\n");
+///
+/// let text = "abcdef".repeat(1024); // 6 KB
+/// let capped = head_cap(&text, 1024);
+/// let (kept, marker) = capped.split_once('\n').unwrap();
+/// assert_eq!(kept, &text[..1024]);
+/// assert_eq!(marker, "[truncated; first 1 KB shown]");
+/// ```
 #[inline]
 pub fn head_cap(text: &str, cap: usize) -> String {
     if text.len() <= cap {
@@ -855,33 +867,23 @@ mod tests {
     }
 
     #[test]
-    fn bash_definition_has_one_required_command_parameter() {
+    fn the_bash_definition_requires_a_command_and_offers_a_timeout() {
         let tool = serde_json::to_value(bash()).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "bash");
         assert_eq!(tool["parameters"]["required"][0], "command");
-    }
-
-    #[test]
-    fn bash_definition_offers_an_optional_timeout_parameter() {
-        let tool = serde_json::to_value(bash()).unwrap();
-
+        // The timeout rides along as an optional integer; command alone is required.
         assert_eq!(tool["parameters"]["properties"]["timeout"]["type"], "integer");
-        // Only the command is required; the timeout keeps its default.
         assert_eq!(tool["parameters"]["required"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn parse_bash_reads_the_command_field() {
-        assert_eq!(parse_bash(r#"{"command":"ls -la"}"#).unwrap().command, "ls -la");
-    }
+        let bash = parse_bash(r#"{"command":"ls -la"}"#).unwrap();
 
-    #[test]
-    fn parse_bash_defaults_the_timeout_when_absent() {
-        let bash = parse_bash(r#"{"command":"ls"}"#).unwrap();
-
-        assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
+        assert_eq!(bash.command, "ls -la");
+        assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT, "an absent timeout defaults");
     }
 
     #[test]
@@ -967,19 +969,9 @@ mod tests {
         );
     }
 
-    /// A short text passes through untouched; a long one keeps its head under a
-    /// trailing marker, cut on a char boundary.
+    /// A multi-byte head must not split a character at the cut.
     #[test]
-    fn head_cap_keeps_the_head_and_marks_the_cut() {
-        assert_eq!(head_cap("hi\n", 10), "hi\n");
-
-        let text = "abcdef".repeat(1024); // 6 KB
-        let capped = head_cap(&text, 1024);
-        let (kept, marker) = capped.split_once('\n').unwrap();
-        assert_eq!(marker, "[truncated; first 1 KB shown]");
-        assert_eq!(kept, &text[..1024]);
-
-        // A multi-byte head must not split a character at the cut.
+    fn head_cap_cuts_on_a_character_boundary() {
         let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
         let capped = head_cap(&wide, 1024);
         let (kept, marker) = capped.split_once('\n').unwrap();

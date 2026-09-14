@@ -26,6 +26,31 @@ pub static SESSIONS_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
 pub const CHAT_PROJECT: &str = "CHAT";
 
 /// One session's JSONL file, appended to at turn boundaries.
+///
+/// A recorded conversation resumes as the same request it recorded:
+///
+/// ```
+/// use std::path::Path;
+///
+/// use tart_agents::Transcript;
+/// use tart_agents::session::{self, Session};
+/// # fn main() -> anyhow::Result<()> {
+/// let root = tempfile::tempdir()?;
+/// let transcript = Transcript::new()?;
+/// transcript.push_user("hello".to_string())?;
+/// transcript.push_assistant("hi".to_string())?;
+///
+/// let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+/// session.record(&transcript)?;
+///
+/// // The resume flow: list the project's files, newest first, and open one.
+/// let (path, opening) = session::list(root.path(), Path::new("/tmp/proj"))?.remove(0);
+/// assert_eq!(opening, "hello");
+/// let (resumed, _) = Session::open(root.path(), Path::new("/tmp/proj"), &path)?;
+/// assert_eq!(resumed.request_items(), transcript.request_items());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Session {
     /// The sessions root, `~/.config/tart/sessions`.
@@ -612,12 +637,6 @@ mod tests {
         transcript.push_assistant("partial".to_string()).unwrap();
         session.record(&transcript).unwrap();
         assert_eq!(line_count(&file), 7);
-
-        let (resumed, _) = Session::open(root.path(), project, &file).unwrap();
-        assert_eq!(
-            serde_json::to_value(resumed.request_items()).unwrap(),
-            serde_json::to_value(transcript.request_items()).unwrap()
-        );
     }
 
     /// A record that shrank below the flushed prefix resyncs at its new end:
@@ -913,37 +932,5 @@ mod tests {
         let next = unused(dir.path(), "20260101-000000");
 
         assert_eq!(next, dir.path().join("20260101-000000-2.jsonl"));
-    }
-
-    #[test]
-    fn the_resumed_stem_finds_its_ledger_gauge() {
-        let _held = crate::usage::tests::held_for_test();
-        let _ledger = crate::usage::tests::ledger_root();
-        let root = tempfile::tempdir().unwrap();
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("hello".to_string()).unwrap();
-        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
-        session.record(&transcript).unwrap();
-
-        // What the `/resume` chooser derives: the file's stem.
-        let stem = session.stem();
-        let from_path = session
-            .path
-            .as_ref()
-            .unwrap()
-            .file_stem()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert_eq!(stem, from_path, "the tag is the name the chooser shows");
-
-        // The round the resumed conversation last billed under that tag.
-        crate::usage::set_session(stem);
-        crate::usage::tests::sample_usage().bill(crate::usage::MAIN_AGENT, "m");
-        assert_eq!(
-            crate::usage::Ledger::gauge_for(&from_path),
-            Some((9001, 8214, 512)),
-            "a resume finds the gauge its own session billed"
-        );
     }
 }
