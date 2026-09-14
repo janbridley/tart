@@ -12,6 +12,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
 use crate::backends::Backend;
+use crate::backends::openai_responses::Responses;
 use crate::{Agent, AgentId, Agents, ChatMode, Progress, sandbox::Policy};
 
 mod web;
@@ -441,7 +442,7 @@ fn command_text(text: &str, status: ExitStatus) -> String {
 }
 
 /// Information required for a tool call, including sandbox and cancellation info.
-pub(crate) struct Tooling<'a, B: Backend = crate::backends::openai_responses::Responses> {
+pub(crate) struct Tooling<'a, B: Backend = Responses> {
     /// The policy the call's commands run sandboxed under.
     pub(crate) policy: &'a Policy,
     /// The turn's cancel lever: Esc kills a command in flight.
