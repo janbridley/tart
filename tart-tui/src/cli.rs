@@ -21,7 +21,8 @@ impl Cli {
         Self::from(&command().get_matches(), std::env::var_os("HOME"))
     }
 
-    /// The command line `matches` name, with the agents file resolved against `home`
+    /// The command line as `matches` name it, with the agents file resolved
+    /// against `home` or a nice error message.
     fn from(matches: &ArgMatches, home: Option<OsString>) -> anyhow::Result<Self> {
         Ok(Self {
             agents: resolve(matches, home)?,

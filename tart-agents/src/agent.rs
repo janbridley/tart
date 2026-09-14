@@ -34,7 +34,7 @@ pub enum ChatMode {
     /// Plan mode: research and plan, blocking writes to the working directory.
     Plan,
     /// Chat mode: no shell and no filesystem access, web tools only. Sessions
-    /// run under [`Policy::none`] and the sandboxed tools are denied at
+    /// run under [`Policy::no_access`] and the sandboxed tools are denied at
     /// execution, not merely withheld from the offered list.
     Chat,
 }

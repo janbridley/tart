@@ -51,6 +51,14 @@ impl Kind {
         }
     }
 
+    /// The policy this kind's agent is built with.
+    fn policy(self) -> anyhow::Result<Policy> {
+        match self {
+            Self::Coding => Ok(Policy::new(std::env::current_dir()?)?.exclude_git()),
+            Self::Chat => Ok(Policy::no_access()),
+        }
+    }
+
     /// The transcript this kind opens: the agentic prompt, or chat's minimal one.
     fn transcript(self) -> anyhow::Result<Transcript> {
         match self {
@@ -91,11 +99,7 @@ impl TryFrom<&cli::Cli> for Tui {
         let label = agent_config.to_string();
         let context_tokens = agent_config.context_tokens;
         let project = kind.project()?;
-        // The cwd-rooted policy serves the coding kinds; chat's tool calls run
-        // under `Policy::none` instead (see `Agent::policy`), so the grant is
-        // inert there.
-        let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
-        let mut agent = agent_config.into_agent(policy);
+        let mut agent = agent_config.into_agent(kind.policy()?);
         agent.set_mode(kind.mode());
         Ok(Self {
             session: Session::start(&SESSIONS_ROOT, &project),
