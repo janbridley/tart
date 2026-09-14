@@ -84,6 +84,9 @@ fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
         description: Some(description.to_string()),
         parameters: Some(parameters),
         strict: None,
+        r#async: None,
+        output_schema: None,
+        allowed_callers: None,
     })
 }
 
@@ -859,6 +862,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
@@ -1356,6 +1361,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
@@ -1547,6 +1554,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
@@ -1661,6 +1670,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         };
         let events = std::cell::RefCell::new(Vec::new());
 

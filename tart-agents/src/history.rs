@@ -183,10 +183,13 @@ impl Transcript {
         let mut outputs = Vec::with_capacity(round.len());
         for (call, output) in round {
             outputs.push(FunctionCallOutputItemParam {
-                call_id: call.call_id.clone(),
+                call_id: Some(call.call_id.clone()),
                 output: FunctionCallOutput::Text(output),
                 id: None,
                 status: None,
+                name: None,
+                namespace: None,
+                caller: None,
             });
             lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCall(call))));
         }
@@ -349,6 +352,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 

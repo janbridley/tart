@@ -6,7 +6,7 @@ use async_openai::{
     config::OpenAIConfig,
     types::responses::{
         CreateResponse, CreateResponseArgs, FunctionToolCall, InputItem, InputParam, OutputItem,
-        Reasoning, ReasoningEffort, ReasoningItem, ResponseStreamEvent, Tool,
+        Reasoning, ReasoningEffort, ReasoningItem, ResponseErrorCode, ResponseStreamEvent, Tool,
     },
 };
 use futures::StreamExt;
@@ -225,6 +225,8 @@ impl Agent {
             .reasoning(Reasoning {
                 effort: self.effort.clone(),
                 summary: None,
+                context: None,
+                mode: None,
             })
             .input(InputParam::Items(items));
         if !definitions.is_empty() {
@@ -485,7 +487,7 @@ impl Agent {
                         debug::log_json("response failed event", || serde_json::to_string(&failed));
                         let reason = failed.response.error.map_or_else(
                             || "response failed".to_string(),
-                            |error| format!("{}: {}", error.code, error.message),
+                            |error| format!("{}: {}", code_text(&error.code), error.message),
                         );
                         if let Some(terminal) =
                             errors::absorb_provider_error(on_progress, &reason, &mut retries)
@@ -616,6 +618,14 @@ impl Agent {
 
 fn with_last_error(message: &str, last_error: Option<String>) -> String {
     last_error.map_or_else(|| message.to_string(), |error| format!("{message}: {error}"))
+}
+
+/// An error code as text: the raw string for passthrough codes, the name otherwise.
+fn code_text(code: &ResponseErrorCode) -> String {
+    match code {
+        ResponseErrorCode::Other(code) => code.clone(),
+        named => format!("{named:?}"),
+    }
 }
 
 /// Bound one tool result before it enters history.
@@ -1295,6 +1305,8 @@ mod tests {
                 call_id: format!("call_{index}"),
                 id: Some(format!("item_{index}")),
                 status: None,
+                caller: None,
+                r#async: None,
             }),
         })
     }

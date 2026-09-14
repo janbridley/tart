@@ -614,6 +614,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
