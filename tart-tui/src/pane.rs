@@ -424,7 +424,7 @@ impl Pane {
             }
             return None;
         }
-        // A queued message claims Option/Cmd+Up before the draft jump, moving
+        // A queued message claims Option+Up before the draft jump, moving
         // the queue into the composer for editing; Enter re-queues the edited
         // draft as a new message.
         if key.code == KeyCode::Up
@@ -980,7 +980,6 @@ impl Pane {
         self.leave_bang();
         self.plan_ready = false;
         self.prompt.clear();
-        // The draft shipped out; undo must not resurrect it.
         self.prompt.forget_undo();
         if bang {
             // A command's echo waits for its run: what the transcript shows
