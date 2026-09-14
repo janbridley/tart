@@ -410,15 +410,28 @@ impl Pane {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
                 KeyCode::Char('u') => self.clear_prompt(),
-                // To the line start / end, as readline
+                // The rendered row's edges, crossing onto the neighboring row
+                // when already at one.
                 KeyCode::Char('a') => self.prompt.home(),
                 KeyCode::Char('e') => self.prompt.end(),
+                // ⌃Y steps the draft back one edit group
+                KeyCode::Char('y') => self.prompt.undo(),
                 // Toggle the thinking run's visibility (only in normal mode)
                 KeyCode::Char('t') => self.transcript.toggle_thinking(),
                 // Toggle expanding the tool outputs' collapsed middles
                 KeyCode::Char('o') => self.transcript.toggle_expand(),
                 _ => {}
             }
+            return None;
+        }
+        // A queued message claims Option/Cmd+Up before the draft jump, moving
+        // the queue into the composer for editing; Enter re-queues the edited
+        // draft as a new message.
+        if key.code == KeyCode::Up
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && !self.queued.is_empty()
+        {
+            self.spill_queued();
             return None;
         }
         // macOS word/line bindings (Option/Cmd + arrows/Backspace); unclaimed
@@ -435,15 +448,6 @@ impl Pane {
         if self.popup.is_some() && !key.modifiers.contains(KeyModifiers::ALT) && claimed {
             return self.popup_key(key);
         }
-        // Option+Up moves the queued messages into the composer for editing.
-        // Enter re-queues the edited draft as a new message.
-        if key.code == KeyCode::Up
-            && key.modifiers.contains(KeyModifiers::ALT)
-            && !self.queued.is_empty()
-        {
-            self.spill_queued();
-            return None;
-        }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
             // Classify manual commands BEFORE queueing
@@ -455,6 +459,7 @@ impl Pane {
                 if !text.trim().is_empty() && !text.trim().starts_with('/') {
                     self.queue_message(text);
                     self.clear_prompt();
+                    self.prompt.forget_undo();
                 }
             }
             KeyCode::Enter => return self.submit(),
@@ -975,6 +980,8 @@ impl Pane {
         self.leave_bang();
         self.plan_ready = false;
         self.prompt.clear();
+        // The draft shipped out; undo must not resurrect it.
+        self.prompt.forget_undo();
         if bang {
             // A command's echo waits for its run: what the transcript shows
             // and what it records both land with the framed output.
@@ -1061,11 +1068,10 @@ impl Pane {
         let (prompt_height, layout) = if self.copy.is_some() {
             (1, None)
         } else {
-            let layout = wrap_draft(
-                &self.prompt.lines,
-                (self.prompt.line, self.prompt.g),
-                area.width.saturating_sub(GUTTER) as usize,
-            );
+            let width = area.width.saturating_sub(GUTTER) as usize;
+            // Row-wise motion (arrows, Cmd+←/→) wraps exactly like the paint.
+            self.prompt.width = width;
+            let layout = wrap_draft(&self.prompt.lines, (self.prompt.line, self.prompt.g), width);
             (layout.rows.len().min(cap).max(1) as u16, Some(layout))
         };
         let [transcript, bar_top, prompt_area, bar_bottom] = Layout::vertical([
@@ -1660,6 +1666,89 @@ mod tests {
         pane.popup = Some(Popup::Files(FilePopup::from_files(vec![], String::new())));
         pane.on_key(key(KeyCode::Up, KeyModifiers::ALT));
         assert_eq!(pane.prompt.text(), "also this\none now two");
+    }
+
+    #[test]
+    fn undo_forgets_a_submitted_draft() {
+        let mut pane = Pane::default();
+        for c in "hello".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Submit("hello".to_string()))
+        );
+        pane.on_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(pane.prompt.text(), "");
+    }
+
+    #[test]
+    fn row_edges_follow_the_rendered_row() {
+        let mut pane = Pane::default();
+        for c in "hello world".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        render(&mut pane, (8, 10)); // rows "hello " / "world"
+        for (home, end) in [
+            (
+                key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            ),
+            (
+                key(KeyCode::Home, KeyModifiers::NONE),
+                key(KeyCode::End, KeyModifiers::NONE),
+            ),
+        ] {
+            pane.prompt.g = 3;
+            pane.on_key(home);
+            assert_eq!(pane.prompt.g, 0);
+            pane.prompt.g = 8;
+            pane.on_key(end);
+            assert_eq!(pane.prompt.g, 11); // the "world" row's end
+
+            // Already at an edge, the jump crosses onto the neighboring row...
+            pane.prompt.g = 6; // the "world" row's first cell
+            pane.on_key(home);
+            assert_eq!(pane.prompt.g, 0);
+            pane.prompt.g = 5; // the "hello " row's last boundary
+            pane.on_key(end);
+            assert_eq!(pane.prompt.g, 11);
+            // ...and holds still at the draft's outer edges.
+            pane.prompt.g = 0;
+            pane.on_key(home);
+            assert_eq!(pane.prompt.g, 0);
+            pane.prompt.g = 11;
+            pane.on_key(end);
+            assert_eq!(pane.prompt.g, 11);
+        }
+    }
+
+    #[test]
+    fn control_y_and_arrows_follow_the_wrapped_draft() {
+        let mut pane = Pane::default();
+        for c in "hello world".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        pane.on_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(pane.prompt.text(), "");
+        pane.on_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL)); // a no-op
+        assert_eq!(pane.prompt.text(), "");
+
+        // Six prompt cells wrap "hello world" into the rows "hello " / "world".
+        for c in "hello world".chars() {
+            pane.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        render(&mut pane, (8, 10));
+        pane.prompt.g = 3;
+        pane.on_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL)); // the row's end
+        assert_eq!(pane.prompt.g, 5); // before the space the row kept
+        pane.on_key(key(KeyCode::Down, KeyModifiers::SUPER)); // the draft's end
+        assert_eq!(pane.prompt.g, 11);
+        pane.on_key(key(KeyCode::Up, KeyModifiers::SUPER)); // the draft's start
+        assert_eq!(pane.prompt.g, 0);
+        pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to (0, 1)
+        pane.on_key(key(KeyCode::Down, KeyModifiers::NONE)); // a row down, column kept
+        assert_eq!(pane.prompt.g, 7);
     }
 
     #[test]
