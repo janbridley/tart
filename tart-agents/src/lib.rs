@@ -11,7 +11,7 @@ pub mod session;
 mod tools;
 pub mod usage;
 
-pub mod backends;
+mod backends;
 
 #[cfg(target_os = "macos")]
 pub mod sandbox;
