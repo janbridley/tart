@@ -61,9 +61,9 @@ impl Editor {
 
     /// Option+Backspace: delete through the previous word start.
     pub(crate) fn delete_word(&mut self) {
-        self.checkpoint(false);
         let start = self.prev_word_start(self.g);
         if start < self.g {
+            self.checkpoint(false); // no word above, no step
             let line = &mut self.lines[self.line];
             line.replace_range(g_to_byte(line, start)..g_to_byte(line, self.g), "");
             self.g = start;
@@ -73,9 +73,11 @@ impl Editor {
     /// Cmd+Backspace: delete from the caret to the line start.
     pub(crate) fn delete_to_line_start(&mut self) {
         self.checkpoint(false);
-        let line = &mut self.lines[self.line];
-        line.replace_range(..g_to_byte(line, self.g), "");
-        self.g = 0;
+        if self.g > 0 {
+            let line = &mut self.lines[self.line];
+            line.replace_range(..g_to_byte(line, self.g), "");
+            self.g = 0;
+        }
     }
 
     /// Cmd+↑: to the very start of the draft.
@@ -179,7 +181,7 @@ mod tests {
     }
 
     /// Only Option+arrows/Backspace are claimed; option-chars fall through, and
-    /// the Command bindings map to row and draft jumps.
+    /// the Command bindings map to word moves and draft jumps.
     #[test]
     fn modifier_routing() {
         let mut e = editor("a b", 0, 3);
