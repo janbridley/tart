@@ -200,10 +200,7 @@ pub(crate) fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize)
 }
 
 /// The cursor's cell among already-wrapped rows: walk the painted graphemes
-/// beside the draft's, skipping whatever wrapping dropped — spaces at row
-/// breaks, control characters — so every boundary rides where its grapheme
-/// finally paints, even when a later wrap carried its word to a lower row
-/// mid-pass.
+/// beside the draft's, skipping whatever wrapping dropped.
 fn caret_in_rows(
     rows: &[Line<'static>],
     lines: &[String],
@@ -321,10 +318,6 @@ mod tests {
         assert_eq!(kept(5), (0, 5)); // before the kept space
         assert_eq!(kept(6), (1, 0)); // the "world" row's start
 
-        // A word a later wrap splits mid-pass moves down whole: at width 4
-        // the rows are "hell" / "o " / "worl" / "d", so the boundary at `w`
-        // rides row 2, where `w` finally paints — not row 1 where it first
-        // landed while the row was still growing.
         let split = |g: usize| {
             let layout = wrap_draft(&["hello world".to_string()], (0, g), 4);
             (layout.caret_row, layout.caret_col)
@@ -360,9 +353,6 @@ mod tests {
         assert_eq!(wrap_draft(&lines, (2, 0), 2).caret_row, 3);
     }
 
-    /// Every boundary's caret sits on the row where its grapheme actually
-    /// paints, whatever the wrap path — word wraps, hard breaks, words a
-    /// later wrap moved down mid-pass, tabs, multi-line drafts.
     #[test]
     fn caret_row_matches_painted_row() {
         let drafts = [
