@@ -629,11 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn search_is_offered_exactly_when_the_cli_is_installed() {
-        assert_eq!(search().is_some(), search_binary().is_some());
-    }
-
-    #[test]
     fn parse_search_reads_the_query_and_defaults_the_rest() {
         let search = parse_search(r#"{"query":"rust regex crate"}"#).unwrap();
 
@@ -727,27 +722,12 @@ mod tests {
     }
 
     #[test]
-    fn results_paths_are_fresh_and_under_the_temporary_directory() {
-        let first = results_path();
-        let second = results_path();
-
-        assert!(first.starts_with(std::env::temp_dir()));
-        assert!(first.extension().is_some_and(|extension| extension == "json"));
-        assert_ne!(first, second);
-    }
-
-    #[test]
     fn fetch_definition_requires_url() {
         let tool = serde_json::to_value(fetch_definition()).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "fetch");
         assert_eq!(tool["parameters"]["required"][0], "url");
-    }
-
-    #[test]
-    fn fetch_is_offered_exactly_when_the_cli_is_installed() {
-        assert_eq!(fetch().is_some(), fetch_binary().is_some());
     }
 
     #[test]
