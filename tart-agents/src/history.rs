@@ -79,9 +79,15 @@ impl Transcript {
     /// A transcript opening with the tart system prompt.
     #[inline]
     pub fn new() -> anyhow::Result<Self> {
+        Self::new_with(SYSTEM)
+    }
+
+    /// A transcript opening with `system` instead of the tart prompt.
+    #[inline]
+    pub fn new_with(system: &str) -> anyhow::Result<Self> {
         Ok(Self {
             lines: Arc::new(Mutex::new(vec![RecordLine {
-                item: input_message(Role::System, SYSTEM.to_string())?,
+                item: input_message(Role::System, system.to_string())?,
                 meta: LineMetadata::default(),
             }])),
             reminder: None,
@@ -365,6 +371,27 @@ mod tests {
 
         assert_eq!(items[0]["role"], "system");
         assert_eq!(items[0]["content"], SYSTEM);
+    }
+
+    #[test]
+    fn new_with_opens_with_the_given_prompt_and_survives_clear() {
+        let transcript = Transcript::new_with("chat preamble").unwrap();
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[0]["content"], "chat preamble");
+
+        // A clear keeps the leading system block, whatever prompt it holds.
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.clear();
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items.as_array().map(Vec::len), Some(1));
+        assert_eq!(items[0]["content"], "chat preamble");
+
+        assert_ne!(SYSTEM, "chat preamble");
+        assert_eq!(
+            serde_json::to_value(Transcript::new().unwrap().request_items()).unwrap()[0]["content"],
+            SYSTEM
+        );
     }
 
     /// A reminder trails the record on every request, once, and doesn't hit record.

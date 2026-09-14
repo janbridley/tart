@@ -21,6 +21,10 @@ pub static SESSIONS_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
     home.join(".config/tart/sessions")
 });
 
+/// The project name chat mode records under: its sessions live in
+/// `~/.config/tart/sessions/CHAT/`, apart from every working directory's.
+pub const CHAT_PROJECT: &str = "CHAT";
+
 /// One session's JSONL file, appended to at turn boundaries.
 #[derive(Debug)]
 pub struct Session {
@@ -407,6 +411,25 @@ mod tests {
         );
         // Relative paths keep their shape; there is just no leading dash.
         assert_eq!(slug(Path::new("relative/dir")), "relative-dir");
+        // The chat project stays verbatim: its own directory, nothing cwd-shaped.
+        assert_eq!(slug(Path::new(CHAT_PROJECT)), "CHAT");
+    }
+
+    /// A chat session records under `<root>/CHAT/`, its own directory.
+    #[test]
+    fn chat_sessions_live_under_their_own_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new(CHAT_PROJECT));
+        session.record(&transcript).unwrap();
+
+        let file = session.path.clone().unwrap();
+        assert_eq!(
+            file.parent().unwrap(),
+            root.path().join("CHAT"),
+            "the chat file sits in the CHAT directory"
+        );
     }
 
     /// The moment `seconds` after the epoch.

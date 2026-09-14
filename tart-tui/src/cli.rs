@@ -12,6 +12,11 @@ pub(crate) fn agents_path() -> anyhow::Result<PathBuf> {
     resolve(&command().get_matches(), std::env::var_os("HOME"))
 }
 
+/// Whether `--chat` was passed: web tools only, no shell or filesystem.
+pub(crate) fn chat() -> bool {
+    command().get_matches().get_flag("chat")
+}
+
 /// The agents file `matches` selects: `--agents FILE` when given, else
 /// `~/.config/tart/providers.toml`.
 fn resolve(matches: &ArgMatches, home: Option<OsString>) -> anyhow::Result<PathBuf> {
@@ -38,6 +43,12 @@ fn command() -> Command {
         .arg(Arg::new("agents").long("agents").value_name("FILE").help(
             "TOML file describing the available agents [default: ~/.config/tart/providers.toml]",
         ))
+        .arg(
+            Arg::new("chat")
+                .long("chat")
+                .action(clap::ArgAction::SetTrue)
+                .help("Chat mode: web tools only, no shell or filesystem access"),
+        )
 }
 
 #[cfg(test)]
@@ -98,5 +109,22 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("--agents"), "{error}");
+    }
+
+    /// `--chat` parses true, and its absence false.
+    #[test]
+    fn the_chat_flag_parses() {
+        assert!(
+            command()
+                .try_get_matches_from(["tart", "--chat"])
+                .expect("the flag parses")
+                .get_flag("chat")
+        );
+        assert!(
+            !command()
+                .try_get_matches_from(["tart"])
+                .expect("no flag is required")
+                .get_flag("chat")
+        );
     }
 }

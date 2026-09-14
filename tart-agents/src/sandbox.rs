@@ -256,6 +256,18 @@ impl Policy {
         self
     }
 
+    /// A policy granting nothing.
+    #[must_use]
+    #[inline]
+    pub fn no_access() -> Self {
+        Self {
+            writable: Vec::new(),
+            read_only: Vec::new(),
+            excluded: Vec::new(),
+            temp: None,
+        }
+    }
+
     /// Convenience for [`Policy::exclude`] with `.git`.
     #[must_use]
     #[inline]

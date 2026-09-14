@@ -25,7 +25,7 @@ mod turn_picker;
 mod testutil;
 
 use std::io::stdout;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -41,9 +41,9 @@ use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use recorded::MANUAL_AT;
 use tart_agents::{
-    AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
-    ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts, sandbox::Policy,
-    usage::Ledger,
+    AGENT_TOOL, Agent, AgentId, Agents, CHAT_PROJECT, CancelToken, ChatMode, MAIN, Outcome,
+    Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts,
+    sandbox::Policy, usage::Ledger,
 };
 
 use tmux_override::{override_shift_up, restore_tmux};
@@ -58,10 +58,25 @@ fn main() -> anyhow::Result<()> {
     let context_tokens = agent_config.context_tokens;
     let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
     let mut agent = agent_config.into_agent(policy);
+    if cli::chat() {
+        // Chat mode: the model keeps the web tools and loses the rest, running
+        // under a policy that grants nothing (`Agent::policy` ignores the
+        // cwd-rooted one above in this mode).
+        agent.set_mode(ChatMode::Chat);
+    }
     let root = &SESSIONS_ROOT;
-    let cwd = std::env::current_dir()?;
-    let mut session = Session::start(root, &cwd);
-    let transcript = Transcript::new()?;
+    // Chat sessions live under their own CHAT directory, not the cwd's.
+    let project = if cli::chat() {
+        PathBuf::from(CHAT_PROJECT)
+    } else {
+        std::env::current_dir()?
+    };
+    let mut session = Session::start(root, &project);
+    let transcript = if cli::chat() {
+        Transcript::new_with(prompts::CHAT)?
+    } else {
+        Transcript::new()?
+    };
     install_panic_hook();
     let mut terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
@@ -72,10 +87,15 @@ fn main() -> anyhow::Result<()> {
     // The alternate screen is live, so the conditional rebind takes effect.
     let _tmux = override_shift_up();
     let mut pane = Pane::default();
-    pane.set_session_dir(SESSIONS_ROOT.clone(), cwd);
+    pane.set_session_dir(SESSIONS_ROOT.clone(), project);
+    pane.set_chat(cli::chat());
     pane.set_control(agent.handle());
     pane.set_conversation(&transcript);
-    pane.note(format!("tart · {label}"));
+    pane.note(if cli::chat() {
+        format!("tart · {label} · chat")
+    } else {
+        format!("tart · {label}")
+    });
     pane.set_context_tokens(context_tokens);
     pane.set_models(config.agents());
     let result = run(
@@ -166,7 +186,10 @@ fn run(
             let _ = sender.send(Wake::Generation(id, progress));
         }
     });
-    agent.set_subagents(std::sync::Arc::new(agents.clone()));
+    // Chat mode leaves the subagent tools unarmed: no `set_subagents`.
+    if agent.mode() != ChatMode::Chat {
+        agent.set_subagents(std::sync::Arc::new(agents.clone()));
+    }
     agents.adopt(agent.handle());
     // A manual command's cancel lever, held while one runs; Esc and quit set it.
     let mut manual_cancel: Option<CancelToken> = None;
@@ -226,13 +249,15 @@ fn run(
                 // Enter approved the drafted plan: leave plan mode and start
                 // the implementing turn, which may now write.
                 Some(PaneEvent::Approve) => {
-                    pane.set_mode(Mode::Default);
-                    agent.set_mode(ChatMode::Default);
-                    transcript.set_reminder(None)?;
-                    pane.note("plan approved · implementing");
-                    pane.echo(prompts::PLAN_APPROVAL);
-                    transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
-                    pane.start_turn(agent, &transcript, &wake);
+                    if agent.mode() != ChatMode::Chat {
+                        pane.set_mode(Mode::Default);
+                        agent.set_mode(ChatMode::Default);
+                        transcript.set_reminder(None)?;
+                        pane.note("plan approved · implementing");
+                        pane.echo(prompts::PLAN_APPROVAL);
+                        transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
+                        pane.start_turn(agent, &transcript, &wake);
+                    }
                 }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
                     // Clear the display and the model's memory of the session
@@ -306,10 +331,17 @@ fn run(
                         let on = !pane.is_plan();
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
-                    _ if line.trim().starts_with('/') => pane.note(format!(
-                        "unknown command {} · /clear /rewind /resume /model /plan /effort /agents /stop /perf /quit",
-                        line.split_whitespace().next().unwrap_or_default()
-                    )),
+                    _ if line.trim().starts_with('/') => {
+                        let commands = if agent.mode() == ChatMode::Chat {
+                            "/clear /rewind /resume /model /effort /perf /quit"
+                        } else {
+                            "/clear /rewind /resume /model /plan /effort /agents /stop /perf /quit"
+                        };
+                        pane.note(format!(
+                            "unknown command {} · {commands}",
+                            line.split_whitespace().next().unwrap_or_default()
+                        ));
+                    }
                     _ => {
                         // A queued message drains into the record ahead of the
                         // fresh submit, joining its turn.
@@ -343,15 +375,13 @@ fn run(
                         pane.note(format!("resumed {name}"));
                         pane.extend(history);
                         // Usage gauge restores with the conversation.
-                        if let Some((input, cached, output)) =
-                            Ledger::gauge_for(&name)
-                        {
+                        if let Some((input, cached, output)) = Ledger::gauge_for(&name) {
                             pane.extend([Progress::Usage { input, cached, output }]);
                         }
                     }
                     // A file too damaged to open just puts the error into our pane.
                     Err(error) => pane.note(error.to_string()),
-                }
+                },
                 Some(PaneEvent::Rewind { start, draft }) => {
                     // Abandoned subagents survive into the new session
                     transcript.rewind(start);

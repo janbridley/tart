@@ -11,7 +11,7 @@ use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
-use crate::{Agent, AgentId, Agents, Progress, sandbox::Policy};
+use crate::{Agent, AgentId, Agents, ChatMode, Progress, sandbox::Policy};
 
 mod web;
 
@@ -328,6 +328,19 @@ pub(crate) fn execute<F: Fn(Progress)>(
     tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
+    // Force-disable tools, lest hallucinated calls attempt execution regardless.
+    if tools.template.mode() == ChatMode::Chat
+        && matches!(
+            call.name.as_str(),
+            "bash" | "read" | "edit" | "spawn_agent" | "check_agent"
+        )
+    {
+        return misuse(
+            call,
+            on_progress,
+            &anyhow::anyhow!("the {} tool is not available in chat mode", call.name),
+        );
+    }
     match call.name.as_str() {
         "bash" => run_bash(call, tools, on_progress),
         "read" => run_read(call, tools, on_progress),
@@ -1259,6 +1272,43 @@ mod tests {
                 Progress::ToolOutput { output, .. }
             ] if name == "rm" && output.contains("unknown tool")
         ));
+    }
+
+    #[test]
+    fn chat_mode_denies_the_sandboxed_tools() {
+        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
+        let mut agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        agent.set_mode(ChatMode::Chat);
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &CancelToken::new(),
+            agents: None,
+            template: &agent,
+        };
+        for name in ["bash", "read", "edit", "spawn_agent", "check_agent"] {
+            let mut call = bash_call(r#"{"command":"echo hi"}"#);
+            call.name = name.to_string();
+            let events = std::cell::RefCell::new(Vec::new());
+            let output = execute(&call, &tools, &|progress| {
+                events.borrow_mut().push(progress);
+            });
+
+            assert!(
+                output.contains(&format!("error: the {name} tool is not available in chat mode")),
+                "{output}"
+            );
+            assert!(
+                matches!(
+                    events.borrow().as_slice(),
+                    [
+                        Progress::ToolStart { .. },
+                        Progress::ToolOutput { output, .. }
+                    ] if output.contains("not available in chat mode")
+                ),
+                "the denial frames as one tool exchange: {:?}",
+                events.borrow()
+            );
+        }
     }
 
     /// A temporary file holding `contents`, removed when the guard drops.
