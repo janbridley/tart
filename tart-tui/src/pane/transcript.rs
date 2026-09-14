@@ -551,11 +551,6 @@ impl Transcript {
         &self.rows
     }
 
-    /// The width the wrapped rows were last folded at.
-    pub(crate) fn width(&self) -> usize {
-        self.cache.0
-    }
-
     /// The text of the transcript's plain messages, tool boxes aside; an answer
     /// contributes one string per rendered line.
     #[cfg(test)]
