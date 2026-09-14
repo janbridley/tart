@@ -791,31 +791,21 @@ mod tests {
         );
     }
 
-    /// The tart extras are merged into every rendered profile, so `/usr/bin/perl`
-    /// can load its runtime library under every policy.
+    /// Every rendered profile denies the cargo credentials file: the one
+    /// extras grant no live test pins unconditionally, since the machine
+    /// running the tests may hold no credentials file at all. The toolchain
+    /// grants themselves are covered live (`perl_runs_under_the_default_grant`,
+    /// `cargo_home_is_readable_but_credentials_are_not`), and the merge
+    /// mechanism by `render_embeds_base_policy_and_platform_defaults`.
     #[test]
-    fn render_includes_the_extras() {
+    fn every_profile_denies_the_cargo_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
 
-        assert!(rendered.contains(
-            r#"(allow file-read* file-test-existence file-map-executable (subpath "/System/Library/Perl"))"#
-        ));
-    }
-
-    /// Extras also grant the user-local interpreter and toolchain trees, so
-    /// `.venv/bin/python` (a symlink into uv's `CPython` install) and the rustup
-    /// `cargo` shim execute under every policy. The cargo grant covers the whole
-    /// `~/.cargo` tree excluding the credentials file.
-    #[test]
-    fn render_includes_user_toolchain_grants() {
-        let dir = tempfile::tempdir().unwrap();
-        let rendered = Policy::new(dir.path()).unwrap().render();
-
-        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.local/share/uv/""#));
-        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo(/|$)""#));
-        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo/\.?credentials(\.toml)?$""#));
-        assert!(rendered.contains(r#"regex #"^/Users/[^/]+/\.rustup/""#));
+        assert!(
+            rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo/\.?credentials(\.toml)?$""#),
+            "registry tokens stay unreadable under every policy: {rendered}"
+        );
     }
 
     /// Empty, absolute, escaping, and root-identical exclusions are rejected.

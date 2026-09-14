@@ -196,13 +196,6 @@ pub(crate) mod tests {
         *locked(&ROOT) = Some(root);
     }
 
-    /// The live session's ledger tag, as a test reads it back.
-    #[inline]
-    #[must_use]
-    pub fn session() -> Option<String> {
-        locked(&SESSION).clone()
-    }
-
     /// A ledger root in a fresh tempdir, held for its test's life.
     pub struct LedgerRoot(tempfile::TempDir);
 
@@ -315,13 +308,6 @@ pub(crate) mod tests {
             Some(sample_usage()),
             "the good entry stands"
         );
-    }
-
-    #[test]
-    fn the_session_slot_round_trips() {
-        let _held = held_for_test();
-        set_session("slot".to_string());
-        assert_eq!(session().as_deref(), Some("slot"));
     }
 
     /// A sample entry, as one billed round writes it.

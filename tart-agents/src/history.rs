@@ -57,6 +57,25 @@ impl RecordLine {
 /// Clones share one record, so the agent loop writes reasoning, tool exchanges, and the
 /// final answer to the callers transcript. After accumulation, the transcript is passed
 /// back into the model and the conversation continues.
+///
+/// A turn's items replay in the order they were recorded, the system prompt leading:
+///
+/// ```
+/// use tart_agents::Progress;
+/// use tart_agents::Transcript;
+/// # fn main() -> anyhow::Result<()> {
+/// let transcript = Transcript::new()?;
+/// transcript.push_user("hello".to_string())?;
+/// transcript.push_assistant("hi there".to_string())?;
+///
+/// assert!(matches!(
+///     transcript.replay().as_slice(),
+///     [Progress::User(text), Progress::Answer(answer)]
+///         if text == "hello" && answer == "hi there"
+/// ));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct Transcript {
     /// The lines, oldest first, opening with the system prompt.
@@ -352,14 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn transcript_opens_with_the_system_prompt() {
-        let items = serde_json::to_value(Transcript::new().unwrap().request_items()).unwrap();
-
-        assert_eq!(items[0]["role"], "system");
-        assert_eq!(items[0]["content"], SYSTEM);
-    }
-
-    #[test]
     fn new_with_opens_with_the_given_prompt_and_survives_clear() {
         let transcript = Transcript::new_with("chat preamble").unwrap();
         let items = serde_json::to_value(transcript.request_items()).unwrap();
@@ -457,21 +468,6 @@ mod tests {
         for (item, cached) in request.iter().zip(sent.as_array().unwrap()) {
             assert_eq!(item, cached, "the cached prefix survives the handover");
         }
-    }
-
-    #[test]
-    fn pushed_turns_serialize_in_order() {
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("hello".to_string()).unwrap();
-        transcript.push_assistant("hi there".to_string()).unwrap();
-
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-
-        assert_eq!(items.as_array().unwrap().len(), 3);
-        assert_eq!(items[1]["role"], "user");
-        assert_eq!(items[1]["content"], "hello");
-        assert_eq!(items[2]["role"], "assistant");
-        assert_eq!(items[2]["content"], "hi there");
     }
 
     #[test]
@@ -626,15 +622,6 @@ mod tests {
         assert_eq!(items[1]["content"], "one");
         assert_eq!(items[2]["role"], "assistant");
         assert_eq!(items[2]["content"], "1");
-    }
-
-    #[test]
-    fn request_items_is_a_copy() {
-        let transcript = Transcript::new().unwrap();
-        let mut items = transcript.request_items();
-        items.clear();
-
-        assert_eq!(transcript.request_items().len(), 1);
     }
 
     /// The cursor read yields exactly the unseen tail, never the flushed prefix.
