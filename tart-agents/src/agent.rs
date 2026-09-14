@@ -1,20 +1,14 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use async_openai::{
-    Client,
-    config::OpenAIConfig,
-    types::responses::{
-        CreateResponse, CreateResponseArgs, FunctionToolCall, InputItem, InputParam, OutputItem,
-        Reasoning, ReasoningEffort, ReasoningItem, ResponseStreamEvent, Tool,
-    },
-};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
-use crate::usage::{MAIN_AGENT, TokenUsage};
+use crate::backends::openai_responses::Responses;
+use crate::backends::{Backend, Event, FunctionToolCall, ReasoningEffort, ReasoningItem, Tool};
+use crate::usage::MAIN_AGENT;
 use crate::{
     AgentId, Agents, CancelToken, MAIN, Progress, Transcript, debug, errors, max_tool_rounds,
     sandbox::Policy, tools,
@@ -40,10 +34,15 @@ pub enum ChatMode {
 }
 
 /// A Responses-API model configured to run the tart tool loop.
+#[allow(
+    private_bounds,
+    private_interfaces,
+    reason = "the default backend and the trait bounds are crate-internal; the public name is `Agent`"
+)]
 #[derive(Clone)]
-pub struct Agent {
-    /// HTTP client for an OpenAI-compatible endpoint; shares its connection pool.
-    client: Client<OpenAIConfig>,
+pub struct Agent<B: Backend = Responses> {
+    /// The provider seam, statically dispatched.
+    backend: Arc<B>,
     /// Model name sent with every request.
     model: String,
     /// How hard the model reasons; `None` uses the provider default.
@@ -143,13 +142,8 @@ impl Agent {
         model: M,
         policy: Policy,
     ) -> Self {
-        // Register a cryptography backend, otherwise reqwest rustls-no-provider panics
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let config = OpenAIConfig::new()
-            .with_api_base(base_url.into())
-            .with_api_key(api_key.into());
         Self {
-            client: Client::with_config(config),
+            backend: Arc::new(crate::backends::openai_responses::backend(base_url, api_key)),
             model: model.into(),
             effort: None,
             max_rounds: max_tool_rounds(),
@@ -162,6 +156,26 @@ impl Agent {
         }
     }
 
+    /// Swap the model, keeping its runtime, policies, subagents, and turn lever.
+    #[inline]
+    pub fn set_model<U: Into<String>, K: Into<String>, M: Into<String>>(
+        &mut self,
+        base_url: U,
+        api_key: K,
+        model: M,
+    ) {
+        self.backend = Arc::new(crate::backends::openai_responses::backend(base_url, api_key));
+        self.model = model.into();
+        self.effort = None;
+    }
+}
+
+#[allow(
+    private_bounds,
+    private_interfaces,
+    reason = "`B` is crate plumbing; the public name is the defaulted `Agent`"
+)]
+impl<B: Backend> Agent<B> {
     /// The session's collaboration mode.
     #[inline]
     pub fn mode(&self) -> ChatMode {
@@ -212,27 +226,6 @@ impl Agent {
         self
     }
 
-    /// The round's request: the model, the effort, the record, and the tools if present
-    fn request(
-        &self,
-        items: Vec<InputItem>,
-        definitions: Vec<Tool>,
-    ) -> Result<CreateResponse, async_openai::error::OpenAIError> {
-        // The builder's setters borrow it, so chain off the binding.
-        let mut args = CreateResponseArgs::default();
-        args.model(self.model.as_str())
-            .stream(true)
-            .reasoning(Reasoning {
-                effort: self.effort.clone(),
-                summary: None,
-            })
-            .input(InputParam::Items(items));
-        if !definitions.is_empty() {
-            args.tools(definitions);
-        }
-        args.build()
-    }
-
     /// Clone this agent as a spawned subagent of itself: a fresh lever, no
     /// registry of its own, and its registry id still to name.
     pub(crate) fn child(&self) -> Self {
@@ -278,22 +271,6 @@ impl Agent {
     #[inline]
     pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
         self.effort = Some(effort);
-    }
-
-    /// Swap the model, keeping its runtime, policies, subagents, and turn lever.
-    #[inline]
-    pub fn set_model<U: Into<String>, K: Into<String>, M: Into<String>>(
-        &mut self,
-        base_url: U,
-        api_key: K,
-        model: M,
-    ) {
-        let config = OpenAIConfig::new()
-            .with_api_base(base_url.into())
-            .with_api_key(api_key.into());
-        self.client = Client::with_config(config);
-        self.model = model.into();
-        self.effort = None;
     }
 
     /// Run one generation on its own thread, reporting progress to `on_progress`.
@@ -373,24 +350,14 @@ impl Agent {
             if self.control.cancelled(&mut cancel_rx) {
                 return terminate_and_log(on_progress, Progress::Cancelled);
             }
-            // The sandboxed trio less `edit` in plan mode, plus web tools if
-            // available, plus the subagent pair for a spawning agent.
-            let definitions = self.tools_for();
-            let items = transcript.request_items();
-            let request = match self.request(items, definitions) {
-                Ok(request) => request,
-                Err(error) => {
-                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-                }
-            };
-
-            debug::log_json("round request", || serde_json::to_string(&request));
-
-            // The owned runtime drives the future
-            let mut stream = match self
-                .runtime
-                .block_on(self.client.responses().create_stream(request))
-            {
+            // The owned runtime drives the future: the model, the effort, the
+            // record, and the tools the model has this round.
+            let mut stream = match self.runtime.block_on(self.backend.round(
+                &self.model,
+                self.effort,
+                transcript.request_items(),
+                self.tools_for(),
+            )) {
                 Ok(stream) => stream,
                 Err(error) => {
                     // The error's class decides the round's next move.
@@ -439,41 +406,32 @@ impl Agent {
                 };
                 let Some(item) = item else { break };
                 match item {
-                    Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
-                        answer.push_str(&delta.delta);
+                    Ok(Event::Answer(delta)) => {
+                        answer.push_str(&delta);
                         saw_output = true;
-                        on_progress(Progress::Answer(delta.delta));
+                        on_progress(Progress::Answer(delta));
                     }
-                    Ok(ResponseStreamEvent::ResponseReasoningTextDelta(delta)) => {
+                    Ok(Event::Thinking(delta)) => {
                         saw_output = true;
-                        on_progress(Progress::Thinking(delta.delta));
+                        on_progress(Progress::Thinking(delta));
                     }
-                    Ok(ResponseStreamEvent::ResponseOutputItemAdded(added)) => {
-                        if matches!(added.item, OutputItem::FunctionCall(_)) {
-                            call_in_flight = true;
-                        }
+                    Ok(Event::CallStarted) => {
+                        call_in_flight = true;
                     }
-                    Ok(ResponseStreamEvent::ResponseOutputItemDone(done)) => match &done.item {
-                        OutputItem::Reasoning(item) => {
-                            debug::log_json("captured reasoning item", || {
-                                serde_json::to_string(item)
-                            });
-                            reasoning = Some(item.clone());
-                            saw_output = true;
-                        }
-                        OutputItem::FunctionCall(call) => {
-                            calls.push(call.clone());
-                            call_in_flight = false;
-                            saw_output = true;
-                        }
-                        _ => {}
-                    },
-                    Ok(ResponseStreamEvent::ResponseCompleted(completed)) => {
+                    Ok(Event::Reasoning(item)) => {
+                        debug::log_json("captured reasoning item", || serde_json::to_string(&item));
+                        reasoning = Some(item);
+                        saw_output = true;
+                    }
+                    Ok(Event::Call(call)) => {
+                        calls.push(call);
+                        call_in_flight = false;
+                        saw_output = true;
+                    }
+                    Ok(Event::Completed(usage)) => {
                         // A completed response is output even when it holds no items.
                         saw_output = true;
-                        if let Some(spend) =
-                            completed.response.usage.as_ref().map(TokenUsage::extract)
-                        {
+                        if let Some(spend) = usage {
                             // The bill lands whatever happens to the round
                             // after this.
                             spend.bill(&self.agent_tag(), &self.model);
@@ -481,12 +439,7 @@ impl Agent {
                             on_progress(Progress::Usage { input, cached, output });
                         }
                     }
-                    Ok(ResponseStreamEvent::ResponseFailed(failed)) => {
-                        debug::log_json("response failed event", || serde_json::to_string(&failed));
-                        let reason = failed.response.error.map_or_else(
-                            || "response failed".to_string(),
-                            |error| format!("{}: {}", error.code, error.message),
-                        );
+                    Ok(Event::Failed(reason)) => {
                         if let Some(terminal) =
                             errors::absorb_provider_error(on_progress, &reason, &mut retries)
                         {
@@ -495,36 +448,13 @@ impl Agent {
                         // Retry: the partial round is discarded unrecorded.
                         continue 'round;
                     }
-                    // The provider said the stream broke mid-flight.
-                    Ok(ResponseStreamEvent::ResponseError(error)) => {
-                        debug::log_json("response error event", || serde_json::to_string(&error));
-                        let reason = format!(
-                            "{}: {}",
-                            error.code.unwrap_or_else(|| "error".to_string()),
-                            error.message
-                        );
-                        if let Some(terminal) =
-                            errors::absorb_provider_error(on_progress, &reason, &mut retries)
-                        {
-                            return terminate_and_log(on_progress, terminal);
-                        }
-                        continue 'round;
-                    }
                     // Truncated (max output tokens, content filter): report it
-                    Ok(ResponseStreamEvent::ResponseIncomplete(incomplete)) => {
-                        debug::log_json("response incomplete event", || {
-                            serde_json::to_string(&incomplete)
-                        });
-                        let reason = incomplete
-                            .response
-                            .incomplete_details
-                            .map_or_else(|| "unknown reason".to_string(), |details| details.reason);
+                    Ok(Event::Incomplete(reason)) => {
                         return terminate_and_log(
                             on_progress,
                             Progress::Failed(format!("response incomplete: {reason}")),
                         );
                     }
-                    Ok(_) => {}
                     // Transport errors are skipped: the stream ends on its own,
                     // and the checks after the loop decide what the round got.
                     Err(error) => {
@@ -648,26 +578,12 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use crate::backends::openai_responses::{
+        OutputItem, ResponseOutputItemDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
+    };
+    use crate::usage::TokenUsage;
     use crate::usage::tests::sample_usage;
-    use async_openai::types::responses::{ResponseOutputItemDoneEvent, ResponseTextDeltaEvent};
     use std::io::{Read, Write};
-
-    #[test]
-    fn the_request_omits_an_empty_tools_list() {
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let agent = Agent::new("http://localhost:9", "key", "model", policy);
-
-        let bare = serde_json::to_value(agent.request(Vec::new(), Vec::new()).unwrap()).unwrap();
-        assert!(bare.get("tools").is_none(), "no tools, no field: {bare}");
-
-        let armed =
-            serde_json::to_value(agent.request(Vec::new(), vec![tools::bash()]).unwrap()).unwrap();
-        assert_eq!(
-            armed["tools"].as_array().map(Vec::len),
-            Some(1),
-            "the offered tool rides along: {armed}"
-        );
-    }
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -1295,6 +1211,8 @@ mod tests {
                 call_id: format!("call_{index}"),
                 id: Some(format!("item_{index}")),
                 status: None,
+                caller: None,
+                r#async: None,
             }),
         })
     }

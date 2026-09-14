@@ -184,7 +184,7 @@ impl Config {
             base_url: provider.base_url.clone(),
             api_key: resolve_api_key(key, &provider.api_key)?,
             model: agent.model.clone(),
-            effort: agent.reasoning_effort.clone(),
+            effort: agent.reasoning_effort,
             context_tokens: agent.context_tokens,
         })
     }
@@ -217,7 +217,7 @@ impl Config {
         match self.resolve(&choice.provider, &choice.name) {
             Ok(next) => {
                 agent.set_model(next.base_url.clone(), next.api_key.clone(), next.model.clone());
-                if let Some(effort) = next.effort.clone() {
+                if let Some(effort) = next.effort {
                     agent.set_reasoning_effort(effort);
                 }
                 pane.set_context_tokens(next.context_tokens);
@@ -482,11 +482,12 @@ model = "glm-4-flash"
 
     #[test]
     fn bad_reasoning_effort_is_an_error() {
-        let text = MINIMAL.replacen("reasoning_effort = \"high\"", "reasoning_effort = \"max\"", 1);
+        let text =
+            MINIMAL.replacen("reasoning_effort = \"high\"", "reasoning_effort = \"extreme\"", 1);
         // `{:#}` walks anyhow's cause chain; `to_string` shows only the context.
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
-        assert!(error.contains("max"), "{error}");
+        assert!(error.contains("extreme"), "{error}");
     }
 
     #[test]

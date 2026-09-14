@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use crate::locked;
 
 use anyhow::Context;
-use async_openai::types::responses::ResponseUsage;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -38,21 +37,6 @@ pub(crate) struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// The usage a completed response reported, its five counts carried over:
-    /// `cached` is `input_tokens_details.cached_tokens`, `reasoning` is
-    /// `output_tokens_details.reasoning_tokens`.
-    #[inline]
-    #[must_use]
-    pub(crate) fn extract(usage: &ResponseUsage) -> Self {
-        Self {
-            input: u64::from(usage.input_tokens),
-            cached: u64::from(usage.input_tokens_details.cached_tokens),
-            output: u64::from(usage.output_tokens),
-            reasoning: u64::from(usage.output_tokens_details.reasoning_tokens),
-            total: u64::from(usage.total_tokens),
-        }
-    }
-
     /// The gauge's three display counts: `(input, cached, output)`.
     #[inline]
     #[must_use]

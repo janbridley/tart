@@ -6,8 +6,8 @@ use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use crate::backends::{InputItem, Item, Role};
 use anyhow::Context;
-use async_openai::types::responses::{InputItem, Item, Role};
 use time::OffsetDateTime;
 
 use crate::history::{LineMetadata, RecordLine, Transcript, stamp_utc_at};
@@ -311,7 +311,7 @@ fn trim_unpaired(lines: &mut Vec<RecordLine>) {
     let answered: HashSet<String> = lines
         .iter()
         .filter_map(|line| match &line.item {
-            InputItem::Item(Item::FunctionCallOutput(output)) => Some(output.call_id.clone()),
+            InputItem::Item(Item::FunctionCallOutput(output)) => output.call_id.clone(),
             _ => None,
         })
         .collect();
@@ -355,7 +355,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use async_openai::types::responses::FunctionToolCall;
+    use crate::backends::FunctionToolCall;
 
     /// A session file's line count.
     fn line_count(path: &Path) -> usize {
@@ -722,6 +722,8 @@ mod tests {
                     call_id: "call_0".to_string(),
                     id: None,
                     status: None,
+                    caller: None,
+                    r#async: None,
                 })),
                 meta: LineMetadata {
                     timestamp: Some("2026-09-09 10:00:09".to_string()),

@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use async_openai::types::responses::{FunctionTool, FunctionToolCall, Tool};
+use crate::backends::{FunctionToolCall, Tool, tool};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
+use crate::backends::Backend;
+use crate::backends::openai_responses::Responses;
 use crate::{Agent, AgentId, Agents, ChatMode, Progress, sandbox::Policy};
 
 mod web;
@@ -73,18 +75,6 @@ fn numbered_read(start: Option<u64>, end: Option<u64>) -> String {
         start.unwrap_or(0),
         end.unwrap_or(0)
     )
-}
-
-/// A function tool with the given name, description, and JSON-schema parameters.
-#[must_use]
-fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        parameters: Some(parameters),
-        strict: None,
-    })
 }
 
 /// The bash tool; commands execute under the caller's [`Policy`].
@@ -323,9 +313,9 @@ fn parse_check(arguments: &str) -> anyhow::Result<Check> {
 ///
 /// Tool *failures* (a non-zero exit, an edit that did not apply, or a command the
 /// sandbox denies) are content that the model should see, and so is a *malformed call*.
-pub(crate) fn execute<F: Fn(Progress)>(
+pub(crate) fn execute<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_>,
+    tools: &Tooling<'_, B>,
     on_progress: &F,
 ) -> String {
     // Force-disable tools, lest hallucinated calls attempt execution regardless.
@@ -356,9 +346,9 @@ pub(crate) fn execute<F: Fn(Progress)>(
 }
 
 /// Fork a subagent on the task and return at once.
-fn run_spawn_agent<F: Fn(Progress)>(
+fn run_spawn_agent<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_>,
+    tools: &Tooling<'_, B>,
     on_progress: &F,
 ) -> String {
     let spawn = match parse_spawn(&call.arguments) {
@@ -386,9 +376,9 @@ fn run_spawn_agent<F: Fn(Progress)>(
 }
 
 /// Run one `check_agent` tool call: an instant check, never a block.
-fn run_check_agent<F: Fn(Progress)>(
+fn run_check_agent<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_>,
+    tools: &Tooling<'_, B>,
     on_progress: &F,
 ) -> String {
     let check = match parse_check(&call.arguments) {
@@ -452,7 +442,7 @@ fn command_text(text: &str, status: ExitStatus) -> String {
 }
 
 /// Information required for a tool call, including sandbox and cancellation info.
-pub(crate) struct Tooling<'a> {
+pub(crate) struct Tooling<'a, B: Backend = Responses> {
     /// The policy the call's commands run sandboxed under.
     pub(crate) policy: &'a Policy,
     /// The turn's cancel lever: Esc kills a command in flight.
@@ -460,7 +450,7 @@ pub(crate) struct Tooling<'a> {
     /// The subagent registry, when this agent can spawn.
     pub(crate) agents: Option<&'a Agents>,
     /// The agent whose turn this is: the template a `spawn_agent` clones.
-    pub(crate) template: &'a Agent,
+    pub(crate) template: &'a Agent<B>,
 }
 
 /// One finished command run under a watchdog: a deadline or a cancel.
@@ -645,9 +635,9 @@ fn misuse<F: Fn(Progress)>(
 /// A command that outlives its timeout is killed with everything it started.
 /// The model sees `[timed out after Ns]` and any partial output; one the user
 /// cancelled mid-flight sees `[cancelled]`.
-fn run_bash<F: Fn(Progress)>(
+fn run_bash<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_>,
+    tools: &Tooling<'_, B>,
     on_progress: &F,
 ) -> String {
     let bash = match parse_bash(&call.arguments) {
@@ -705,9 +695,9 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
 }
 
 /// Run one read tool call under `tools`, reporting its steps to `on_progress`.
-fn run_read<F: Fn(Progress)>(
+fn run_read<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_>,
+    tools: &Tooling<'_, B>,
     on_progress: &F,
 ) -> String {
     let read = match parse_read(&call.arguments) {
@@ -740,9 +730,9 @@ fn run_read<F: Fn(Progress)>(
 /// As with bash, edit *failures* (an unreadable file, no or ambiguous match, a
 /// sandbox denial) are not errors: their message is content the model can act
 /// on and retry.
-fn run_edit<F: Fn(Progress)>(
+fn run_edit<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_>,
+    tools: &Tooling<'_, B>,
     on_progress: &F,
 ) -> String {
     let edit = match parse_edit(&call.arguments) {
@@ -859,6 +849,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
@@ -1356,6 +1348,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
@@ -1547,6 +1541,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
@@ -1661,6 +1657,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         };
         let events = std::cell::RefCell::new(Vec::new());
 

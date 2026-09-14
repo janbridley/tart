@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use async_openai::types::responses::{
-    EasyInputContent, EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam,
-    FunctionToolCall, InputItem, Item, ReasoningItem, ReasoningItemContent, Role,
+use crate::backends::{
+    EasyInputContent, FunctionToolCall, InputItem, Item, ReasoningItem, ReasoningItemContent, Role,
+    call_output, message,
 };
 
 use time::OffsetDateTime;
@@ -87,7 +87,7 @@ impl Transcript {
     pub fn new_with(system: &str) -> anyhow::Result<Self> {
         Ok(Self {
             lines: Arc::new(Mutex::new(vec![RecordLine {
-                item: input_message(Role::System, system.to_string())?,
+                item: message(Role::System, system.to_string())?,
                 meta: LineMetadata::default(),
             }])),
             reminder: None,
@@ -145,14 +145,14 @@ impl Transcript {
     /// Record the user's turn.
     #[inline]
     pub fn push_user(&self, text: String) -> anyhow::Result<()> {
-        self.push(input_message(Role::User, text)?);
+        self.push(message(Role::User, text)?);
         Ok(())
     }
 
     /// Record the assistant's final answer for the current turn.
     #[inline]
     pub fn push_assistant(&self, text: String) -> anyhow::Result<()> {
-        self.push(input_message(Role::Assistant, text)?);
+        self.push(message(Role::Assistant, text)?);
         Ok(())
     }
 
@@ -182,18 +182,11 @@ impl Transcript {
         let mut lines = self.lines();
         let mut outputs = Vec::with_capacity(round.len());
         for (call, output) in round {
-            outputs.push(FunctionCallOutputItemParam {
-                call_id: call.call_id.clone(),
-                output: FunctionCallOutput::Text(output),
-                id: None,
-                status: None,
-            });
+            outputs.push(call_output(&call, output));
             lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCall(call))));
         }
         for output in outputs {
-            lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCallOutput(
-                output,
-            ))));
+            lines.push(RecordLine::fresh(output));
         }
     }
 
@@ -205,7 +198,7 @@ impl Transcript {
     #[inline]
     pub fn set_reminder(&mut self, text: Option<&str>) -> anyhow::Result<()> {
         self.reminder = match text {
-            Some(text) => Some(input_message(Role::System, text.to_string())?),
+            Some(text) => Some(message(Role::System, text.to_string())?),
             None => None,
         };
         Ok(())
@@ -296,21 +289,12 @@ impl Transcript {
     }
 }
 
-/// One message in the conversation, as the Responses API sends it.
-fn input_message(role: Role, text: String) -> anyhow::Result<InputItem> {
-    Ok(EasyInputMessageArgs::default()
-        .role(role)
-        .content(text)
-        .build()?
-        .into())
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use async_openai::types::responses::{ReasoningItemContent, ReasoningTextContent};
+    use crate::backends::openai_responses::ReasoningTextContent;
 
     impl Transcript {
         /// A transcript over `items`, as a session file restored them: the
@@ -349,6 +333,8 @@ mod tests {
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
+            caller: None,
+            r#async: None,
         }
     }
 
@@ -596,9 +582,9 @@ mod tests {
         // A record restored from an older tart's session file may open with a
         // second system item; the whole leading block survives a clear.
         let transcript = Transcript::from_items(vec![
-            input_message(Role::System, SYSTEM.to_string()).unwrap(),
-            input_message(Role::System, "be terse".to_string()).unwrap(),
-            input_message(Role::User, "hello".to_string()).unwrap(),
+            message(Role::System, SYSTEM.to_string()).unwrap(),
+            message(Role::System, "be terse".to_string()).unwrap(),
+            message(Role::User, "hello".to_string()).unwrap(),
         ]);
         transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
         transcript.push_assistant("hi".to_string()).unwrap();

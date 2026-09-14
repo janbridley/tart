@@ -99,17 +99,9 @@ fn install_panic_hook() {
     }));
 }
 
-/// Parse a `/effort` argument.
+/// Parse a `/effort` argument, spelled exactly as the config file spells one.
 fn effort_of(name: &str) -> Option<ReasoningEffort> {
-    match name {
-        "none" => Some(ReasoningEffort::None),
-        "minimal" => Some(ReasoningEffort::Minimal),
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" => Some(ReasoningEffort::High),
-        "xhigh" => Some(ReasoningEffort::Xhigh),
-        _ => None,
-    }
+    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
 }
 
 /// The user message recording one manual command and its framed output, so the
@@ -298,7 +290,9 @@ fn run(
                                 pane.note(format!("reasoning effort: {arg}"));
                             }
                             // Bare and unknown arguments both show the usage.
-                            None => pane.note("usage: /effort none|minimal|low|medium|high|xhigh"),
+                            None => {
+                                pane.note("usage: /effort none|minimal|low|medium|high|xhigh|max");
+                            }
                         }
                     }
                     // Toggle plan mode: read-only research and planning.
