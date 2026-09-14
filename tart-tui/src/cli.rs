@@ -7,14 +7,27 @@ use std::path::PathBuf;
 use anyhow::bail;
 use clap::{Arg, ArgMatches, Command};
 
-/// The `--agents` command line, with a resolved path or nice error message..
-pub(crate) fn agents_path() -> anyhow::Result<PathBuf> {
-    resolve(&command().get_matches(), std::env::var_os("HOME"))
+/// The command line, parsed once: the agents file to load, and whether this session is chat.
+pub(crate) struct Cli {
+    /// The TOML file describing the available agents.
+    pub(crate) agents: PathBuf,
+    /// Whether `--chat` was passed: web tools only, no shell or filesystem.
+    pub(crate) chat: bool,
 }
 
-/// Whether `--chat` was passed: web tools only, no shell or filesystem.
-pub(crate) fn chat() -> bool {
-    command().get_matches().get_flag("chat")
+impl Cli {
+    /// Parse the process's argv.
+    pub(crate) fn parse() -> anyhow::Result<Self> {
+        Self::from(&command().get_matches(), std::env::var_os("HOME"))
+    }
+
+    /// The command line `matches` name, with the agents file resolved against `home`
+    fn from(matches: &ArgMatches, home: Option<OsString>) -> anyhow::Result<Self> {
+        Ok(Self {
+            agents: resolve(matches, home)?,
+            chat: matches.get_flag("chat"),
+        })
+    }
 }
 
 /// The agents file `matches` selects: `--agents FILE` when given, else
@@ -111,20 +124,26 @@ mod tests {
         assert!(error.contains("--agents"), "{error}");
     }
 
-    /// `--chat` parses true, and its absence false.
+    /// `--chat` parses true, and its absence false, alongside the agents file.
     #[test]
     fn the_chat_flag_parses() {
-        assert!(
-            command()
-                .try_get_matches_from(["tart", "--chat"])
-                .expect("the flag parses")
-                .get_flag("chat")
-        );
-        assert!(
-            !command()
-                .try_get_matches_from(["tart"])
-                .expect("no flag is required")
-                .get_flag("chat")
-        );
+        let with = Cli::from(
+            &command()
+                .try_get_matches_from(["tart", "--agents", "f.toml", "--chat"])
+                .expect("the flags parse"),
+            None,
+        )
+        .expect("the named file is used as-is");
+        assert!(with.chat);
+        assert_eq!(with.agents, PathBuf::from("f.toml"));
+
+        let without = Cli::from(
+            &command()
+                .try_get_matches_from(["tart", "--agents", "f.toml"])
+                .expect("the flags parse"),
+            None,
+        )
+        .expect("the named file is used as-is");
+        assert!(!without.chat);
     }
 }

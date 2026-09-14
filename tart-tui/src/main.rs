@@ -13,6 +13,7 @@ mod cli;
 mod clipboard;
 mod config;
 mod file_mentions;
+mod init;
 mod keybinds;
 mod pane;
 mod perf;
@@ -25,7 +26,7 @@ mod turn_picker;
 mod testutil;
 
 use std::io::stdout;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -37,13 +38,13 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
+use init::Tui;
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
 use perf::Perf;
 use recorded::MANUAL_AT;
 use tart_agents::{
-    AGENT_TOOL, Agent, AgentId, Agents, CHAT_PROJECT, CancelToken, ChatMode, MAIN, Outcome,
-    Progress, ReasoningEffort, SESSIONS_ROOT, Session, Transcript, manual_command, prompts,
-    sandbox::Policy, usage::Ledger,
+    AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
+    ReasoningEffort, Session, Transcript, manual_command, prompts, usage::Ledger,
 };
 
 use tmux_override::{override_shift_up, restore_tmux};
@@ -51,66 +52,40 @@ use tmux_override::{override_shift_up, restore_tmux};
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
-    let path = cli::agents_path()?;
-    let config = config::Config::load(&path)?;
-    let agent_config = config.default_agent()?;
-    let label = agent_config.to_string();
-    let context_tokens = agent_config.context_tokens;
-    let policy = Policy::new(std::env::current_dir()?)?.exclude_git();
-    let mut agent = agent_config.into_agent(policy);
-    if cli::chat() {
-        // Chat mode: the model keeps the web tools and loses the rest, running
-        // under a policy that grants nothing (`Agent::policy` ignores the
-        // cwd-rooted one above in this mode).
-        agent.set_mode(ChatMode::Chat);
-    }
-    let root = &SESSIONS_ROOT;
-    // Chat sessions live under their own CHAT directory, not the cwd's.
-    let project = if cli::chat() {
-        PathBuf::from(CHAT_PROJECT)
-    } else {
-        std::env::current_dir()?
-    };
-    let mut session = Session::start(root, &project);
-    let transcript = if cli::chat() {
-        Transcript::new_with(prompts::CHAT)?
-    } else {
-        Transcript::new()?
-    };
+    let mut tui = Tui::try_from(&cli::Cli::parse()?)?;
     install_panic_hook();
-    let mut terminal = ratatui::try_init()?;
+    let (mut terminal, _tmux) = enter_terminal()?;
+    let mut pane = tui.open_pane();
+    let result = run(
+        &mut terminal,
+        &mut tui.agent,
+        tui.transcript,
+        &mut tui.session,
+        &mut pane,
+        &tui.config,
+    );
+    leave_terminal(&mut terminal)?;
+    result
+}
+
+/// Enter the alternate screen with bracketed paste and disambiguated escape codes on.
+fn enter_terminal() -> anyhow::Result<(DefaultTerminal, Option<tmux_override::TmuxGuard>)> {
+    let terminal = ratatui::try_init()?;
     execute!(stdout(), EnableBracketedPaste)?;
     execute!(
         stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     // The alternate screen is live, so the conditional rebind takes effect.
-    let _tmux = override_shift_up();
-    let mut pane = Pane::default();
-    pane.set_session_dir(SESSIONS_ROOT.clone(), project);
-    pane.set_chat(cli::chat());
-    pane.set_control(agent.handle());
-    pane.set_conversation(&transcript);
-    pane.note(if cli::chat() {
-        format!("tart · {label} · chat")
-    } else {
-        format!("tart · {label}")
-    });
-    pane.set_context_tokens(context_tokens);
-    pane.set_models(config.agents());
-    let result = run(
-        &mut terminal,
-        &mut agent,
-        transcript,
-        &mut session,
-        &mut pane,
-        &config,
-    );
+    Ok((terminal, override_shift_up()))
+}
+
+/// Leave the alternate screen, restoring the terminal modes and the cursor.
+fn leave_terminal(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
     ratatui::try_restore()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
     execute!(stdout(), DisableBracketedPaste)?;
-    terminal.show_cursor()?;
-    result
+    Ok(terminal.show_cursor()?)
 }
 
 /// Leave a normal terminal (and the tmux binding restored) even on panic.
