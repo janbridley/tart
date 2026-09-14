@@ -42,7 +42,13 @@ pub(crate) fn derive_query(editor: &Editor) -> Option<(String, usize)> {
 pub(crate) fn command_query(editor: &Editor, command: &str) -> Option<String> {
     let line = &editor.lines[editor.line];
     let rest = line.strip_prefix(command)?;
-    (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim_start().to_string())
+    is_command(line, command).then(|| rest.trim_start().to_string())
+}
+
+/// Whether `line` is `command` itself, bare or with space-separated arguments
+pub(crate) fn is_command(line: &str, command: &str) -> bool {
+    line.strip_prefix(command)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
 }
 
 /// The argument under the caret, as a file to complete.
@@ -381,17 +387,11 @@ impl<T> Picker<T> {
     pub(crate) fn set_query(&mut self, query: String) {
         self.popup.set_query(query);
     }
-}
 
-/// Draw a picker's rows above `anchor`, titled `title` with the given hint.
-pub(crate) fn render_picker<T>(
-    picker: &mut Picker<T>,
-    frame: &mut Frame,
-    anchor: Rect,
-    title: &str,
-    hint: &str,
-) {
-    picker.popup.render(frame, anchor, title, hint);
+    /// Draw the picker's rows above `anchor`, titled `title` with the hint.
+    pub(crate) fn render(&mut self, frame: &mut Frame, anchor: Rect, title: &str, hint: &str) {
+        self.popup.render(frame, anchor, title, hint);
+    }
 }
 
 #[cfg(test)]
