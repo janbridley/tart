@@ -220,6 +220,15 @@ impl Transcript {
         self.messages.push(Entry::Text(line.into()));
     }
 
+    /// Append a blank row, unless the log is empty or already ends on one.
+    pub(crate) fn blank(&mut self) {
+        let ends_blank =
+            matches!(self.messages.last(), Some(Entry::Text(line)) if line.width() == 0);
+        if !self.messages.is_empty() && !ends_blank {
+            self.push(Line::from(""));
+        }
+    }
+
     /// Record a tool invocation's start; it renders as a running header until
     /// finished. A `read`, `edit`, or `check_agent` following its own kind
     /// merges into that trailing finished box instead of stacking a fresh

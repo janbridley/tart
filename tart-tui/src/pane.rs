@@ -993,6 +993,7 @@ impl Pane {
     /// exactly like the prompt row that launched it.
     fn echo_styled(&mut self, glyph: &'static str, style: Style, text: &str) {
         let mut rows = text.split('\n');
+        self.transcript.blank();
         self.transcript.push(Line::from(vec![
             Span::styled(glyph, style),
             Span::raw(rows.next().unwrap_or_default().to_string()),
@@ -1000,6 +1001,7 @@ impl Pane {
         for continuation in rows {
             self.transcript.push(Line::from(format!("  {continuation}")));
         }
+        self.transcript.blank();
     }
 
     /// Mark a manual command in flight: the frame holds the bang styling and
@@ -1987,6 +1989,7 @@ mod tests {
             pane.transcript.message_texts(),
             [
                 format!("! {}", "x".repeat(60)),
+                String::new(),
                 "[exit 1]".to_string(),
                 "boom".to_string()
             ]
@@ -2027,7 +2030,7 @@ mod tests {
         );
         assert_eq!(
             pane.transcript.message_texts(),
-            ["! cargo build", "  cargo test", "done"]
+            ["! cargo build", "  cargo test", "", "done"]
         );
     }
 
@@ -2366,10 +2369,14 @@ mod tests {
     #[test]
     fn echo_renders_the_prompt_and_indents_continuations() {
         let mut pane = Pane::default();
+        pane.push(Line::from("banner"));
 
         pane.echo("first\nsecond");
 
-        assert_eq!(pane.transcript.message_texts(), ["❯ first", "  second"]);
+        assert_eq!(
+            pane.transcript.message_texts(),
+            ["banner", "", "❯ first", "  second", ""]
+        );
     }
 
     /// A `/resume` line opens the session chooser; Enter swaps to the picked
@@ -2761,7 +2768,7 @@ mod tests {
         ]);
         let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
         let rows: Vec<&str> = styles.lines().collect();
-        assert!(rows[1].starts_with("BBBB"), "the H3 is bold: {styles}");
+        assert!(rows[2].starts_with("BBBB"), "the H3 is bold: {styles}");
         assert!(
             styles.contains("yyyyyyyyyy"),
             "inline code is light yellow: {styles}"
