@@ -9,6 +9,16 @@ use super::SpansExt;
 /// Spaces a tab renders as.
 const TAB_WIDTH: usize = 4;
 
+/// One grapheme's cell width, never less than one.
+#[inline]
+pub(crate) fn grapheme_width(grapheme: &str) -> usize {
+    if grapheme.len() == 1 {
+        1
+    } else {
+        Span::raw(grapheme).width().max(1)
+    }
+}
+
 /// One wrapped row under construction: (&'a grapheme, style, cell width).
 type Row<'a> = Vec<(&'a str, Style, usize)>;
 
@@ -48,7 +58,7 @@ impl<'a> Wrapper<'a> {
     /// Add one rendered cell; `sym` is a single space for expanded tabs.
     fn push(&mut self, sym: &'a str, style: Style) {
         // Single-byte symbols can be printed without looking up width.
-        let gw = if sym.len() == 1 { 1 } else { Span::raw(sym).width() };
+        let gw = grapheme_width(sym);
         let space = sym == " ";
         if self.row_width + gw > self.width && !self.row.is_empty() && gw > 0 {
             if space {

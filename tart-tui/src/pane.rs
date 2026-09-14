@@ -38,6 +38,8 @@ use copy::{CopyCursor, Frozen, clamp_cell, moved, window_top};
 use transcript::Transcript;
 use wrap::{wrap_draft, wrap_lines};
 
+pub(crate) use wrap::grapheme_width;
+
 pub const PROMPT: &str = "❯ ";
 /// Cells before the editor starts (the prompt symbol's width).
 const GUTTER: u16 = 2;
@@ -1313,20 +1315,16 @@ fn token_count(tokens: u64) -> String {
 }
 
 /// One grapheme's width in cells, never zero.
-fn cell_width(grapheme: &str) -> usize {
-    Span::raw(grapheme).width().max(1)
-}
-
 /// `text` as-is when it fits `budget` cells, else its clipped start and an ellipsis
 pub(crate) fn ellipsize(text: &str, budget: usize) -> String {
-    if text.graphemes(true).map(cell_width).sum::<usize>() <= budget {
+    if text.graphemes(true).map(grapheme_width).sum::<usize>() <= budget {
         return text.to_string();
     }
     // One cell stays free so a cut always shows its ellipsis.
     let mut cut: String = text
         .graphemes(true)
         .scan(0, |used, grapheme| {
-            let spent = cell_width(grapheme);
+            let spent = grapheme_width(grapheme);
             (*used + spent < budget).then(|| {
                 *used += spent;
                 grapheme
