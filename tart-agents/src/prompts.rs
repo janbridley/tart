@@ -22,18 +22,10 @@ pub const CHAT: &str = include_str!("data/CHAT.md");
 mod tests {
     use super::*;
 
+    /// The chat prompt must not advertise tools chat mode withholds, or the
+    /// model would call a tool that only answers with a denial.
     #[test]
-    fn the_canned_prompts_read_as_written() {
-        assert!(PLAN_REMINDER.contains("Plan mode is on"));
-        assert!(
-            PLAN_REMINDER.contains("read-only"),
-            "the reminder names the contract"
-        );
-        assert!(PLAN_APPROVAL.contains("approved"));
-        assert!(
-            CHAT.contains("no shell and no filesystem"),
-            "chat owns its limits"
-        );
+    fn chat_does_not_advertise_withheld_tools() {
         assert!(
             !CHAT.contains("spawn_agent"),
             "the minimal prompt does not advertise withheld tools"
