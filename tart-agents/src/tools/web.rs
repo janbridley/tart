@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use async_openai::types::responses::{FunctionToolCall, Tool};
+use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
     CancelToken, WatchedRun, combined_output, command_text, misuse, parse_arguments, run_watched,

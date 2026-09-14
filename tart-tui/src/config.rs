@@ -184,7 +184,7 @@ impl Config {
             base_url: provider.base_url.clone(),
             api_key: resolve_api_key(key, &provider.api_key)?,
             model: agent.model.clone(),
-            effort: agent.reasoning_effort.clone(),
+            effort: agent.reasoning_effort,
             context_tokens: agent.context_tokens,
         })
     }
@@ -217,7 +217,7 @@ impl Config {
         match self.resolve(&choice.provider, &choice.name) {
             Ok(next) => {
                 agent.set_model(next.base_url.clone(), next.api_key.clone(), next.model.clone());
-                if let Some(effort) = next.effort.clone() {
+                if let Some(effort) = next.effort {
                     agent.set_reasoning_effort(effort);
                 }
                 pane.set_context_tokens(next.context_tokens);

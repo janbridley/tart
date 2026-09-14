@@ -6,8 +6,8 @@ use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use crate::backends::{InputItem, Item, Role};
 use anyhow::Context;
-use async_openai::types::responses::{InputItem, Item, Role};
 use time::OffsetDateTime;
 
 use crate::history::{LineMetadata, RecordLine, Transcript, stamp_utc_at};
@@ -355,7 +355,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use async_openai::types::responses::FunctionToolCall;
+    use crate::backends::FunctionToolCall;
 
     /// A session file's line count.
     fn line_count(path: &Path) -> usize {

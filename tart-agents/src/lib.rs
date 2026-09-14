@@ -11,6 +11,8 @@ pub mod session;
 mod tools;
 pub mod usage;
 
+pub mod backends;
+
 #[cfg(target_os = "macos")]
 pub mod sandbox;
 
@@ -46,6 +48,6 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 /// The round cap when `TART_MAX_TOOL_ROUNDS` is unset or invalid.
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 4096;
 
-/// Re-exported so callers can pick a reasoning effort without depending on
-/// `async-openai`.
-pub use async_openai::types::responses::ReasoningEffort;
+/// The reasoning efforts a backend accepts, so callers can pick one without
+/// depending on the backend's own vocabulary.
+pub use backends::ReasoningEffort;
