@@ -5,6 +5,12 @@
 provider = "z.ai"
 name = "Coding Specialist"
 
+# The agent `tart --chat` sessions run instead, when chat wants a different
+# model than coding. Optional: without it, chat uses the default agent.
+[chat_agent]
+provider = "z.ai"
+name = "History Expert"
+
 # The table key is the provider's name; quoting allows dots.
 ["z.ai"]
 base_url = "https://api.z.ai/api/v1"

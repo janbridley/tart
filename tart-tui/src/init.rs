@@ -25,6 +25,15 @@ impl Kind {
         if chat { Self::Chat } else { Self::Coding }
     }
 
+    /// The agent this kind runs: the `[chat_agent]` pick for chat, the
+    /// default agent for coding.
+    fn agent(self, config: &config::Config) -> anyhow::Result<config::ResolvedAgent> {
+        match self {
+            Self::Coding => config.default_agent(),
+            Self::Chat => config.chat_agent(),
+        }
+    }
+
     /// The mode the agent runs in.
     fn mode(self) -> ChatMode {
         match self {
@@ -77,10 +86,10 @@ impl TryFrom<&cli::Cli> for Tui {
 
     fn try_from(cli: &cli::Cli) -> Result<Self, Self::Error> {
         let config = config::Config::load(&cli.agents)?;
-        let agent_config = config.default_agent()?;
+        let kind = Kind::of(cli.chat);
+        let agent_config = kind.agent(&config)?;
         let label = agent_config.to_string();
         let context_tokens = agent_config.context_tokens;
-        let kind = Kind::of(cli.chat);
         let project = kind.project()?;
         // The cwd-rooted policy serves the coding kinds; chat's tool calls run
         // under `Policy::none` instead (see `Agent::policy`), so the grant is
