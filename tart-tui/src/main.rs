@@ -223,7 +223,7 @@ fn run(
                         pane.note("plan approved · implementing");
                         pane.echo(prompts::PLAN_APPROVAL);
                         transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
-                        pane.start_turn(agent, &transcript, &wake);
+                        pane.start_turn(agent, false, &transcript, &wake);
                     }
                 }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
@@ -314,15 +314,11 @@ fn run(
                     _ => {
                         // A queued message drains into the record ahead of the
                         // fresh submit, joining its turn.
+                        // An `ultrathink` in the line or the queue boosts this one turn.
+                        let ultrathink = line.contains(ULTRATHINK) || pane.queue_has_ultrathink();
                         pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
-                        // Temporarily enable max reasoning effort.
-                        let mut turn = agent.clone();
-                        if line.contains(ULTRATHINK) {
-                            pane.note("ultrathink · max reasoning for this turn");
-                            turn.set_reasoning_effort(ReasoningEffort::Max);
-                        }
-                        pane.start_turn(&turn, &transcript, &wake);
+                        pane.start_turn(agent, ultrathink, &transcript, &wake);
                     }
                 },
                 // A session picked in the `/resume` chooser swaps the conversation

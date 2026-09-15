@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 use tart_agents::{
-    Agent, AgentId, Agents, ChatMode, MAIN, Progress, Transcript as Conversation, TurnHandle,
-    prompts,
+    Agent, AgentId, Agents, ChatMode, MAIN, Progress, ReasoningEffort, Transcript as Conversation,
+    TurnHandle, prompts,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -788,11 +788,25 @@ impl Pane {
     }
 
     /// Begin a response, retiring the previous turn's thinking box, and run the turn
-    pub fn start_turn(&mut self, agent: &Agent, transcript: &Conversation, wake: &Sender<Wake>) {
+    ///
+    /// `ultrathink` enables max reasoning effort in the main agnet but not in subagents
+    pub fn start_turn(
+        &mut self,
+        agent: &Agent,
+        ultrathink: bool,
+        transcript: &Conversation,
+        wake: &Sender<Wake>,
+    ) {
+        let effort = ultrathink
+            .then_some(ReasoningEffort::Max)
+            .or(agent.configured_effort());
+        if ultrathink {
+            self.note("ultrathink · max reasoning for this turn");
+        }
         self.begin_response();
         self.set_generating(true);
         let sender = wake.clone();
-        agent.spawn(transcript, move |progress| {
+        agent.spawn_with(effort, transcript, move |progress| {
             let _ = sender.send(Wake::Generation(MAIN, progress));
         });
     }
@@ -910,8 +924,13 @@ impl Pane {
         self.transcript
             .append_span(&Span::styled(text.clone(), DIM_STYLE));
         transcript.push_user(format!("{REPORTS_AT}\n\n{text}"))?;
-        self.start_turn(agent, transcript, wake);
+        self.start_turn(agent, false, transcript, wake);
         Ok(true)
+    }
+
+    /// Whether the front queued message holds `ultrathink`.
+    pub fn queue_has_ultrathink(&self) -> bool {
+        self.queued.front().is_some_and(|text| text.contains(ULTRATHINK))
     }
 
     /// Echo and record the front queued message, if one waits, reporting
@@ -935,10 +954,11 @@ impl Pane {
         cwd: &Path,
         wake: &Sender<Wake>,
     ) -> anyhow::Result<bool> {
+        let ultrathink = self.queue_has_ultrathink();
         if !self.drain_queued(transcript, cwd)? {
             return Ok(false);
         }
-        self.start_turn(agent, transcript, wake);
+        self.start_turn(agent, ultrathink, transcript, wake);
         Ok(true)
     }
 

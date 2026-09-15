@@ -14,14 +14,12 @@ pub(crate) const ULTRATHINK: &str = "ultrathink";
 /// The palette cycled across the keyword's characters.
 const RAINBOW: [Color; 4] = [Color::Red, Color::Yellow, Color::Cyan, Color::Magenta];
 
-/// A draft grapheme's style: bold rainbow inside `ultrathink`, plain otherwise.
-fn ultra_style(hits: &[usize], byte: usize) -> Style {
-    hits.iter()
-        .find(|&at| *at <= byte && byte < at + ULTRATHINK.len())
-        .map_or(Style::new(), |&at| {
-            let fg = RAINBOW[(byte - at) % RAINBOW.len()];
-            Style::new().fg(fg).add_modifier(Modifier::BOLD)
-        })
+/// Bold rainbow inside `ultrathink`, else plain.
+fn ultra_style(hit: Option<&usize>, byte: usize) -> Style {
+    hit.filter(|&&at| byte >= at).map_or(Style::new(), |&at| {
+        let fg = RAINBOW[(byte - at) % RAINBOW.len()];
+        Style::new().fg(fg).add_modifier(Modifier::BOLD)
+    })
 }
 
 /// One grapheme's cell width, never less than one.
@@ -198,7 +196,8 @@ pub(crate) fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize)
         starts.push(wrapper.rows.len());
         let hits: Vec<usize> = line.match_indices(ULTRATHINK).map(|(at, _)| at).collect();
         for (byte, grapheme) in line.grapheme_indices(true) {
-            feed(&mut wrapper, grapheme, ultra_style(&hits, byte));
+            let open = hits.partition_point(|&at| at + ULTRATHINK.len() <= byte);
+            feed(&mut wrapper, grapheme, ultra_style(hits.get(open), byte));
         }
         wrapper.hard_break();
     }
@@ -290,6 +289,14 @@ mod tests {
         let word: String = hits.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(word, ULTRATHINK);
         assert!(hits.windows(2).any(|w| w[0].style != w[1].style));
+        // Bold, anchored to the palette's start, case-sensitive, repeatable.
+        let expect = Style::new().fg(RAINBOW[0]).add_modifier(Modifier::BOLD);
+        assert_eq!(hits[0].style, expect);
+        let upper = wrap_draft(&["ULTRATHINK".to_string()], (0, 0), 30).rows;
+        assert!(upper[0].spans.iter().all(|s| s.style == Style::new()));
+        let twice = wrap_draft(&["ultrathinkultrathink".to_string()], (0, 0), 30).rows;
+        assert_eq!(twice[0].spans.len(), 2 * ULTRATHINK.len());
+        assert_eq!(twice[0].spans[0].style, twice[0].spans[ULTRATHINK.len()].style);
     }
 
     #[test]
