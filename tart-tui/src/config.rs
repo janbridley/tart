@@ -216,12 +216,12 @@ impl Config {
     ) {
         match self.resolve(&choice.provider, &choice.name) {
             Ok(next) => {
-                agent.set_model(next.base_url.clone(), next.api_key.clone(), next.model.clone());
+                pane.note(format!("model: {next}"));
+                agent.set_model(next.base_url, next.api_key, next.model);
                 if let Some(effort) = next.effort {
                     agent.set_reasoning_effort(effort);
                 }
                 pane.set_context_tokens(next.context_tokens);
-                pane.note(format!("model: {next}"));
             }
             Err(error) => pane.note(error.to_string()),
         }

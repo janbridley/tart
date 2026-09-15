@@ -179,20 +179,36 @@ impl Agents {
         agent.spawn(&transcript, move |progress| {
             // A terminal outcome is stored before the event forwards, so
             // whoever acts on the event always finds the outcome already
-            // registered
+            // registered. The event keeps its own copy for the front end.
             if let Some(outcome) = progress.outcome() {
-                inner.with_child(id, |child| child.outcome = Some(outcome.clone()));
+                inner.with_child(id, move |child| child.outcome = Some(outcome));
             }
             (inner.events)(id, progress);
         });
         Ok(id)
     }
 
-    /// The subagent's terminal result, when it has ended: a peek that claims
-    /// nothing, for drawing its box. Delivery is [`Agents::take_outcome`].
+    /// Run `f` on the subagent's terminal result, when it has ended.
+    ///
+    /// Delivery is [`Agents::take_outcome`].
     #[inline]
-    pub fn outcome(&self, id: AgentId) -> Option<Outcome> {
-        self.inner.with_child(id, |child| child.outcome.clone()).flatten()
+    pub fn with_outcome<R, F: FnOnce(&Outcome) -> R>(&self, id: AgentId, f: F) -> Option<R> {
+        self.inner
+            .with_child(id, |child| child.outcome.as_ref().map(f))
+            .flatten()
+    }
+
+    /// Whether the subagent has ended.
+    ///
+    /// False for a child still running, one that never ran, and one whose report was
+    /// already delivered.
+    #[inline]
+    #[must_use]
+    pub fn done(&self, id: AgentId) -> bool {
+        matches!(
+            self.inner.with_child(id, |child| child.outcome.is_some()),
+            Some(true)
+        )
     }
 
     /// Claim the subagent's terminal result, with the task it ran: the one
@@ -349,7 +365,7 @@ mod tests {
         // `/stop` still ends it: the child's own lever works.
         registry.cancel(id);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while registry.outcome(id).is_none() {
+        while !registry.done(id) {
             assert!(std::time::Instant::now() < deadline, "the child ends");
             std::thread::sleep(Duration::from_millis(10));
         }

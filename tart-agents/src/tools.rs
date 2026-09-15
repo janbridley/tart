@@ -370,7 +370,10 @@ fn run_spawn_agent<B: Backend, F: Fn(Progress)>(
                 let text = format!("started subagent {id}: {}", spawn.task);
                 (text.clone(), text, Some(0))
             }
-            Err(error) => (error.to_string(), error.to_string(), None),
+            Err(error) => {
+                let text = error.to_string();
+                (text.clone(), text, None)
+            }
         }
     })
 }
@@ -410,7 +413,10 @@ fn run_check_agent<B: Backend, F: Fn(Progress)>(
                 );
                 (text.clone(), text, None)
             }
-            Err(error) => (error.to_string(), error.to_string(), None),
+            Err(error) => {
+                let text = error.to_string();
+                (text.clone(), text, None)
+            }
         }
     })
 }
@@ -516,10 +522,12 @@ fn tail_cap(text: &str, cap: usize) -> String {
     format!("[truncated; last {} KB shown]\n{}", cap / 1024, &text[start..])
 }
 
-/// Keep the first and last `cap / 2` bytes of `text`, marking the omitted middle.
-pub fn bounded(text: &str, cap: usize) -> String {
+/// Keep the first and last `cap / 2` bytes of `text`, marking the omitted
+/// middle; under-cap text moves through untouched, so a caller handing over
+/// dead ownership pays nothing.
+pub fn bounded(text: String, cap: usize) -> String {
     if text.len() <= cap {
-        return text.to_string();
+        return text;
     }
     let half = cap / 2;
     // Slicing must land on a char boundary; lossy decoding made `text` valid.
@@ -621,6 +629,8 @@ fn traced<F: Fn(Progress)>(
         arguments: call.arguments.clone(),
     });
     let (result, output, exit) = run();
+    // Display-only copy of the text is bounded to match the string we pass to the model
+    let output = bounded(output, CONTENT_CAP);
     on_progress(Progress::ToolOutput {
         id: call.call_id.clone(),
         output,
@@ -1004,10 +1014,10 @@ mod tests {
 
     #[test]
     fn bounded_keeps_both_ends_and_marks_the_middle() {
-        assert_eq!(bounded("hi\n", 10), "hi\n");
+        assert_eq!(bounded("hi\n".to_string(), 10), "hi\n");
 
         let text = "abcdef".repeat(1024); // 6 KB
-        let capped = bounded(&text, 2048);
+        let capped = bounded(text.clone(), 2048);
         let (head, rest) = capped.split_once('\n').unwrap();
         let (marker, tail) = rest.split_once('\n').unwrap();
         assert_eq!(marker, "[truncated; first and last 1 KB shown]");
@@ -1016,7 +1026,7 @@ mod tests {
 
         // Multi-byte characters must not split at either cut.
         let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
-        let capped = bounded(&wide, 2048);
+        let capped = bounded(wide, 2048);
         let (head, rest) = capped.split_once('\n').unwrap();
         let (marker, tail) = rest.split_once('\n').unwrap();
         assert_eq!(marker, "[truncated; first and last 1 KB shown]");
@@ -1225,6 +1235,33 @@ mod tests {
         assert_eq!(
             execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}),
             "done"
+        );
+    }
+
+    /// An output past the cap reaches the model whole but the front end capped,
+    /// with the marker the model's own history carries: expanded view shows
+    /// exactly what the model saw.
+    #[test]
+    fn oversized_output_reaches_the_front_end_capped() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = traced(
+            &bash_call(r#"{"command":"echo hi"}"#),
+            &|progress| events.borrow_mut().push(progress),
+            || {
+                let text = "x".repeat(70_000);
+                (text.clone(), text, Some(0))
+            },
+        );
+
+        assert_eq!(result.len(), 70_000, "the model sees the whole text");
+        assert!(
+            matches!(
+                events.borrow().as_slice(),
+                [Progress::ToolStart { .. }, Progress::ToolOutput { output, .. }]
+                    if output.len() < 70_000
+                        && output.contains("[truncated; first and last 32 KB shown]")
+            ),
+            "the event's copy is capped like the model's history"
         );
     }
 

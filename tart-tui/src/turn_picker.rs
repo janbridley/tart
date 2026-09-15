@@ -29,10 +29,13 @@ pub(crate) fn rewind_picker(
     // rewinding there empties the conversation: a `/clear` into a fresh file.
     let start_row = (turns.first()?.0, String::new());
     let mut picks: Vec<_> = turns
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(_, (_, text))| !synthetic(text))
-        .map(|(number, (start, text))| ((*start, text.clone()), label(number + 1, text)))
+        .map(|(number, (start, text))| {
+            let label = label(number + 1, &text);
+            ((start, text), label)
+        })
         .collect();
     // Newest first: the closest rewind point leads the unfiltered list.
     picks.reverse();

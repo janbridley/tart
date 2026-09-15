@@ -510,14 +510,12 @@ fn on_child_event(
             // The peek resolves the box and queues the id; the
             // claim happens at delivery, so a `wait` inside this
             // turn can still take the report for itself.
-            match agents.outcome(id) {
-                Some(outcome) => {
+            match agents.with_outcome(id, |outcome| {
+                (outcome.report(), matches!(outcome, Outcome::Done(_)).then_some(0))
+            }) {
+                Some((report, exit)) => {
                     pane.report(id);
-                    pane.finish_agent(
-                        id,
-                        outcome.report(),
-                        matches!(outcome, Outcome::Done(_)).then_some(0),
-                    );
+                    pane.finish_agent(id, report, exit);
                 }
                 None => pane.finish_agent(id, "report delivered through wait".to_string(), Some(0)),
             }

@@ -920,10 +920,8 @@ impl Pane {
         }
         self.transcript
             .push(Line::from(Span::styled("● ".to_string(), DIM_STYLE)));
-        // The reports are the agents' words, not the user's, so the report text is dim
-        self.transcript
-            .append_span(&Span::styled(text.clone(), DIM_STYLE));
         transcript.push_user(format!("{REPORTS_AT}\n\n{text}"))?;
+        self.transcript.append_span(&Span::styled(text, DIM_STYLE));
         self.start_turn(agent, false, transcript, wake);
         Ok(true)
     }
@@ -1455,7 +1453,7 @@ mod tests {
     /// Poll the registry until every `id` has an outcome.
     fn await_outcome(agents: &Agents, ids: &[AgentId]) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while ids.iter().any(|id| agents.outcome(*id).is_none()) {
+        while ids.iter().any(|id| !agents.done(*id)) {
             assert!(std::time::Instant::now() < deadline, "the children end");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -1856,7 +1854,7 @@ mod tests {
 
         registry.cancel(id);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while registry.outcome(id).is_none() {
+        while !registry.done(id) {
             assert!(std::time::Instant::now() < deadline, "the child ends");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
