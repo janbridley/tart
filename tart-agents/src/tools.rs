@@ -370,7 +370,10 @@ fn run_spawn_agent<B: Backend, F: Fn(Progress)>(
                 let text = format!("started subagent {id}: {}", spawn.task);
                 (text.clone(), text, Some(0))
             }
-            Err(error) => (error.to_string(), error.to_string(), None),
+            Err(error) => {
+                let text = error.to_string();
+                (text.clone(), text, None)
+            }
         }
     })
 }
@@ -410,7 +413,10 @@ fn run_check_agent<B: Backend, F: Fn(Progress)>(
                 );
                 (text.clone(), text, None)
             }
-            Err(error) => (error.to_string(), error.to_string(), None),
+            Err(error) => {
+                let text = error.to_string();
+                (text.clone(), text, None)
+            }
         }
     })
 }
