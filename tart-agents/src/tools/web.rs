@@ -508,15 +508,16 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
                     return (command_text(&text, output.status), text, exit);
                 }
                 // Success: split and check where redirects landed.
-                let checked = match separate_final_url(&text) {
-                    Some((body, final_url)) => match private_redirect(final_url) {
-                        Some(refused) => return (refused.clone(), refused, exit),
-                        None => body,
-                    },
-                    None => text.as_str(),
-                };
-                let text = checked.to_string();
-                (command_text(&text, output.status), text, exit)
+                if let Some((body, final_url)) = separate_final_url(&text) {
+                    if let Some(refused) = private_redirect(final_url) {
+                        (refused.clone(), refused, exit)
+                    } else {
+                        let text = body.to_string();
+                        (command_text(&text, output.status), text, exit)
+                    }
+                } else {
+                    (command_text(&text, output.status), text, exit)
+                }
             }
         }
     })
