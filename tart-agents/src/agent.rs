@@ -531,7 +531,15 @@ impl<B: Backend> Agent<B> {
                 }
                 // Tool calls exit with errors/denial text/parse failures if they fail
                 let output = tools::execute(&call, &tooling, on_progress);
-                let bounded = bounded_for_history(&call.name, &output, on_progress);
+                // History keeps no more than the cap, noted when it cut.
+                if output.len() > tools::CONTENT_CAP {
+                    on_progress(Progress::Note(format!(
+                        "{} output truncated to {} KiB",
+                        call.name,
+                        tools::CONTENT_CAP / 1024
+                    )));
+                }
+                let bounded = tools::bounded(output, tools::CONTENT_CAP);
                 exchanges.push((call, bounded));
             }
             // A round cut short before its first executed call records no
@@ -566,18 +574,6 @@ impl<B: Backend> Agent<B> {
 
 fn with_last_error(message: &str, last_error: Option<String>) -> String {
     last_error.map_or_else(|| message.to_string(), |error| format!("{message}: {error}"))
-}
-
-/// Bound one tool result before it enters history.
-fn bounded_for_history<F: Fn(Progress)>(name: &str, output: &str, on_progress: &F) -> String {
-    let capped = tools::bounded(output, tools::CONTENT_CAP);
-    if output.len() > tools::CONTENT_CAP {
-        on_progress(Progress::Note(format!(
-            "{name} output truncated to {} KiB",
-            tools::CONTENT_CAP / 1024
-        )));
-    }
-    capped
 }
 
 /// Deliver the generation's terminal event, mirroring its outcome to the debug lob.
