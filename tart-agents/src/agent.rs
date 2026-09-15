@@ -1186,7 +1186,7 @@ mod tests {
     /// until the worker reports one, bounded so a stuck child fails the test.
     fn settled(agents: &crate::Agents, id: crate::AgentId) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while agents.outcome(id).is_none() {
+        while !agents.done(id) {
             assert!(std::time::Instant::now() < deadline, "the child ends");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

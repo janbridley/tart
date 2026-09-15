@@ -1455,7 +1455,7 @@ mod tests {
     /// Poll the registry until every `id` has an outcome.
     fn await_outcome(agents: &Agents, ids: &[AgentId]) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while ids.iter().any(|id| agents.outcome(*id).is_none()) {
+        while ids.iter().any(|id| !agents.done(*id)) {
             assert!(std::time::Instant::now() < deadline, "the children end");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -1856,7 +1856,7 @@ mod tests {
 
         registry.cancel(id);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while registry.outcome(id).is_none() {
+        while !registry.done(id) {
             assert!(std::time::Instant::now() < deadline, "the child ends");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
