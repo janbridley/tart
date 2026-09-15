@@ -36,6 +36,7 @@ use crate::session_picker::{derive_query as session_query, session_picker};
 use crate::turn_picker::rewind_picker;
 use copy::{CopyCursor, clamp_cell, window_top};
 use transcript::Transcript;
+pub(crate) use wrap::ULTRATHINK;
 use wrap::wrap_draft;
 
 pub(crate) use wrap::grapheme_width;

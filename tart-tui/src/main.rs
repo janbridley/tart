@@ -39,7 +39,7 @@ use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
 use init::Tui;
-use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
+use pane::{DIM_STYLE, Mode, Pane, PaneEvent, ULTRATHINK, Wake};
 use perf::Perf;
 use recorded::MANUAL_AT;
 use tart_agents::{
@@ -316,7 +316,13 @@ fn run(
                         // fresh submit, joining its turn.
                         pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
-                        pane.start_turn(agent, &transcript, &wake);
+                        // Temporarily enable max reasoning effort.
+                        let mut turn = agent.clone();
+                        if line.contains(ULTRATHINK) {
+                            pane.note("ultrathink · max reasoning for this turn");
+                            turn.set_reasoning_effort(ReasoningEffort::Max);
+                        }
+                        pane.start_turn(&turn, &transcript, &wake);
                     }
                 },
                 // A session picked in the `/resume` chooser swaps the conversation

@@ -1,6 +1,6 @@
 //! The word-wrap engine: styled transcript lines and the draft to display rows.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -8,6 +8,21 @@ use super::SpansExt;
 
 /// Spaces a tab renders as.
 const TAB_WIDTH: usize = 4;
+
+/// Trigger max reasoning for one turn.
+pub(crate) const ULTRATHINK: &str = "ultrathink";
+/// The palette cycled across the keyword's characters.
+const RAINBOW: [Color; 4] = [Color::Red, Color::Yellow, Color::Cyan, Color::Magenta];
+
+/// A draft grapheme's style: bold rainbow inside `ultrathink`, plain otherwise.
+fn ultra_style(hits: &[usize], byte: usize) -> Style {
+    hits.iter()
+        .find(|&at| *at <= byte && byte < at + ULTRATHINK.len())
+        .map_or(Style::new(), |&at| {
+            let fg = RAINBOW[(byte - at) % RAINBOW.len()];
+            Style::new().fg(fg).add_modifier(Modifier::BOLD)
+        })
+}
 
 /// One grapheme's cell width, never less than one.
 #[inline]
@@ -181,8 +196,9 @@ pub(crate) fn wrap_draft(lines: &[String], cursor: (usize, usize), width: usize)
     let mut starts = Vec::with_capacity(lines.len());
     for line in lines {
         starts.push(wrapper.rows.len());
-        for grapheme in line.graphemes(true) {
-            feed(&mut wrapper, grapheme, Style::new());
+        let hits: Vec<usize> = line.match_indices(ULTRATHINK).map(|(at, _)| at).collect();
+        for (byte, grapheme) in line.grapheme_indices(true) {
+            feed(&mut wrapper, grapheme, ultra_style(&hits, byte));
         }
         wrapper.hard_break();
     }
@@ -266,6 +282,15 @@ fn caret_in_rows(
 mod tests {
     use super::*;
     use crate::testutil::texts;
+
+    #[test]
+    fn ultrathink_paints_the_word_and_only_the_word() {
+        let rows = wrap_draft(&["go ultrathink ok".to_string()], (0, 0), 30).rows;
+        let hits: Vec<&Span> = rows[0].spans.iter().filter(|s| s.style != Style::new()).collect();
+        let word: String = hits.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(word, ULTRATHINK);
+        assert!(hits.windows(2).any(|w| w[0].style != w[1].style));
+    }
 
     #[test]
     fn wraps_words_hard_breaks_and_keeps_non_ascii_spaces() {
