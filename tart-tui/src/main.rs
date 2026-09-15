@@ -39,7 +39,7 @@ use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
 use init::Tui;
-use pane::{DIM_STYLE, Mode, Pane, PaneEvent, Wake};
+use pane::{DIM_STYLE, Mode, Pane, PaneEvent, ULTRATHINK, Wake};
 use perf::Perf;
 use recorded::MANUAL_AT;
 use tart_agents::{
@@ -223,7 +223,7 @@ fn run(
                         pane.note("plan approved · implementing");
                         pane.echo(prompts::PLAN_APPROVAL);
                         transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
-                        pane.start_turn(agent, &transcript, &wake);
+                        pane.start_turn(agent, false, &transcript, &wake);
                     }
                 }
                 Some(PaneEvent::Submit(line)) => match line.trim() {
@@ -314,9 +314,11 @@ fn run(
                     _ => {
                         // A queued message drains into the record ahead of the
                         // fresh submit, joining its turn.
+                        // An `ultrathink` in the line or the queue boosts this one turn.
+                        let ultrathink = line.contains(ULTRATHINK) || pane.queue_has_ultrathink();
                         pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
-                        pane.start_turn(agent, &transcript, &wake);
+                        pane.start_turn(agent, ultrathink, &transcript, &wake);
                     }
                 },
                 // A session picked in the `/resume` chooser swaps the conversation

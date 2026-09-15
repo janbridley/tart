@@ -273,6 +273,13 @@ impl<B: Backend> Agent<B> {
         self.effort = Some(effort);
     }
 
+    /// The configured effort, so a caller can layer a one-turn boost on it.
+    #[inline]
+    #[must_use]
+    pub fn configured_effort(&self) -> Option<ReasoningEffort> {
+        self.effort
+    }
+
     /// Run one generation on its own thread, reporting progress to `on_progress`.
     ///
     /// The worker records its turns (reasoning, tool exchanges, final answer) into the
@@ -281,6 +288,18 @@ impl<B: Backend> Agent<B> {
     /// worker panics.
     #[inline]
     pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
+        self.spawn_with(self.effort, transcript, on_progress);
+    }
+
+    /// [`Self::spawn`] at a caller-chosen effort: the `ultrathink` boost
+    /// passes max without touching the agent, so children keep their effort.
+    #[inline]
+    pub fn spawn_with<F: Fn(Progress) + Send + 'static>(
+        &self,
+        effort: Option<ReasoningEffort>,
+        transcript: &Transcript,
+        on_progress: F,
+    ) {
         let agent = self.clone();
         let transcript = transcript.clone();
         // This turn's wake channel: the sender waits where Esc can reach it, and
@@ -290,7 +309,7 @@ impl<B: Backend> Agent<B> {
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                agent.run(&transcript, receiver, &token, &on_progress);
+                agent.run(effort, &transcript, receiver, &token, &on_progress);
             }));
             // The turn is over: retire the lever unless a newer turn claimed it.
             agent.control.release(generation);
@@ -335,6 +354,7 @@ impl<B: Backend> Agent<B> {
     )]
     fn run<F: Fn(Progress)>(
         &self,
+        effort: Option<ReasoningEffort>,
         transcript: &Transcript,
         mut cancel_rx: mpsc::Receiver<()>,
         token: &CancelToken,
@@ -354,7 +374,7 @@ impl<B: Backend> Agent<B> {
             // record, and the tools the model has this round.
             let mut stream = match self.runtime.block_on(self.backend.round(
                 &self.model,
-                self.effort,
+                effort,
                 transcript.request_items(),
                 self.tools_for(),
             )) {
@@ -619,6 +639,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn children_keep_the_configured_effort() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
+        agent.set_reasoning_effort(ReasoningEffort::Low);
+        assert_eq!(agent.configured_effort(), Some(ReasoningEffort::Low));
+        assert_eq!(agent.child().configured_effort(), Some(ReasoningEffort::Low));
+    }
+
     /// `/model` swaps the endpoint and model, keeping the runtime, policies, and turn
     #[test]
     fn set_model_swaps_the_endpoint_and_resets_effort() {
@@ -704,7 +733,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let handle = agent.handle();
         let (generation, token) = handle.claim(sender);
-        agent.run(transcript, receiver, &token, &|progress| {
+        agent.run(None, transcript, receiver, &token, &|progress| {
             log.lock().unwrap().push(format!("{progress:?}"));
         });
         handle.release(generation);
@@ -794,7 +823,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let handle = agent.handle();
         let (generation, token) = handle.claim(sender);
-        agent.run(&transcript, receiver, &token, &|progress| {
+        agent.run(None, &transcript, receiver, &token, &|progress| {
             log.lock().unwrap().push(format!("{progress:?}"));
         });
         handle.release(generation);
