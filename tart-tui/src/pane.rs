@@ -920,10 +920,8 @@ impl Pane {
         }
         self.transcript
             .push(Line::from(Span::styled("● ".to_string(), DIM_STYLE)));
-        // The reports are the agents' words, not the user's, so the report text is dim
-        self.transcript
-            .append_span(&Span::styled(text.clone(), DIM_STYLE));
         transcript.push_user(format!("{REPORTS_AT}\n\n{text}"))?;
+        self.transcript.append_span(&Span::styled(text, DIM_STYLE));
         self.start_turn(agent, false, transcript, wake);
         Ok(true)
     }
