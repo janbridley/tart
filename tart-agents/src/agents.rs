@@ -179,9 +179,9 @@ impl Agents {
         agent.spawn(&transcript, move |progress| {
             // A terminal outcome is stored before the event forwards, so
             // whoever acts on the event always finds the outcome already
-            // registered
+            // registered. The event keeps its own copy for the front end.
             if let Some(outcome) = progress.outcome() {
-                inner.with_child(id, |child| child.outcome = Some(outcome.clone()));
+                inner.with_child(id, move |child| child.outcome = Some(outcome));
             }
             (inner.events)(id, progress);
         });
