@@ -11,9 +11,8 @@ step at a time.
 
 Call `bash` with:
 
-- `command` (string): the bash command to run.
-- `timeout` (integer, optional): seconds the command may run before it is killed, 1-600;
-  default 120.
+- `command` (string): the command to execute.
+- `timeout` (number, optional): timeout in milliseconds, max 600000; default 120000.
 
 Each call is **independent**: there is no persistent shell, so the working directory,
 environment variables, and shell state do NOT carry over between calls. If you need a
@@ -113,14 +112,20 @@ progress when you check, defer to the user or end your turn.
 
 ## Execution Model
 
-- The tool result is the command's stdout followed by its stderr. To see them merged as
-  they were written, redirect with `2>&1` inside the command.
-- Exit status is surfaced: a failed command returns `[exit N]` followed by its output; a
-  command that succeeds with no output returns `done`.
-- A command may run for at most its `timeout` (seconds, 1-600; default 120). Past that
-  the command is killed with every process it started, and the result is
-  `[timed out after Ns]` followed by whatever output was captured before the kill. Plan
-  long work (full builds, long test suites) as steps that finish inside the limit.
+- The tool result is the command's stdout with its stderr as a separate paragraph below.
+  To see them merged as they were written, redirect with `2>&1` inside the command.
+- A successful command returns its output verbatim; one that succeeds with no output
+  returns `(Bash completed with no output)`. A failed command's output ends with
+  `Exit code N` as its final line. An exit code of 1 from `grep`, `rg`, `find`, `diff`,
+  `test`, `git diff`, or `git grep` counts as success: it means "no match" or "false".
+- A command may run for at most its `timeout` (milliseconds; default 120000, max
+  600000). Past that the command is killed with every process it started and cannot be
+  resumed. Timed-out commands will end with `Exit code 137` and
+  `Command timed out after Nm Ns` after whatever output was captured before the kill.
+  Plan long work (full builds, long test suites) as steps that finish inside the limit.
+- A success that prints more than 30,000 characters spills: the result points at a file
+  holding the full output and previews its start. A failure that large is excerpted head
+  and tail.
 
 ## Sandbox
 

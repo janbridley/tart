@@ -1,11 +1,11 @@
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::backends::{FunctionToolCall, Tool, tool};
 use nix::sys::signal::{Signal, killpg};
@@ -87,10 +87,10 @@ pub(crate) fn bash() -> Tool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "The bash command to run"},
+                "command": {"type": "string", "description": "The command to execute"},
                 "timeout": {
-                    "type": "integer",
-                    "description": "Seconds the command may run before it is killed (1-600); default 120"
+                    "type": "number",
+                    "description": "Optional timeout in milliseconds (max 600000)"
                 }
             },
             "required": ["command"]
@@ -207,6 +207,8 @@ struct Bash {
 }
 
 /// Extract the fields from a bash tool call's JSON arguments.
+///
+/// The timeout arrives in milliseconds, as in Claude Code, clamped to [1s, 10m]
 fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
     let args = parse_arguments(arguments)?;
     // `as_i64` so negatives join the clamp instead of falling to the default.
@@ -215,13 +217,13 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         clippy::cast_sign_loss,
         reason = "the clamp bounds the value to 1-600 seconds before either cast"
     )]
-    let seconds = args["timeout"]
+    let milliseconds = args["timeout"]
         .as_i64()
-        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_secs() as i64)
-        .clamp(1, MAX_BASH_TIMEOUT.as_secs() as i64) as u64;
+        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_millis() as i64)
+        .clamp(1000, MAX_BASH_TIMEOUT.as_millis() as i64) as u64;
     Ok(Bash {
         command: string_field(&args, "command")?,
-        timeout: Duration::from_secs(seconds),
+        timeout: Duration::from_millis(milliseconds),
     })
 }
 
@@ -421,30 +423,125 @@ fn run_check_agent<B: Backend, F: Fn(Progress)>(
     })
 }
 
-/// One finished process's combined streams: stdout then stderr, lossily decoded.
+/// One finished process's combined streams: stdout, then stderr as its own paragraph.
 fn combined_output(output: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => stderr.into_owned(),
+        (false, true) => stdout.into_owned(),
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
 }
 
-/// The model-facing framing of a finished command's text: prefixed with
-/// `[exit N]` when it failed, or `done` when a success printed nothing.
-fn command_text(text: &str, status: ExitStatus) -> String {
-    if status.success() {
+/// Whether an exit code of 1 from `command` counts as success.
+fn exit_one_is_success(command: &str) -> bool {
+    // The exempt list is transcribed from Claude Code's documented Bash behavior.
+    let mut words = command.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    // A leading path belongs to the binary's name.
+    let first = first.rsplit('/').next().unwrap_or(first);
+    match first {
+        "grep" | "rg" | "egrep" | "fgrep" | "find" | "diff" | "test" | "[" => true,
+        "git" => matches!(words.next(), Some("diff" | "grep")),
+        _ => false,
+    }
+}
+
+/// Maximum output sizes in characters before the data is spilled to a file.
+const BASH_SUCCESS_CAP: usize = 30_000;
+const BASH_FAILURE_CAP: usize = 10_000;
+
+/// How much of a spilled output previews inline, in characters.
+const SPILL_PREVIEW: usize = 2_048;
+
+/// The model-facing framing of a finished command's text.
+fn command_text(text: &str, status: ExitStatus, one_is_success: bool) -> String {
+    let success = status.success() || (one_is_success && status.code() == Some(1));
+    if success {
+        if text.chars().count() > BASH_SUCCESS_CAP {
+            return spill(text);
+        }
         return if text.is_empty() {
-            "done".to_string()
+            "(Bash completed with no output)".to_string()
         } else {
             text.to_string()
         };
     }
 
-    let status = status.code().map_or_else(|| "signal".into(), |c| c.to_string());
+    if text.chars().count() > BASH_FAILURE_CAP {
+        return append_line(&excerpt(text), &exit_line(status));
+    }
+    append_line(text, &exit_line(status))
+}
 
-    let separator = if text.is_empty() { "" } else { "\n" };
-    format!("[exit {status}]{separator}{text}")
+/// `text` with `line` appended as its own final line, without doubling a trailing `\n`
+fn append_line(text: &str, line: &str) -> String {
+    if text.is_empty() || text.ends_with('\n') {
+        format!("{text}{line}")
+    } else {
+        format!("{text}\n{line}")
+    }
+}
+
+/// The trailing failure line: the exit code, or the shell's conventional
+/// 128+signal for a death by signal.
+fn exit_line(status: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal));
+    format!("Exit code {}", code.unwrap_or(1))
+}
+
+/// A unique-enough scratch suffix: nanoseconds since the epoch.
+fn nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos())
+}
+
+/// tart's scratch directory under the temp root for spill files.
+fn spill_dir() -> PathBuf {
+    std::env::temp_dir().join("tart")
+}
+
+/// Write `text` to a scratch file and point the model at it, previewing the head.
+fn spill(text: &str) -> String {
+    let dir = spill_dir();
+    let name = format!("tart-bash-{}-{}.output", std::process::id(), nanos());
+    let path = dir.join(name);
+    if std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&path, text))
+        .is_err()
+    {
+        return excerpt(text);
+    }
+    let kilobytes = text.len() as f64 / 1024.0;
+    let preview: String = text.chars().take(SPILL_PREVIEW).collect();
+    format!(
+        "Output too large ({kilobytes:.1}KB). Full output saved to: {}\n\n{preview}",
+        path.display()
+    )
+}
+
+/// A head-and-tail excerpt of `text` at the failure cap, split at a character boundary
+fn excerpt(text: &str) -> String {
+    let half = BASH_FAILURE_CAP / 2;
+    let head: String = text.chars().take(half).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}\n{tail}")
 }
 
 /// Information required for a tool call, including sandbox and cancellation info.
@@ -476,10 +573,22 @@ enum KillReason {
     Cancelled,
 }
 
-/// Model-facing explanation for a command the timeout killed.
+/// Model-facing explanation for a command the timeout killed, in Claude
+///
+/// Kill's exit code, then the timeout line.
 fn timeout_text(text: &str, timeout: Duration) -> String {
-    let separator = if text.is_empty() { "" } else { "\n" };
-    format!("[timed out after {}s]{separator}{text}", timeout.as_secs())
+    use std::fmt::Write as _;
+
+    let mut framed = append_line(text, "Exit code 137");
+    // Infallible: the target is a `String`.
+    let _ = write!(framed, "\nCommand timed out after {}", duration_text(timeout));
+    framed
+}
+
+/// A Claude Code-style duration: `2m 0s`, `6m 40s`.
+fn duration_text(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    format!("{}m {}s", seconds / 60, seconds % 60)
 }
 
 /// Model-facing explanation for a command the user cancelled with Esc.
@@ -655,8 +764,6 @@ fn misuse<F: Fn(Progress)>(
 /// Run one bash tool call under `tools`, reporting its steps to `on_progress`.
 ///
 /// A command that outlives its timeout is killed with everything it started.
-/// The model sees `[timed out after Ns]` and any partial output; one the user
-/// cancelled mid-flight sees `[cancelled]`.
 fn run_bash<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_, B>,
@@ -677,8 +784,10 @@ fn run_bash<B: Backend, F: Fn(Progress)>(
                 let WatchedRun { output, killed } = run;
                 let text = combined_output(&output);
                 let exit = output.status.code();
+                let one_is_success =
+                    output.status.code() == Some(1) && exit_one_is_success(&bash.command);
                 match killed {
-                    // A kill has no exit code for the header, so we mark up the body.
+                    // A kill has no exit status of its own, so we mark up the body.
                     Some(KillReason::Timeout) => {
                         let marked = timeout_text(&text, bash.timeout);
                         (marked.clone(), marked, exit)
@@ -687,7 +796,7 @@ fn run_bash<B: Backend, F: Fn(Progress)>(
                         let marked = cancel_text(&text);
                         (marked.clone(), marked, exit)
                     }
-                    None => (command_text(&text, output.status), text, exit),
+                    None => (command_text(&text, output.status, one_is_success), text, exit),
                 }
             }
             Err(error) => {
@@ -709,7 +818,7 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
             match killed {
                 Some(KillReason::Cancelled) => cancel_text(&text),
                 // No deadline exists to outlive, so nothing else kills it.
-                _ => command_text(&text, output.status),
+                _ => command_text(&text, output.status, false),
             }
         }
         Err(error) => format!("error: {error}"),
@@ -877,14 +986,22 @@ mod tests {
     }
 
     #[test]
-    fn the_bash_definition_requires_a_command_and_offers_a_timeout() {
+    fn the_bash_definition_matches_claude_code() {
         let tool = serde_json::to_value(bash()).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "bash");
         assert_eq!(tool["parameters"]["required"][0], "command");
-        // The timeout rides along as an optional integer; command alone is required.
-        assert_eq!(tool["parameters"]["properties"]["timeout"]["type"], "integer");
+        assert_eq!(
+            tool["parameters"]["properties"]["command"]["description"],
+            "The command to execute"
+        );
+        // Claude Code's timeout: a number, in milliseconds, capped at ten minutes.
+        assert_eq!(tool["parameters"]["properties"]["timeout"]["type"], "number");
+        assert_eq!(
+            tool["parameters"]["properties"]["timeout"]["description"],
+            "Optional timeout in milliseconds (max 600000)"
+        );
         assert_eq!(tool["parameters"]["required"].as_array().unwrap().len(), 1);
     }
 
@@ -898,7 +1015,7 @@ mod tests {
 
     #[test]
     fn parse_bash_clamps_out_of_range_timeouts() {
-        let bash = parse_bash(r#"{"command":"sleep 5","timeout":9000}"#).unwrap();
+        let bash = parse_bash(r#"{"command":"sleep 5","timeout":9000000}"#).unwrap();
         assert_eq!(bash.timeout, MAX_BASH_TIMEOUT);
 
         // Both ends: a negative joins the clamp rather than falling to the default
@@ -906,6 +1023,12 @@ mod tests {
         assert_eq!(bash.timeout, Duration::from_secs(1));
         let bash = parse_bash(r#"{"command":"ls","timeout":-5}"#).unwrap();
         assert_eq!(bash.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parse_bash_reads_the_timeout_in_milliseconds() {
+        let bash = parse_bash(r#"{"command":"cargo build","timeout":300000}"#).unwrap();
+        assert_eq!(bash.timeout, Duration::from_secs(300));
     }
 
     #[test]
@@ -930,7 +1053,7 @@ mod tests {
     }
 
     /// The tool result for a finished command with a Unix wait status: 0 is a success,
-    /// `code << 8` an exit code, a small number a signal, framed as in the tui.
+    /// `code << 8` an exit code, a small number a signal, with no exemption.
     fn framed(raw: i32, stdout: &str, stderr: &str) -> String {
         use std::os::unix::process::ExitStatusExt;
 
@@ -939,7 +1062,7 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        command_text(&combined_output(&output), output.status)
+        command_text(&combined_output(&output), output.status, false)
     }
 
     #[test]
@@ -948,34 +1071,132 @@ mod tests {
     }
 
     #[test]
-    fn command_result_reports_a_silent_success_as_done() {
-        assert_eq!(framed(0, "", ""), "done");
+    fn command_result_reports_a_silent_success_explicitly() {
+        assert_eq!(framed(0, "", ""), "(Bash completed with no output)");
     }
 
     #[test]
-    fn command_result_prefixes_a_failure_with_its_exit_code() {
-        assert_eq!(framed(1 << 8, "hi\n", "boom\n"), "[exit 1]\nhi\nboom\n");
+    fn command_result_appends_the_exit_code_after_a_failure() {
+        // stderr paragraphs below stdout, exit code as the final line.
+        assert_eq!(framed(1 << 8, "hi\n", "boom\n"), "hi\n\nboom\nExit code 1");
     }
 
     #[test]
     fn command_result_marks_a_silent_failure_with_just_the_exit_code() {
-        assert_eq!(framed(1 << 8, "", ""), "[exit 1]");
+        assert_eq!(framed(1 << 8, "", ""), "Exit code 1");
     }
 
     #[test]
-    fn command_result_marks_a_signal_death() {
-        assert_eq!(framed(9, "", ""), "[exit signal]");
+    fn command_result_reports_a_signal_death_as_its_conventional_code() {
+        assert_eq!(framed(9, "", ""), "Exit code 137");
+    }
+
+    /// stderr reads as its own paragraph below stdout, as in Claude Code.
+    #[test]
+    fn command_result_paragraphs_stderr_below_stdout() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"no trailing newline".to_vec(),
+            stderr: b"warning\n".to_vec(),
+        };
+        assert_eq!(combined_output(&output), "no trailing newline\nwarning\n");
+    }
+
+    /// The search-and-test family's "no match" exit is a success.
+    #[test]
+    fn an_exit_one_from_the_search_family_is_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert!(exit_one_is_success("grep needle file"));
+        assert!(exit_one_is_success("/usr/bin/rg needle"));
+        assert!(exit_one_is_success("git diff --stat"));
+        assert!(exit_one_is_success("git grep needle"));
+        assert!(!exit_one_is_success("git push"));
+        assert!(!exit_one_is_success("cargo test"));
+
+        // The exemption only forgives an exit of exactly 1.
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            command_text("", output.status, exit_one_is_success("grep x")),
+            "(Bash completed with no output)"
+        );
+        let failed = Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            command_text("", failed.status, exit_one_is_success("grep x")),
+            "Exit code 2"
+        );
+    }
+
+    /// A success past the inline cap spills to a file and previews the start.
+    #[test]
+    fn an_oversized_success_spills_to_a_file() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let text = "x".repeat(BASH_SUCCESS_CAP + 1);
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.clone().into_bytes(),
+            stderr: Vec::new(),
+        };
+        let framed = command_text(&combined_output(&output), output.status, false);
+
+        let (message, preview) = framed.split_once("\n\n").unwrap();
+        let (size, saved) = message.split_once(". Full output saved to: ").unwrap();
+        assert!(size.starts_with("Output too large ("), "{framed}");
+        assert_eq!(preview.chars().count(), SPILL_PREVIEW, "{framed}");
+        // The spill lives in tart's throwaway directory, not the temp root.
+        let path = std::path::Path::new(saved);
+        assert_eq!(path.parent(), Some(spill_dir().as_path()), "{framed}");
+        // The spill file holds the whole output for a later `read`.
+        let file = std::fs::read_to_string(path).unwrap();
+        assert_eq!(file, text);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A failure past the inline cap shrinks to a head-and-tail excerpt.
+    #[test]
+    fn an_oversized_failure_excerpts_head_and_tail() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let text = format!(
+            "{}zzzz{}",
+            "a".repeat(BASH_FAILURE_CAP),
+            "b".repeat(BASH_FAILURE_CAP)
+        );
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: text.into_bytes(),
+            stderr: Vec::new(),
+        };
+        let framed = command_text(&combined_output(&output), output.status, false);
+
+        let (excerpted, code) = framed.split_once("\nExit code ").unwrap();
+        assert_eq!(code, "1");
+        let (head, tail) = excerpted.split_once('\n').unwrap();
+        assert_eq!(head.chars().count(), BASH_FAILURE_CAP / 2);
+        assert!(head.chars().all(|c| c == 'a'), "{head}");
+        assert!(tail.chars().all(|c| c == 'b'), "{tail}");
     }
 
     #[test]
-    fn timeout_text_prefixes_the_partial_output() {
+    fn timeout_text_appends_claude_code_kill_lines() {
         assert_eq!(
             timeout_text("partial\ntail\n", DEFAULT_BASH_TIMEOUT),
-            "[timed out after 120s]\npartial\ntail\n"
+            "partial\ntail\nExit code 137\nCommand timed out after 2m 0s"
         );
         assert_eq!(
-            timeout_text("still going\n", MAX_BASH_TIMEOUT),
-            "[timed out after 600s]\nstill going\n"
+            timeout_text("", MAX_BASH_TIMEOUT),
+            "Exit code 137\nCommand timed out after 10m 0s"
         );
     }
 
@@ -990,8 +1211,11 @@ mod tests {
     }
 
     #[test]
-    fn timeout_text_without_output_is_just_the_marker() {
-        assert_eq!(timeout_text("", DEFAULT_BASH_TIMEOUT), "[timed out after 120s]");
+    fn timeout_text_without_output_is_just_the_kill_lines() {
+        assert_eq!(
+            timeout_text("", DEFAULT_BASH_TIMEOUT),
+            "Exit code 137\nCommand timed out after 2m 0s"
+        );
     }
 
     #[test]
@@ -1038,11 +1262,14 @@ mod tests {
     #[test]
     fn manual_command_frames_success_and_failure() {
         assert_eq!(manual_command("echo hi", &CancelToken::new()), "hi\n");
-        assert_eq!(manual_command("true", &CancelToken::new()), "done");
-        assert_eq!(manual_command("false", &CancelToken::new()), "[exit 1]");
+        assert_eq!(
+            manual_command("true", &CancelToken::new()),
+            "(Bash completed with no output)"
+        );
+        assert_eq!(manual_command("false", &CancelToken::new()), "Exit code 1");
         assert_eq!(
             manual_command("echo boom >&2; exit 3", &CancelToken::new()),
-            "[exit 3]\nboom\n"
+            "boom\nExit code 3"
         );
     }
 
@@ -1227,14 +1454,23 @@ mod tests {
                 && output == "hi\n"
         ));
 
-        // The exit status reaches the model verbatim.
+        // A failure carries its exit code as the trailing line.
         assert_eq!(
             execute(&bash_call(r#"{"command":"false"}"#), &tools, &|_| {}),
-            "[exit 1]"
+            "Exit code 1"
         );
         assert_eq!(
             execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}),
-            "done"
+            "(Bash completed with no output)"
+        );
+        // The search family's "no match" exit of 1 reads as success.
+        assert_eq!(
+            execute(
+                &bash_call(r#"{"command":"grep needle /dev/null"}"#),
+                &tools,
+                &|_| {}
+            ),
+            "(Bash completed with no output)"
         );
     }
 

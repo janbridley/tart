@@ -298,7 +298,7 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
                         let marked = timeout_text(&text, SEARCH_TIMEOUT);
                         (marked.clone(), marked, exit)
                     } else {
-                        (command_text(&text, output.status), text, exit)
+                        (command_text(&text, output.status, false), text, exit)
                     }
                 }
                 Err(error) => {
@@ -505,7 +505,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
                 let exit = output.status.code();
                 let text = combined_output(&output);
                 if !output.status.success() {
-                    return (command_text(&text, output.status), text, exit);
+                    return (command_text(&text, output.status, false), text, exit);
                 }
                 // Success: split and check where redirects landed.
                 if let Some((body, final_url)) = separate_final_url(&text) {
@@ -513,10 +513,10 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
                         (refused.clone(), refused, exit)
                     } else {
                         let text = body.to_string();
-                        (command_text(&text, output.status), text, exit)
+                        (command_text(&text, output.status, false), text, exit)
                     }
                 } else {
-                    (command_text(&text, output.status), text, exit)
+                    (command_text(&text, output.status, false), text, exit)
                 }
             }
         }
