@@ -345,8 +345,8 @@ impl Policy {
         }
         if let Some(temp) = &self.temp {
             cmd.env("TMPDIR", temp);
-            // Matplotlib needs a writable config dir
-            cmd.env("MPLCONFIGDIR", temp);
+            // matplotlib needs a writable config dir; home is unreadable.
+            cmd.env("MPLCONFIGDIR", temp.join("matplotlib"));
         }
         cmd
     }
@@ -820,6 +820,8 @@ mod tests {
         );
     }
 
+    /// Every rendered profile carries the uv, gitignore, and homebrew grants
+    /// from `sbpl/extras.sbpl`, and none of the excluded paths.
     #[test]
     fn every_profile_carries_the_uv_brew_and_gitignore_grants() {
         let dir = tempfile::tempdir().unwrap();
@@ -850,7 +852,7 @@ mod tests {
         // Only the ignore file: the global git config stays denied, keeping the
         // sandboxed git hermetic.
         assert!(
-            !rendered.contains(r#"git/config"#),
+            !rendered.contains("git/config"),
             "the git config must stay denied: {rendered}"
         );
     }
@@ -1034,7 +1036,9 @@ mod tests {
         }
         if let Some(temp) = &policy.temp {
             assert!(vars.contains(&(OsStr::new("TMPDIR"), temp.as_os_str())));
-            assert!(vars.contains(&(OsStr::new("MPLCONFIGDIR"), temp.as_os_str())));
+            assert!(
+                vars.contains(&(OsStr::new("MPLCONFIGDIR"), temp.join("matplotlib").as_os_str()))
+            );
         }
     }
 
@@ -1504,5 +1508,35 @@ mod tests {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// The exclusion half of the brew grant, live: `etc` stays unlistable and
+    /// `brew` itself cannot run.
+    ///
+    /// Live: reaches `sandbox-exec`, so it skips in a nested sandbox; each
+    /// probe is skipped when its target does not exist on this machine.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn brew_exclusions_stay_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy::new(dir.path()).unwrap();
+        for (cmd, present) in [
+            ("ls /opt/homebrew/etc", Path::new("/opt/homebrew/etc").is_dir()),
+            (
+                "/opt/homebrew/bin/brew --version",
+                Path::new("/opt/homebrew/bin/brew").is_file(),
+            ),
+        ] {
+            if !present {
+                continue;
+            }
+            let out = policy.command("/bin/sh").arg("-c").arg(cmd).output().unwrap();
+            assert!(
+                !out.status.success()
+                    && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted"),
+                "the sandbox must deny `{cmd}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
