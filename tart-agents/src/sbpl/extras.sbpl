@@ -5,9 +5,21 @@
 
 ; Allow uv-managed CPython installs to run in the seatbelt, so venv shims like
 ; .venv/bin/python (symlinks into ~/.local/share/uv/python/...) can execute and
-; load their stdlib.
+; load their stdlib. The (/|$) anchor also matches the directory itself, so it
+; can be listed.
 (allow file-read* file-test-existence file-map-executable
-  (regex #"^/Users/[^/]+/\.local/share/uv/"))
+  (regex #"^/Users/[^/]+/\.local/share/uv(/|$)"))
+
+; The uv cache, read-only: cached wheels can be copied into venvs, but the
+; cache cannot be refreshed and no build environments can be created in it.
+(allow file-read* file-test-existence
+  (regex #"^/Users/[^/]+/\.cache/uv(/|$)"))
+
+; The global gitignore: git defaults core.excludesFile to $XDG_CONFIG_HOME/git/ignore
+; and warns "unable to access ... Operation not permitted" on every call when HOME is
+; set but unreadable. config and attributes stay denied.
+(allow file-read* file-test-existence
+  (regex #"^/Users/[^/]+/\.config/git/ignore$"))
 
 ; Allow reading the cargo home (~/.cargo): the rustup shims in bin/, the user
 ; config at the top level, and the cached registry and git checkouts it builds
@@ -20,3 +32,14 @@
 ; Allow the ~/.rustup toolchains the cargo shim execs into.
 (allow file-read* file-test-existence file-map-executable
   (regex #"^/Users/[^/]+/\.rustup/"))
+
+; Homebrew on Apple Silicon
+; lib needs file-map-executable even though the platform defaults read it, or brew
+; binaries cannot load their dylibs. etc/ and var/ (service configs, databases, logs),
+; Caskroom, and share are deliberately excluded.
+(allow file-read* file-test-existence file-map-executable
+  (subpath "/opt/homebrew/bin")
+  (subpath "/opt/homebrew/opt")
+  (subpath "/opt/homebrew/Cellar")
+  (subpath "/opt/homebrew/lib")
+  (subpath "/opt/homebrew/Frameworks"))

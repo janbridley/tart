@@ -34,8 +34,10 @@
 //!
 //! - Network access is denied (the base profile is `(deny default)`).
 //! - The child environment is cleared except for a minimal `PATH` (the system
-//!   directories, plus the rustup shims in `~/.cargo/bin` when present), the
-//!   granted temp directory, and `HOME`, so paths like `~/.cargo` resolve.
+//!   directories, plus `~/.cargo/bin` and `/opt/homebrew/bin` when present), the
+//!   granted temp directory (`TMPDIR`, and `MPLCONFIGDIR` so matplotlib caches
+//!   in scratch instead of the unreadable home directory), and `HOME`, so paths
+//!   like `~/.cargo` resolve.
 //!   With the environment cleared, secrets held by the caller cannot be printed
 //!   into captured output. Re-add variables with the usual `std` methods.
 //! - Git's global and system configuration are voided
@@ -43,9 +45,11 @@
 //!   effectively a read-only git tool.
 //! - Standard input is [`Stdio::null`](std::process::Stdio::null) by default, and the
 //!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices.
-//! - Binaries outside the platform read baseline (for example `/opt/homebrew/bin`)
-//!   cannot be executed unless their directory is granted with
-//!   [`Policy::add_read_only_root`] or `sbpl/extras.sbpl`.
+//! - Homebrew under `/opt/homebrew` is readable and executable, minus `etc`,
+//!   `var`, `Caskroom`, `share`, and the brew runtime itself (`Library`, `Taps`),
+//!   so `brew` commands fail outright (see `sbpl/extras.sbpl`). Binaries outside
+//!   that prefix stay unexecutable: [`Policy::add_read_only_root`] grants
+//!   reads, not `file-map-executable`.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -61,18 +65,24 @@ const SANDBOXED_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// The `PATH` seeded into the sandboxed child.
 ///
-/// Includes the system baseline, plus rustup shims in `~/.cargo/bin` when that
-/// directory exists so agents can run `cargo`.
+/// Includes the system baseline, plus the rustup shims in `~/.cargo/bin` and
+/// homebrew in `/opt/homebrew/bin` when those directories exist, so agents
+/// can run `cargo` and brew-installed tools.
 fn sandboxed_path() -> OsString {
     let mut path = OsString::from(SANDBOXED_PATH);
     if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-        let cargo_bin = Path::new(&home).join(".cargo/bin");
-        if cargo_bin.is_dir() {
-            path.push(":");
-            path.push(cargo_bin.as_os_str());
-        }
+        append_if_dir(&mut path, &Path::new(&home).join(".cargo/bin"));
     }
+    append_if_dir(&mut path, Path::new("/opt/homebrew/bin"));
     path
+}
+
+/// Append `:/dir` to a seeded `PATH` when `dir` exists.
+fn append_if_dir(path: &mut OsString, dir: &Path) {
+    if dir.is_dir() {
+        path.push(":");
+        path.push(dir);
+    }
 }
 
 // Vendored from openai/codex `codex-rs/sandboxing/src` at commit
@@ -335,6 +345,8 @@ impl Policy {
         }
         if let Some(temp) = &self.temp {
             cmd.env("TMPDIR", temp);
+            // matplotlib needs a writable config dir; home is unreadable.
+            cmd.env("MPLCONFIGDIR", temp.join("matplotlib"));
         }
         cmd
     }
@@ -808,6 +820,43 @@ mod tests {
         );
     }
 
+    /// Every rendered profile carries the uv, gitignore, and homebrew grants
+    /// from `sbpl/extras.sbpl`, and none of the excluded paths.
+    #[test]
+    fn every_profile_carries_the_uv_brew_and_gitignore_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered = Policy::new(dir.path()).unwrap().render();
+
+        assert!(
+            rendered.contains(r#"regex #"^/Users/[^/]+/\.local/share/uv(/|$)""#),
+            "uv installs stay executable: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"regex #"^/Users/[^/]+/\.cache/uv(/|$)""#),
+            "the uv cache stays readable: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"regex #"^/Users/[^/]+/\.config/git/ignore$""#),
+            "only the global gitignore becomes readable: {rendered}"
+        );
+        assert!(rendered.contains(r#"(subpath "/opt/homebrew/bin")"#));
+        assert!(rendered.contains(r#"(subpath "/opt/homebrew/Cellar")"#));
+        // The exclusion intent is the security-relevant half: brew's runtime,
+        // service configs, databases, and logs stay denied.
+        for excluded in ["etc", "var", "share", "Caskroom", "Library", "Taps"] {
+            assert!(
+                !rendered.contains(&format!(r#"(subpath "/opt/homebrew/{excluded}")"#)),
+                "/opt/homebrew/{excluded} must stay denied: {rendered}"
+            );
+        }
+        // Only the ignore file: the global git config stays denied, keeping the
+        // sandboxed git hermetic.
+        assert!(
+            !rendered.contains("git/config"),
+            "the git config must stay denied: {rendered}"
+        );
+    }
+
     /// Empty, absolute, escaping, and root-identical exclusions are rejected.
     #[test]
     fn bad_exclusions_are_rejected() {
@@ -976,7 +1025,8 @@ mod tests {
         let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
         assert_eq!(
             vars.len(),
-            3 + usize::from(home.is_some()) + usize::from(policy.temp.is_some())
+            3 + usize::from(home.is_some()) + 2 * usize::from(policy.temp.is_some()),
+            "TMPDIR and MPLCONFIGDIR ride along with the temp root"
         );
         assert!(vars.contains(&(OsStr::new("PATH"), sandboxed_path().as_os_str())));
         assert!(vars.contains(&(OsStr::new("GIT_CONFIG_GLOBAL"), OsStr::new("/dev/null"))));
@@ -986,24 +1036,28 @@ mod tests {
         }
         if let Some(temp) = &policy.temp {
             assert!(vars.contains(&(OsStr::new("TMPDIR"), temp.as_os_str())));
+            assert!(
+                vars.contains(&(OsStr::new("MPLCONFIGDIR"), temp.join("matplotlib").as_os_str()))
+            );
         }
     }
 
-    /// The seeded `PATH` is the system baseline, plus the rustup shims only when
-    /// `~/.cargo/bin` exists.
+    /// The seeded `PATH` is the system baseline, plus `~/.cargo/bin` and
+    /// `/opt/homebrew/bin`, each only when that directory exists.
     #[test]
-    fn sandboxed_path_appends_cargo_bin_only_when_present() {
-        let path = sandboxed_path();
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-        let cargo_bin = home.join(".cargo/bin");
-        if cargo_bin.is_dir() {
-            assert_eq!(
-                path,
-                OsString::from(format!("{SANDBOXED_PATH}:{}", cargo_bin.display()))
-            );
-        } else {
-            assert_eq!(path, OsString::from(SANDBOXED_PATH));
+    fn sandboxed_path_appends_present_toolchain_bins() {
+        let mut expected = OsString::from(SANDBOXED_PATH);
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            let cargo_bin = Path::new(&home).join(".cargo/bin");
+            if cargo_bin.is_dir() {
+                expected.push(":");
+                expected.push(cargo_bin.as_os_str());
+            }
         }
+        if Path::new("/opt/homebrew/bin").is_dir() {
+            expected.push(":/opt/homebrew/bin");
+        }
+        assert_eq!(sandboxed_path(), expected);
     }
 
     /// Callers extend the command with plain std methods, after `--`.
@@ -1340,6 +1394,148 @@ mod tests {
                 String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"),
                 "stderr: {}",
                 String::from_utf8_lossy(&denied.stderr)
+            );
+        }
+    }
+
+    /// The global gitignore grant exists so sandboxed git stays quiet: git
+    /// defaults `core.excludesFile` to `$XDG_CONFIG_HOME/git/ignore` and warns
+    /// `unable to access ... Operation not permitted` on every call when HOME
+    /// is set but otherwise unreadable.
+    ///
+    /// Live: reaches `sandbox-exec` and `git`, so it skips in a nested sandbox
+    /// or on a machine without git.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn git_does_not_warn_about_the_global_ignore() {
+        let probe = std::process::Command::new("git")
+            .arg("--version")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        if !probe.status.success() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let policy = Policy::new(repo.path()).unwrap();
+        let run = |args: &[&str]| {
+            policy
+                .command("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+        };
+        let init = run(&["init", "-q", "-b", "main"]);
+        assert!(
+            init.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let status = run(&["status"]);
+        assert!(
+            status.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&status.stderr).contains("unable to access"),
+            "the ignore grant must keep git quiet: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    /// The uv directories are listable when present: the `(/|$)` anchor grants
+    /// the directory itself, not just its contents.
+    ///
+    /// Live: reaches `sandbox-exec`, so it skips in a nested sandbox, and each
+    /// directory is only probed when it exists.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn uv_directories_are_listable_when_present() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        for dir in [home.join(".local/share/uv"), home.join(".cache/uv")] {
+            if !dir.is_dir() {
+                continue;
+            }
+            let list = policy.command("/bin/ls").arg(&dir).output().unwrap();
+            assert!(
+                list.status.success(),
+                "{}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&list.stderr)
+            );
+        }
+    }
+
+    /// A homebrew binary executes and loads its dylibs under the default
+    /// grants; the first versioned tool found stands in for the prefix.
+    ///
+    /// The candidates must not read `~/.config` at startup: `gh` executes
+    /// under the grants but exits nonzero because its config file stays
+    /// denied, while `python3` and `node` load their dylibs through
+    /// `/opt/homebrew/opt`, which is what the map-exec grant covers.
+    ///
+    /// Live: reaches `sandbox-exec`, so it skips in a nested sandbox or on a
+    /// machine without any of the probed tools.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn homebrew_binary_runs_under_the_default_grant() {
+        let bin = [
+            "/opt/homebrew/bin/python3",
+            "/opt/homebrew/bin/jq",
+            "/opt/homebrew/bin/node",
+        ]
+        .into_iter()
+        .find(|bin| Path::new(bin).is_file());
+        let Some(bin) = bin else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = Policy::new(dir.path())
+            .unwrap()
+            .command(bin)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The exclusion half of the brew grant, live: `etc` stays unlistable and
+    /// `brew` itself cannot run.
+    ///
+    /// Live: reaches `sandbox-exec`, so it skips in a nested sandbox; each
+    /// probe is skipped when its target does not exist on this machine.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn brew_exclusions_stay_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy::new(dir.path()).unwrap();
+        for (cmd, present) in [
+            ("ls /opt/homebrew/etc", Path::new("/opt/homebrew/etc").is_dir()),
+            (
+                "/opt/homebrew/bin/brew --version",
+                Path::new("/opt/homebrew/bin/brew").is_file(),
+            ),
+        ] {
+            if !present {
+                continue;
+            }
+            let out = policy.command("/bin/sh").arg("-c").arg(cmd).output().unwrap();
+            assert!(
+                !out.status.success()
+                    && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted"),
+                "the sandbox must deny `{cmd}`: {}",
+                String::from_utf8_lossy(&out.stderr)
             );
         }
     }
