@@ -134,9 +134,11 @@ limits are intentional:
   network.
 - **Writes are confined to the working directory and `/tmp`** (and `/var/tmp`). Nothing
   else is writable.
-- **Your home directory is unreadable** (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`);
-  do not attempt to read credentials or keys. A `.env` inside the working directory is
-  readable like any other project file.
+- **Your home directory is otherwise unreadable** (`~/.ssh`, `~/.aws`, `~/.gnupg`, most
+  of `~/.config`); do not attempt to read credentials or keys. A `.env` inside the
+  working directory is readable like any other project file. The toolchain exceptions
+  are `~/.cargo`, `~/.rustup`, `~/.cache/uv`, and `~/.local/share/uv`, plus
+  `~/.config/git/ignore` and executables under `/opt/homebrew`.
 
 A `Permission denied` / `Operation not permitted` on the above is the sandbox doing its
 job, not a bug to work around.
