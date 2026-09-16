@@ -208,17 +208,20 @@ struct Bash {
 
 /// Extract the fields from a bash tool call's JSON arguments.
 ///
-/// The timeout arrives in milliseconds, as in Claude Code, clamped to [1s, 10m]
+/// The timeout arrives in milliseconds, as in Claude Code, clamped to the
+/// 10-minute ceiling. A request under a second is refused rather than clamped.
 fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
     let args = parse_arguments(arguments)?;
-    // `as_i64` so negatives join the clamp instead of falling to the default.
+    let requested = args["timeout"].as_i64();
+    if requested.is_some_and(|milliseconds| milliseconds < 1000) {
+        anyhow::bail!("error: timeout is measured in milliseconds; pass at least 1000");
+    }
     #[allow(
         clippy::cast_possible_wrap,
         clippy::cast_sign_loss,
-        reason = "the clamp bounds the value to 1-600 seconds before either cast"
+        reason = "the clamp bounds the value to 1-600 seconds before the cast"
     )]
-    let milliseconds = args["timeout"]
-        .as_i64()
+    let milliseconds = requested
         .unwrap_or(DEFAULT_BASH_TIMEOUT.as_millis() as i64)
         .clamp(1000, MAX_BASH_TIMEOUT.as_millis() as i64) as u64;
     Ok(Bash {
@@ -585,10 +588,14 @@ fn timeout_text(text: &str, timeout: Duration) -> String {
     framed
 }
 
-/// A Claude Code-style duration: `2m 0s`, `6m 40s`.
+/// A Claude Code-style duration: `1s`, `2m 0s`, `6m 40s`.
 fn duration_text(duration: Duration) -> String {
     let seconds = duration.as_secs();
-    format!("{}m {}s", seconds / 60, seconds % 60)
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
 }
 
 /// Model-facing explanation for a command the user cancelled with Esc.
@@ -1017,12 +1024,22 @@ mod tests {
     fn parse_bash_clamps_out_of_range_timeouts() {
         let bash = parse_bash(r#"{"command":"sleep 5","timeout":9000000}"#).unwrap();
         assert_eq!(bash.timeout, MAX_BASH_TIMEOUT);
+    }
 
-        // Both ends: a negative joins the clamp rather than falling to the default
-        let bash = parse_bash(r#"{"command":"ls","timeout":0}"#).unwrap();
-        assert_eq!(bash.timeout, Duration::from_secs(1));
-        let bash = parse_bash(r#"{"command":"ls","timeout":-5}"#).unwrap();
-        assert_eq!(bash.timeout, Duration::from_secs(1));
+    #[test]
+    fn parse_bash_refuses_a_sub_second_timeout() {
+        for arguments in [
+            r#"{"command":"ls","timeout":300}"#,
+            r#"{"command":"ls","timeout":999}"#,
+            r#"{"command":"ls","timeout":0}"#,
+            r#"{"command":"ls","timeout":-5}"#,
+        ] {
+            let error = parse_bash(arguments).unwrap_err().to_string();
+            assert!(
+                error.contains("timeout is measured in milliseconds"),
+                "{arguments}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1198,6 +1215,13 @@ mod tests {
             timeout_text("", MAX_BASH_TIMEOUT),
             "Exit code 137\nCommand timed out after 10m 0s"
         );
+        // Sub-minute durations carry no minute marker.
+        assert_eq!(
+            timeout_text("", Duration::from_millis(1000)),
+            "Exit code 137\nCommand timed out after 1s"
+        );
+        assert_eq!(duration_text(Duration::from_millis(59_999)), "59s");
+        assert_eq!(duration_text(Duration::from_secs(60)), "1m 0s");
     }
 
     /// A multi-byte head must not split a character at the cut.

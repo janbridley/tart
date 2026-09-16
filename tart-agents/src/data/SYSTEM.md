@@ -12,7 +12,9 @@ step at a time.
 Call `bash` with:
 
 - `command` (string): the command to execute.
-- `timeout` (number, optional): timeout in milliseconds, max 600000; default 120000.
+- `timeout` (number, optional): timeout in milliseconds, minimum 1000, max 600000;
+  default 120000. Values are milliseconds: `120` means a tenth of a second, not two
+  minutes.
 
 Each call is **independent**: there is no persistent shell, so the working directory,
 environment variables, and shell state do NOT carry over between calls. If you need a
