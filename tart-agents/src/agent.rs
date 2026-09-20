@@ -943,7 +943,7 @@ mod tests {
         assert!(
             items[3]["output"]
                 .as_str()
-                .is_some_and(|output| output.contains("missing 'path'")),
+                .is_some_and(|output| output.contains("missing 'file_path'")),
             "the call's error is its output: {}",
             items[3]["output"]
         );
@@ -1009,7 +1009,7 @@ mod tests {
             assert!(
                 items[output]["output"]
                     .as_str()
-                    .is_some_and(|text| text.contains("missing 'path'")),
+                    .is_some_and(|text| text.contains("missing 'file_path'")),
                 "the call's error is its output: {}",
                 items[output]["output"]
             );
@@ -1223,7 +1223,7 @@ mod tests {
 
     /// An output-item-done event carrying one finished function call: the
     /// shape a provider streams when the model calls a tool. This one calls
-    /// `read` without the required `path`; `index` keeps concurrent calls'
+    /// `read` without the required `file_path`; `index` keeps concurrent calls'
     /// ids distinct.
     fn call_done(index: usize) -> ResponseStreamEvent {
         ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {

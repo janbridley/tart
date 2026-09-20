@@ -1931,8 +1931,8 @@ mod tests {
                 Progress::ToolOutput { .. }
             ] if name == "read"
                 && arguments
-                    == &serde_json::json!({"path": file.path(), "start_line": null,
-                                           "end_line": null})
+                    == &serde_json::json!({"file_path": file.path(), "offset": null,
+                                           "limit": null})
                         .to_string()
         ));
 
@@ -1948,9 +1948,9 @@ mod tests {
                 if name == "read"
                     && arguments
                         == &serde_json::json!({
-                            "path": file.path(),
-                            "start_line": 10,
-                            "end_line": 12
+                            "file_path": file.path(),
+                            "offset": 10,
+                            "limit": 3
                         })
                         .to_string()
         ));
