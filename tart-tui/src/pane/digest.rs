@@ -83,7 +83,10 @@ fn parts(raw: &str) -> Option<(String, (u64, u64))> {
         .as_str()
         .or_else(|| args["path"].as_str())?
         .to_string();
-    let (start, end) = match (args["offset"].as_u64(), args["limit"].as_u64()) {
+    // Zeros count as omitted, matching how the reader itself treats them.
+    let offset = args["offset"].as_u64().filter(|&offset| offset > 0);
+    let limit = args["limit"].as_u64().filter(|&limit| limit > 0);
+    let (start, end) = match (offset, limit) {
         (Some(offset), Some(limit)) => (offset, offset.saturating_add(limit).saturating_sub(1)),
         (Some(offset), None) => (offset, u64::MAX),
         (None, Some(limit)) => (0, limit),
@@ -187,6 +190,12 @@ mod tests {
             ),
             ("read", r#"{"file_path":"a.rs","offset":28}"#, "Read(a.rs:28-)"),
             ("read", r#"{"file_path":"a.rs","limit":12}"#, "Read(a.rs:-12)"),
+            // Zeros count as omitted, so they do not invert the span.
+            (
+                "read",
+                r#"{"file_path":"a.rs","offset":0,"limit":12}"#,
+                "Read(a.rs:-12)",
+            ),
             // The subagent pair: the task spawned, the id checked on.
             (
                 "spawn_agent",

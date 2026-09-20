@@ -84,7 +84,7 @@ pub(crate) fn bash() -> Tool {
     tool(
         "bash",
         "Run a bash command in a sandbox (writes restricted to granted roots, no network) \
-        and return its combined stdout/stderr",
+        and return its stdout, with stderr as a separate paragraph below",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -212,22 +212,24 @@ struct Bash {
 
 /// Extract the fields from a bash tool call's JSON arguments.
 ///
-/// The timeout arrives in milliseconds, as in Claude Code, clamped to the
-/// 10-minute ceiling. A request under a second is refused rather than clamped.
+/// The timeout arrives in milliseconds as a JSON number, as in Claude Code,
+/// clamped to the 10-minute ceiling with fractions rounded to the nearest
+/// millisecond. A request under a second is refused rather than clamped.
 fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
     let args = parse_arguments(arguments)?;
-    let requested = args["timeout"].as_i64();
-    if requested.is_some_and(|milliseconds| milliseconds < 1000) {
+    let requested = args["timeout"].as_f64();
+    if requested.is_some_and(|milliseconds| milliseconds < 1000.0) {
         anyhow::bail!("error: timeout is measured in milliseconds; pass at least 1000");
     }
     #[allow(
-        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "the clamp bounds the value to 1-600 seconds before the cast"
     )]
     let milliseconds = requested
-        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_millis() as i64)
-        .clamp(1000, MAX_BASH_TIMEOUT.as_millis() as i64) as u64;
+        .unwrap_or(DEFAULT_BASH_TIMEOUT.as_millis() as f64)
+        .clamp(1000.0, MAX_BASH_TIMEOUT.as_millis() as f64)
+        .round() as u64;
     Ok(Bash {
         command: string_field(&args, "command")?,
         timeout: Duration::from_millis(milliseconds),
@@ -262,14 +264,12 @@ impl Read {
 }
 
 /// Extract the fields from a read tool call's JSON arguments.
-///
-/// The offset and limit are optional; wrong-typed values are ignored.
 fn parse_read(arguments: &str) -> anyhow::Result<Read> {
     let args = parse_arguments(arguments)?;
     Ok(Read {
         file_path: string_field(&args, "file_path")?,
-        offset: args["offset"].as_u64(),
-        limit: args["limit"].as_u64(),
+        offset: args["offset"].as_u64().filter(|&offset| offset > 0),
+        limit: args["limit"].as_u64().filter(|&limit| limit > 0),
     })
 }
 
@@ -1087,6 +1087,7 @@ mod tests {
         for arguments in [
             r#"{"command":"ls","timeout":300}"#,
             r#"{"command":"ls","timeout":999}"#,
+            r#"{"command":"ls","timeout":999.5}"#,
             r#"{"command":"ls","timeout":0}"#,
             r#"{"command":"ls","timeout":-5}"#,
         ] {
@@ -1102,6 +1103,12 @@ mod tests {
     fn parse_bash_reads_the_timeout_in_milliseconds() {
         let bash = parse_bash(r#"{"command":"cargo build","timeout":300000}"#).unwrap();
         assert_eq!(bash.timeout, Duration::from_secs(300));
+
+        // The schema says number, so a fractional timeout rounds.
+        let bash = parse_bash(r#"{"command":"sleep 1","timeout":1500.7}"#).unwrap();
+        assert_eq!(bash.timeout, Duration::from_millis(1501));
+        let bash = parse_bash(r#"{"command":"sleep 1","timeout":120000.0}"#).unwrap();
+        assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
     }
 
     #[test]
@@ -1890,6 +1897,14 @@ mod tests {
 
         let whole = parse_read(r#"{"file_path":"src/main.rs"}"#).unwrap();
         assert_eq!(whole.bounds(), (None, None));
+
+        // Zeros count as omitted rather than inverting the range.
+        let zero_offset =
+            parse_read(r#"{"file_path":"src/main.rs","offset":0,"limit":5}"#).unwrap();
+        assert_eq!(zero_offset.bounds(), (None, Some(5)));
+        let zero_limit =
+            parse_read(r#"{"file_path":"src/main.rs","offset":10,"limit":0}"#).unwrap();
+        assert_eq!(zero_limit.bounds(), (Some(10), None));
     }
 
     #[test]
