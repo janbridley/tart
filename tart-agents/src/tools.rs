@@ -1,4 +1,5 @@
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -473,19 +474,32 @@ fn exit_one_is_success(command: &str) -> bool {
     }
 }
 
-/// Maximum output sizes in characters before the data is spilled to a file.
+/// Maximum output sizes in bytes before the data is spilled to a file.
 const BASH_SUCCESS_CAP: usize = 30_000;
 const BASH_FAILURE_CAP: usize = 10_000;
 
-/// How much of a spilled output previews inline, in characters.
+/// How much of a spilled output previews inline, in bytes.
 const SPILL_PREVIEW: usize = 2_048;
 
-/// The model-facing framing of a finished command's text.
+/// The model-facing framing of a finished command's text; the bash tool's, which
+/// spills an oversized success to a scratch file.
 fn command_text(text: &str, status: ExitStatus, one_is_success: bool) -> String {
+    frame(text, status, one_is_success, true)
+}
+
+/// The framing for callers whose text is returned inline however large: the web
+/// tools and the user's own manual commands.
+fn command_text_inline(text: &str, status: ExitStatus, one_is_success: bool) -> String {
+    frame(text, status, one_is_success, false)
+}
+
+/// The shared framing: the exit-one exemption, a trailing exit code on failure,
+/// and (when `spill` is set) an oversized success written to a scratch file.
+fn frame(text: &str, status: ExitStatus, one_is_success: bool, spill: bool) -> String {
     let success = status.success() || (one_is_success && status.code() == Some(1));
     if success {
-        if text.chars().count() > BASH_SUCCESS_CAP {
-            return spill(text);
+        if spill && text.len() > BASH_SUCCESS_CAP {
+            return spill_to_file(text);
         }
         return if text.is_empty() {
             "(Bash completed with no output)".to_string()
@@ -494,7 +508,7 @@ fn command_text(text: &str, status: ExitStatus, one_is_success: bool) -> String 
         };
     }
 
-    if text.chars().count() > BASH_FAILURE_CAP {
+    if text.len() > BASH_FAILURE_CAP {
         return append_line(&excerpt(text), &exit_line(status));
     }
     append_line(text, &exit_line(status))
@@ -527,43 +541,58 @@ fn nanos() -> u128 {
         .map_or(0, |since| since.as_nanos())
 }
 
-/// tart's scratch directory under the temp root for spill files.
+/// tart's scratch directory under the temp root for spill files. The sandbox
+/// grants that root either way it resolves: `TMPDIR` when set ([`Policy::new`]
+/// adds it as a writable root), `/tmp` otherwise, via the platform defaults
+/// every policy carries.
 fn spill_dir() -> PathBuf {
     std::env::temp_dir().join("tart")
 }
 
-/// Write `text` to a scratch file and point the model at it, previewing the head.
-fn spill(text: &str) -> String {
+/// Write `text` to a private scratch file and point the model at it, previewing
+/// the head. Falls back to an excerpt when there is nowhere safe to write.
+fn spill_to_file(text: &str) -> String {
     let dir = spill_dir();
     let name = format!("tart-bash-{}-{}.output", std::process::id(), nanos());
     let path = dir.join(name);
-    if std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(&path, text))
-        .is_err()
-    {
+    if write_private(&dir, &path, text).is_err() {
         return excerpt(text);
     }
     let kilobytes = text.len() as f64 / 1024.0;
-    let preview: String = text.chars().take(SPILL_PREVIEW).collect();
+    let (preview, _) = ends(text, SPILL_PREVIEW, 0);
     format!(
         "Output too large ({kilobytes:.1}KB). Full output saved to: {}\n\n{preview}",
         path.display()
     )
 }
 
-/// A head-and-tail excerpt of `text` at the failure cap, split at a character boundary
+/// Create `dir` and write `text` to `path` owner-only, so a command's output
+/// spilled out of the transcript cannot be read by other local users.
+fn write_private(dir: &Path, path: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+
+    // A pre-planted symlink would otherwise redirect the write (and the chmod).
+    if dir.symlink_metadata().is_ok_and(|meta| meta.is_symlink()) {
+        return Err(io::Error::other("scratch directory is a symlink"));
+    }
+    // Private from the moment of creation, and tightened if it predates us.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(text.as_bytes())
+}
+
+/// A head-and-tail excerpt of `text` at the failure cap: [`bounded`], whose
+/// marker keeps the seam from reading as contiguous output.
 fn excerpt(text: &str) -> String {
-    let half = BASH_FAILURE_CAP / 2;
-    let head: String = text.chars().take(half).collect();
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(half)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}\n{tail}")
+    bounded(text.to_string(), BASH_FAILURE_CAP)
 }
 
 /// Information required for a tool call, including sandbox and cancellation info.
@@ -595,9 +624,8 @@ enum KillReason {
     Cancelled,
 }
 
-/// Model-facing explanation for a command the timeout killed, in Claude
-///
-/// Kill's exit code, then the timeout line.
+/// Model-facing explanation for a command the timeout killed, in Claude Code's
+/// shape: the kill's exit code, then the timeout line.
 fn timeout_text(text: &str, timeout: Duration) -> String {
     use std::fmt::Write as _;
 
@@ -623,6 +651,16 @@ fn cancel_text(text: &str) -> String {
     format!("[cancelled]{separator}{text}")
 }
 
+/// The first `head` and last `tail` bytes of `text`, both snapped to character
+/// boundaries so neither slice can split one; the two never overlap.
+fn ends(text: &str, head: usize, tail: usize) -> (&str, &str) {
+    // Slicing must land on a char boundary; lossy decoding made `text` valid.
+    let head_end = text.floor_char_boundary(head.min(text.len()));
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(tail));
+    let head_end = head_end.min(tail_start);
+    (&text[..head_end], &text[tail_start..])
+}
+
 /// Keep the first `cap` bytes of `text`, suffixing a marker when it cut: an
 /// attached file reads from the top, where its interesting part usually is.
 ///
@@ -642,9 +680,8 @@ pub fn head_cap(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_string();
     }
-    // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let end = text.floor_char_boundary(cap);
-    format!("{}\n[truncated; first {} KB shown]", &text[..end], cap / 1024)
+    let (head, _) = ends(text, cap, 0);
+    format!("{head}\n[truncated; first {} KB shown]", cap / 1024)
 }
 
 /// Keep the last `cap` bytes of `text`, prefixing a marker when it cut.
@@ -652,9 +689,8 @@ fn tail_cap(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_string();
     }
-    // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let start = text.ceil_char_boundary(text.len() - cap);
-    format!("[truncated; last {} KB shown]\n{}", cap / 1024, &text[start..])
+    let (_, tail) = ends(text, 0, cap);
+    format!("[truncated; last {} KB shown]\n{tail}", cap / 1024)
 }
 
 /// Keep the first and last `cap / 2` bytes of `text`, marking the omitted
@@ -665,14 +701,10 @@ pub fn bounded(text: String, cap: usize) -> String {
         return text;
     }
     let half = cap / 2;
-    // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let end = text.floor_char_boundary(half);
-    let start = text.ceil_char_boundary(text.len() - half);
+    let (head, tail) = ends(&text, half, half);
     format!(
-        "{}\n[truncated; first and last {} KB shown]\n{}",
-        &text[..end],
-        half / 1024,
-        &text[start..]
+        "{head}\n[truncated; first and last {} KB shown]\n{tail}",
+        half / 1024
     )
 }
 
@@ -810,8 +842,7 @@ fn run_bash<B: Backend, F: Fn(Progress)>(
                 let WatchedRun { output, killed } = run;
                 let text = combined_output(&output);
                 let exit = output.status.code();
-                let one_is_success =
-                    output.status.code() == Some(1) && exit_one_is_success(&bash.command);
+                let one_is_success = exit == Some(1) && exit_one_is_success(&bash.command);
                 match killed {
                     // A kill has no exit status of its own, so we mark up the body.
                     Some(KillReason::Timeout) => {
@@ -822,7 +853,12 @@ fn run_bash<B: Backend, F: Fn(Progress)>(
                         let marked = cancel_text(&text);
                         (marked.clone(), marked, exit)
                     }
-                    None => (command_text(&text, output.status, one_is_success), text, exit),
+                    None => {
+                        // An exempt "no match" exit is a success everywhere: the
+                        // box paints green instead of showing `exit 1`.
+                        let reported = if one_is_success { Some(0) } else { exit };
+                        (command_text(&text, output.status, one_is_success), text, reported)
+                    }
                 }
             }
             Err(error) => {
@@ -844,7 +880,7 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
             match killed {
                 Some(KillReason::Cancelled) => cancel_text(&text),
                 // No deadline exists to outlive, so nothing else kills it.
-                _ => command_text(&text, output.status, false),
+                _ => command_text_inline(&text, output.status, false),
             }
         }
         Err(error) => format!("error: {error}"),
@@ -1177,8 +1213,10 @@ mod tests {
     /// A success past the inline cap spills to a file and previews the start.
     #[test]
     fn an_oversized_success_spills_to_a_file() {
+        use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::ExitStatusExt;
 
+        let dir = spill_dir();
         let text = "x".repeat(BASH_SUCCESS_CAP + 1);
         let output = Output {
             status: std::process::ExitStatus::from_raw(0),
@@ -1193,11 +1231,37 @@ mod tests {
         assert_eq!(preview.chars().count(), SPILL_PREVIEW, "{framed}");
         // The spill lives in tart's throwaway directory, not the temp root.
         let path = std::path::Path::new(saved);
-        assert_eq!(path.parent(), Some(spill_dir().as_path()), "{framed}");
-        // The spill file holds the whole output for a later `read`.
+        assert_eq!(path.parent(), Some(dir.as_path()), "{framed}");
+        // However the environment spells the temp root, the spill resolves
+        // inside the one the sandbox grants for reading.
+        let granted = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(
+            std::fs::canonicalize(path).unwrap().starts_with(&granted),
+            "{framed}"
+        );
+        // The spill file holds the whole output for a later `read`, readable
+        // only by its owner.
         let file = std::fs::read_to_string(path).unwrap();
         assert_eq!(file, text);
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{framed}");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The web tools and manual runs return their text inline however large, so a
+    /// fetched page is never silently replaced by a scratch-file pointer.
+    #[test]
+    fn inline_framing_never_spills() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let text = "x".repeat(BASH_SUCCESS_CAP + 1);
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.clone().into_bytes(),
+            stderr: Vec::new(),
+        };
+        let framed = command_text_inline(&combined_output(&output), output.status, false);
+        assert_eq!(framed, text);
     }
 
     /// A failure past the inline cap shrinks to a head-and-tail excerpt.
@@ -1219,7 +1283,11 @@ mod tests {
 
         let (excerpted, code) = framed.split_once("\nExit code ").unwrap();
         assert_eq!(code, "1");
-        let (head, tail) = excerpted.split_once('\n').unwrap();
+        // The excerpt is `bounded` at the failure cap, so the seam carries the
+        // same truncation marker the display caps use.
+        let (head, rest) = excerpted.split_once('\n').unwrap();
+        let (marker, tail) = rest.split_once('\n').unwrap();
+        assert_eq!(marker, "[truncated; first and last 4 KB shown]", "{framed}");
         assert_eq!(head.chars().count(), BASH_FAILURE_CAP / 2);
         assert!(head.chars().all(|c| c == 'a'), "{head}");
         assert!(tail.chars().all(|c| c == 'b'), "{tail}");
@@ -1507,15 +1575,21 @@ mod tests {
             execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}),
             "(Bash completed with no output)"
         );
-        // The search family's "no match" exit of 1 reads as success.
+        // The search family's "no match" exit of 1 reads as success, and is
+        // reported as such so the front end paints the box green too.
+        let events = std::cell::RefCell::new(Vec::new());
         assert_eq!(
             execute(
                 &bash_call(r#"{"command":"grep needle /dev/null"}"#),
                 &tools,
-                &|_| {}
+                &|progress| events.borrow_mut().push(progress)
             ),
             "(Bash completed with no output)"
         );
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [_, Progress::ToolOutput { exit: Some(0), .. }]
+        ));
     }
 
     /// An output past the cap reaches the model whole but the front end capped,

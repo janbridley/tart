@@ -77,8 +77,8 @@ Call `fetch` with:
 The page comes back as markdown (title, source url, then the text with scripts, styles,
 and markup stripped) so prefer it over `raw` for documentation and articles. Pass
 `raw=true` for JSON or plain-text endpoints. When the reader errors (rate limit, auth),
-retry the same URL with `raw=true`. The result is cut at 150,000 characters, which is
-marked when it happens.
+retry the same URL with `raw=true`. A result over 64 KB reaches you cut to its first and
+last 32 KB, with the dropped middle marked.
 
 ## The Spawn Agent Tool
 
@@ -120,16 +120,17 @@ progress when you check, defer to the user or end your turn.
   To see them merged as they were written, redirect with `2>&1` inside the command.
 - A successful command returns its output verbatim; one that succeeds with no output
   returns `(Bash completed with no output)`. A failed command's output ends with
-  `Exit code N` as its final line. An exit code of 1 from `grep`, `rg`, `find`, `diff`,
-  `test`, `git diff`, or `git grep` counts as success: it means "no match" or "false".
+  `Exit code N` as its final line. An exit code of 1 from `grep` (and its
+  `egrep`/`fgrep` aliases), `rg`, `find`, `diff`, `test`, `[`, `git diff`, or `git grep`
+  counts as success: it means "no match" or "false".
 - A command may run for at most its `timeout` (milliseconds; default 120000, max
   600000). Past that the command is killed with every process it started and cannot be
   resumed. Timed-out commands will end with `Exit code 137` and
   `Command timed out after Nm Ns` after whatever output was captured before the kill.
   Plan long work (full builds, long test suites) as steps that finish inside the limit.
-- A success that prints more than 30,000 characters spills: the result points at a file
-  holding the full output and previews its start. A failure that large is excerpted head
-  and tail.
+- A success that prints more than 30,000 bytes spills to a file holding the full output
+  and previews its start. A failure over 10,000 bytes is cut to its first and last 5,000
+  bytes, with a marker where the middle was dropped.
 
 ## Sandbox
 
