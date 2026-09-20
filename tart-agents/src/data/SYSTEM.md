@@ -25,9 +25,11 @@ specific directory or environment, set it inline within the command. For example
 
 Call `read` with:
 
-- `path` (string): the file to read.
-- `start_line` / `end_line` (integer, optional): 1-based, inclusive; without them the
-  whole file is returned.
+- `file_path` (string): the file to read.
+- `offset` (integer, optional): line number to start reading from, 1-based; without it
+  the read starts at the top.
+- `limit` (integer, optional): how many lines to read; without it the read runs to the
+  end of the file.
 
 Contents are numbered `cat -n` style. Read before editing; when copying `old_string`,
 omit the line-number prefixes.

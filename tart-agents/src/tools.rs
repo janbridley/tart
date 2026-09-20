@@ -99,21 +99,24 @@ pub(crate) fn bash() -> Tool {
 }
 
 /// The read tool; files are read under the caller's [`Policy`].
+///
+/// The parameters match Claude Code's Read tool (and zcode's): `file_path`, with a
+/// 1-based `offset` and a line-count `limit`, rather than absolute end bounds.
 #[must_use]
 pub(crate) fn read() -> Tool {
     tool(
         "read",
         "Read a file with line numbers (cat -n style) in a sandbox (reads restricted to \
-        granted roots); optionally pass start_line/end_line (1-based, inclusive) to read \
-        a range",
+        granted roots); optionally pass an offset (1-based line to start from) and a \
+        limit (number of lines) to read a range",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "The file to read"},
-                "start_line": {"type": "integer", "description": "First line to read (1-based); omit to start at the top"},
-                "end_line": {"type": "integer", "description": "Last line to read (inclusive); omit to read to the end"}
+                "file_path": {"type": "string", "description": "The path to the file to read"},
+                "offset": {"type": "integer", "description": "Line number to start reading from, 1-based; omit to start at the top"},
+                "limit": {"type": "integer", "description": "Number of lines to read; omit to read to the end"}
             },
-            "required": ["path"]
+            "required": ["file_path"]
         }),
     )
 }
@@ -234,22 +237,38 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
 #[derive(Debug)]
 struct Read {
     /// The file to read.
-    path: String,
-    /// First line to read, 1-based; `None` starts at the top.
-    start_line: Option<u64>,
-    /// Last line to read, inclusive; `None` reads to the end.
-    end_line: Option<u64>,
+    file_path: String,
+    /// Line number to start from, 1-based; `None` starts at the top.
+    offset: Option<u64>,
+    /// How many lines to read; `None` reads to the end.
+    limit: Option<u64>,
+}
+
+impl Read {
+    /// The inclusive line bounds the perl reader takes: an offset becomes the
+    /// first line, a limit counts from it (or from the top).
+    fn bounds(&self) -> (Option<u64>, Option<u64>) {
+        match (self.offset, self.limit) {
+            (Some(offset), Some(limit)) => {
+                (Some(offset), Some(offset.saturating_add(limit).saturating_sub(1)))
+            }
+            (Some(offset), None) => (Some(offset), None),
+            // A limit without an offset reads the first `limit` lines.
+            (None, Some(limit)) => (None, Some(limit)),
+            (None, None) => (None, None),
+        }
+    }
 }
 
 /// Extract the fields from a read tool call's JSON arguments.
 ///
-/// The line bounds are optional; wrong-typed bounds are ignored.
+/// The offset and limit are optional; wrong-typed values are ignored.
 fn parse_read(arguments: &str) -> anyhow::Result<Read> {
     let args = parse_arguments(arguments)?;
     Ok(Read {
-        path: string_field(&args, "path")?,
-        start_line: args["start_line"].as_u64(),
-        end_line: args["end_line"].as_u64(),
+        file_path: string_field(&args, "file_path")?,
+        offset: args["offset"].as_u64(),
+        limit: args["limit"].as_u64(),
     })
 }
 
@@ -842,12 +861,13 @@ fn run_read<B: Backend, F: Fn(Progress)>(
         Ok(read) => read,
         Err(error) => return misuse(call, on_progress, &error),
     };
+    let (start_line, end_line) = read.bounds();
     let mut command = tools.policy.command("/usr/bin/perl");
     command
         .arg("-e")
-        .arg(numbered_read(read.start_line, read.end_line))
+        .arg(numbered_read(start_line, end_line))
         .arg("--")
-        .arg(&read.path);
+        .arg(&read.file_path);
     traced(call, on_progress, || {
         // A failure to launch comes back as an error string for the model to deal with.
         match &command.output() {
@@ -1769,32 +1789,40 @@ mod tests {
     }
 
     #[test]
-    fn read_definition_requires_path() {
+    fn read_definition_matches_claude_code() {
         let tool = serde_json::to_value(read()).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "read");
-        assert_eq!(tool["parameters"]["required"][0], "path");
-        assert!(tool["parameters"]["properties"]["start_line"].is_object());
-        assert!(tool["parameters"]["properties"]["end_line"].is_object());
+        assert_eq!(tool["parameters"]["required"][0], "file_path");
+        assert!(tool["parameters"]["properties"]["offset"].is_object());
+        assert!(tool["parameters"]["properties"]["limit"].is_object());
+        // The old absolute-bound names are gone from the schema.
+        assert!(tool["parameters"]["properties"]["path"].is_null());
+        assert!(tool["parameters"]["properties"]["start_line"].is_null());
     }
 
     #[test]
     fn parse_read_reads_the_path_and_bounds() {
-        let read = parse_read(r#"{"path":"src/main.rs","start_line":10,"end_line":50}"#).unwrap();
+        let read = parse_read(r#"{"file_path":"src/main.rs","offset":10,"limit":41}"#).unwrap();
+        assert_eq!(read.file_path, "src/main.rs");
+        assert_eq!(read.bounds(), (Some(10), Some(50)));
 
-        assert_eq!(read.path, "src/main.rs");
-        assert_eq!((read.start_line, read.end_line), (Some(10), Some(50)));
+        // Either bound alone reads from the top or to the end.
+        let offset_only = parse_read(r#"{"file_path":"src/main.rs","offset":20}"#).unwrap();
+        assert_eq!(offset_only.bounds(), (Some(20), None));
+        let limit_only = parse_read(r#"{"file_path":"src/main.rs","limit":5}"#).unwrap();
+        assert_eq!(limit_only.bounds(), (None, Some(5)));
 
-        let whole = parse_read(r#"{"path":"src/main.rs"}"#).unwrap();
-        assert_eq!((whole.start_line, whole.end_line), (None, None));
+        let whole = parse_read(r#"{"file_path":"src/main.rs"}"#).unwrap();
+        assert_eq!(whole.bounds(), (None, None));
     }
 
     #[test]
     fn parse_read_rejects_a_missing_path() {
-        let error = parse_read(r#"{"start_line":1}"#).unwrap_err().to_string();
+        let error = parse_read(r#"{"offset":1}"#).unwrap_err().to_string();
 
-        assert!(error.contains("missing 'path'"), "{error}");
+        assert!(error.contains("missing 'file_path'"), "{error}");
     }
 
     #[test]
@@ -1816,15 +1844,22 @@ mod tests {
         assert!(error.contains("check_agent needs an integer 'id'"), "{error}");
     }
 
-    /// A `read` tool call for `path`, optionally bounded to a line range.
+    /// A `read` tool call for `path`, optionally bounded to a line range, in
+    /// the schema's offset/limit shape.
     fn read_call(path: &Path, start_line: Option<u64>, end_line: Option<u64>) -> FunctionToolCall {
+        // The inclusive bounds become a 1-based offset and a line count.
+        let limit = match (start_line, end_line) {
+            (Some(start), Some(end)) => end.checked_sub(start).map(|span| span + 1),
+            (None, Some(end)) => Some(end),
+            _ => None,
+        };
         FunctionToolCall {
             namespace: None,
             name: "read".to_string(),
             arguments: serde_json::json!({
-                "path": path,
-                "start_line": start_line,
-                "end_line": end_line,
+                "file_path": path,
+                "offset": start_line,
+                "limit": limit,
             })
             .to_string(),
             call_id: "call_0".to_string(),
@@ -1955,13 +1990,16 @@ mod tests {
             events.borrow_mut().push(progress);
         });
 
-        assert!(output.contains("error: tool call missing 'path'"), "{output}");
+        assert!(
+            output.contains("error: tool call missing 'file_path'"),
+            "{output}"
+        );
         assert!(matches!(
             events.borrow().as_slice(),
             [
                 Progress::ToolStart { name, .. },
                 Progress::ToolOutput { output, .. }
-            ] if name == "read" && output.contains("missing 'path'")
+            ] if name == "read" && output.contains("missing 'file_path'")
         ));
     }
 }
