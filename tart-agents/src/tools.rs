@@ -135,12 +135,12 @@ pub(crate) fn edit() -> Tool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path of the existing file to edit"},
+                "file_path": {"type": "string", "description": "The path to the file to edit"},
                 "old_string": {"type": "string", "description": "Text to replace; must match exactly and be unique unless replace_all"},
                 "new_string": {"type": "string", "description": "Replacement text; empty deletes old_string"},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of one unique match"}
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["file_path", "old_string", "new_string"]
         }),
     )
 }
@@ -277,7 +277,7 @@ fn parse_read(arguments: &str) -> anyhow::Result<Read> {
 #[derive(Debug)]
 struct Edit {
     /// The file to edit.
-    path: String,
+    file_path: String,
     /// The exact text to replace.
     old_string: String,
     /// What replaces it; empty deletes `old_string`.
@@ -292,7 +292,7 @@ struct Edit {
 fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
     let args = parse_arguments(arguments)?;
     Ok(Edit {
-        path: string_field(&args, "path")?,
+        file_path: string_field(&args, "file_path")?,
         old_string: string_field(&args, "old_string")?,
         new_string: string_field(&args, "new_string")?,
         replace_all: args["replace_all"].as_bool().unwrap_or(false),
@@ -944,7 +944,7 @@ fn run_edit<B: Backend, F: Fn(Progress)>(
 /// We pre-check that the edit is valid in rust for performance, though the perl script
 /// verifies to ensure we don't run into TOCTOU issues between here and the lock.
 fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
-    let path = Path::new(&edit.path);
+    let path = Path::new(&edit.file_path);
     if edit.old_string.is_empty() {
         return (
             format!("edit: old_string must not be empty: {}", path.display()),
@@ -994,11 +994,11 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
 /// Split out so tests can drive the program with a plain command, exercising
 /// its locking and matching semantics without the sandbox.
 fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i32>) {
-    let path = Path::new(&edit.path);
+    let path = Path::new(&edit.file_path);
     cmd.arg("-e")
         .arg(EDIT_PROGRAM)
         .arg("--")
-        .arg(&edit.path)
+        .arg(&edit.file_path)
         .env("TART_OLD", &edit.old_string)
         .env("TART_NEW", &edit.new_string)
         .envs(edit.replace_all.then_some(("TART_ALL", "1")));
@@ -1728,13 +1728,16 @@ mod tests {
         file
     }
 
-    /// An `edit` tool call replacing `old` with `new` in `path`.
+    /// An `edit` tool call replacing `old` with `new` in `path`, in the
+    /// schema's `file_path` shape.
     fn edit_call(path: &Path, old: &str, new: &str) -> FunctionToolCall {
         FunctionToolCall {
             namespace: None,
             name: "edit".to_string(),
-            arguments: serde_json::json!({"path": path, "old_string": old, "new_string": new})
-                .to_string(),
+            arguments: serde_json::json!({
+                "file_path": path, "old_string": old, "new_string": new
+            })
+            .to_string(),
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
@@ -1747,7 +1750,7 @@ mod tests {
     fn perl_edit(path: &Path, old: &str, new: &str, replace_all: bool) -> String {
         spawn_perl(
             &Edit {
-                path: path.display().to_string(),
+                file_path: path.display().to_string(),
                 old_string: old.to_string(),
                 new_string: new.to_string(),
                 replace_all,
@@ -1867,6 +1870,30 @@ mod tests {
             std::fs::read_to_string(file.path()).unwrap(),
             "one uno alpha\ntwo dos beta\n"
         );
+    }
+
+    #[test]
+    fn edit_definition_matches_claude_code() {
+        let tool = serde_json::to_value(edit()).unwrap();
+
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "edit");
+        assert_eq!(tool["parameters"]["required"][0], "file_path");
+        // The old name is gone from the schema.
+        assert!(tool["parameters"]["properties"]["path"].is_null());
+        assert_eq!(tool["parameters"]["required"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn parse_edit_reads_the_file_path() {
+        let edit =
+            parse_edit(r#"{"file_path":"src/main.rs","old_string":"a","new_string":"b"}"#).unwrap();
+        assert_eq!(edit.file_path, "src/main.rs");
+
+        let error = parse_edit(r#"{"old_string":"a","new_string":"b"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing 'file_path'"), "{error}");
     }
 
     #[test]

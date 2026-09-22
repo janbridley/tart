@@ -63,7 +63,10 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
                 .as_str()
                 .or_else(|| args["path"].as_str()) // Backwards compat
                 .map(str::to_string),
-            "edit" => args["path"].as_str().map(str::to_string),
+            "edit" => args["file_path"]
+                .as_str()
+                .or_else(|| args["path"].as_str()) // Backwards compat
+                .map(str::to_string),
             // The subagent pair: the task spawned, and the id checked on.
             "spawn_agent" => args["task"].as_str().map(str::to_string),
             "check_agent" => args["id"].as_u64().map(|id| id.to_string()),
@@ -179,6 +182,7 @@ mod tests {
         for (name, raw, expected) in [
             ("bash", r#"{"command":"ls -la"}"#, "Bash(ls -la)"),
             ("edit", r#"{"path":"src/main.rs"}"#, "Edit(src/main.rs)"),
+            ("edit", r#"{"file_path":"src/main.rs"}"#, "Edit(src/main.rs)"),
             ("fetch", r#"{"url":"http://x"}"#, "Fetch(http://x)"),
             ("search", r#"{"query":"rust regex"}"#, "Search(rust regex)"),
             // Reads in Claude Code's shape: file_path with offset/limit.

@@ -38,7 +38,7 @@ omit the line-number prefixes.
 
 Call `edit` with:
 
-- `path` (string): the path to the file to edit.
+- `file_path` (string): the path to the file to edit.
 - `old_string` (string): the exact text to find. This must occur exactly once unless
   `replace_all` is true.
 - `new_string` (string): the replacement text (must differ from `old_string`).
