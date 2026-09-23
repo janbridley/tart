@@ -1,7 +1,7 @@
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -589,17 +589,9 @@ fn nanos() -> u128 {
         .map_or(0, |since| since.as_nanos())
 }
 
-/// tart's scratch directory under the temp root for spill files. The sandbox
-/// grants that root either way it resolves: `TMPDIR` when set ([`Policy::new`]
-/// adds it as a writable root), `/tmp` otherwise, via the platform defaults
-/// every policy carries.
-fn spill_dir() -> PathBuf {
-    std::env::temp_dir().join("tart")
-}
-
 /// Write `text` to a private scratch file and point the model at it, previewing head.
 fn spill_to_file(text: &str) -> String {
-    let dir = spill_dir();
+    let dir = std::env::temp_dir().join("tart");
     let name = format!("tart-bash-{}-{}.output", std::process::id(), nanos());
     let path = dir.join(name);
     if write_private(&dir, &path, text).is_err() {
@@ -676,14 +668,13 @@ enum KillReason {
 }
 
 /// Model-facing explanation for a command the timeout killed.
+// <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-semantics.ts#L105>
 fn timeout_text(text: &str, timeout: Duration) -> String {
-    use std::fmt::Write as _;
-
-    let mut framed = append_line(text, "Exit code 137");
-    // Infallible: the target is a `String`.
-    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-semantics.ts#L105>
-    let _ = write!(framed, "\nCommand timed out after {}", duration_text(timeout));
-    framed
+    format!(
+        "{}\nCommand timed out after {}",
+        append_line(text, "Exit code 137"),
+        duration_text(timeout)
+    )
 }
 
 /// Styled duration: `1s`, `2m 0s`, `6m 40s`.
@@ -1327,9 +1318,7 @@ mod tests {
     /// A success past the inline cap spills to a file and previews the start.
     #[test]
     fn an_oversized_success_spills_to_a_file() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = spill_dir();
+        let dir = std::env::temp_dir().join("tart");
         let text = "x".repeat(BASH_SUCCESS_CAP + 1);
         let output = output(0, &text, "");
         let framed = command_text(&combined_output(&output), output.status, false);
@@ -1511,8 +1500,10 @@ mod tests {
     /// An untouched token leaves the command to finish on its own.
     #[test]
     fn manual_command_runs_to_completion_without_a_cancel() {
-        let run =
-            run_watched(Command::new("/bin/echo").arg("hi"), None, &CancelToken::new()).unwrap();
+        let mut command = Command::new("/bin/echo");
+        command.arg("hi");
+
+        let run = run_watched(&mut command, None, &CancelToken::new()).unwrap();
 
         assert_eq!(run.killed, None);
         assert_eq!(combined_output(&run.output), "hi\n");
@@ -1539,10 +1530,12 @@ mod tests {
     /// These drive `run_watched` with plain commands, so they run without the sandbox
     #[test]
     fn run_watched_kills_a_command_that_outruns_the_deadline() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
         let started = Instant::now();
 
         let run = run_watched(
-            Command::new("/bin/sleep").arg("30"),
+            &mut command,
             Some(Duration::from_millis(300)),
             &CancelToken::new(),
         )
@@ -1555,6 +1548,8 @@ mod tests {
 
     #[test]
     fn run_watched_kills_a_command_the_moment_the_token_fires() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
         let token = CancelToken::new();
         let trip = {
             let token = token.clone();
@@ -1565,12 +1560,7 @@ mod tests {
         };
         let started = Instant::now();
 
-        let run = run_watched(
-            Command::new("/bin/sleep").arg("30"),
-            Some(Duration::from_secs(60)),
-            &token,
-        )
-        .unwrap();
+        let run = run_watched(&mut command, Some(Duration::from_secs(60)), &token).unwrap();
 
         assert_eq!(run.killed, Some(KillReason::Cancelled));
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1581,12 +1571,12 @@ mod tests {
     fn run_watched_kills_the_whole_process_group() {
         // The backgrounded sleeps outlive bash and hold the output pipe; only a
         // group kill frees the capture, so returning promptly proves they died.
+        let mut command = Command::new("/bin/bash");
+        command.arg("-c").arg("sleep 9871 & sleep 9871 & wait");
         let started = Instant::now();
 
         let run = run_watched(
-            Command::new("/bin/bash")
-                .arg("-c")
-                .arg("sleep 9871 & sleep 9871 & wait"),
+            &mut command,
             Some(Duration::from_millis(300)),
             &CancelToken::new(),
         )
@@ -1600,14 +1590,12 @@ mod tests {
     /// joins the watchdog at once rather than letting it sleep out the timeout.
     #[test]
     fn run_watched_wakes_the_watchdog_when_the_command_finishes_early() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("hi");
         let started = Instant::now();
 
-        let run = run_watched(
-            Command::new("/bin/echo").arg("hi"),
-            Some(DEFAULT_BASH_TIMEOUT),
-            &CancelToken::new(),
-        )
-        .unwrap();
+        let run =
+            run_watched(&mut command, Some(DEFAULT_BASH_TIMEOUT), &CancelToken::new()).unwrap();
 
         assert_eq!(run.killed, None);
         assert_eq!(combined_output(&run.output), "hi\n");
@@ -1620,14 +1608,11 @@ mod tests {
     #[test]
     fn execute_reports_command_then_output() {
         let rig = TestSetup::new(std::env::current_dir().unwrap());
+        let tools = rig.tools();
         let events = std::cell::RefCell::new(Vec::new());
-        let output = execute(
-            &bash_call(r#"{"command":"echo hi"}"#),
-            &rig.tools(),
-            &|progress| {
-                events.borrow_mut().push(progress);
-            },
-        );
+        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
 
         assert_eq!(output, "hi\n");
         assert!(matches!(
@@ -1651,20 +1636,20 @@ mod tests {
 
         // A failure carries its exit code as the trailing line.
         assert_eq!(
-            execute(&bash_call(r#"{"command":"false"}"#), &rig.tools(), &|_| {}),
+            execute(&bash_call(r#"{"command":"false"}"#), &tools, &|_| {}),
             "Exit code 1"
         );
         assert_eq!(
-            execute(&bash_call(r#"{"command":"true"}"#), &rig.tools(), &|_| {}),
+            execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}),
             "(Bash completed with no output)"
         );
         // The search family's "no match" exit of 1 reads as success, and is
         // reported as such so the front end paints the box green too.
-        let events = std::cell::RefCell::new(Vec::new());
+        events.borrow_mut().clear();
         assert_eq!(
             execute(
                 &bash_call(r#"{"command":"grep needle /dev/null"}"#),
-                &rig.tools(),
+                &tools,
                 &|progress| events.borrow_mut().push(progress)
             ),
             "(Bash completed with no output)"
@@ -1705,13 +1690,14 @@ mod tests {
     #[test]
     fn execute_answers_an_unknown_tool_with_output_not_failure() {
         let rig = TestSetup::new(std::env::current_dir().unwrap());
+        let tools = rig.tools();
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
         let events = std::cell::RefCell::new(Vec::new());
 
         // Only the model can fix calling a tool that does not exist, so the
         // error is its output
-        let output = execute(&call, &rig.tools(), &|progress| {
+        let output = execute(&call, &tools, &|progress| {
             events.borrow_mut().push(progress);
         });
 
@@ -2041,16 +2027,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_read_rejects_a_missing_path() {
-        let error = parse_read(r#"{"offset":1}"#).unwrap_err().to_string();
-
-        assert!(
-            error.contains("The required parameter `file_path` is missing"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn parse_spawn_takes_the_task_and_rejects_its_absence() {
         assert_eq!(
             parse_spawn(r#"{"task":"count the tests"}"#).unwrap().task,
@@ -2130,10 +2106,11 @@ mod tests {
         }
         let file = scratch(&contents);
         let rig = TestSetup::new(std::env::temp_dir());
+        let tools = rig.tools();
         let events = std::cell::RefCell::new(Vec::new());
 
-        let whole = execute(&read_call(file.path(), None, None), &rig.tools(), &|progress| {
-            events.borrow_mut().push(progress)
+        let whole = execute(&read_call(file.path(), None, None), &tools, &|progress| {
+            events.borrow_mut().push(progress);
         });
 
         assert!(whole.starts_with("     1\tline 1\n"), "{whole}");
@@ -2153,11 +2130,9 @@ mod tests {
 
         // A bounded read's arguments ride along untouched.
         events.borrow_mut().clear();
-        let range = execute(
-            &read_call(file.path(), Some(10), Some(12)),
-            &rig.tools(),
-            &|progress| events.borrow_mut().push(progress),
-        );
+        let range = execute(&read_call(file.path(), Some(10), Some(12)), &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
         assert!(matches!(
             events.borrow().as_slice(),
@@ -2172,12 +2147,12 @@ mod tests {
                         .to_string()
         ));
 
-        let tail = execute(&read_call(file.path(), Some(28), None), &rig.tools(), &|_| {});
+        let tail = execute(&read_call(file.path(), Some(28), None), &tools, &|_| {});
         assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
         assert_eq!(tail.lines().count(), 3);
 
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
-        let absent = execute(&read_call(&missing, None, None), &rig.tools(), &|_| {});
+        let absent = execute(&read_call(&missing, None, None), &tools, &|_| {});
         assert!(
             absent.contains("File does not exist. Note: your current working directory is"),
             "{absent}"
@@ -2187,10 +2162,11 @@ mod tests {
     #[test]
     fn a_malformed_call_is_output_not_failure() {
         let rig = TestSetup::new(std::env::temp_dir());
+        let tools = rig.tools();
         let call = call("read", r#"{"start_line": 1}"#.to_string());
         let events = std::cell::RefCell::new(Vec::new());
 
-        let output = execute(&call, &rig.tools(), &|progress| {
+        let output = execute(&call, &tools, &|progress| {
             events.borrow_mut().push(progress);
         });
 

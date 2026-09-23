@@ -59,13 +59,9 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
         .and_then(|args| match name {
             "bash" => args["command"].as_str().map(preprocess_bash_command),
             "fetch" => args["url"].as_str().map(str::to_string),
-            "read" => args["file_path"]
+            "read" | "edit" => args["file_path"]
                 .as_str()
-                .or_else(|| args["path"].as_str()) // Backwards compat
-                .map(str::to_string),
-            "edit" => args["file_path"]
-                .as_str()
-                .or_else(|| args["path"].as_str()) // Backwards compat
+                .or_else(|| args["path"].as_str())
                 .map(str::to_string),
             // The subagent pair: the task spawned, and the id checked on.
             "spawn_agent" => args["task"].as_str().map(str::to_string),
