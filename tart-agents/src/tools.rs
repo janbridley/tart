@@ -238,7 +238,7 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         .clamp(1000.0, MAX_BASH_TIMEOUT.as_millis() as f64)
         .round() as u64;
     Ok(Bash {
-        command: string_field(&args, "bash", "command")?,
+        command: string_field(&args, "Bash", "command")?,
         timeout: Duration::from_millis(milliseconds),
     })
 }
@@ -274,7 +274,7 @@ impl Read {
 fn parse_read(arguments: &str) -> anyhow::Result<Read> {
     let args = parse_arguments(arguments)?;
     Ok(Read {
-        file_path: string_field(&args, "read", "file_path")?,
+        file_path: string_field(&args, "Read", "file_path")?,
         offset: args["offset"].as_u64().filter(|&offset| offset > 0),
         limit: args["limit"].as_u64().filter(|&limit| limit > 0),
     })
@@ -299,9 +299,9 @@ struct Edit {
 fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
     let args = parse_arguments(arguments)?;
     Ok(Edit {
-        file_path: string_field(&args, "edit", "file_path")?,
-        old_string: string_field(&args, "edit", "old_string")?,
-        new_string: string_field(&args, "edit", "new_string")?,
+        file_path: string_field(&args, "Edit", "file_path")?,
+        old_string: string_field(&args, "Edit", "old_string")?,
+        new_string: string_field(&args, "Edit", "new_string")?,
         replace_all: args["replace_all"].as_bool().unwrap_or(false),
     })
 }
@@ -681,7 +681,7 @@ fn timeout_text(text: &str, timeout: Duration) -> String {
 
     let mut framed = append_line(text, "Exit code 137");
     // Infallible: the target is a `String`.
-    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts#L109>
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-semantics.ts#L105>
     let _ = write!(framed, "\nCommand timed out after {}", duration_text(timeout));
     framed
 }
@@ -1004,33 +1004,33 @@ fn run_edit<B: Backend, F: Fn(Progress)>(
 fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
     let path = Path::new(&edit.file_path);
     if edit.old_string.is_empty() {
-        return (
-            format!("edit: old_string must not be empty: {}", path.display()),
-            None,
-        );
+        return edit_failure(&format!("edit: old_string must not be empty: {}", path.display()));
     }
     if edit.old_string == edit.new_string {
         // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts#L107>
-        return (
-            "No changes to make: old_string and new_string are exactly the same.".to_string(),
-            None,
-        );
+        return edit_failure("No changes to make: old_string and new_string are exactly the same.");
     }
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return (missing_file_message(), None);
+            return edit_failure(&missing_file_message());
         }
         Err(error) => return (format!("edit: cannot read {}: {error}", path.display()), None),
     };
     let count = content.matches(&edit.old_string).count();
     if count == 0 {
-        return (no_match_message(edit), None);
+        return edit_failure(&no_match_message(edit));
     }
     if count > 1 && !edit.replace_all {
-        return (ambiguous_match_message(count, edit), None);
+        return edit_failure(&ambiguous_match_message(count, edit));
     }
     spawn_perl(edit, &mut policy.command("/usr/bin/perl"))
+}
+
+/// An edit-tool failure as the model sees it.
+// <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/executor/errors.ts#L22>
+fn edit_failure(message: &str) -> (String, Option<i32>) {
+    (format!("<tool_use_error>{message}</tool_use_error>"), None)
 }
 
 /// Missing-file message; the cwd note keeps relative paths debuggable.
@@ -1118,22 +1118,58 @@ mod tests {
 
     use super::*;
     use std::fmt::Write as _;
+    use std::os::unix::process::ExitStatusExt as _;
 
     use crate::sandbox::live::skip_unless_live;
     use macro_rules_attribute::apply;
     use std::time::Instant;
 
-    /// A `bash` tool call requesting `command`.
-    fn bash_call(arguments: &str) -> FunctionToolCall {
+    /// A tool call for `name` carrying `arguments` as the provider sent them.
+    fn call(name: &str, arguments: String) -> FunctionToolCall {
         FunctionToolCall {
             namespace: None,
-            name: "bash".to_string(),
-            arguments: arguments.to_string(),
+            name: name.to_string(),
+            arguments,
             call_id: "call_0".to_string(),
             id: Some("item_0".to_string()),
             status: None,
             caller: None,
             r#async: None,
+        }
+    }
+
+    /// A `bash` tool call requesting `command`.
+    fn bash_call(arguments: &str) -> FunctionToolCall {
+        call("bash", arguments.to_string())
+    }
+
+    /// A policy over a root, an agent on it, and the unarmed tooling over
+    /// both: the scaffolding every `execute` test needs.
+    struct TestSetup {
+        policy: Policy,
+        agent: Agent,
+        token: CancelToken,
+    }
+
+    impl TestSetup {
+        /// A rig whose sandbox grants writes under `root`.
+        fn new(root: impl AsRef<Path>) -> Self {
+            let policy = Policy::new(root).unwrap();
+            Self {
+                agent: Agent::new("http://localhost:9", "key", "model", policy.clone()),
+                policy,
+                token: CancelToken::new(),
+            }
+        }
+
+        /// The tooling `execute` takes: no cancel lever, no subagents.
+        fn tools(&self) -> Tooling<'_> {
+            Tooling {
+                policy: &self.policy,
+                cancel: &self.token,
+                agents: None,
+                template: &self.agent,
+            }
         }
     }
 
@@ -1166,12 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_bash_clamps_out_of_range_timeouts() {
-        let bash = parse_bash(r#"{"command":"sleep 5","timeout":9000000}"#).unwrap();
-        assert_eq!(bash.timeout, MAX_BASH_TIMEOUT);
-    }
-
-    #[test]
     fn parse_bash_refuses_a_sub_second_timeout() {
         for arguments in [
             r#"{"command":"ls","timeout":300}"#,
@@ -1188,23 +1218,21 @@ mod tests {
         }
     }
 
+    /// The schema says number, so a fractional timeout rounds; an out-of-range
+    /// one clamps to [`MAX_BASH_TIMEOUT`], and a wrongly typed one is ignored
+    /// in favor of [`DEFAULT_BASH_TIMEOUT`]. Expected values are milliseconds.
     #[test]
     fn parse_bash_reads_the_timeout_in_milliseconds() {
-        let bash = parse_bash(r#"{"command":"cargo build","timeout":300000}"#).unwrap();
-        assert_eq!(bash.timeout, Duration::from_secs(300));
-
-        // The schema says number, so a fractional timeout rounds.
-        let bash = parse_bash(r#"{"command":"sleep 1","timeout":1500.7}"#).unwrap();
-        assert_eq!(bash.timeout, Duration::from_millis(1501));
-        let bash = parse_bash(r#"{"command":"sleep 1","timeout":120000.0}"#).unwrap();
-        assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
-    }
-
-    #[test]
-    fn parse_bash_ignores_a_wrong_typed_timeout() {
-        let bash = parse_bash(r#"{"command":"ls","timeout":"300"}"#).unwrap();
-
-        assert_eq!(bash.timeout, DEFAULT_BASH_TIMEOUT);
+        for (arguments, millis) in [
+            (r#"{"command":"cargo build","timeout":300000}"#, 300_000),
+            (r#"{"command":"sleep 1","timeout":1500.7}"#, 1_501),
+            (r#"{"command":"sleep 1","timeout":120000.0}"#, 120_000),
+            (r#"{"command":"ls","timeout":"300"}"#, 120_000),
+            (r#"{"command":"sleep 5","timeout":9000000}"#, 600_000),
+        ] {
+            let parsed = parse_bash(arguments).unwrap();
+            assert_eq!(parsed.timeout, Duration::from_millis(millis), "{arguments}");
+        }
     }
 
     #[test]
@@ -1224,16 +1252,19 @@ mod tests {
         );
     }
 
-    /// The tool result for a finished command with a Unix wait status: 0 is a success,
-    /// `code << 8` an exit code, a small number a signal, with no exemption.
-    fn framed(raw: i32, stdout: &str, stderr: &str) -> String {
-        use std::os::unix::process::ExitStatusExt;
-
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(raw),
+    /// A finished command's streams with a Unix wait status: 0 is a success,
+    /// `code << 8` an exit code, a small number a signal.
+    fn output(raw: i32, stdout: &str, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(raw),
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
-        };
+        }
+    }
+
+    /// The tool result for a finished command, with no exit-one exemption.
+    fn framed(raw: i32, stdout: &str, stderr: &str) -> String {
+        let output = output(raw, stdout, stderr);
         command_text(&combined_output(&output), output.status, false)
     }
 
@@ -1266,21 +1297,13 @@ mod tests {
     /// stderr reads as its own paragraph below stdout
     #[test]
     fn command_result_paragraphs_stderr_below_stdout() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: b"no trailing newline".to_vec(),
-            stderr: b"warning\n".to_vec(),
-        };
+        let output = output(0, "no trailing newline", "warning\n");
         assert_eq!(combined_output(&output), "no trailing newline\nwarning\n");
     }
 
     /// The search-and-test family's "no match" exit is a success.
     #[test]
     fn an_exit_one_from_the_search_family_is_success() {
-        use std::os::unix::process::ExitStatusExt;
-
         assert!(exit_one_is_success("grep needle file"));
         assert!(exit_one_is_success("/usr/bin/rg needle"));
         assert!(exit_one_is_success("git diff --stat"));
@@ -1289,20 +1312,12 @@ mod tests {
         assert!(!exit_one_is_success("cargo test"));
 
         // The exemption only forgives an exit of exactly 1.
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(1 << 8),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        };
+        let forgiven = output(1 << 8, "", "");
         assert_eq!(
-            command_text("", output.status, exit_one_is_success("grep x")),
+            command_text("", forgiven.status, exit_one_is_success("grep x")),
             "(Bash completed with no output)"
         );
-        let failed = Output {
-            status: std::process::ExitStatus::from_raw(2 << 8),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        };
+        let failed = output(2 << 8, "", "");
         assert_eq!(
             command_text("", failed.status, exit_one_is_success("grep x")),
             "Exit code 2"
@@ -1313,15 +1328,10 @@ mod tests {
     #[test]
     fn an_oversized_success_spills_to_a_file() {
         use std::os::unix::fs::PermissionsExt as _;
-        use std::os::unix::process::ExitStatusExt;
 
         let dir = spill_dir();
         let text = "x".repeat(BASH_SUCCESS_CAP + 1);
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: text.clone().into_bytes(),
-            stderr: Vec::new(),
-        };
+        let output = output(0, &text, "");
         let framed = command_text(&combined_output(&output), output.status, false);
 
         let lines: Vec<&str> = framed.lines().collect();
@@ -1358,14 +1368,8 @@ mod tests {
     /// fetched page is never silently replaced by a scratch-file pointer.
     #[test]
     fn inline_framing_never_spills() {
-        use std::os::unix::process::ExitStatusExt;
-
         let text = "x".repeat(BASH_SUCCESS_CAP + 1);
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: text.clone().into_bytes(),
-            stderr: Vec::new(),
-        };
+        let output = output(0, &text, "");
         let framed = command_text_inline(&combined_output(&output), output.status, false);
         assert_eq!(framed, text);
     }
@@ -1373,18 +1377,12 @@ mod tests {
     /// A failure past the inline cap shrinks to a head-and-tail excerpt.
     #[test]
     fn an_oversized_failure_excerpts_head_and_tail() {
-        use std::os::unix::process::ExitStatusExt;
-
         let text = format!(
             "{}zzzz{}",
             "a".repeat(BASH_FAILURE_CAP),
             "b".repeat(BASH_FAILURE_CAP)
         );
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(1 << 8),
-            stdout: text.into_bytes(),
-            stderr: Vec::new(),
-        };
+        let output = output(1 << 8, &text, "");
         let framed = command_text(&combined_output(&output), output.status, false);
 
         let (excerpted, code) = framed.split_once("\nExit code ").unwrap();
@@ -1426,14 +1424,6 @@ mod tests {
         let (kept, marker) = capped.split_once('\n').unwrap();
         assert_eq!(marker, "[truncated; first 1 KB shown]");
         assert!(kept.chars().all(|c| c == '語'), "cut inside a character");
-    }
-
-    #[test]
-    fn timeout_text_without_output_is_just_the_kill_lines() {
-        assert_eq!(
-            timeout_text("", DEFAULT_BASH_TIMEOUT),
-            "Exit code 137\nCommand timed out after 2m 0s"
-        );
     }
 
     #[test]
@@ -1521,10 +1511,8 @@ mod tests {
     /// An untouched token leaves the command to finish on its own.
     #[test]
     fn manual_command_runs_to_completion_without_a_cancel() {
-        let mut command = Command::new("/bin/echo");
-        command.arg("hi");
-
-        let run = run_watched(&mut command, None, &CancelToken::new()).unwrap();
+        let run =
+            run_watched(Command::new("/bin/echo").arg("hi"), None, &CancelToken::new()).unwrap();
 
         assert_eq!(run.killed, None);
         assert_eq!(combined_output(&run.output), "hi\n");
@@ -1550,26 +1538,11 @@ mod tests {
 
     /// These drive `run_watched` with plain commands, so they run without the sandbox
     #[test]
-    fn run_watched_returns_a_fast_command_normally() {
-        let mut command = Command::new("/bin/echo");
-        command.arg("hi");
-
-        let run =
-            run_watched(&mut command, Some(Duration::from_secs(10)), &CancelToken::new()).unwrap();
-
-        assert_eq!(run.killed, None);
-        assert_eq!(combined_output(&run.output), "hi\n");
-        assert!(run.output.status.success());
-    }
-
-    #[test]
     fn run_watched_kills_a_command_that_outruns_the_deadline() {
-        let mut command = Command::new("/bin/sleep");
-        command.arg("30");
         let started = Instant::now();
 
         let run = run_watched(
-            &mut command,
+            Command::new("/bin/sleep").arg("30"),
             Some(Duration::from_millis(300)),
             &CancelToken::new(),
         )
@@ -1582,8 +1555,6 @@ mod tests {
 
     #[test]
     fn run_watched_kills_a_command_the_moment_the_token_fires() {
-        let mut command = Command::new("/bin/sleep");
-        command.arg("30");
         let token = CancelToken::new();
         let trip = {
             let token = token.clone();
@@ -1594,7 +1565,12 @@ mod tests {
         };
         let started = Instant::now();
 
-        let run = run_watched(&mut command, Some(Duration::from_secs(60)), &token).unwrap();
+        let run = run_watched(
+            Command::new("/bin/sleep").arg("30"),
+            Some(Duration::from_secs(60)),
+            &token,
+        )
+        .unwrap();
 
         assert_eq!(run.killed, Some(KillReason::Cancelled));
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1605,12 +1581,12 @@ mod tests {
     fn run_watched_kills_the_whole_process_group() {
         // The backgrounded sleeps outlive bash and hold the output pipe; only a
         // group kill frees the capture, so returning promptly proves they died.
-        let mut command = Command::new("/bin/bash");
-        command.arg("-c").arg("sleep 9871 & sleep 9871 & wait");
         let started = Instant::now();
 
         let run = run_watched(
-            &mut command,
+            Command::new("/bin/bash")
+                .arg("-c")
+                .arg("sleep 9871 & sleep 9871 & wait"),
             Some(Duration::from_millis(300)),
             &CancelToken::new(),
         )
@@ -1620,18 +1596,22 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    /// A fast command finishes un-killed and successful, and the sender's drop
+    /// joins the watchdog at once rather than letting it sleep out the timeout.
     #[test]
     fn run_watched_wakes_the_watchdog_when_the_command_finishes_early() {
-        let mut command = Command::new("/bin/echo");
-        command.arg("hi");
         let started = Instant::now();
 
-        let run =
-            run_watched(&mut command, Some(DEFAULT_BASH_TIMEOUT), &CancelToken::new()).unwrap();
+        let run = run_watched(
+            Command::new("/bin/echo").arg("hi"),
+            Some(DEFAULT_BASH_TIMEOUT),
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         assert_eq!(run.killed, None);
-        // The sender's drop joins the watchdog at once rather than letting it
-        // sleep out the full timeout.
+        assert_eq!(combined_output(&run.output), "hi\n");
+        assert!(run.output.status.success());
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -1639,18 +1619,15 @@ mod tests {
     #[apply(skip_unless_live!)]
     #[test]
     fn execute_reports_command_then_output() {
-        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
-        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
-        let tools = Tooling {
-            policy: &policy,
-            cancel: &CancelToken::new(),
-            agents: None,
-            template: &agent,
-        };
+        let rig = TestSetup::new(std::env::current_dir().unwrap());
         let events = std::cell::RefCell::new(Vec::new());
-        let output = execute(&bash_call(r#"{"command":"echo hi"}"#), &tools, &|progress| {
-            events.borrow_mut().push(progress);
-        });
+        let output = execute(
+            &bash_call(r#"{"command":"echo hi"}"#),
+            &rig.tools(),
+            &|progress| {
+                events.borrow_mut().push(progress);
+            },
+        );
 
         assert_eq!(output, "hi\n");
         assert!(matches!(
@@ -1674,11 +1651,11 @@ mod tests {
 
         // A failure carries its exit code as the trailing line.
         assert_eq!(
-            execute(&bash_call(r#"{"command":"false"}"#), &tools, &|_| {}),
+            execute(&bash_call(r#"{"command":"false"}"#), &rig.tools(), &|_| {}),
             "Exit code 1"
         );
         assert_eq!(
-            execute(&bash_call(r#"{"command":"true"}"#), &tools, &|_| {}),
+            execute(&bash_call(r#"{"command":"true"}"#), &rig.tools(), &|_| {}),
             "(Bash completed with no output)"
         );
         // The search family's "no match" exit of 1 reads as success, and is
@@ -1687,7 +1664,7 @@ mod tests {
         assert_eq!(
             execute(
                 &bash_call(r#"{"command":"grep needle /dev/null"}"#),
-                &tools,
+                &rig.tools(),
                 &|progress| events.borrow_mut().push(progress)
             ),
             "(Bash completed with no output)"
@@ -1727,21 +1704,14 @@ mod tests {
 
     #[test]
     fn execute_answers_an_unknown_tool_with_output_not_failure() {
-        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
-        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
-        let tools = Tooling {
-            policy: &policy,
-            cancel: &CancelToken::new(),
-            agents: None,
-            template: &agent,
-        };
+        let rig = TestSetup::new(std::env::current_dir().unwrap());
         let mut call = bash_call(r#"{"command":"ls"}"#);
         call.name = "rm".to_string();
         let events = std::cell::RefCell::new(Vec::new());
 
         // Only the model can fix calling a tool that does not exist, so the
         // error is its output
-        let output = execute(&call, &tools, &|progress| {
+        let output = execute(&call, &rig.tools(), &|progress| {
             events.borrow_mut().push(progress);
         });
 
@@ -1760,15 +1730,9 @@ mod tests {
 
     #[test]
     fn chat_mode_denies_the_sandboxed_tools() {
-        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
-        let mut agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
-        agent.set_mode(ChatMode::Chat);
-        let tools = Tooling {
-            policy: &policy,
-            cancel: &CancelToken::new(),
-            agents: None,
-            template: &agent,
-        };
+        let mut rig = TestSetup::new(std::env::current_dir().unwrap());
+        rig.agent.set_mode(ChatMode::Chat);
+        let tools = rig.tools();
         for name in ["bash", "read", "edit", "spawn_agent", "check_agent"] {
             let mut call = bash_call(r#"{"command":"echo hi"}"#);
             call.name = name.to_string();
@@ -1800,16 +1764,15 @@ mod tests {
     /// the guard fires before the registry is touched.
     #[test]
     fn chat_mode_denies_spawn_even_when_armed() {
-        let policy = Policy::new(std::env::current_dir().unwrap()).unwrap();
-        let mut agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
-        agent.set_mode(ChatMode::Chat);
+        let mut rig = TestSetup::new(std::env::current_dir().unwrap());
+        rig.agent.set_mode(ChatMode::Chat);
         let agents = Agents::new(|_, _| ());
-        agent.set_subagents(std::sync::Arc::new(agents.clone()));
+        rig.agent.set_subagents(std::sync::Arc::new(agents.clone()));
         let tools = Tooling {
-            policy: &policy,
-            cancel: &CancelToken::new(),
+            policy: &rig.policy,
+            cancel: &rig.token,
             agents: Some(&agents),
-            template: &agent,
+            template: &rig.agent,
         };
         let mut call = bash_call(r#"{"task":"do things"}"#);
         call.name = "spawn_agent".to_string();
@@ -1833,30 +1796,29 @@ mod tests {
     /// An `edit` tool call replacing `old` with `new` in `path`, in the
     /// schema's `file_path` shape.
     fn edit_call(path: &Path, old: &str, new: &str) -> FunctionToolCall {
-        FunctionToolCall {
-            namespace: None,
-            name: "edit".to_string(),
-            arguments: serde_json::json!({
+        call(
+            "edit",
+            serde_json::json!({
                 "file_path": path, "old_string": old, "new_string": new
             })
             .to_string(),
-            call_id: "call_0".to_string(),
-            id: Some("item_0".to_string()),
-            status: None,
-            caller: None,
-            r#async: None,
+        )
+    }
+
+    /// One parsed edit call for `path`, as its JSON arguments would have built it.
+    fn an_edit(path: &Path, old: &str, new: &str, replace_all: bool) -> Edit {
+        Edit {
+            file_path: path.display().to_string(),
+            old_string: old.to_string(),
+            new_string: new.to_string(),
+            replace_all,
         }
     }
 
     /// Drive [`EDIT_PROGRAM`] with a plain, unsandboxed perl command.
     fn perl_edit(path: &Path, old: &str, new: &str, replace_all: bool) -> String {
         spawn_perl(
-            &Edit {
-                file_path: path.display().to_string(),
-                old_string: old.to_string(),
-                new_string: new.to_string(),
-                replace_all,
-            },
+            &an_edit(path, old, new, replace_all),
             &mut std::process::Command::new("/usr/bin/perl"),
         )
         .0
@@ -1955,20 +1917,11 @@ mod tests {
     #[test]
     fn concurrent_edits_to_one_file_both_apply() {
         let file = scratch("one UNO alpha\ntwo DOS beta\n");
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
         let spawn_edit = |old: &str, new: &str| {
             let call = edit_call(file.path(), old, new);
-            let policy = policy.clone();
             std::thread::spawn(move || {
-                let token = CancelToken::new();
-                let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
-                let tools = Tooling {
-                    policy: &policy,
-                    cancel: &token,
-                    agents: None,
-                    template: &agent,
-                };
-                execute(&call, &tools, &|_| {})
+                let rig = TestSetup::new(std::env::temp_dir());
+                execute(&call, &rig.tools(), &|_| {})
             })
         };
         let first = spawn_edit("UNO", "uno");
@@ -2015,63 +1968,35 @@ mod tests {
         let file = scratch("a\nb\na\n");
 
         // An identical pair refuses
-        let (identical, _) = apply_edit(
-            &Edit {
-                file_path: file.path().display().to_string(),
-                old_string: "a".into(),
-                new_string: "a".into(),
-                replace_all: false,
-            },
-            &policy,
-        );
+        let (identical, _) = apply_edit(&an_edit(file.path(), "a", "a", false), &policy);
         assert_eq!(
             identical,
-            "No changes to make: old_string and new_string are exactly the same."
+            "<tool_use_error>No changes to make: old_string and new_string are exactly the \
+             same.</tool_use_error>"
         );
 
         // A no-match echoes the string, as Claude Code does, so quoting slips show.
-        let (missing, _) = apply_edit(
-            &Edit {
-                file_path: file.path().display().to_string(),
-                old_string: "z\n".into(),
-                new_string: "y\n".into(),
-                replace_all: false,
-            },
-            &policy,
+        let (missing, _) = apply_edit(&an_edit(file.path(), "z\n", "y\n", false), &policy);
+        assert_eq!(
+            missing,
+            "<tool_use_error>String to replace not found in file.\nString: z\n</tool_use_error>"
         );
-        assert_eq!(missing, "String to replace not found in file.\nString: z\n");
 
         // An ambiguous match without replace_all reports the count and the fix.
-        let (ambiguous, _) = apply_edit(
-            &Edit {
-                file_path: file.path().display().to_string(),
-                old_string: "a".into(),
-                new_string: "c".into(),
-                replace_all: false,
-            },
-            &policy,
-        );
-        assert!(
-            ambiguous
-                .starts_with("Found 2 matches of the string to replace, but replace_all is false.")
-        );
-        assert!(ambiguous.ends_with("instance.\nString: a"));
+        let (ambiguous, _) = apply_edit(&an_edit(file.path(), "a", "c", false), &policy);
+        assert!(ambiguous.starts_with(
+            "<tool_use_error>Found 2 matches of the string to replace, but replace_all is \
+                 false."
+        ));
+        assert!(ambiguous.ends_with("instance.\nString: a</tool_use_error>"));
 
         // A missing file names the working directory.
         let absent = std::env::temp_dir().join("tart-edit-does-not-exist");
-        let (missing_file, _) = apply_edit(
-            &Edit {
-                file_path: absent.display().to_string(),
-                old_string: "a".into(),
-                new_string: "b".into(),
-                replace_all: false,
-            },
-            &policy,
-        );
+        let (missing_file, _) = apply_edit(&an_edit(&absent, "a", "b", false), &policy);
         assert_eq!(
             missing_file,
             format!(
-                "File does not exist. Note: your current working directory is {}.",
+                "<tool_use_error>File does not exist. Note: your current working directory is {}.</tool_use_error>",
                 std::env::current_dir().unwrap().display()
             )
         );
@@ -2156,21 +2081,15 @@ mod tests {
             (None, Some(end)) => Some(end),
             _ => None,
         };
-        FunctionToolCall {
-            namespace: None,
-            name: "read".to_string(),
-            arguments: serde_json::json!({
+        call(
+            "read",
+            serde_json::json!({
                 "file_path": path,
                 "offset": start_line,
                 "limit": limit,
             })
             .to_string(),
-            call_id: "call_0".to_string(),
-            id: Some("item_0".to_string()),
-            status: None,
-            caller: None,
-            r#async: None,
-        }
+        )
     }
 
     #[test]
@@ -2210,18 +2129,11 @@ mod tests {
             let _ = writeln!(contents, "line {line}");
         }
         let file = scratch(&contents);
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
-        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
-        let tools = Tooling {
-            policy: &policy,
-            cancel: &CancelToken::new(),
-            agents: None,
-            template: &agent,
-        };
+        let rig = TestSetup::new(std::env::temp_dir());
         let events = std::cell::RefCell::new(Vec::new());
 
-        let whole = execute(&read_call(file.path(), None, None), &tools, &|progress| {
-            events.borrow_mut().push(progress);
+        let whole = execute(&read_call(file.path(), None, None), &rig.tools(), &|progress| {
+            events.borrow_mut().push(progress)
         });
 
         assert!(whole.starts_with("     1\tline 1\n"), "{whole}");
@@ -2241,9 +2153,11 @@ mod tests {
 
         // A bounded read's arguments ride along untouched.
         events.borrow_mut().clear();
-        let range = execute(&read_call(file.path(), Some(10), Some(12)), &tools, &|progress| {
-            events.borrow_mut().push(progress);
-        });
+        let range = execute(
+            &read_call(file.path(), Some(10), Some(12)),
+            &rig.tools(),
+            &|progress| events.borrow_mut().push(progress),
+        );
         assert_eq!(range, "    10\tline 10\n    11\tline 11\n    12\tline 12\n");
         assert!(matches!(
             events.borrow().as_slice(),
@@ -2258,12 +2172,12 @@ mod tests {
                         .to_string()
         ));
 
-        let tail = execute(&read_call(file.path(), Some(28), None), &tools, &|_| {});
+        let tail = execute(&read_call(file.path(), Some(28), None), &rig.tools(), &|_| {});
         assert!(tail.starts_with("    28\tline 28\n"), "{tail}");
         assert_eq!(tail.lines().count(), 3);
 
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
-        let absent = execute(&read_call(&missing, None, None), &tools, &|_| {});
+        let absent = execute(&read_call(&missing, None, None), &rig.tools(), &|_| {});
         assert!(
             absent.contains("File does not exist. Note: your current working directory is"),
             "{absent}"
@@ -2272,33 +2186,17 @@ mod tests {
 
     #[test]
     fn a_malformed_call_is_output_not_failure() {
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
-        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
-        let tools = Tooling {
-            policy: &policy,
-            cancel: &CancelToken::new(),
-            agents: None,
-            template: &agent,
-        };
-        let call = FunctionToolCall {
-            namespace: None,
-            name: "read".to_string(),
-            arguments: r#"{"start_line": 1}"#.to_string(),
-            call_id: "call_0".to_string(),
-            id: Some("item_0".to_string()),
-            status: None,
-            caller: None,
-            r#async: None,
-        };
+        let rig = TestSetup::new(std::env::temp_dir());
+        let call = call("read", r#"{"start_line": 1}"#.to_string());
         let events = std::cell::RefCell::new(Vec::new());
 
-        let output = execute(&call, &tools, &|progress| {
+        let output = execute(&call, &rig.tools(), &|progress| {
             events.borrow_mut().push(progress);
         });
 
         assert!(
             output.contains(
-                "<tool_use_error>InputValidationError: read failed due to the following \
+                "<tool_use_error>InputValidationError: Read failed due to the following \
                  issue:\nThe required parameter `file_path` is missing</tool_use_error>"
             ),
             "{output}"
