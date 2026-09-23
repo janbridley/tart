@@ -36,6 +36,9 @@ const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest timeout a bash call may ask for.
 const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// read.pl's exit code for a missing file.
+const READ_EXIT_NOT_FOUND: i32 = 3;
+
 /// The most of any one blob the model is handed, in bytes.
 pub const CONTENT_CAP: usize = 64 * 1024;
 
@@ -85,6 +88,7 @@ pub(crate) fn bash() -> Tool {
         "bash",
         "Run a bash command in a sandbox (writes restricted to granted roots, no network) \
         and return its stdout, with stderr as a separate paragraph below",
+        // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash.ts#L565>
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -193,9 +197,10 @@ fn parse_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
         .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))
 }
 
-/// A required string field from parsed tool arguments, absent ones reported as in CC.
+/// A required string field from parsed tool arguments, absent ones reported.
 fn string_field(args: &serde_json::Value, tool: &str, name: &str) -> anyhow::Result<String> {
     args[name].as_str().map(str::to_string).ok_or_else(|| {
+        // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/input-validation-model-content.ts#L18>
         anyhow::anyhow!(
             "InputValidationError: {tool} failed due to the following issue:\nThe required \
              parameter `{name}` is missing"
@@ -370,6 +375,7 @@ pub(crate) fn execute<B: Backend, F: Fn(Progress)>(
         // The subagent pair, offered to spawning agents only.
         "spawn_agent" => run_spawn_agent(call, tools, on_progress),
         "check_agent" => run_check_agent(call, tools, on_progress),
+        // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/executor/call-runner.ts#L128>
         other => misuse(call, on_progress, &anyhow::anyhow!("Tool not found: {other}")),
     }
 }
@@ -535,6 +541,7 @@ fn exit_line(status: ExitStatus) -> String {
     let code = status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal));
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts#L52>
     format!("Exit code {}", code.unwrap_or(1))
 }
 
@@ -555,6 +562,8 @@ fn spill_dir() -> PathBuf {
 
 /// Write `text` to a private scratch file and point the model at it, previewing
 /// the head. Falls back to an excerpt when there is nowhere safe to write.
+/// TODO: this one does not match!!
+/// <https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts>
 fn spill_to_file(text: &str) -> String {
     let dir = spill_dir();
     let name = format!("tart-bash-{}-{}.output", std::process::id(), nanos());
@@ -630,6 +639,7 @@ enum KillReason {
 
 /// Model-facing explanation for a command the timeout killed, in Claude Code's
 /// shape: the kill's exit code, then the timeout line.
+/// TODO: missing permalink!.
 fn timeout_text(text: &str, timeout: Duration) -> String {
     use std::fmt::Write as _;
 
@@ -819,6 +829,7 @@ fn misuse<F: Fn(Progress)>(
     on_progress: &F,
     error: &anyhow::Error,
 ) -> String {
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/executor/errors.ts#L22>
     let text = format!("<tool_use_error>{error}</tool_use_error>");
     traced(call, on_progress, || (text.clone(), text, None))
 }
@@ -913,9 +924,9 @@ fn run_read<B: Backend, F: Fn(Progress)>(
         match &command.output() {
             Ok(spawned) => {
                 let text = combined_output(spawned);
-                // A missing file maps perl's raw warning to Claude Code's message;
-                // everything here runs under the sandbox policy, unlike a stat.
-                if !spawned.status.success() && text.contains("No such file or directory") {
+                // A missing file reports its typed exit code, and maps to Claude
+                // Code's message; every other failure keeps perl's raw warning.
+                if spawned.status.code() == Some(READ_EXIT_NOT_FOUND) {
                     let missing = missing_file_message();
                     (missing.clone(), missing, None)
                 } else {
@@ -963,6 +974,7 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
         );
     }
     if edit.old_string == edit.new_string {
+        // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts#L107>
         return (
             "No changes to make: old_string and new_string are exactly the same.".to_string(),
             None,
@@ -985,23 +997,26 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
     spawn_perl(edit, &mut policy.command("/usr/bin/perl"))
 }
 
-/// Claude Code's missing-file message; the cwd note keeps relative paths debuggable.
+/// Missing-file message; the cwd note keeps relative paths debuggable.
 fn missing_file_message() -> String {
     let cwd =
         std::env::current_dir().map_or_else(|_| ".".to_string(), |dir| dir.display().to_string());
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/read.ts#L401>
     format!("File does not exist. Note: your current working directory is {cwd}.")
 }
 
-/// Claude Code's no-match error, echoing the string so quoting slips are visible.
+/// No-match error, echoing the string so quoting slips are visible.
 fn no_match_message(edit: &Edit) -> String {
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts#L213>
     format!(
         "String to replace not found in file.\nString: {}",
         edit.old_string
     )
 }
 
-/// Claude Code's multi-match error for a call without `replace_all`.
+/// Multi-match error for a call without `replace_all`.
 fn ambiguous_match_message(count: usize, edit: &Edit) -> String {
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts#L639>
     format!(
         "Found {count} matches of the string to replace, but replace_all is false. To replace \
          all occurrences, set replace_all to true. To replace only one occurrence, please \
@@ -1041,18 +1056,22 @@ fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i
     }
 }
 
-/// Claude Code's edit receipt.
+const FILE_FRESHNESS_SUFFIX: &str =
+    "(file state is current in your context — no need to Read it back)";
+
+/// Edit receipt when a file reread is not needed.
 fn edit_receipt(edit: &Edit) -> String {
     if edit.replace_all {
+        // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts#L78>
         format!(
             "The file {} has been updated. All occurrences were successfully replaced. \
-             (file state is current in your context \u{2014} no need to Read it back)",
+            {FILE_FRESHNESS_SUFFIX}
+             ",
             edit.file_path
         )
     } else {
         format!(
-            "The file {} has been updated successfully. (file state is current in your context \
-             \u{2014} no need to Read it back)",
+            "The file {} has been updated successfully. {FILE_FRESHNESS_SUFFIX}",
             edit.file_path
         )
     }
