@@ -488,8 +488,45 @@ fn exit_one_is_success(command: &str) -> bool {
 const BASH_SUCCESS_CAP: usize = 30_000;
 const BASH_FAILURE_CAP: usize = 10_000;
 
-/// How much of a spilled output previews inline, in bytes.
-const SPILL_PREVIEW: usize = 2_048;
+/// How much of a spilled output previews inline, in characters.
+const SPILL_PREVIEW: usize = 2_000;
+
+/// The first `max_chars` characters of `text`, snapped back to a newline in the
+/// back half so a cut lands on a line boundary; the flag says it was cut.
+// <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/result-persistence-format.ts#L50>
+fn preview_first_chars(text: &str, max_chars: usize) -> (&str, bool) {
+    // `None` means at most `max_chars` characters: there is no cut to make.
+    let Some(end) = text.char_indices().nth(max_chars).map(|(index, _)| index) else {
+        return (text, false);
+    };
+    let head = &text[..end];
+    let snapped = head
+        .rfind('\n')
+        .filter(|&newline| 2 * head[..newline].chars().count() > max_chars)
+        .unwrap_or(end);
+    (&head[..snapped], true)
+}
+
+/// A size in binary units with one decimal, a trailing `.0` trimmed: `2KB`, `1.5MB`.
+// <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts#L177>
+fn bash_byte_size(bytes: usize) -> String {
+    let unit = |value: f64| {
+        let fixed = format!("{value:.1}");
+        fixed.strip_suffix(".0").unwrap_or(&fixed).to_owned()
+    };
+    let kilobytes = bytes as f64 / 1024.0;
+    if bytes == 0 {
+        "0 bytes".to_string()
+    } else if kilobytes < 1.0 {
+        format!("{bytes} bytes")
+    } else if kilobytes < 1024.0 {
+        format!("{}KB", unit(kilobytes))
+    } else if kilobytes < 1024.0 * 1024.0 {
+        format!("{}MB", unit(kilobytes / 1024.0))
+    } else {
+        format!("{}GB", unit(kilobytes / 1024.0 / 1024.0))
+    }
+}
 
 /// The model-facing framing of a finished command's text; the bash tool's, which
 /// spills an oversized success to a scratch file.
@@ -560,10 +597,7 @@ fn spill_dir() -> PathBuf {
     std::env::temp_dir().join("tart")
 }
 
-/// Write `text` to a private scratch file and point the model at it, previewing
-/// the head. Falls back to an excerpt when there is nowhere safe to write.
-/// TODO: this one does not match!!
-/// <https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts>
+/// Write `text` to a private scratch file and point the model at it, previewing head.
 fn spill_to_file(text: &str) -> String {
     let dir = spill_dir();
     let name = format!("tart-bash-{}-{}.output", std::process::id(), nanos());
@@ -571,11 +605,15 @@ fn spill_to_file(text: &str) -> String {
     if write_private(&dir, &path, text).is_err() {
         return excerpt(text);
     }
-    let kilobytes = text.len() as f64 / 1024.0;
-    let (preview, _) = ends(text, SPILL_PREVIEW, 0);
+    let (preview, more) = preview_first_chars(text, SPILL_PREVIEW);
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/result-persistence-format.ts#L29>
+    let tail = if more { "...\n" } else { "" };
     format!(
-        "Output too large ({kilobytes:.1}KB). Full output saved to: {}\n\n{preview}",
-        path.display()
+        "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\nPreview (first \
+         {}):\n{preview}\n{tail}</persisted-output>",
+        bash_byte_size(text.len()),
+        path.display(),
+        bash_byte_size(SPILL_PREVIEW),
     )
 }
 
@@ -638,12 +676,12 @@ enum KillReason {
 }
 
 /// Model-facing explanation for a command the timeout killed.
-/// TODO: missing permalink!.
 fn timeout_text(text: &str, timeout: Duration) -> String {
     use std::fmt::Write as _;
 
     let mut framed = append_line(text, "Exit code 137");
     // Infallible: the target is a `String`.
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts#L109>
     let _ = write!(framed, "\nCommand timed out after {}", duration_text(timeout));
     framed
 }
@@ -1063,8 +1101,7 @@ fn edit_receipt(edit: &Edit) -> String {
         // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts#L78>
         format!(
             "The file {} has been updated. All occurrences were successfully replaced. \
-            {FILE_FRESHNESS_SUFFIX}
-             ",
+             {FILE_FRESHNESS_SUFFIX}",
             edit.file_path
         )
     } else {
@@ -1287,10 +1324,17 @@ mod tests {
         };
         let framed = command_text(&combined_output(&output), output.status, false);
 
-        let (message, preview) = framed.split_once("\n\n").unwrap();
-        let (size, saved) = message.split_once(". Full output saved to: ").unwrap();
-        assert!(size.starts_with("Output too large ("), "{framed}");
-        assert_eq!(preview.chars().count(), SPILL_PREVIEW, "{framed}");
+        let lines: Vec<&str> = framed.lines().collect();
+        assert_eq!(lines[0], "<persisted-output>", "{framed}");
+        let (size, saved) = lines[1].split_once(". Full output saved to: ").unwrap();
+        assert_eq!(size, "Output too large (29.3KB)", "{framed}");
+        assert_eq!(lines[2], "", "{framed}");
+        assert_eq!(lines[3], "Preview (first 2KB):", "{framed}");
+        assert_eq!(lines[4].chars().count(), SPILL_PREVIEW, "{framed}");
+        assert!(lines[4].chars().all(|c| c == 'x'), "{framed}");
+        assert_eq!(lines[5], "...", "{framed}");
+        assert_eq!(lines[6], "</persisted-output>", "{framed}");
+        assert_eq!(lines.len(), 7, "{framed}");
         // The spill lives in tart's throwaway directory, not the temp root.
         let path = std::path::Path::new(saved);
         assert_eq!(path.parent(), Some(dir.as_path()), "{framed}");
