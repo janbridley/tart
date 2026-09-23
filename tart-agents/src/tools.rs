@@ -219,9 +219,9 @@ struct Bash {
 
 /// Extract the fields from a bash tool call's JSON arguments.
 ///
-/// The timeout arrives in milliseconds as a JSON number, as in Claude Code,
-/// clamped to the 10-minute ceiling with fractions rounded to the nearest
-/// millisecond. A request under a second is refused rather than clamped.
+/// The timeout arrives in milliseconds as a JSON number, clamped to the 10-minute
+/// ceiling with fractions rounded to the nearest millisecond. A request under a second
+/// is refused rather than clamped.
 fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
     let args = parse_arguments(arguments)?;
     let requested = args["timeout"].as_f64();
@@ -637,8 +637,7 @@ enum KillReason {
     Cancelled,
 }
 
-/// Model-facing explanation for a command the timeout killed, in Claude Code's
-/// shape: the kill's exit code, then the timeout line.
+/// Model-facing explanation for a command the timeout killed.
 /// TODO: missing permalink!.
 fn timeout_text(text: &str, timeout: Duration) -> String {
     use std::fmt::Write as _;
@@ -649,7 +648,7 @@ fn timeout_text(text: &str, timeout: Duration) -> String {
     framed
 }
 
-/// A Claude Code-style duration: `1s`, `2m 0s`, `6m 40s`.
+/// Styled duration: `1s`, `2m 0s`, `6m 40s`.
 fn duration_text(duration: Duration) -> String {
     let seconds = duration.as_secs();
     if seconds < 60 {
@@ -924,8 +923,7 @@ fn run_read<B: Backend, F: Fn(Progress)>(
         match &command.output() {
             Ok(spawned) => {
                 let text = combined_output(spawned);
-                // A missing file reports its typed exit code, and maps to Claude
-                // Code's message; every other failure keeps perl's raw warning.
+                // A missing file reports its typed exit code, or perl warning if unknown
                 if spawned.status.code() == Some(READ_EXIT_NOT_FOUND) {
                     let missing = missing_file_message();
                     (missing.clone(), missing, None)
@@ -1113,7 +1111,7 @@ mod tests {
             tool["parameters"]["properties"]["command"]["description"],
             "The command to execute"
         );
-        // Claude Code's timeout: a number, in milliseconds, capped at ten minutes.
+        // A number, in milliseconds, capped at ten minutes.
         assert_eq!(tool["parameters"]["properties"]["timeout"]["type"], "number");
         assert_eq!(
             tool["parameters"]["properties"]["timeout"]["description"],
@@ -1228,7 +1226,7 @@ mod tests {
         assert_eq!(framed(9, "", ""), "Exit code 137");
     }
 
-    /// stderr reads as its own paragraph below stdout, as in Claude Code.
+    /// stderr reads as its own paragraph below stdout
     #[test]
     fn command_result_paragraphs_stderr_below_stdout() {
         use std::os::unix::process::ExitStatusExt;
@@ -1972,7 +1970,7 @@ mod tests {
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let file = scratch("a\nb\na\n");
 
-        // An identical pair refuses with Claude Code's wording.
+        // An identical pair refuses
         let (identical, _) = apply_edit(
             &Edit {
                 file_path: file.path().display().to_string(),
@@ -2015,7 +2013,7 @@ mod tests {
         );
         assert!(ambiguous.ends_with("instance.\nString: a"));
 
-        // A missing file names the working directory, as Claude Code does.
+        // A missing file names the working directory.
         let absent = std::env::temp_dir().join("tart-edit-does-not-exist");
         let (missing_file, _) = apply_edit(
             &Edit {
