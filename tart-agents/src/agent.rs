@@ -943,7 +943,7 @@ mod tests {
         assert!(
             items[3]["output"]
                 .as_str()
-                .is_some_and(|output| output.contains("missing 'file_path'")),
+                .is_some_and(|output| output.contains("`file_path` is missing")),
             "the call's error is its output: {}",
             items[3]["output"]
         );
@@ -1009,7 +1009,7 @@ mod tests {
             assert!(
                 items[output]["output"]
                     .as_str()
-                    .is_some_and(|text| text.contains("missing 'file_path'")),
+                    .is_some_and(|text| text.contains("`file_path` is missing")),
                 "the call's error is its output: {}",
                 items[output]["output"]
             );

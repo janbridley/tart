@@ -193,12 +193,14 @@ fn parse_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
         .map_err(|error| anyhow::anyhow!("tool arguments weren't JSON: {error}"))
 }
 
-/// A required string field from parsed tool arguments.
-fn string_field(args: &serde_json::Value, name: &str) -> anyhow::Result<String> {
-    args[name]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("tool call missing '{name}'"))
+/// A required string field from parsed tool arguments, absent ones reported as in CC.
+fn string_field(args: &serde_json::Value, tool: &str, name: &str) -> anyhow::Result<String> {
+    args[name].as_str().map(str::to_string).ok_or_else(|| {
+        anyhow::anyhow!(
+            "InputValidationError: {tool} failed due to the following issue:\nThe required \
+             parameter `{name}` is missing"
+        )
+    })
 }
 
 /// One parsed bash tool call.
@@ -219,7 +221,7 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
     let args = parse_arguments(arguments)?;
     let requested = args["timeout"].as_f64();
     if requested.is_some_and(|milliseconds| milliseconds < 1000.0) {
-        anyhow::bail!("error: timeout is measured in milliseconds; pass at least 1000");
+        anyhow::bail!("timeout is measured in milliseconds; pass at least 1000");
     }
     #[allow(
         clippy::cast_possible_truncation,
@@ -231,7 +233,7 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         .clamp(1000.0, MAX_BASH_TIMEOUT.as_millis() as f64)
         .round() as u64;
     Ok(Bash {
-        command: string_field(&args, "command")?,
+        command: string_field(&args, "bash", "command")?,
         timeout: Duration::from_millis(milliseconds),
     })
 }
@@ -267,7 +269,7 @@ impl Read {
 fn parse_read(arguments: &str) -> anyhow::Result<Read> {
     let args = parse_arguments(arguments)?;
     Ok(Read {
-        file_path: string_field(&args, "file_path")?,
+        file_path: string_field(&args, "read", "file_path")?,
         offset: args["offset"].as_u64().filter(|&offset| offset > 0),
         limit: args["limit"].as_u64().filter(|&limit| limit > 0),
     })
@@ -292,9 +294,9 @@ struct Edit {
 fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
     let args = parse_arguments(arguments)?;
     Ok(Edit {
-        file_path: string_field(&args, "file_path")?,
-        old_string: string_field(&args, "old_string")?,
-        new_string: string_field(&args, "new_string")?,
+        file_path: string_field(&args, "edit", "file_path")?,
+        old_string: string_field(&args, "edit", "old_string")?,
+        new_string: string_field(&args, "edit", "new_string")?,
         replace_all: args["replace_all"].as_bool().unwrap_or(false),
     })
 }
@@ -309,7 +311,9 @@ struct Spawn {
 /// Extract the fields from a spawn tool call's JSON arguments.
 fn parse_spawn(arguments: &str) -> anyhow::Result<Spawn> {
     let args = parse_arguments(arguments)?;
-    Ok(Spawn { task: string_field(&args, "task")? })
+    Ok(Spawn {
+        task: string_field(&args, "spawn_agent", "task")?,
+    })
 }
 
 /// One parsed `check_agent` tool call.
@@ -366,7 +370,7 @@ pub(crate) fn execute<B: Backend, F: Fn(Progress)>(
         // The subagent pair, offered to spawning agents only.
         "spawn_agent" => run_spawn_agent(call, tools, on_progress),
         "check_agent" => run_check_agent(call, tools, on_progress),
-        other => misuse(call, on_progress, &anyhow::anyhow!("unknown tool: {other}")),
+        other => misuse(call, on_progress, &anyhow::anyhow!("Tool not found: {other}")),
     }
 }
 
@@ -815,7 +819,7 @@ fn misuse<F: Fn(Progress)>(
     on_progress: &F,
     error: &anyhow::Error,
 ) -> String {
-    let text = format!("error: {error}");
+    let text = format!("<tool_use_error>{error}</tool_use_error>");
     traced(call, on_progress, || (text.clone(), text, None))
 }
 
@@ -909,7 +913,14 @@ fn run_read<B: Backend, F: Fn(Progress)>(
         match &command.output() {
             Ok(spawned) => {
                 let text = combined_output(spawned);
-                (text.clone(), text, spawned.status.code())
+                // A missing file maps perl's raw warning to Claude Code's message;
+                // everything here runs under the sandbox policy, unlike a stat.
+                if !spawned.status.success() && text.contains("No such file or directory") {
+                    let missing = missing_file_message();
+                    (missing.clone(), missing, None)
+                } else {
+                    (text.clone(), text, spawned.status.code())
+                }
             }
             Err(error) => {
                 let text = format!("error: {error}");
@@ -953,48 +964,58 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
     }
     if edit.old_string == edit.new_string {
         return (
-            format!(
-                "edit: old_string and new_string are identical: {}",
-                path.display()
-            ),
+            "No changes to make: old_string and new_string are exactly the same.".to_string(),
             None,
         );
     }
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (missing_file_message(), None);
+        }
         Err(error) => return (format!("edit: cannot read {}: {error}", path.display()), None),
     };
     let count = content.matches(&edit.old_string).count();
     if count == 0 {
-        return (
-            format!(
-                "edit: old_string not found in {}; the match must be exact, including whitespace",
-                path.display()
-            ),
-            None,
-        );
+        return (no_match_message(edit), None);
     }
     if count > 1 && !edit.replace_all {
-        return (
-            format!(
-                "edit: old_string matches {count} times in {}; pass replace_all or include more \
-                surrounding lines to make it unique",
-                path.display()
-            ),
-            None,
-        );
+        return (ambiguous_match_message(count, edit), None);
     }
     spawn_perl(edit, &mut policy.command("/usr/bin/perl"))
 }
 
+/// Claude Code's missing-file message; the cwd note keeps relative paths debuggable.
+fn missing_file_message() -> String {
+    let cwd =
+        std::env::current_dir().map_or_else(|_| ".".to_string(), |dir| dir.display().to_string());
+    format!("File does not exist. Note: your current working directory is {cwd}.")
+}
+
+/// Claude Code's no-match error, echoing the string so quoting slips are visible.
+fn no_match_message(edit: &Edit) -> String {
+    format!(
+        "String to replace not found in file.\nString: {}",
+        edit.old_string
+    )
+}
+
+/// Claude Code's multi-match error for a call without `replace_all`.
+fn ambiguous_match_message(count: usize, edit: &Edit) -> String {
+    format!(
+        "Found {count} matches of the string to replace, but replace_all is false. To replace \
+         all occurrences, set replace_all to true. To replace only one occurrence, please \
+         provide more context to uniquely identify the instance.\nString: {}",
+        edit.old_string
+    )
+}
+
 /// Run [`EDIT_PROGRAM`] through an already-configured `perl` command and map
-/// its exit status to the message the model sees: perl's report on success,
-/// its warning as retryable content otherwise.
+/// its exit status to the message the model sees.
 ///
 /// Split out so tests can drive the program with a plain command, exercising
 /// its locking and matching semantics without the sandbox.
 fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i32>) {
-    let path = Path::new(&edit.file_path);
     cmd.arg("-e")
         .arg(EDIT_PROGRAM)
         .arg("--")
@@ -1003,23 +1024,37 @@ fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i
         .env("TART_NEW", &edit.new_string)
         .envs(edit.replace_all.then_some(("TART_ALL", "1")));
     match cmd.output() {
-        Ok(output) if output.status.success() => (
-            String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
-            Some(0),
-        ),
+        Ok(output) if output.status.success() => (edit_receipt(edit), Some(0)),
         Ok(output) => (
             format!(
                 "edit failed on {}: {}{}",
-                path.display(),
+                edit.file_path,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ),
             Some(1),
         ),
         Err(error) => (
-            format!("edit failed on {}: failed to run perl: {error}", path.display()),
+            format!("edit failed on {}: failed to run perl: {error}", edit.file_path),
             None,
         ),
+    }
+}
+
+/// Claude Code's edit receipt.
+fn edit_receipt(edit: &Edit) -> String {
+    if edit.replace_all {
+        format!(
+            "The file {} has been updated. All occurrences were successfully replaced. \
+             (file state is current in your context \u{2014} no need to Read it back)",
+            edit.file_path
+        )
+    } else {
+        format!(
+            "The file {} has been updated successfully. (file state is current in your context \
+             \u{2014} no need to Read it back)",
+            edit.file_path
+        )
     }
 }
 
@@ -1129,7 +1164,10 @@ mod tests {
     fn parse_bash_rejects_a_missing_command() {
         let error = parse_bash(r#"{"other":1}"#).unwrap_err().to_string();
 
-        assert!(error.contains("missing 'command'"), "{error}");
+        assert!(
+            error.contains("The required parameter `command` is missing"),
+            "{error}"
+        );
     }
 
     /// The tool result for a finished command with a Unix wait status: 0 is a success,
@@ -1646,13 +1684,16 @@ mod tests {
             events.borrow_mut().push(progress);
         });
 
-        assert!(output.contains("error: unknown tool: rm"), "{output}");
+        assert!(
+            output.contains("<tool_use_error>Tool not found: rm</tool_use_error>"),
+            "{output}"
+        );
         assert!(matches!(
             events.borrow().as_slice(),
             [
                 Progress::ToolStart { name, .. },
                 Progress::ToolOutput { output, .. }
-            ] if name == "rm" && output.contains("unknown tool")
+            ] if name == "rm" && output.contains("Tool not found")
         ));
     }
 
@@ -1676,7 +1717,7 @@ mod tests {
             });
 
             assert!(
-                output.contains(&format!("error: the {name} tool is not available in chat mode")),
+                output.contains(&format!("the {name} tool is not available in chat mode")),
                 "{output}"
             );
             assert!(
@@ -1715,7 +1756,7 @@ mod tests {
         let output = execute(&call, &tools, &|_| {});
 
         assert!(
-            output.contains("error: the spawn_agent tool is not available in chat mode"),
+            output.contains("the spawn_agent tool is not available in chat mode"),
             "{output}"
         );
     }
@@ -1767,7 +1808,11 @@ mod tests {
 
         assert_eq!(
             output,
-            format!("edited {}: 1 replacement(s)", file.path().display())
+            format!(
+                "The file {} has been updated successfully. (file state is current in your \
+                 context \u{2014} no need to Read it back)",
+                file.path().display()
+            )
         );
         assert_eq!(
             std::fs::read_to_string(file.path()).unwrap(),
@@ -1782,7 +1827,11 @@ mod tests {
 
         assert_eq!(
             output,
-            format!("edited {}: 3 replacement(s)", file.path().display())
+            format!(
+                "The file {} has been updated. All occurrences were successfully replaced. \
+                 (file state is current in your context \u{2014} no need to Read it back)",
+                file.path().display()
+            )
         );
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "b b b\n");
     }
@@ -1792,7 +1841,7 @@ mod tests {
         let file = scratch("keep\ndrop me\nkeep\n");
         let output = perl_edit(file.path(), "drop me\n", "", false);
 
-        assert!(output.contains("1 replacement(s)"), "{output}");
+        assert!(output.contains("updated successfully"), "{output}");
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "keep\nkeep\n");
     }
 
@@ -1832,8 +1881,8 @@ mod tests {
         let first = spawn_edit("AA", "aa");
         let second = spawn_edit("BB", "bb");
 
-        assert!(first.join().unwrap().contains("1 replacement(s)"));
-        assert!(second.join().unwrap().contains("1 replacement(s)"));
+        assert!(first.join().unwrap().contains("updated successfully"));
+        assert!(second.join().unwrap().contains("updated successfully"));
         assert_eq!(
             std::fs::read_to_string(file.path()).unwrap(),
             "aa eleven\nmid\nbb twelve\n"
@@ -1864,8 +1913,8 @@ mod tests {
         let first = spawn_edit("UNO", "uno");
         let second = spawn_edit("DOS", "dos");
 
-        assert!(first.join().unwrap().contains("1 replacement(s)"));
-        assert!(second.join().unwrap().contains("1 replacement(s)"));
+        assert!(first.join().unwrap().contains("updated successfully"));
+        assert!(second.join().unwrap().contains("updated successfully"));
         assert_eq!(
             std::fs::read_to_string(file.path()).unwrap(),
             "one uno alpha\ntwo dos beta\n"
@@ -1893,7 +1942,78 @@ mod tests {
         let error = parse_edit(r#"{"old_string":"a","new_string":"b"}"#)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("missing 'file_path'"), "{error}");
+        assert!(
+            error.contains("The required parameter `file_path` is missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn edit_failures_speak_claude_code() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let file = scratch("a\nb\na\n");
+
+        // An identical pair refuses with Claude Code's wording.
+        let (identical, _) = apply_edit(
+            &Edit {
+                file_path: file.path().display().to_string(),
+                old_string: "a".into(),
+                new_string: "a".into(),
+                replace_all: false,
+            },
+            &policy,
+        );
+        assert_eq!(
+            identical,
+            "No changes to make: old_string and new_string are exactly the same."
+        );
+
+        // A no-match echoes the string, as Claude Code does, so quoting slips show.
+        let (missing, _) = apply_edit(
+            &Edit {
+                file_path: file.path().display().to_string(),
+                old_string: "z\n".into(),
+                new_string: "y\n".into(),
+                replace_all: false,
+            },
+            &policy,
+        );
+        assert_eq!(missing, "String to replace not found in file.\nString: z\n");
+
+        // An ambiguous match without replace_all reports the count and the fix.
+        let (ambiguous, _) = apply_edit(
+            &Edit {
+                file_path: file.path().display().to_string(),
+                old_string: "a".into(),
+                new_string: "c".into(),
+                replace_all: false,
+            },
+            &policy,
+        );
+        assert!(
+            ambiguous
+                .starts_with("Found 2 matches of the string to replace, but replace_all is false.")
+        );
+        assert!(ambiguous.ends_with("instance.\nString: a"));
+
+        // A missing file names the working directory, as Claude Code does.
+        let absent = std::env::temp_dir().join("tart-edit-does-not-exist");
+        let (missing_file, _) = apply_edit(
+            &Edit {
+                file_path: absent.display().to_string(),
+                old_string: "a".into(),
+                new_string: "b".into(),
+                replace_all: false,
+            },
+            &policy,
+        );
+        assert_eq!(
+            missing_file,
+            format!(
+                "File does not exist. Note: your current working directory is {}.",
+                std::env::current_dir().unwrap().display()
+            )
+        );
     }
 
     #[test]
@@ -1938,7 +2058,10 @@ mod tests {
     fn parse_read_rejects_a_missing_path() {
         let error = parse_read(r#"{"offset":1}"#).unwrap_err().to_string();
 
-        assert!(error.contains("missing 'file_path'"), "{error}");
+        assert!(
+            error.contains("The required parameter `file_path` is missing"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1949,7 +2072,10 @@ mod tests {
         );
 
         let error = parse_spawn("{}").unwrap_err().to_string();
-        assert!(error.contains("missing 'task'"), "{error}");
+        assert!(
+            error.contains("The required parameter `task` is missing"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2077,7 +2203,10 @@ mod tests {
 
         let missing = std::env::temp_dir().join("tart-read-does-not-exist");
         let absent = execute(&read_call(&missing, None, None), &tools, &|_| {});
-        assert!(absent.contains("No such file or directory"), "{absent}");
+        assert!(
+            absent.contains("File does not exist. Note: your current working directory is"),
+            "{absent}"
+        );
     }
 
     #[test]
@@ -2107,7 +2236,10 @@ mod tests {
         });
 
         assert!(
-            output.contains("error: tool call missing 'file_path'"),
+            output.contains(
+                "<tool_use_error>InputValidationError: read failed due to the following \
+                 issue:\nThe required parameter `file_path` is missing</tool_use_error>"
+            ),
             "{output}"
         );
         assert!(matches!(
@@ -2115,7 +2247,7 @@ mod tests {
             [
                 Progress::ToolStart { name, .. },
                 Progress::ToolOutput { output, .. }
-            ] if name == "read" && output.contains("missing 'file_path'")
+            ] if name == "read" && output.contains("`file_path` is missing")
         ));
     }
 }

@@ -145,7 +145,7 @@ pub(super) struct Search {
 pub(super) fn parse_search(arguments: &str) -> anyhow::Result<Search> {
     let args = parse_arguments(arguments)?;
     Ok(Search {
-        query: string_field(&args, "query")?,
+        query: string_field(&args, "search", "query")?,
         max_results: args["max_results"]
             .as_u64()
             .unwrap_or(DEFAULT_SEARCH_RESULTS)
@@ -173,7 +173,7 @@ pub(super) struct Fetch {
 pub(super) fn parse_fetch(arguments: &str) -> anyhow::Result<Fetch> {
     let args = parse_arguments(arguments)?;
     Ok(Fetch {
-        url: string_field(&args, "url")?,
+        url: string_field(&args, "fetch", "url")?,
         raw: args["raw"].as_bool().unwrap_or(false),
     })
 }
@@ -656,7 +656,10 @@ mod tests {
     fn parse_search_rejects_a_missing_query() {
         let error = parse_search(r#"{"timelimit":"d"}"#).unwrap_err().to_string();
 
-        assert!(error.contains("missing 'query'"), "{error}");
+        assert!(
+            error.contains("The required parameter `query` is missing"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -746,7 +749,10 @@ mod tests {
     fn parse_fetch_rejects_a_missing_url() {
         let error = parse_fetch(r#"{"raw":true}"#).unwrap_err().to_string();
 
-        assert!(error.contains("missing 'url'"), "{error}");
+        assert!(
+            error.contains("The required parameter `url` is missing"),
+            "{error}"
+        );
     }
 
     #[test]
