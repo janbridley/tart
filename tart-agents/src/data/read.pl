@@ -20,6 +20,6 @@ while (<$in>) {
 }
 # An empty file gets Claude Code's reminder, since there are no lines to show.
 if ($lines == 0) {
-    # <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/read-text.ts#L99>
+    # <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/read-text.ts#L15>
     print "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>\n";
 }
