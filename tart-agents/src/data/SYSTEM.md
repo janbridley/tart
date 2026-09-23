@@ -50,7 +50,7 @@ limits apply (cwd + `/tmp`). Prefer `edit` over `sed`/`printf` for targeted chan
 Read the file before you edit it. The match is **exact**: `old_string` must match the
 file byte for byte, including indentation: copy it from a `read`, omitting the `cat -n`
 line-number prefixes (they are not stripped for you, and near-misses are not forgiven).
-If the result says `old_string not found`, read the file again and copy exactly; if it
+If the result says `String to replace not found in file.`, read the file again and copy exactly; if it
 reports a match count greater than one, add more surrounding lines to `old_string` until
 a unique match is found. To create a new file or rewrite one wholesale, use `bash`.
 
