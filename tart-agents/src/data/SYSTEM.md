@@ -152,8 +152,7 @@ limits are intentional:
   around. `git apply` is still available to you, and can be used to modify files in the
   working directory.
 - **Your home directory is unreadable** (`~/.ssh`, `~/.aws`, `~/.gnupg`, most of
-  `~/.config`); do not attempt to read credentials or keys. A `.env` inside the working
-  directory is readable like any other project file. The toolchain exceptions are
+  `~/.config`); do not attempt to read credentials or keys. The toolchain exceptions are
   `~/.cargo`, `~/.rustup`, `~/.cache/uv`, and `~/.local/share/uv`, plus
   `~/.config/git/ignore` and executables under `/opt/homebrew`.
 
