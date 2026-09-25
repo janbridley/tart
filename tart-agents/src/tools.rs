@@ -238,7 +238,7 @@ fn parse_bash(arguments: &str) -> anyhow::Result<Bash> {
         .clamp(1000.0, MAX_BASH_TIMEOUT.as_millis() as f64)
         .round() as u64;
     Ok(Bash {
-        command: string_field(&args, "Bash", "command")?,
+        command: string_field(&args, "bash", "command")?,
         timeout: Duration::from_millis(milliseconds),
     })
 }
@@ -274,7 +274,7 @@ impl Read {
 fn parse_read(arguments: &str) -> anyhow::Result<Read> {
     let args = parse_arguments(arguments)?;
     Ok(Read {
-        file_path: string_field(&args, "Read", "file_path")?,
+        file_path: string_field(&args, "read", "file_path")?,
         offset: args["offset"].as_u64().filter(|&offset| offset > 0),
         limit: args["limit"].as_u64().filter(|&limit| limit > 0),
     })
@@ -299,9 +299,9 @@ struct Edit {
 fn parse_edit(arguments: &str) -> anyhow::Result<Edit> {
     let args = parse_arguments(arguments)?;
     Ok(Edit {
-        file_path: string_field(&args, "Edit", "file_path")?,
-        old_string: string_field(&args, "Edit", "old_string")?,
-        new_string: string_field(&args, "Edit", "new_string")?,
+        file_path: string_field(&args, "edit", "file_path")?,
+        old_string: string_field(&args, "edit", "old_string")?,
+        new_string: string_field(&args, "edit", "new_string")?,
         replace_all: args["replace_all"].as_bool().unwrap_or(false),
     })
 }
@@ -2172,7 +2172,7 @@ mod tests {
 
         assert!(
             output.contains(
-                "<tool_use_error>InputValidationError: Read failed due to the following \
+                "<tool_use_error>InputValidationError: read failed due to the following \
                  issue:\nThe required parameter `file_path` is missing</tool_use_error>"
             ),
             "{output}"
