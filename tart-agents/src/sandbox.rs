@@ -34,7 +34,8 @@
 //!
 //! - Network access is denied (the base profile is `(deny default)`).
 //! - The child environment is cleared except for a minimal `PATH` (the system
-//!   directories, plus `~/.cargo/bin` and `/opt/homebrew/bin` when present), the
+//!   directories, led by `/opt/homebrew/bin` when present so brew's `python3`
+//!   shadows the system one, plus `~/.cargo/bin`), the
 //!   granted temp directory (`TMPDIR`, and `MPLCONFIGDIR` so matplotlib caches
 //!   in scratch instead of the unreadable home directory), and `HOME`, so paths
 //!   like `~/.cargo` resolve.
@@ -68,15 +69,17 @@ const SANDBOXED_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// The `PATH` seeded into the sandboxed child.
 ///
-/// Includes the system baseline, plus the rustup shims in `~/.cargo/bin` and
-/// homebrew in `/opt/homebrew/bin` when those directories exist, so agents
-/// can run `cargo` and brew-installed tools.
+/// Homebrew leads the system baseline when installed. The rustup shims in
+/// `~/.cargo/bin` are at the end, also only when present.
 fn sandboxed_path() -> OsString {
-    let mut path = OsString::from(SANDBOXED_PATH);
+    let mut path = OsString::new();
+    if Path::new("/opt/homebrew/bin").is_dir() {
+        path.push("/opt/homebrew/bin:");
+    }
+    path.push(SANDBOXED_PATH);
     if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
         append_if_dir(&mut path, &Path::new(&home).join(".cargo/bin"));
     }
-    append_if_dir(&mut path, Path::new("/opt/homebrew/bin"));
     path
 }
 
@@ -1127,20 +1130,19 @@ mod tests {
         }
     }
 
-    /// The seeded `PATH` is the system baseline, plus `~/.cargo/bin` and
-    /// `/opt/homebrew/bin`, each only when that directory exists.
     #[test]
-    fn sandboxed_path_appends_present_toolchain_bins() {
-        let mut expected = OsString::from(SANDBOXED_PATH);
+    fn sandboxed_path_leads_with_homebrew() {
+        let mut expected = OsString::new();
+        if Path::new("/opt/homebrew/bin").is_dir() {
+            expected.push("/opt/homebrew/bin:");
+        }
+        expected.push(SANDBOXED_PATH);
         if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
             let cargo_bin = Path::new(&home).join(".cargo/bin");
             if cargo_bin.is_dir() {
                 expected.push(":");
                 expected.push(cargo_bin.as_os_str());
             }
-        }
-        if Path::new("/opt/homebrew/bin").is_dir() {
-            expected.push(":/opt/homebrew/bin");
         }
         assert_eq!(sandboxed_path(), expected);
     }
