@@ -192,6 +192,17 @@ impl<B: Backend> Agent<B> {
         self.mode = mode;
     }
 
+    /// Toggle the writable policy's GPU grants mid-session, returning the new
+    /// state. Like [`Agent::set_mode`], a turn already in flight keeps the
+    /// policy it started with; chat mode never runs GPU grants, while plan
+    /// mode inherits them — GPU probing is read-only research. Subagents
+    /// inherit the state at their spawn, like every other policy aspect, so
+    /// a later toggle does not reach agents already running.
+    #[inline]
+    pub fn toggle_gpu(&mut self) -> bool {
+        self.writable.toggle_gpu()
+    }
+
     /// The policy the current mode runs tool calls under.
     fn policy(&self) -> Policy {
         match self.mode {
@@ -600,6 +611,23 @@ mod tests {
     use crate::usage::TokenUsage;
     use crate::usage::tests::sample_usage;
     use std::io::{Read, Write};
+
+    /// Toggling flips the policy the default mode runs under; the sandbox
+    /// test module pins plan-mode inheritance and chat's no-access policy.
+    #[test]
+    fn toggling_gpu_flips_the_default_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(
+            "http://127.0.0.1:1",
+            "key",
+            "model",
+            Policy::new(dir.path()).unwrap(),
+        );
+        assert!(agent.toggle_gpu());
+        assert!(agent.policy().render().contains("AGXDeviceUserClient"));
+        assert!(!agent.toggle_gpu());
+        assert!(!agent.policy().render().contains("AGXDeviceUserClient"));
+    }
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.

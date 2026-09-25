@@ -1,0 +1,13 @@
+; GPU access for Metal compute, granted only by Policy::allow_gpu
+(allow iokit-open (iokit-user-client-class "AGXDeviceUserClient"))
+; The shader-compiler service
+(allow mach-lookup (global-name "com.apple.MTLCompilerService"))
+(allow mach-lookup (local-name "com.apple.MTLCompilerService"))
+(allow mach-lookup (global-name "com.apple.gputools.service"))
+(allow mach-lookup (local-name "com.apple.gputools.service"))
+; The Metal toolchain cryptex, so `xcrun metal` can offline-compile MSL.
+(allow file-read* file-test-existence file-map-executable
+  (regex #"^/private/var/run/com\.apple\.security\.cryptexd/mnt/com\.apple\.MobileAsset\.MetalToolchain[^/]*(/|$)"))
+; The GPU's Metal driver bundle.
+(allow file-read* file-test-existence
+  (regex #"^(/System/Library/Extensions|/Library/GPUBundles)/AGXMetal[^/]*\.bundle(/|$)"))

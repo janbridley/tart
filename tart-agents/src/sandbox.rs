@@ -36,9 +36,10 @@
 //! - The child environment is cleared except for a minimal `PATH` (the system
 //!   directories, led by `/opt/homebrew/bin` when present so brew's `python3`
 //!   shadows the system one, plus `~/.cargo/bin`), the
-//!   granted temp directory (`TMPDIR`, and `MPLCONFIGDIR` so matplotlib caches
-//!   in scratch instead of the unreadable home directory), and `HOME`, so paths
-//!   like `~/.cargo` resolve.
+//!   granted temp directory (`TMPDIR`, `MPLCONFIGDIR` so matplotlib caches
+//!   in scratch instead of the unreadable home directory, and
+//!   `CLANG_MODULE_CACHE_PATH` so swift/clang compiles do too), and `HOME`,
+//!   so paths like `~/.cargo` resolve.
 //!   With the environment cleared, secrets held by the caller cannot be printed
 //!   into captured output. Re-add variables with the usual `std` methods.
 //! - Git's global and system configuration are voided
@@ -51,6 +52,10 @@
 //!   so `brew` commands fail outright (see `sbpl/extras.sbpl`). Binaries outside
 //!   that prefix stay unexecutable: [`Policy::add_read_only_root`] grants
 //!   reads, not `file-map-executable`.
+//! - The GPU stays inaccessible unless [`Policy::allow_gpu`] opts in: Metal
+//!   compute then gets the AGX user client and the runtime shader compiler,
+//!   and nothing else (no cache writes, no further services — see
+//!   `sbpl/gpu.sbpl`).
 //! - Non-public data: `.ssh` and `id_*` keys, `.env`-style files, registry
 //!   and cloud credentials, `*.pem`/`*.key`-style extensions (see `sbpl/secrets.sbpl`)
 //!   is denied reads, writes, and existence tests under *every* policy.
@@ -99,6 +104,10 @@ const PLATFORM_DEFAULTS: &str = include_str!("sbpl/restricted_read_only_platform
 // tart's own additions, merged into every profile
 const EXTRAS: &str = include_str!("sbpl/extras.sbpl");
 
+// The GPU grants, rendered only under Policy::allow_gpu: what Metal compute
+// on Apple Silicon needs beyond the baseline — see sbpl/gpu.sbpl.
+const GPU: &str = include_str!("sbpl/gpu.sbpl");
+
 // The secret denies, appended last to ensure they are not overwritten.
 const SECRETS: &str = include_str!("sbpl/secrets.sbpl");
 
@@ -120,6 +129,9 @@ pub struct Policy {
     ///
     /// This path becomes `TMPDIR` in the sandboxed environment.
     temp: Option<PathBuf>,
+    /// Whether the GPU grants from `sbpl/gpu.sbpl` (Metal compute) render.
+    /// Kernel-reachable surface, so opt-in via [`Policy::allow_gpu`].
+    gpu: bool,
 }
 
 /// The rendered profile plus its `-D` parameter bindings.
@@ -144,6 +156,7 @@ impl Policy {
             read_only: Vec::new(),
             excluded: Vec::new(),
             temp: None,
+            gpu: false,
         };
         if let Some(temp) = std::env::var_os("TMPDIR").filter(|temp| !temp.is_empty())
             && let Ok(canonical) = canonicalize_root(Path::new(&temp))
@@ -284,6 +297,7 @@ impl Policy {
             read_only: Vec::new(),
             excluded: Vec::new(),
             temp: None,
+            gpu: false,
         }
     }
 
@@ -296,6 +310,25 @@ impl Policy {
             self.excluded.push(git);
         }
         self
+    }
+
+    /// Grant GPU access for Metal compute: the AGX user client and the
+    /// runtime shader compiler, plus the Metal toolchain cryptex for
+    /// GPU-less `xcrun metal` pre-flights (see `sbpl/gpu.sbpl`). This is
+    /// kernel-reachable surface, so it stays opt-in: default policies
+    /// leave the GPU inaccessible.
+    #[must_use]
+    #[inline]
+    pub fn allow_gpu(mut self) -> Self {
+        self.gpu = true;
+        self
+    }
+
+    /// Flip [`Policy::allow_gpu`]'s grants, returning the new state.
+    #[inline]
+    pub fn toggle_gpu(&mut self) -> bool {
+        self.gpu = !self.gpu;
+        self.gpu
     }
 
     /// The complete SBPL profile text, exactly as passed to `sandbox-exec -p`.
@@ -356,6 +389,7 @@ impl Policy {
             cmd.env("TMPDIR", temp);
             // matplotlib needs a writable config dir; home is unreadable.
             cmd.env("MPLCONFIGDIR", temp.join("matplotlib"));
+            cmd.env("CLANG_MODULE_CACHE_PATH", temp.join("clang"));
         }
         cmd
     }
@@ -427,6 +461,12 @@ impl Policy {
         text.push_str(PLATFORM_DEFAULTS);
         text.push('\n');
         text.push_str(EXTRAS);
+        if self.gpu {
+            // Before SECRETS, like every allow: the secret denies must stay
+            // the profile's final section.
+            text.push('\n');
+            text.push_str(GPU);
+        }
         text.push('\n');
         text.push_str(SECRETS);
 
@@ -912,6 +952,30 @@ mod tests {
         }
     }
 
+    /// The GPU grants render only under [`Policy::allow_gpu`], and even then
+    /// before the secret denies: opting in must not reorder the profile.
+    #[test]
+    fn gpu_grants_render_only_when_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Policy::new(dir.path()).unwrap().render();
+        assert!(!plain.contains("AGXDeviceUserClient"), "default: {plain}");
+        let gpu = Policy::new(dir.path()).unwrap().allow_gpu().render();
+        assert!(gpu.contains(r#"(iokit-user-client-class "AGXDeviceUserClient")"#));
+        assert!(gpu.contains(r#"(global-name "com.apple.MTLCompilerService")"#));
+        assert!(gpu.ends_with(SECRETS), "secrets stay the final section");
+
+        // Toggling flips the grants back off, and the read-only research
+        // posture drops them even when left on.
+        let mut policy = Policy::new(dir.path()).unwrap();
+        assert!(policy.toggle_gpu());
+        assert!(policy.render().contains("AGXDeviceUserClient"));
+        assert!(!policy.toggle_gpu());
+        assert!(!policy.render().contains("AGXDeviceUserClient"));
+        // Plan mode inherits the grants: GPU probing is read-only research.
+        assert!(policy.toggle_gpu());
+        assert!(policy.read_only().render().contains("AGXDeviceUserClient"));
+    }
+
     /// Every rendered profile carries the uv, gitignore, and homebrew grants
     /// from `sbpl/extras.sbpl`, and none of the excluded paths.
     #[test]
@@ -1113,8 +1177,8 @@ mod tests {
         let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
         assert_eq!(
             vars.len(),
-            3 + usize::from(home.is_some()) + 2 * usize::from(policy.temp.is_some()),
-            "TMPDIR and MPLCONFIGDIR ride along with the temp root"
+            3 + usize::from(home.is_some()) + 3 * usize::from(policy.temp.is_some()),
+            "TMPDIR, MPLCONFIGDIR, and CLANG_MODULE_CACHE_PATH ride along with the temp root"
         );
         assert!(vars.contains(&(OsStr::new("PATH"), sandboxed_path().as_os_str())));
         assert!(vars.contains(&(OsStr::new("GIT_CONFIG_GLOBAL"), OsStr::new("/dev/null"))));
@@ -1127,6 +1191,10 @@ mod tests {
             assert!(
                 vars.contains(&(OsStr::new("MPLCONFIGDIR"), temp.join("matplotlib").as_os_str()))
             );
+            assert!(vars.contains(&(
+                OsStr::new("CLANG_MODULE_CACHE_PATH"),
+                temp.join("clang").as_os_str()
+            )));
         }
     }
 

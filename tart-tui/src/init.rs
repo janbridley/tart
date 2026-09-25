@@ -73,10 +73,15 @@ impl Kind {
         }
     }
 
-    /// The policy this kind's agent is built with.
-    fn policy(self, cwd: &Path) -> anyhow::Result<Policy> {
+    /// The policy this kind of agent is built with. The coding root has already
+    /// been screened by `refuse_bare_root` by the time this runs; `gpu` opts
+    /// the coding sandbox into Metal compute.
+    fn policy(self, cwd: &Path, gpu: bool) -> anyhow::Result<Policy> {
         match self {
-            Self::Coding => Ok(Policy::new(cwd)?.exclude_git()),
+            Self::Coding => {
+                let policy = Policy::new(cwd)?.exclude_git();
+                Ok(if gpu { policy.allow_gpu() } else { policy })
+            }
             Self::Chat => Ok(Policy::no_access()),
         }
     }
@@ -127,7 +132,7 @@ impl TryFrom<&cli::Cli> for Tui {
         let label = agent_config.to_string();
         let context_tokens = agent_config.context_tokens;
         let project = kind.project(&cwd);
-        let mut agent = agent_config.into_agent(kind.policy(&cwd)?);
+        let mut agent = agent_config.into_agent(kind.policy(&cwd, cli.gpu)?);
         agent.set_mode(kind.mode());
         Ok(Self {
             session: Session::start(&SESSIONS_ROOT, &project),
@@ -188,6 +193,7 @@ mod tests {
         let cli = cli::Cli {
             agents: providers(dir.path()),
             chat: true,
+            gpu: false,
         };
 
         let tui = Tui::try_from(&cli).unwrap();
@@ -197,6 +203,19 @@ mod tests {
         let items = serde_json::to_value(tui.transcript.request_items()).unwrap();
         assert_eq!(items[0]["role"], "system");
         assert_eq!(items[0]["content"], prompts::CHAT);
+    }
+
+    /// The gpu flag reaches the coding policy, and only the coding policy:
+    /// chat is no-access whatever the flag says.
+    #[test]
+    fn the_gpu_flag_wires_into_the_coding_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gpu = Kind::Coding.policy(dir.path(), true).unwrap().render();
+        assert!(gpu.contains("AGXDeviceUserClient"), "{gpu}");
+        let plain = Kind::Coding.policy(dir.path(), false).unwrap().render();
+        assert!(!plain.contains("AGXDeviceUserClient"), "{plain}");
+        let chat = Kind::Chat.policy(dir.path(), true).unwrap().render();
+        assert!(!chat.contains("AGXDeviceUserClient"), "{chat}");
     }
 
     #[test]
@@ -232,6 +251,7 @@ mod tests {
         let cli = cli::Cli {
             agents: providers(dir.path()),
             chat: false,
+            gpu: false,
         };
 
         let tui = Tui::try_from(&cli).unwrap();
