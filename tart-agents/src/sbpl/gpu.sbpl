@@ -1,4 +1,6 @@
 ; GPU access for Metal compute, granted only by Policy::allow_gpu
+; The frontend's caches (com.apple.metalfe and siblings under DARWIN_USER_CACHE_DIR) are
+; granted as param-bound rules in compile().
 (allow iokit-open (iokit-user-client-class "AGXDeviceUserClient"))
 ; The shader-compiler service
 (allow mach-lookup (global-name "com.apple.MTLCompilerService"))

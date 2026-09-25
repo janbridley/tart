@@ -52,10 +52,8 @@
 //!   so `brew` commands fail outright (see `sbpl/extras.sbpl`). Binaries outside
 //!   that prefix stay unexecutable: [`Policy::add_read_only_root`] grants
 //!   reads, not `file-map-executable`.
-//! - The GPU stays inaccessible unless [`Policy::allow_gpu`] opts in: Metal
-//!   compute then gets the AGX user client and the runtime shader compiler,
-//!   and nothing else (no cache writes, no further services — see
-//!   `sbpl/gpu.sbpl`).
+//! - The GPU stays inaccessible unless [`Policy::allow_gpu`] opts in: Metal compute
+//!   then gets the AGX user client, the shader compiler, and the Metal cache.
 //! - Non-public data: `.ssh` and `id_*` keys, `.env`-style files, registry
 //!   and cloud credentials, `*.pem`/`*.key`-style extensions (see `sbpl/secrets.sbpl`)
 //!   is denied reads, writes, and existence tests under *every* policy.
@@ -63,6 +61,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
@@ -107,6 +106,10 @@ const EXTRAS: &str = include_str!("sbpl/extras.sbpl");
 // The GPU grants, rendered only under Policy::allow_gpu: what Metal compute
 // on Apple Silicon needs beyond the baseline — see sbpl/gpu.sbpl.
 const GPU: &str = include_str!("sbpl/gpu.sbpl");
+
+// Metal cache folders are required to compile objc/swift gpu projects.
+const METAL_CACHE_LEAVES: [&str; 3] =
+    ["com.apple.metalfe", "com.apple.metal", "com.apple.gpuarchiver"];
 
 // The secret denies, appended last to ensure they are not overwritten.
 const SECRETS: &str = include_str!("sbpl/secrets.sbpl");
@@ -312,11 +315,7 @@ impl Policy {
         self
     }
 
-    /// Grant GPU access for Metal compute: the AGX user client and the
-    /// runtime shader compiler, plus the Metal toolchain cryptex for
-    /// GPU-less `xcrun metal` pre-flights (see `sbpl/gpu.sbpl`). This is
-    /// kernel-reachable surface, so it stays opt-in: default policies
-    /// leave the GPU inaccessible.
+    /// Grant GPU access for Metal compute.
     #[must_use]
     #[inline]
     pub fn allow_gpu(mut self) -> Self {
@@ -466,6 +465,21 @@ impl Policy {
             // the profile's final section.
             text.push('\n');
             text.push_str(GPU);
+            let cache_rules: Vec<String> = metal_caches()
+                .iter()
+                .enumerate()
+                .map(|(i, cache)| {
+                    let name = format!("METAL_CACHE_ROOT_{i}");
+                    params.push((name.clone(), cache.clone().into_os_string()));
+                    format!(
+                        r#"(allow file-read* file-test-existence file-write* (subpath (param "{name}")))"#
+                    )
+                })
+                .collect();
+            if !cache_rules.is_empty() {
+                text.push('\n');
+                text.push_str(&cache_rules.join("\n"));
+            }
         }
         text.push('\n');
         text.push_str(SECRETS);
@@ -501,6 +515,35 @@ impl Policy {
 fn canonicalize_root(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize sandbox root: {}", path.display()))
+}
+
+static METAL_CACHES: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+fn metal_caches() -> &'static [PathBuf] {
+    METAL_CACHES
+        .get_or_init(|| {
+            let Some(cache) = std::process::Command::new("/usr/bin/getconf")
+                .arg("DARWIN_USER_CACHE_DIR")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| {
+                    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().trim_end_matches('/'))
+                })
+                .filter(|cache| !cache.as_os_str().is_empty())
+            else {
+                return Vec::new();
+            };
+            METAL_CACHE_LEAVES
+                .iter()
+                .map(|leaf| cache.join(leaf))
+                .filter_map(|leaf| {
+                    std::fs::create_dir_all(&leaf).ok()?;
+                    canonicalize_root(&leaf).ok()
+                })
+                .collect()
+        })
+        .as_slice()
 }
 
 /// Test support for the live tests, which reach `sandbox-exec` through
@@ -959,9 +1002,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plain = Policy::new(dir.path()).unwrap().render();
         assert!(!plain.contains("AGXDeviceUserClient"), "default: {plain}");
+        assert!(!plain.contains("METAL_CACHE_ROOT"), "default: {plain}");
         let gpu = Policy::new(dir.path()).unwrap().allow_gpu().render();
         assert!(gpu.contains(r#"(iokit-user-client-class "AGXDeviceUserClient")"#));
         assert!(gpu.contains(r#"(global-name "com.apple.MTLCompilerService")"#));
+        // One read-write rule per resolved Metal cache leaf, still ahead of
+        // the secret denies; the bindings' values are pinned by the params
+        // test below.
+        let rule = "(allow file-read* file-test-existence file-write* \
+                    (subpath (param \"METAL_CACHE_ROOT_";
+        assert_eq!(gpu.matches(rule).count(), metal_caches().len());
         assert!(gpu.ends_with(SECRETS), "secrets stay the final section");
 
         // Toggling flips the grants back off, and the read-only research
@@ -974,6 +1024,56 @@ mod tests {
         // Plan mode inherits the grants: GPU probing is read-only research.
         assert!(policy.toggle_gpu());
         assert!(policy.read_only().render().contains("AGXDeviceUserClient"));
+    }
+
+    /// The Metal cache leaves ride along as canonicalized `-D` bindings, and
+    /// only under `allow_gpu`.
+    #[test]
+    fn metal_cache_leaves_ride_as_params_only_under_gpu() {
+        let caches = metal_caches();
+        assert!(
+            caches
+                .iter()
+                .all(|cache| METAL_CACHE_LEAVES.iter().any(|leaf| cache.ends_with(leaf)))
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let bindings = |policy: Policy| {
+            policy
+                .command("/usr/bin/true")
+                .get_args()
+                .filter(|arg| arg.to_string_lossy().starts_with("-DMETAL_CACHE_ROOT_"))
+                .map(OsStr::to_os_string)
+                .collect::<Vec<_>>()
+        };
+        let gpu = bindings(Policy::new(dir.path()).unwrap().allow_gpu());
+        assert_eq!(gpu.len(), caches.len());
+        for (binding, cache) in gpu.iter().zip(caches) {
+            let binding = binding.to_string_lossy();
+            assert_eq!(binding.split_once('=').unwrap().1, cache.display().to_string());
+        }
+        assert!(bindings(Policy::new(dir.path()).unwrap()).is_empty());
+    }
+
+    /// The cache leaves are writable under `allow_gpu`, and denied without it.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn metal_caches_are_writable_only_under_gpu() {
+        let dir = tempfile::tempdir().unwrap();
+        let gpu = Policy::new(dir.path()).unwrap().allow_gpu();
+        let plain = Policy::new(dir.path()).unwrap();
+        for cache in metal_caches() {
+            let probe = cache.join("tart-gpu-cache-probe");
+            let write = format!("echo ok > {}", probe.display());
+            let out = gpu.command("/bin/sh").arg("-c").arg(&write).output().unwrap();
+            assert!(
+                out.status.success(),
+                "gpu must allow `{write}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let out = plain.command("/bin/sh").arg("-c").arg(&write).output().unwrap();
+            assert!(!out.status.success(), "the default policy must deny `{write}`");
+            std::fs::remove_file(&probe).ok();
+        }
     }
 
     /// Every rendered profile carries the uv, gitignore, and homebrew grants
