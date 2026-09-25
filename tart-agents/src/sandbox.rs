@@ -50,6 +50,9 @@
 //!   so `brew` commands fail outright (see `sbpl/extras.sbpl`). Binaries outside
 //!   that prefix stay unexecutable: [`Policy::add_read_only_root`] grants
 //!   reads, not `file-map-executable`.
+//! - Non-public data: `.ssh` and `id_*` keys, `.env`-style files, registry
+//!   and cloud credentials, `*.pem`/`*.key`-style extensions (see `sbpl/secrets.sbpl`)
+//!   is denied reads, writes, and existence tests under *every* policy.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -92,6 +95,9 @@ const PLATFORM_DEFAULTS: &str = include_str!("sbpl/restricted_read_only_platform
 
 // tart's own additions, merged into every profile
 const EXTRAS: &str = include_str!("sbpl/extras.sbpl");
+
+// The secret denies, appended last to ensure they are not overwritten.
+const SECRETS: &str = include_str!("sbpl/secrets.sbpl");
 
 /// A macOS Seatbelt sandbox profile under which commands can be run.
 ///
@@ -418,6 +424,8 @@ impl Policy {
         text.push_str(PLATFORM_DEFAULTS);
         text.push('\n');
         text.push_str(EXTRAS);
+        text.push('\n');
+        text.push_str(SECRETS);
 
         CompiledPolicy { text, params }
     }
@@ -803,21 +811,102 @@ mod tests {
         );
     }
 
-    /// Every rendered profile denies the cargo credentials file: the one
-    /// extras grant no live test pins unconditionally, since the machine
-    /// running the tests may hold no credentials file at all. The toolchain
-    /// grants themselves are covered live (`perl_runs_under_the_default_grant`,
-    /// `cargo_home_is_readable_but_credentials_are_not`), and the merge
-    /// mechanism by `render_embeds_base_policy_and_platform_defaults`.
     #[test]
-    fn every_profile_denies_the_cargo_credentials() {
+    fn every_profile_ends_with_the_secret_denies() {
         let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
 
         assert!(
-            rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo/\.?credentials(\.toml)?$""#),
-            "registry tokens stay unreadable under every policy: {rendered}"
+            rendered.ends_with(SECRETS),
+            "the secret denies must be the profile's final section: {rendered}"
         );
+        assert!(!SECRETS.contains("(allow"), "secrets.sbpl holds only denies");
+        // ends_with(SECRETS) above already proves every rule renders verbatim.
+        let rules = SECRETS.lines().filter(|line| line.starts_with("(deny"));
+        assert_eq!(
+            SECRETS
+                .matches("(deny file-read* file-write* file-test-existence")
+                .count(),
+            rules.count(),
+            "every secret deny blocks reads, writes, and existence probes"
+        );
+        for rule in SECRETS.split("(deny").skip(1) {
+            let head = rule.split("(regex").next().unwrap_or_default();
+            assert!(
+                !head.contains("(require-not") || head.contains("(require-all"),
+                "a require-not outside require-all would deny everything the \
+                 rule's other filters match: {rule}"
+            );
+        }
+    }
+
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn secrets_inside_a_writable_root_stay_inaccessible() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".ssh/id_ed25519"), "secret\n").unwrap();
+        let files = [
+            ".env",
+            "prod.env",
+            ".envrc",
+            "id_rsa",
+            "id_ed25519_sk",
+            "cert.pem",
+            ".netrc",
+        ];
+        for name in files {
+            std::fs::write(dir.path().join(name), "secret\n").unwrap();
+        }
+        std::os::unix::fs::symlink(".ssh/id_ed25519", dir.path().join("key-link")).unwrap();
+        let policy = Policy::new(dir.path()).unwrap();
+
+        let mut targets: Vec<_> = files.iter().map(|name| dir.path().join(name)).collect();
+        targets.push(dir.path().join(".ssh/id_ed25519"));
+        targets.push(dir.path().join("key-link"));
+        for target in &targets {
+            for op in [
+                format!("cat {}", target.display()),
+                format!("echo x >> {}", target.display()),
+            ] {
+                let out = policy.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+                assert!(
+                    !out.status.success(),
+                    "the sandbox must deny `{op}`: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+
+        // Case-twiddled requests resolve to the lowercase on-disk names on a
+        // case-insensitive volume, so the deny must still fire; on a
+        // case-sensitive volume the miss itself fails.
+        let op = format!("cat {}", dir.path().join(".ENV").display());
+        let out = policy.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "the sandbox must deny the case-twiddled `{op}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Listing the .ssh directory, and merely probing its existence, are
+        // denied along with reading its files.
+        for probe in [
+            format!("/bin/ls {}", dir.path().join(".ssh").display()),
+            format!("test -e {}", dir.path().join(".ssh").display()),
+        ] {
+            let out = policy
+                .command("/bin/sh")
+                .arg("-c")
+                .arg(probe.clone())
+                .output()
+                .unwrap();
+            assert!(
+                !out.status.success(),
+                "the sandbox must deny `{probe}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     /// Every rendered profile carries the uv, gitignore, and homebrew grants
@@ -841,16 +930,12 @@ mod tests {
         );
         assert!(rendered.contains(r#"(subpath "/opt/homebrew/bin")"#));
         assert!(rendered.contains(r#"(subpath "/opt/homebrew/Cellar")"#));
-        // The exclusion intent is the security-relevant half: brew's runtime,
-        // service configs, databases, and logs stay denied.
         for excluded in ["etc", "var", "share", "Caskroom", "Library", "Taps"] {
             assert!(
                 !rendered.contains(&format!(r#"(subpath "/opt/homebrew/{excluded}")"#)),
                 "/opt/homebrew/{excluded} must stay denied: {rendered}"
             );
         }
-        // Only the ignore file: the global git config stays denied, keeping the
-        // sandboxed git hermetic.
         assert!(
             !rendered.contains("git/config"),
             "the git config must stay denied: {rendered}"

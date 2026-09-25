@@ -1,7 +1,8 @@
 //! Startup: the session the command line describes, and the pane over it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use tart_agents::{
     Agent, CHAT_PROJECT, ChatMode, SESSIONS_ROOT, Session, Transcript, prompts, sandbox::Policy,
 };
@@ -9,6 +10,27 @@ use tart_agents::{
 use crate::cli;
 use crate::config;
 use crate::pane::Pane;
+
+const REFUSAL: &str = "cd into a project directory, or pass --chat for a session \
+                   with no filesystem access";
+
+/// Refuse the coding session when its writable root would cover the user's home dir.
+fn refuse_bare_root(dir: &Path) -> anyhow::Result<()> {
+    let canonical = std::fs::canonicalize(dir)
+        .with_context(|| format!("failed to resolve the working directory: {}", dir.display()))?;
+    if canonical == Path::new("/") {
+        anyhow::bail!("refusing to run at the filesystem root: {REFUSAL}");
+    }
+    // `home.starts_with(&canonical)` is containment: the working directory is
+    // home, or an ancestor of it.
+    if let Some(home) = std::env::home_dir()
+        && let Ok(home) = std::fs::canonicalize(&home)
+        && home.starts_with(&canonical)
+    {
+        anyhow::bail!("tart should not be run in or above $HOME: {REFUSAL}");
+    }
+    Ok(())
+}
 
 /// The session kind the command line selects.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,18 +65,18 @@ impl Kind {
     }
 
     /// Where this kind's sessions record and resume from.
-    fn project(self) -> anyhow::Result<PathBuf> {
+    fn project(self, cwd: &Path) -> PathBuf {
         match self {
-            Self::Coding => Ok(std::env::current_dir()?),
             // Chat sessions live under their own CHAT directory, not the cwd's.
-            Self::Chat => Ok(PathBuf::from(CHAT_PROJECT)),
+            Self::Chat => PathBuf::from(CHAT_PROJECT),
+            Self::Coding => cwd.to_path_buf(),
         }
     }
 
     /// The policy this kind's agent is built with.
-    fn policy(self) -> anyhow::Result<Policy> {
+    fn policy(self, cwd: &Path) -> anyhow::Result<Policy> {
         match self {
-            Self::Coding => Ok(Policy::new(std::env::current_dir()?)?.exclude_git()),
+            Self::Coding => Ok(Policy::new(cwd)?.exclude_git()),
             Self::Chat => Ok(Policy::no_access()),
         }
     }
@@ -93,13 +115,19 @@ impl TryFrom<&cli::Cli> for Tui {
     type Error = anyhow::Error;
 
     fn try_from(cli: &cli::Cli) -> Result<Self, Self::Error> {
-        let config = config::Config::load(&cli.agents)?;
         let kind = Kind::of(cli.chat);
+        // The coding grant root, fetched once and screened before anything else
+        // loads, so a bare-cwd invocation reports its own error, not a config one.
+        let cwd = std::env::current_dir()?;
+        if kind == Kind::Coding {
+            refuse_bare_root(&cwd)?;
+        }
+        let config = config::Config::load(&cli.agents)?;
         let agent_config = kind.agent(&config)?;
         let label = agent_config.to_string();
         let context_tokens = agent_config.context_tokens;
-        let project = kind.project()?;
-        let mut agent = agent_config.into_agent(kind.policy()?);
+        let project = kind.project(&cwd);
+        let mut agent = agent_config.into_agent(kind.policy(&cwd)?);
         agent.set_mode(kind.mode());
         Ok(Self {
             session: Session::start(&SESSIONS_ROOT, &project),
@@ -169,6 +197,32 @@ mod tests {
         let items = serde_json::to_value(tui.transcript.request_items()).unwrap();
         assert_eq!(items[0]["role"], "system");
         assert_eq!(items[0]["content"], prompts::CHAT);
+    }
+
+    #[test]
+    fn coding_refuses_roots_covering_home() {
+        let err = refuse_bare_root(Path::new("/")).unwrap_err().to_string();
+        assert!(err.contains("filesystem root"), "{err}");
+
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        let home = std::fs::canonicalize(&home).unwrap();
+        for root in [home.as_path(), home.parent().expect("home has a parent")] {
+            let err = refuse_bare_root(root).unwrap_err().to_string();
+            assert!(err.contains("in or above $HOME"), "{root:?}: {err}");
+        }
+
+        // A symlink to home resolves to home and is refused identically;
+        // sibling branches of home and scratch directories are not its ancestors.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(refuse_bare_root(&link).is_err());
+        if Path::new("/Volumes").is_dir() {
+            refuse_bare_root(Path::new("/Volumes")).unwrap();
+        }
+        refuse_bare_root(dir.path()).unwrap();
     }
 
     /// The bare command line stays the coding kind.
