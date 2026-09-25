@@ -55,6 +55,13 @@ exactly; if it reports a match count greater than one, add more surrounding line
 `old_string` until a unique match is found. To create a new file or rewrite one
 wholesale, use `bash`.
 
+Use `edit` for inline changes, deletions included. An empty `new_string` will simply
+delete `old_string`. `replace_all` should almost always be `false` when deleting text.
+Scripted edits (`python`, `sed`) should be reserved for mechanical changes across many
+files, and must meet the same standard: anchor spans on exact markers, verifying every
+anchor matched before writing anything, and stop with a named path on the first miss.
+Never infer a span's boundaries from structure you assume is present.
+
 ## The Search Tool
 
 Call `search` with:
