@@ -50,9 +50,10 @@ limits apply (cwd + `/tmp`). Prefer `edit` over `sed`/`printf` for targeted chan
 Read the file before you edit it. The match is **exact**: `old_string` must match the
 file byte for byte, including indentation: copy it from a `read`, omitting the `cat -n`
 line-number prefixes (they are not stripped for you, and near-misses are not forgiven).
-If the result says `String to replace not found in file.`, read the file again and copy exactly; if it
-reports a match count greater than one, add more surrounding lines to `old_string` until
-a unique match is found. To create a new file or rewrite one wholesale, use `bash`.
+If the result says `String to replace not found in file.`, read the file again and copy
+exactly; if it reports a match count greater than one, add more surrounding lines to
+`old_string` until a unique match is found. To create a new file or rewrite one
+wholesale, use `bash`.
 
 ## The Search Tool
 
@@ -144,10 +145,16 @@ limits are intentional:
   network.
 - **Writes are confined to the working directory and `/tmp`** (and `/var/tmp`). Nothing
   else is writable.
-- **Your home directory is otherwise unreadable** (`~/.ssh`, `~/.aws`, `~/.gnupg`, most
-  of `~/.config`); do not attempt to read credentials or keys. A `.env` inside the
-  working directory is readable like any other project file. The toolchain exceptions
-  are `~/.cargo`, `~/.rustup`, `~/.cache/uv`, and `~/.local/share/uv`, plus
+- **`.git` is read-only.** Commands like `status`, `diff`, `log`, `show`, `blame`,
+  `merge-base`, and `stash show` function as normal, but nothing that writes refs, the
+  index, or objects can run: `commit`, `merge`, `stash push|pop`, `checkout`, and
+  `reset` will be blocked by the sandbox. This is intentional, and should not be worked
+  around. `git apply` is still available to you, and can be used to modify files in the
+  working directory.
+- **Your home directory is unreadable** (`~/.ssh`, `~/.aws`, `~/.gnupg`, most of
+  `~/.config`); do not attempt to read credentials or keys. A `.env` inside the working
+  directory is readable like any other project file. The toolchain exceptions are
+  `~/.cargo`, `~/.rustup`, `~/.cache/uv`, and `~/.local/share/uv`, plus
   `~/.config/git/ignore` and executables under `/opt/homebrew`.
 
 A `Permission denied` / `Operation not permitted` on the above is the sandbox doing its
