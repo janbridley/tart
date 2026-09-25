@@ -779,10 +779,10 @@ mod tests {
         t.push(Line::from("❯ go"));
         t.begin_response();
 
-        start_read(&mut t, "r0", r#"{"path":"a.rs","start_line":1,"end_line":10}"#);
+        start_read(&mut t, "r0", r#"{"file_path":"a.rs","offset":1,"limit":10}"#);
         t.finish_tool("r0", "one\n".to_string(), Some(0));
         t.append_thinking("mid-run reasoning"); // rides below the boxes
-        start_read(&mut t, "r1", r#"{"path":"a.rs","start_line":20,"end_line":30}"#);
+        start_read(&mut t, "r1", r#"{"file_path":"a.rs","offset":20,"limit":11}"#);
         t.sync(40);
         let rows = texts(t.rows());
         assert_eq!(rows.iter().filter(|row| row.contains("Read(")).count(), 1);
@@ -796,7 +796,7 @@ mod tests {
 
         // An answer between calls breaks the run: a second box.
         t.append("done reading");
-        start_read(&mut t, "r2", r#"{"path":"b.rs","start_line":1,"end_line":5}"#);
+        start_read(&mut t, "r2", r#"{"file_path":"b.rs","offset":1,"limit":5}"#);
         t.sync(40);
         assert_eq!(
             texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
@@ -804,7 +804,7 @@ mod tests {
         );
 
         // A box still running never absorbs the next call.
-        start_read(&mut t, "r3", r#"{"path":"b.rs","start_line":9,"end_line":9}"#);
+        start_read(&mut t, "r3", r#"{"file_path":"b.rs","offset":9,"limit":1}"#);
         t.sync(40);
         assert_eq!(
             texts(t.rows()).iter().filter(|row| row.contains("Read(")).count(),
@@ -868,13 +868,13 @@ mod tests {
         let mut t = Transcript::default();
         t.push(Line::from("❯ go"));
         t.begin_response();
-        start_read(&mut t, "r0", r#"{"path":"a.rs","start_line":1,"end_line":10}"#);
+        start_read(&mut t, "r0", r#"{"file_path":"a.rs","offset":1,"limit":10}"#);
         t.finish_tool("r0", "one\ntwo\nthree\n".to_string(), Some(0));
         t.sync(40);
         let settled = texts(t.rows());
         assert_eq!(settled.len(), 5, "{settled:?}"); // prompt, header, three rows
 
-        start_read(&mut t, "r1", r#"{"path":"a.rs","start_line":20,"end_line":30}"#);
+        start_read(&mut t, "r1", r#"{"file_path":"a.rs","offset":20,"limit":11}"#);
         t.sync(40);
         let reopened = texts(t.rows());
         assert_eq!(reopened.len(), settled.len(), "{reopened:?}");

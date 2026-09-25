@@ -16,8 +16,8 @@ use std::time::Duration;
 use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
-    CancelToken, WatchedRun, combined_output, command_text, misuse, parse_arguments, run_watched,
-    string_field, timeout_text, tool, traced,
+    CancelToken, WatchedRun, combined_output, command_text_inline, misuse, parse_arguments,
+    run_watched, string_field, timeout_text, tool, traced,
 };
 use crate::Progress;
 
@@ -145,7 +145,7 @@ pub(super) struct Search {
 pub(super) fn parse_search(arguments: &str) -> anyhow::Result<Search> {
     let args = parse_arguments(arguments)?;
     Ok(Search {
-        query: string_field(&args, "query")?,
+        query: string_field(&args, "WebSearch", "query")?,
         max_results: args["max_results"]
             .as_u64()
             .unwrap_or(DEFAULT_SEARCH_RESULTS)
@@ -173,7 +173,7 @@ pub(super) struct Fetch {
 pub(super) fn parse_fetch(arguments: &str) -> anyhow::Result<Fetch> {
     let args = parse_arguments(arguments)?;
     Ok(Fetch {
-        url: string_field(&args, "url")?,
+        url: string_field(&args, "WebFetch", "url")?,
         raw: args["raw"].as_bool().unwrap_or(false),
     })
 }
@@ -298,7 +298,7 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
                         let marked = timeout_text(&text, SEARCH_TIMEOUT);
                         (marked.clone(), marked, exit)
                     } else {
-                        (command_text(&text, output.status), text, exit)
+                        (command_text_inline(&text, output.status, false), text, exit)
                     }
                 }
                 Err(error) => {
@@ -505,7 +505,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
                 let exit = output.status.code();
                 let text = combined_output(&output);
                 if !output.status.success() {
-                    return (command_text(&text, output.status), text, exit);
+                    return (command_text_inline(&text, output.status, false), text, exit);
                 }
                 // Success: split and check where redirects landed.
                 if let Some((body, final_url)) = separate_final_url(&text) {
@@ -513,10 +513,10 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
                         (refused.clone(), refused, exit)
                     } else {
                         let text = body.to_string();
-                        (command_text(&text, output.status), text, exit)
+                        (command_text_inline(&text, output.status, false), text, exit)
                     }
                 } else {
-                    (command_text(&text, output.status), text, exit)
+                    (command_text_inline(&text, output.status, false), text, exit)
                 }
             }
         }
@@ -656,7 +656,10 @@ mod tests {
     fn parse_search_rejects_a_missing_query() {
         let error = parse_search(r#"{"timelimit":"d"}"#).unwrap_err().to_string();
 
-        assert!(error.contains("missing 'query'"), "{error}");
+        assert!(
+            error.contains("The required parameter `query` is missing"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -746,7 +749,10 @@ mod tests {
     fn parse_fetch_rejects_a_missing_url() {
         let error = parse_fetch(r#"{"raw":true}"#).unwrap_err().to_string();
 
-        assert!(error.contains("missing 'url'"), "{error}");
+        assert!(
+            error.contains("The required parameter `url` is missing"),
+            "{error}"
+        );
     }
 
     #[test]

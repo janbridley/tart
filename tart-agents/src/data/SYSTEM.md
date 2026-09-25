@@ -11,9 +11,10 @@ step at a time.
 
 Call `bash` with:
 
-- `command` (string): the bash command to run.
-- `timeout` (integer, optional): seconds the command may run before it is killed, 1-600;
-  default 120.
+- `command` (string): the command to execute.
+- `timeout` (number, optional): timeout in milliseconds, minimum 1000, max 600000;
+  default 120000. Values are milliseconds: `120` means a tenth of a second, not two
+  minutes.
 
 Each call is **independent**: there is no persistent shell, so the working directory,
 environment variables, and shell state do NOT carry over between calls. If you need a
@@ -24,9 +25,11 @@ specific directory or environment, set it inline within the command. For example
 
 Call `read` with:
 
-- `path` (string): the file to read.
-- `start_line` / `end_line` (integer, optional): 1-based, inclusive; without them the
-  whole file is returned.
+- `file_path` (string): the file to read.
+- `offset` (integer, optional): line number to start reading from, 1-based; without it
+  the read starts at the top.
+- `limit` (integer, optional): how many lines to read; without it the read runs to the
+  end of the file.
 
 Contents are numbered `cat -n` style. Read before editing; when copying `old_string`,
 omit the line-number prefixes.
@@ -35,7 +38,7 @@ omit the line-number prefixes.
 
 Call `edit` with:
 
-- `path` (string): the path to the file to edit.
+- `file_path` (string): the path to the file to edit.
 - `old_string` (string): the exact text to find. This must occur exactly once unless
   `replace_all` is true.
 - `new_string` (string): the replacement text (must differ from `old_string`).
@@ -47,7 +50,7 @@ limits apply (cwd + `/tmp`). Prefer `edit` over `sed`/`printf` for targeted chan
 Read the file before you edit it. The match is **exact**: `old_string` must match the
 file byte for byte, including indentation: copy it from a `read`, omitting the `cat -n`
 line-number prefixes (they are not stripped for you, and near-misses are not forgiven).
-If the result says `old_string not found`, read the file again and copy exactly; if it
+If the result says `String to replace not found in file.`, read the file again and copy exactly; if it
 reports a match count greater than one, add more surrounding lines to `old_string` until
 a unique match is found. To create a new file or rewrite one wholesale, use `bash`.
 
@@ -74,8 +77,8 @@ Call `fetch` with:
 The page comes back as markdown (title, source url, then the text with scripts, styles,
 and markup stripped) so prefer it over `raw` for documentation and articles. Pass
 `raw=true` for JSON or plain-text endpoints. When the reader errors (rate limit, auth),
-retry the same URL with `raw=true`. The result is cut at 150,000 characters, which is
-marked when it happens.
+retry the same URL with `raw=true`. A result over 64 KB reaches you cut to its first and
+last 32 KB, with the dropped middle marked.
 
 ## The Spawn Agent Tool
 
@@ -113,14 +116,21 @@ progress when you check, defer to the user or end your turn.
 
 ## Execution Model
 
-- The tool result is the command's stdout followed by its stderr. To see them merged as
-  they were written, redirect with `2>&1` inside the command.
-- Exit status is surfaced: a failed command returns `[exit N]` followed by its output; a
-  command that succeeds with no output returns `done`.
-- A command may run for at most its `timeout` (seconds, 1-600; default 120). Past that
-  the command is killed with every process it started, and the result is
-  `[timed out after Ns]` followed by whatever output was captured before the kill. Plan
-  long work (full builds, long test suites) as steps that finish inside the limit.
+- The tool result is the command's stdout with its stderr as a separate paragraph below.
+  To see them merged as they were written, redirect with `2>&1` inside the command.
+- A successful command returns its output verbatim; one that succeeds with no output
+  returns `(Bash completed with no output)`. A failed command's output ends with
+  `Exit code N` as its final line. An exit code of 1 from `grep` (and its
+  `egrep`/`fgrep` aliases), `rg`, `find`, `diff`, `test`, `[`, `git diff`, or `git grep`
+  counts as success: it means "no match" or "false".
+- A command may run for at most its `timeout` (milliseconds; default 120000, max
+  600000). Past that the command is killed with every process it started and cannot be
+  resumed. Timed-out commands will end with `Exit code 137` and
+  `Command timed out after Nm Ns` after whatever output was captured before the kill.
+  Plan long work (full builds, long test suites) as steps that finish inside the limit.
+- A success that prints more than 30,000 bytes spills to a file holding the full output
+  and previews its start. A failure over 10,000 bytes is cut to its first and last 5,000
+  bytes, with a marker where the middle was dropped.
 
 ## Sandbox
 

@@ -59,7 +59,10 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
         .and_then(|args| match name {
             "bash" => args["command"].as_str().map(preprocess_bash_command),
             "fetch" => args["url"].as_str().map(str::to_string),
-            "read" | "edit" => args["path"].as_str().map(str::to_string),
+            "read" | "edit" => args["file_path"]
+                .as_str()
+                .or_else(|| args["path"].as_str())
+                .map(str::to_string),
             // The subagent pair: the task spawned, and the id checked on.
             "spawn_agent" => args["task"].as_str().map(str::to_string),
             "check_agent" => args["id"].as_u64().map(|id| id.to_string()),
@@ -75,9 +78,20 @@ pub(crate) fn argument(name: &str, raw: &str) -> String {
 /// One `edit`/`read` call's `(path, span)`; `None` when the arguments name no path.
 fn parts(raw: &str) -> Option<(String, (u64, u64))> {
     let args: Value = serde_json::from_str(raw).ok()?;
-    let path = args["path"].as_str()?.to_string();
-    let side = |key: &str, or: u64| args[key].as_u64().unwrap_or(or);
-    Some((path, (side("start_line", 0), side("end_line", u64::MAX))))
+    let path = args["file_path"]
+        .as_str()
+        .or_else(|| args["path"].as_str())?
+        .to_string();
+    // Zeros count as omitted, matching how the reader itself treats them.
+    let offset = args["offset"].as_u64().filter(|&offset| offset > 0);
+    let limit = args["limit"].as_u64().filter(|&limit| limit > 0);
+    let (start, end) = match (offset, limit) {
+        (Some(offset), Some(limit)) => (offset, offset.saturating_add(limit).saturating_sub(1)),
+        (Some(offset), None) => (offset, u64::MAX),
+        (None, Some(limit)) => (0, limit),
+        (None, None) => (0, u64::MAX),
+    };
+    Some((path, (start, end)))
 }
 
 /// Group several `edit`/`read` calls grouped per path, each path once.
@@ -164,8 +178,24 @@ mod tests {
         for (name, raw, expected) in [
             ("bash", r#"{"command":"ls -la"}"#, "Bash(ls -la)"),
             ("edit", r#"{"path":"src/main.rs"}"#, "Edit(src/main.rs)"),
+            ("edit", r#"{"file_path":"src/main.rs"}"#, "Edit(src/main.rs)"),
             ("fetch", r#"{"url":"http://x"}"#, "Fetch(http://x)"),
             ("search", r#"{"query":"rust regex"}"#, "Search(rust regex)"),
+            // Reads in Claude Code's shape: file_path with offset/limit.
+            ("read", r#"{"file_path":"src/main.rs"}"#, "Read(src/main.rs)"),
+            (
+                "read",
+                r#"{"file_path":"a.rs","offset":1,"limit":2}"#,
+                "Read(a.rs:1-2)",
+            ),
+            ("read", r#"{"file_path":"a.rs","offset":28}"#, "Read(a.rs:28-)"),
+            ("read", r#"{"file_path":"a.rs","limit":12}"#, "Read(a.rs:-12)"),
+            // Zeros count as omitted, so they do not invert the span.
+            (
+                "read",
+                r#"{"file_path":"a.rs","offset":0,"limit":12}"#,
+                "Read(a.rs:-12)",
+            ),
             // The subagent pair: the task spawned, the id checked on.
             (
                 "spawn_agent",
@@ -175,11 +205,8 @@ mod tests {
             ("check_agent", r#"{"id":2}"#, "Check Agent(2)"),
             // A news search tags its query; the rest of the arguments stay out.
             ("search", news, "Search(elections [news])"),
-            // A read carries its bounds: whole-file, closed, or open at an end.
             ("read", r#"{"path":"src/main.rs"}"#, "Read(src/main.rs)"),
-            ("read", a12, "Read(a.rs:1-2)"),
-            ("read", r#"{"path":"a.rs","start_line":28}"#, "Read(a.rs:28-)"),
-            ("read", r#"{"path":"a.rs","end_line":12}"#, "Read(a.rs:-12)"),
+            ("read", a12, "Read(a.rs)"),
             // Odd names keep their lead and an empty one stays empty; an
             // underscore names a word break.
             ("Bash", r#"{"command":"ls"}"#, r#"Bash({"command":"ls"})"#),
@@ -198,14 +225,14 @@ mod tests {
 
     #[test]
     fn runs_of_calls_group_or_join() {
-        let a12 = r#"{"path":"a.rs","start_line":1,"end_line":2}"#;
+        let a12 = r#"{"file_path":"a.rs","offset":1,"limit":2}"#;
         let (x, a, b) = (r#"{"path":"x.py"}"#, r#"{"path":"a.rs"}"#, r#"{"path":"b.rs"}"#);
-        let a10_20 = r#"{"path":"a.rs","start_line":10,"end_line":20}"#;
-        let a15_30 = r#"{"path":"a.rs","start_line":15,"end_line":30}"#;
+        let a10_20 = r#"{"file_path":"a.rs","offset":10,"limit":11}"#;
+        let a15_30 = r#"{"file_path":"a.rs","offset":15,"limit":16}"#;
         let (a5, a60, head12) = (
-            r#"{"path":"a.rs","start_line":5}"#,
-            r#"{"path":"a.rs","start_line":60}"#,
-            r#"{"path":"a.rs","end_line":12}"#,
+            r#"{"file_path":"a.rs","offset":5}"#,
+            r#"{"file_path":"a.rs","offset":60}"#,
+            r#"{"file_path":"a.rs","limit":12}"#,
         );
         let calls: &[(&str, &[&str], &str)] = &[
             // The tools without paths join plainly, identical or not.
@@ -214,9 +241,9 @@ mod tests {
             (
                 "read",
                 &[
-                    r#"{"path":"README.md","start_line":1,"end_line":10}"#,
-                    r#"{"path":"README.md","start_line":11,"end_line":20}"#,
-                    r#"{"path":"README.md","start_line":21,"end_line":30}"#,
+                    r#"{"file_path":"README.md","offset":1,"limit":10}"#,
+                    r#"{"file_path":"README.md","offset":11,"limit":10}"#,
+                    r#"{"file_path":"README.md","offset":21,"limit":10}"#,
                 ],
                 "Read(README.md:1-30)",
             ),
@@ -232,9 +259,9 @@ mod tests {
             (
                 "read",
                 &[
-                    r#"{"path":"b.rs","start_line":1,"end_line":2}"#,
-                    r#"{"path":"a.rs","start_line":5}"#,
-                    r#"{"path":"b.rs","start_line":4,"end_line":5}"#,
+                    r#"{"file_path":"b.rs","offset":1,"limit":2}"#,
+                    r#"{"file_path":"a.rs","offset":5}"#,
+                    r#"{"file_path":"b.rs","offset":4,"limit":2}"#,
                 ],
                 "Read(b.rs:1-2,4-5, a.rs:5-)",
             ),
@@ -242,9 +269,9 @@ mod tests {
             (
                 "read",
                 &[
-                    r#"{"path":"a.rs","start_line":10,"end_line":20}"#,
-                    r#"{"path":"b.rs","start_line":1,"end_line":2}"#,
-                    r#"{"path":"a.rs"}"#,
+                    r#"{"file_path":"a.rs","offset":10,"limit":11}"#,
+                    r#"{"file_path":"b.rs","offset":1,"limit":2}"#,
+                    r#"{"file_path":"a.rs"}"#,
                 ],
                 "Read(a.rs, b.rs:1-2)",
             ),
