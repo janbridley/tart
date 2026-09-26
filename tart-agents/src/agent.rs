@@ -192,12 +192,7 @@ impl<B: Backend> Agent<B> {
         self.mode = mode;
     }
 
-    /// Toggle the writable policy's GPU grants mid-session, returning the new
-    /// state. Like [`Agent::set_mode`], a turn already in flight keeps the
-    /// policy it started with; chat mode never runs GPU grants, while plan
-    /// mode inherits them — GPU probing is read-only research. Subagents
-    /// inherit the state at their spawn, like every other policy aspect, so
-    /// a later toggle does not reach agents already running.
+    /// Toggle the writable policy's GPU grants mid-session, returning the new state.
     #[inline]
     pub fn toggle_gpu(&mut self) -> bool {
         self.writable.toggle_gpu()

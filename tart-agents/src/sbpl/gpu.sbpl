@@ -1,6 +1,4 @@
 ; GPU access for Metal compute, granted only by Policy::allow_gpu
-; The frontend's caches (com.apple.metalfe and siblings under DARWIN_USER_CACHE_DIR) are
-; granted as param-bound rules in compile().
 (allow iokit-open (iokit-user-client-class "AGXDeviceUserClient"))
 ; The shader-compiler service
 (allow mach-lookup (global-name "com.apple.MTLCompilerService"))
@@ -13,3 +11,19 @@
 ; The GPU's Metal driver bundle.
 (allow file-read* file-test-existence
   (regex #"^(/System/Library/Extensions|/Library/GPUBundles)/AGXMetal[^/]*\.bundle(/|$)"))
+; The frontend's caches: com.apple.metalfe (the module cache, one .pcm per
+; option hash), com.apple.metal (shader archives), com.apple.gpuarchiver.
+(allow file-read* file-test-existence file-write*
+  (regex #"^/(private/)?var/folders/[^/]+/[^/]+/C/([^/]+/)?com\.apple\.(metalfe|metal|gpuarchiver)(/|$)"))
+; MTLCompilerService compiles out-of-process, over XPC, and Metal passes it
+; file access as sandbox extensions this process issues. See Chromium's gpu.sb
+; grants the read variant (crbug 41485470) and its common.sb the read-write one scoped
+; to these files.
+(allow file-issue-extension
+  (require-all
+    (extension-class "com.apple.app-sandbox.read")
+    (regex #"^/(private/)?var/folders/[^/]+/[^/]+/T(/|$)")))
+(allow file-issue-extension
+  (require-all
+    (extension-class "com.apple.app-sandbox.read-write")
+    (regex #"^/(private/)?var/folders/[^/]+/[^/]+/C/([^/]+/)?com\.apple\.(metalfe|metal|gpuarchiver)(/|$)")))

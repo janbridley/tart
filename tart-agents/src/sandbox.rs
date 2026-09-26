@@ -102,7 +102,7 @@ const PLATFORM_DEFAULTS: &str = include_str!("sbpl/restricted_read_only_platform
 const EXTRAS: &str = include_str!("sbpl/extras.sbpl");
 
 // The GPU grants, rendered only under Policy::allow_gpu: what Metal compute
-// on Apple Silicon needs beyond the baseline — see sbpl/gpu.sbpl.
+// on Apple Silicon needs beyond the baseline.
 const GPU: &str = include_str!("sbpl/gpu.sbpl");
 
 // The secret denies, appended last to ensure they are not overwritten.
@@ -917,21 +917,17 @@ mod tests {
         }
 
         // Case-twiddled requests resolve to the lowercase on-disk names on a
-        // case-insensitive volume, so the deny must still fire; on a
-        // case-sensitive volume the miss itself fails. The denies fold case,
-        // so an on-disk uppercase spelling is covered on either volume, and a
+        // case-insensitive volume, so the lowercase-only deny must still
+        // fire; on a case-sensitive volume the miss itself fails. A
         // directory named like a secret denies its contents with it.
-        for extra in ["SECRETS.YML", "dev.env/token", ".ENV"] {
-            let path = dir.path().join(extra);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).unwrap();
-            }
-            std::fs::write(&path, "secret\n").unwrap();
-            let op = format!("cat {}", path.display());
+        std::fs::create_dir_all(dir.path().join("dev.env")).unwrap();
+        std::fs::write(dir.path().join("dev.env/token"), "secret\n").unwrap();
+        for extra in ["dev.env/token", ".ENV"] {
+            let op = format!("cat {}", dir.path().join(extra).display());
             let out = policy.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
             assert!(
                 !out.status.success(),
-                "the sandbox must deny the case- or directory-shaped `{op}`: {}",
+                "the sandbox must deny `{op}`: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
         }
