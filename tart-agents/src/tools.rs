@@ -1083,8 +1083,8 @@ fn spawn_perl(edit: &Edit, cmd: &mut std::process::Command) -> (String, Option<i
     }
 }
 
-const FILE_FRESHNESS_SUFFIX: &str =
-    "(file state is current in your context — no need to Read it back)";
+// Upstream = "(file state is current in your context — no need to Read it back)"
+const FILE_FRESHNESS_SUFFIX: &str = ""; // this seems unnecessary
 
 /// Edit receipt when a file reread is not needed.
 fn edit_receipt(edit: &Edit) -> String {
@@ -1818,8 +1818,7 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "The file {} has been updated successfully. (file state is current in your \
-                 context \u{2014} no need to Read it back)",
+                "The file {} has been updated successfully. ",
                 file.path().display()
             )
         );
@@ -1837,8 +1836,7 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "The file {} has been updated. All occurrences were successfully replaced. \
-                 (file state is current in your context \u{2014} no need to Read it back)",
+                "The file {} has been updated. All occurrences were successfully replaced. ",
                 file.path().display()
             )
         );
