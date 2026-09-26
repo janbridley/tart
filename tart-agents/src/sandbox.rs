@@ -52,8 +52,7 @@
 //!   so `brew` commands fail outright (see `sbpl/extras.sbpl`). Binaries outside
 //!   that prefix stay unexecutable: [`Policy::add_read_only_root`] grants
 //!   reads, not `file-map-executable`.
-//! - The GPU stays inaccessible unless [`Policy::allow_gpu`] opts in: Metal compute
-//!   then gets the AGX user client, the shader compiler, and the Metal cache.
+//! - The GPU stays inaccessible unless [`Policy::allow_gpu`] opts in.
 //! - Non-public data: `.ssh` and `id_*` keys, `.env`-style files, registry
 //!   and cloud credentials, `*.pem`/`*.key`-style extensions (see `sbpl/secrets.sbpl`)
 //!   is denied reads, writes, and existence tests under *every* policy.
@@ -61,7 +60,6 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
@@ -106,10 +104,6 @@ const EXTRAS: &str = include_str!("sbpl/extras.sbpl");
 // The GPU grants, rendered only under Policy::allow_gpu: what Metal compute
 // on Apple Silicon needs beyond the baseline — see sbpl/gpu.sbpl.
 const GPU: &str = include_str!("sbpl/gpu.sbpl");
-
-// Metal cache folders are required to compile objc/swift gpu projects.
-const METAL_CACHE_LEAVES: [&str; 3] =
-    ["com.apple.metalfe", "com.apple.metal", "com.apple.gpuarchiver"];
 
 // The secret denies, appended last to ensure they are not overwritten.
 const SECRETS: &str = include_str!("sbpl/secrets.sbpl");
@@ -450,7 +444,7 @@ impl Policy {
         deny_rules.push(r#"(deny file-read-data file-write-data (literal "/dev/tty"))"#.to_owned());
 
         let mut text = String::from(BASE_POLICY);
-        for section in [&read_rules, &write_rules, &deny_rules] {
+        for section in [&read_rules, &write_rules] {
             if !section.is_empty() {
                 text.push('\n');
                 text.push_str(&section.join("\n"));
@@ -461,25 +455,12 @@ impl Policy {
         text.push('\n');
         text.push_str(EXTRAS);
         if self.gpu {
-            // Before SECRETS, like every allow: the secret denies must stay
-            // the profile's final section.
             text.push('\n');
             text.push_str(GPU);
-            let cache_rules: Vec<String> = metal_caches()
-                .iter()
-                .enumerate()
-                .map(|(i, cache)| {
-                    let name = format!("METAL_CACHE_ROOT_{i}");
-                    params.push((name.clone(), cache.clone().into_os_string()));
-                    format!(
-                        r#"(allow file-read* file-test-existence file-write* (subpath (param "{name}")))"#
-                    )
-                })
-                .collect();
-            if !cache_rules.is_empty() {
-                text.push('\n');
-                text.push_str(&cache_rules.join("\n"));
-            }
+        }
+        if !deny_rules.is_empty() {
+            text.push('\n');
+            text.push_str(&deny_rules.join("\n"));
         }
         text.push('\n');
         text.push_str(SECRETS);
@@ -515,35 +496,6 @@ impl Policy {
 fn canonicalize_root(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize sandbox root: {}", path.display()))
-}
-
-static METAL_CACHES: OnceLock<Vec<PathBuf>> = OnceLock::new();
-
-fn metal_caches() -> &'static [PathBuf] {
-    METAL_CACHES
-        .get_or_init(|| {
-            let Some(cache) = std::process::Command::new("/usr/bin/getconf")
-                .arg("DARWIN_USER_CACHE_DIR")
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .map(|out| {
-                    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().trim_end_matches('/'))
-                })
-                .filter(|cache| !cache.as_os_str().is_empty())
-            else {
-                return Vec::new();
-            };
-            METAL_CACHE_LEAVES
-                .iter()
-                .map(|leaf| cache.join(leaf))
-                .filter_map(|leaf| {
-                    std::fs::create_dir_all(&leaf).ok()?;
-                    canonicalize_root(&leaf).ok()
-                })
-                .collect()
-        })
-        .as_slice()
 }
 
 /// Test support for the live tests, which reach `sandbox-exec` through
@@ -966,14 +918,23 @@ mod tests {
 
         // Case-twiddled requests resolve to the lowercase on-disk names on a
         // case-insensitive volume, so the deny must still fire; on a
-        // case-sensitive volume the miss itself fails.
-        let op = format!("cat {}", dir.path().join(".ENV").display());
-        let out = policy.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
-        assert!(
-            !out.status.success(),
-            "the sandbox must deny the case-twiddled `{op}`: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        // case-sensitive volume the miss itself fails. The denies fold case,
+        // so an on-disk uppercase spelling is covered on either volume, and a
+        // directory named like a secret denies its contents with it.
+        for extra in ["SECRETS.YML", "dev.env/token", ".ENV"] {
+            let path = dir.path().join(extra);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, "secret\n").unwrap();
+            let op = format!("cat {}", path.display());
+            let out = policy.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "the sandbox must deny the case- or directory-shaped `{op}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
 
         // Listing the .ssh directory, and merely probing its existence, are
         // denied along with reading its files.
@@ -1002,16 +963,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plain = Policy::new(dir.path()).unwrap().render();
         assert!(!plain.contains("AGXDeviceUserClient"), "default: {plain}");
-        assert!(!plain.contains("METAL_CACHE_ROOT"), "default: {plain}");
+        assert!(!plain.contains("com.apple.metalfe"), "default: {plain}");
         let gpu = Policy::new(dir.path()).unwrap().allow_gpu().render();
         assert!(gpu.contains(r#"(iokit-user-client-class "AGXDeviceUserClient")"#));
         assert!(gpu.contains(r#"(global-name "com.apple.MTLCompilerService")"#));
-        // One read-write rule per resolved Metal cache leaf, still ahead of
-        // the secret denies; the bindings' values are pinned by the params
-        // test below.
-        let rule = "(allow file-read* file-test-existence file-write* \
-                    (subpath (param \"METAL_CACHE_ROOT_";
-        assert_eq!(gpu.matches(rule).count(), metal_caches().len());
+        // The cache-leaf grant is fixed text in gpu.sbpl, matched against the
+        // OS's layout rather than resolved per host, and still lands ahead
+        // of the secret denies.
+        assert!(gpu.contains(r"(metalfe|metal|gpuarchiver)"), "{gpu}");
+        assert_eq!(gpu.matches("file-issue-extension").count(), 2);
+        assert!(!plain.contains("file-issue-extension"));
         assert!(gpu.ends_with(SECRETS), "secrets stay the final section");
 
         // Toggling flips the grants back off, and the read-only research
@@ -1026,54 +987,54 @@ mod tests {
         assert!(policy.read_only().render().contains("AGXDeviceUserClient"));
     }
 
-    /// The Metal cache leaves ride along as canonicalized `-D` bindings, and
-    /// only under `allow_gpu`.
-    #[test]
-    fn metal_cache_leaves_ride_as_params_only_under_gpu() {
-        let caches = metal_caches();
-        assert!(
-            caches
-                .iter()
-                .all(|cache| METAL_CACHE_LEAVES.iter().any(|leaf| cache.ends_with(leaf)))
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let bindings = |policy: Policy| {
-            policy
-                .command("/usr/bin/true")
-                .get_args()
-                .filter(|arg| arg.to_string_lossy().starts_with("-DMETAL_CACHE_ROOT_"))
-                .map(OsStr::to_os_string)
-                .collect::<Vec<_>>()
-        };
-        let gpu = bindings(Policy::new(dir.path()).unwrap().allow_gpu());
-        assert_eq!(gpu.len(), caches.len());
-        for (binding, cache) in gpu.iter().zip(caches) {
-            let binding = binding.to_string_lossy();
-            assert_eq!(binding.split_once('=').unwrap().1, cache.display().to_string());
-        }
-        assert!(bindings(Policy::new(dir.path()).unwrap()).is_empty());
-    }
-
     /// The cache leaves are writable under `allow_gpu`, and denied without it.
     #[apply(skip_unless_live!)]
     #[test]
     fn metal_caches_are_writable_only_under_gpu() {
+        let reported = std::process::Command::new("/usr/bin/getconf")
+            .arg("DARWIN_USER_CACHE_DIR")
+            .output()
+            .expect("getconf runs");
+        let reported = String::from_utf8_lossy(&reported.stdout);
+        let cache_root = reported.trim().trim_end_matches('/');
         let dir = tempfile::tempdir().unwrap();
         let gpu = Policy::new(dir.path()).unwrap().allow_gpu();
         let plain = Policy::new(dir.path()).unwrap();
-        for cache in metal_caches() {
-            let probe = cache.join("tart-gpu-cache-probe");
-            let write = format!("echo ok > {}", probe.display());
-            let out = gpu.command("/bin/sh").arg("-c").arg(&write).output().unwrap();
+        for leaf in ["com.apple.metalfe", "com.apple.metal", "com.apple.gpuarchiver"] {
+            // Creating the probe directory also exercises the grant's
+            // coverage of the leaves the frontend would create itself.
+            let probe = PathBuf::from(cache_root).join(leaf).join("tart-gpu-cache-probe");
+            let op = format!(
+                "mkdir -p {} && echo ok > {}",
+                probe.display(),
+                probe.join("pcm").display()
+            );
+            let out = gpu.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
             assert!(
                 out.status.success(),
-                "gpu must allow `{write}`: {}",
+                "gpu must allow `{op}`: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let out = plain.command("/bin/sh").arg("-c").arg(&write).output().unwrap();
-            assert!(!out.status.success(), "the default policy must deny `{write}`");
-            std::fs::remove_file(&probe).ok();
+            std::fs::remove_dir_all(&probe).unwrap();
+            let out = plain.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+            assert!(!out.status.success(), "the default policy must deny `{op}`");
         }
+    }
+
+    #[test]
+    fn tart_denies_follow_every_vendored_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered = Policy::new(dir.path())
+            .unwrap()
+            .exclude_git()
+            .allow_gpu()
+            .render();
+        let last = |needle: &str| rendered.rfind(needle).expect(needle);
+        let tty_deny = r#"(deny file-read-data file-write-data (literal "/dev/tty"))"#;
+        assert!(last(r#"(subpath "/tmp")"#) < last(tty_deny));
+        assert!(last(r#"(subpath "/private/var/tmp")"#) < last("(deny file-write*"));
+        assert!(last("AGXDeviceUserClient") < last(tty_deny));
+        assert!(rendered.ends_with(SECRETS), "secrets stay the final section");
     }
 
     /// Every rendered profile carries the uv, gitignore, and homebrew grants
