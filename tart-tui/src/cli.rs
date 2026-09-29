@@ -13,6 +13,8 @@ pub(crate) struct Cli {
     pub(crate) agents: PathBuf,
     /// Whether `--chat` was passed: web tools only, no shell or filesystem.
     pub(crate) chat: bool,
+    /// Whether `--gpu` was passed: Metal compute inside the sandbox.
+    pub(crate) gpu: bool,
 }
 
 impl Cli {
@@ -27,6 +29,7 @@ impl Cli {
         Ok(Self {
             agents: resolve(matches, home)?,
             chat: matches.get_flag("chat"),
+            gpu: matches.get_flag("gpu"),
         })
     }
 }
@@ -63,6 +66,9 @@ fn command() -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Chat mode: web tools only, no shell or filesystem access"),
         )
+        .arg(Arg::new("gpu").long("gpu").action(clap::ArgAction::SetTrue).help(
+            "Grant the coding sandbox GPU access for Metal compute (toggle at runtime with /gpu)",
+        ))
 }
 
 #[cfg(test)]
@@ -123,6 +129,29 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("--agents"), "{error}");
+    }
+
+    /// `--gpu` parses true, and its absence false, alongside the agents file.
+    #[test]
+    fn the_gpu_flag_parses() {
+        let with = Cli::from(
+            &command()
+                .try_get_matches_from(["tart", "--agents", "f.toml", "--gpu"])
+                .expect("the flags parse"),
+            None,
+        )
+        .expect("the named file is used as-is");
+        assert!(with.gpu);
+        assert_eq!(with.agents, PathBuf::from("f.toml"));
+
+        let without = Cli::from(
+            &command()
+                .try_get_matches_from(["tart", "--agents", "f.toml"])
+                .expect("the flags parse"),
+            None,
+        )
+        .expect("the named file is used as-is");
+        assert!(!without.gpu);
     }
 
     /// `--chat` parses true, and its absence false, alongside the agents file.

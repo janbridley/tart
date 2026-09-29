@@ -34,10 +34,12 @@
 //!
 //! - Network access is denied (the base profile is `(deny default)`).
 //! - The child environment is cleared except for a minimal `PATH` (the system
-//!   directories, plus `~/.cargo/bin` and `/opt/homebrew/bin` when present), the
-//!   granted temp directory (`TMPDIR`, and `MPLCONFIGDIR` so matplotlib caches
-//!   in scratch instead of the unreadable home directory), and `HOME`, so paths
-//!   like `~/.cargo` resolve.
+//!   directories, led by `/opt/homebrew/bin` when present so brew's `python3`
+//!   shadows the system one, plus `~/.cargo/bin`), the
+//!   granted temp directory (`TMPDIR`, `MPLCONFIGDIR` so matplotlib caches
+//!   in scratch instead of the unreadable home directory, and
+//!   `CLANG_MODULE_CACHE_PATH` so swift/clang compiles do too), and `HOME`,
+//!   so paths like `~/.cargo` resolve.
 //!   With the environment cleared, secrets held by the caller cannot be printed
 //!   into captured output. Re-add variables with the usual `std` methods.
 //! - Git's global and system configuration are voided
@@ -50,6 +52,10 @@
 //!   so `brew` commands fail outright (see `sbpl/extras.sbpl`). Binaries outside
 //!   that prefix stay unexecutable: [`Policy::add_read_only_root`] grants
 //!   reads, not `file-map-executable`.
+//! - The GPU stays inaccessible unless [`Policy::allow_gpu`] opts in.
+//! - Non-public data: `.ssh` and `id_*` keys, `.env`-style files, registry
+//!   and cloud credentials, `*.pem`/`*.key`-style extensions (see `sbpl/secrets.sbpl`)
+//!   is denied reads, writes, and existence tests under *every* policy.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -65,15 +71,17 @@ const SANDBOXED_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// The `PATH` seeded into the sandboxed child.
 ///
-/// Includes the system baseline, plus the rustup shims in `~/.cargo/bin` and
-/// homebrew in `/opt/homebrew/bin` when those directories exist, so agents
-/// can run `cargo` and brew-installed tools.
+/// Homebrew leads the system baseline when installed. The rustup shims in
+/// `~/.cargo/bin` are at the end, also only when present.
 fn sandboxed_path() -> OsString {
-    let mut path = OsString::from(SANDBOXED_PATH);
+    let mut path = OsString::new();
+    if Path::new("/opt/homebrew/bin").is_dir() {
+        path.push("/opt/homebrew/bin:");
+    }
+    path.push(SANDBOXED_PATH);
     if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
         append_if_dir(&mut path, &Path::new(&home).join(".cargo/bin"));
     }
-    append_if_dir(&mut path, Path::new("/opt/homebrew/bin"));
     path
 }
 
@@ -93,6 +101,13 @@ const PLATFORM_DEFAULTS: &str = include_str!("sbpl/restricted_read_only_platform
 // tart's own additions, merged into every profile
 const EXTRAS: &str = include_str!("sbpl/extras.sbpl");
 
+// The GPU grants, rendered only under Policy::allow_gpu: what Metal compute
+// on Apple Silicon needs beyond the baseline.
+const GPU: &str = include_str!("sbpl/gpu.sbpl");
+
+// The secret denies, appended last to ensure they are not overwritten.
+const SECRETS: &str = include_str!("sbpl/secrets.sbpl");
+
 /// A macOS Seatbelt sandbox profile under which commands can be run.
 ///
 /// The profile grants write access to a set of canonicalized roots (the
@@ -111,6 +126,9 @@ pub struct Policy {
     ///
     /// This path becomes `TMPDIR` in the sandboxed environment.
     temp: Option<PathBuf>,
+    /// Whether the GPU grants from `sbpl/gpu.sbpl` (Metal compute) render.
+    /// Kernel-reachable surface, so opt-in via [`Policy::allow_gpu`].
+    gpu: bool,
 }
 
 /// The rendered profile plus its `-D` parameter bindings.
@@ -135,6 +153,7 @@ impl Policy {
             read_only: Vec::new(),
             excluded: Vec::new(),
             temp: None,
+            gpu: false,
         };
         if let Some(temp) = std::env::var_os("TMPDIR").filter(|temp| !temp.is_empty())
             && let Ok(canonical) = canonicalize_root(Path::new(&temp))
@@ -275,6 +294,7 @@ impl Policy {
             read_only: Vec::new(),
             excluded: Vec::new(),
             temp: None,
+            gpu: false,
         }
     }
 
@@ -287,6 +307,21 @@ impl Policy {
             self.excluded.push(git);
         }
         self
+    }
+
+    /// Grant GPU access for Metal compute.
+    #[must_use]
+    #[inline]
+    pub fn allow_gpu(mut self) -> Self {
+        self.gpu = true;
+        self
+    }
+
+    /// Flip [`Policy::allow_gpu`]'s grants, returning the new state.
+    #[inline]
+    pub fn toggle_gpu(&mut self) -> bool {
+        self.gpu = !self.gpu;
+        self.gpu
     }
 
     /// The complete SBPL profile text, exactly as passed to `sandbox-exec -p`.
@@ -347,6 +382,7 @@ impl Policy {
             cmd.env("TMPDIR", temp);
             // matplotlib needs a writable config dir; home is unreadable.
             cmd.env("MPLCONFIGDIR", temp.join("matplotlib"));
+            cmd.env("CLANG_MODULE_CACHE_PATH", temp.join("clang"));
         }
         cmd
     }
@@ -408,7 +444,7 @@ impl Policy {
         deny_rules.push(r#"(deny file-read-data file-write-data (literal "/dev/tty"))"#.to_owned());
 
         let mut text = String::from(BASE_POLICY);
-        for section in [&read_rules, &write_rules, &deny_rules] {
+        for section in [&read_rules, &write_rules] {
             if !section.is_empty() {
                 text.push('\n');
                 text.push_str(&section.join("\n"));
@@ -418,6 +454,16 @@ impl Policy {
         text.push_str(PLATFORM_DEFAULTS);
         text.push('\n');
         text.push_str(EXTRAS);
+        if self.gpu {
+            text.push('\n');
+            text.push_str(GPU);
+        }
+        if !deny_rules.is_empty() {
+            text.push('\n');
+            text.push_str(&deny_rules.join("\n"));
+        }
+        text.push('\n');
+        text.push_str(SECRETS);
 
         CompiledPolicy { text, params }
     }
@@ -803,21 +849,188 @@ mod tests {
         );
     }
 
-    /// Every rendered profile denies the cargo credentials file: the one
-    /// extras grant no live test pins unconditionally, since the machine
-    /// running the tests may hold no credentials file at all. The toolchain
-    /// grants themselves are covered live (`perl_runs_under_the_default_grant`,
-    /// `cargo_home_is_readable_but_credentials_are_not`), and the merge
-    /// mechanism by `render_embeds_base_policy_and_platform_defaults`.
     #[test]
-    fn every_profile_denies_the_cargo_credentials() {
+    fn every_profile_ends_with_the_secret_denies() {
         let dir = tempfile::tempdir().unwrap();
         let rendered = Policy::new(dir.path()).unwrap().render();
 
         assert!(
-            rendered.contains(r#"regex #"^/Users/[^/]+/\.cargo/\.?credentials(\.toml)?$""#),
-            "registry tokens stay unreadable under every policy: {rendered}"
+            rendered.ends_with(SECRETS),
+            "the secret denies must be the profile's final section: {rendered}"
         );
+        assert!(!SECRETS.contains("(allow"), "secrets.sbpl holds only denies");
+        // ends_with(SECRETS) above already proves every rule renders verbatim.
+        let rules = SECRETS.lines().filter(|line| line.starts_with("(deny"));
+        assert_eq!(
+            SECRETS
+                .matches("(deny file-read* file-write* file-test-existence")
+                .count(),
+            rules.count(),
+            "every secret deny blocks reads, writes, and existence probes"
+        );
+        for rule in SECRETS.split("(deny").skip(1) {
+            let head = rule.split("(regex").next().unwrap_or_default();
+            assert!(
+                !head.contains("(require-not") || head.contains("(require-all"),
+                "a require-not outside require-all would deny everything the \
+                 rule's other filters match: {rule}"
+            );
+        }
+    }
+
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn secrets_inside_a_writable_root_stay_inaccessible() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".ssh/id_ed25519"), "secret\n").unwrap();
+        let files = [
+            ".env",
+            "prod.env",
+            ".envrc",
+            "id_rsa",
+            "id_ed25519_sk",
+            "cert.pem",
+            ".netrc",
+        ];
+        for name in files {
+            std::fs::write(dir.path().join(name), "secret\n").unwrap();
+        }
+        std::os::unix::fs::symlink(".ssh/id_ed25519", dir.path().join("key-link")).unwrap();
+        let policy = Policy::new(dir.path()).unwrap();
+
+        let mut targets: Vec<_> = files.iter().map(|name| dir.path().join(name)).collect();
+        targets.push(dir.path().join(".ssh/id_ed25519"));
+        targets.push(dir.path().join("key-link"));
+        for target in &targets {
+            for op in [
+                format!("cat {}", target.display()),
+                format!("echo x >> {}", target.display()),
+            ] {
+                let out = policy.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+                assert!(
+                    !out.status.success(),
+                    "the sandbox must deny `{op}`: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+
+        // Case-twiddled requests resolve to the lowercase on-disk names on a
+        // case-insensitive volume, so the lowercase-only deny must still
+        // fire; on a case-sensitive volume the miss itself fails. A
+        // directory named like a secret denies its contents with it.
+        std::fs::create_dir_all(dir.path().join("dev.env")).unwrap();
+        std::fs::write(dir.path().join("dev.env/token"), "secret\n").unwrap();
+        for extra in ["dev.env/token", ".ENV"] {
+            let op = format!("cat {}", dir.path().join(extra).display());
+            let out = policy.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "the sandbox must deny `{op}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // Listing the .ssh directory, and merely probing its existence, are
+        // denied along with reading its files.
+        for probe in [
+            format!("/bin/ls {}", dir.path().join(".ssh").display()),
+            format!("test -e {}", dir.path().join(".ssh").display()),
+        ] {
+            let out = policy
+                .command("/bin/sh")
+                .arg("-c")
+                .arg(probe.clone())
+                .output()
+                .unwrap();
+            assert!(
+                !out.status.success(),
+                "the sandbox must deny `{probe}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The GPU grants render only under [`Policy::allow_gpu`], and even then
+    /// before the secret denies: opting in must not reorder the profile.
+    #[test]
+    fn gpu_grants_render_only_when_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Policy::new(dir.path()).unwrap().render();
+        assert!(!plain.contains("AGXDeviceUserClient"), "default: {plain}");
+        assert!(!plain.contains("com.apple.metalfe"), "default: {plain}");
+        let gpu = Policy::new(dir.path()).unwrap().allow_gpu().render();
+        assert!(gpu.contains(r#"(iokit-user-client-class "AGXDeviceUserClient")"#));
+        assert!(gpu.contains(r#"(global-name "com.apple.MTLCompilerService")"#));
+        // The cache-leaf grant is fixed text in gpu.sbpl, matched against the
+        // OS's layout rather than resolved per host, and still lands ahead
+        // of the secret denies.
+        assert!(gpu.contains(r"(metalfe|metal|gpuarchiver)"), "{gpu}");
+        assert_eq!(gpu.matches("file-issue-extension").count(), 2);
+        assert!(!plain.contains("file-issue-extension"));
+        assert!(gpu.ends_with(SECRETS), "secrets stay the final section");
+
+        // Toggling flips the grants back off, and the read-only research
+        // posture drops them even when left on.
+        let mut policy = Policy::new(dir.path()).unwrap();
+        assert!(policy.toggle_gpu());
+        assert!(policy.render().contains("AGXDeviceUserClient"));
+        assert!(!policy.toggle_gpu());
+        assert!(!policy.render().contains("AGXDeviceUserClient"));
+        // Plan mode inherits the grants: GPU probing is read-only research.
+        assert!(policy.toggle_gpu());
+        assert!(policy.read_only().render().contains("AGXDeviceUserClient"));
+    }
+
+    /// The cache leaves are writable under `allow_gpu`, and denied without it.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn metal_caches_are_writable_only_under_gpu() {
+        let reported = std::process::Command::new("/usr/bin/getconf")
+            .arg("DARWIN_USER_CACHE_DIR")
+            .output()
+            .expect("getconf runs");
+        let reported = String::from_utf8_lossy(&reported.stdout);
+        let cache_root = reported.trim().trim_end_matches('/');
+        let dir = tempfile::tempdir().unwrap();
+        let gpu = Policy::new(dir.path()).unwrap().allow_gpu();
+        let plain = Policy::new(dir.path()).unwrap();
+        for leaf in ["com.apple.metalfe", "com.apple.metal", "com.apple.gpuarchiver"] {
+            // Creating the probe directory also exercises the grant's
+            // coverage of the leaves the frontend would create itself.
+            let probe = PathBuf::from(cache_root).join(leaf).join("tart-gpu-cache-probe");
+            let op = format!(
+                "mkdir -p {} && echo ok > {}",
+                probe.display(),
+                probe.join("pcm").display()
+            );
+            let out = gpu.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+            assert!(
+                out.status.success(),
+                "gpu must allow `{op}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::remove_dir_all(&probe).unwrap();
+            let out = plain.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
+            assert!(!out.status.success(), "the default policy must deny `{op}`");
+        }
+    }
+
+    #[test]
+    fn tart_denies_follow_every_vendored_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered = Policy::new(dir.path())
+            .unwrap()
+            .exclude_git()
+            .allow_gpu()
+            .render();
+        let last = |needle: &str| rendered.rfind(needle).expect(needle);
+        let tty_deny = r#"(deny file-read-data file-write-data (literal "/dev/tty"))"#;
+        assert!(last(r#"(subpath "/tmp")"#) < last(tty_deny));
+        assert!(last(r#"(subpath "/private/var/tmp")"#) < last("(deny file-write*"));
+        assert!(last("AGXDeviceUserClient") < last(tty_deny));
+        assert!(rendered.ends_with(SECRETS), "secrets stay the final section");
     }
 
     /// Every rendered profile carries the uv, gitignore, and homebrew grants
@@ -841,16 +1054,12 @@ mod tests {
         );
         assert!(rendered.contains(r#"(subpath "/opt/homebrew/bin")"#));
         assert!(rendered.contains(r#"(subpath "/opt/homebrew/Cellar")"#));
-        // The exclusion intent is the security-relevant half: brew's runtime,
-        // service configs, databases, and logs stay denied.
         for excluded in ["etc", "var", "share", "Caskroom", "Library", "Taps"] {
             assert!(
                 !rendered.contains(&format!(r#"(subpath "/opt/homebrew/{excluded}")"#)),
                 "/opt/homebrew/{excluded} must stay denied: {rendered}"
             );
         }
-        // Only the ignore file: the global git config stays denied, keeping the
-        // sandboxed git hermetic.
         assert!(
             !rendered.contains("git/config"),
             "the git config must stay denied: {rendered}"
@@ -1025,8 +1234,8 @@ mod tests {
         let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
         assert_eq!(
             vars.len(),
-            3 + usize::from(home.is_some()) + 2 * usize::from(policy.temp.is_some()),
-            "TMPDIR and MPLCONFIGDIR ride along with the temp root"
+            3 + usize::from(home.is_some()) + 3 * usize::from(policy.temp.is_some()),
+            "TMPDIR, MPLCONFIGDIR, and CLANG_MODULE_CACHE_PATH ride along with the temp root"
         );
         assert!(vars.contains(&(OsStr::new("PATH"), sandboxed_path().as_os_str())));
         assert!(vars.contains(&(OsStr::new("GIT_CONFIG_GLOBAL"), OsStr::new("/dev/null"))));
@@ -1039,23 +1248,26 @@ mod tests {
             assert!(
                 vars.contains(&(OsStr::new("MPLCONFIGDIR"), temp.join("matplotlib").as_os_str()))
             );
+            assert!(vars.contains(&(
+                OsStr::new("CLANG_MODULE_CACHE_PATH"),
+                temp.join("clang").as_os_str()
+            )));
         }
     }
 
-    /// The seeded `PATH` is the system baseline, plus `~/.cargo/bin` and
-    /// `/opt/homebrew/bin`, each only when that directory exists.
     #[test]
-    fn sandboxed_path_appends_present_toolchain_bins() {
-        let mut expected = OsString::from(SANDBOXED_PATH);
+    fn sandboxed_path_leads_with_homebrew() {
+        let mut expected = OsString::new();
+        if Path::new("/opt/homebrew/bin").is_dir() {
+            expected.push("/opt/homebrew/bin:");
+        }
+        expected.push(SANDBOXED_PATH);
         if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
             let cargo_bin = Path::new(&home).join(".cargo/bin");
             if cargo_bin.is_dir() {
                 expected.push(":");
                 expected.push(cargo_bin.as_os_str());
             }
-        }
-        if Path::new("/opt/homebrew/bin").is_dir() {
-            expected.push(":/opt/homebrew/bin");
         }
         assert_eq!(sandboxed_path(), expected);
     }

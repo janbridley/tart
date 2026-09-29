@@ -242,6 +242,17 @@ fn run(
                         perf_on = !perf_on;
                         perf = Perf::default();
                     }
+                    // Toggle the coding sandbox's GPU grants for this session.
+                    "/gpu" => {
+                        if agent.mode() == ChatMode::Chat {
+                            pane.note("chat has no sandbox to grant");
+                        } else {
+                            pane.note(format!(
+                                "gpu: {}",
+                                if agent.toggle_gpu() { "on" } else { "off" }
+                            ));
+                        }
+                    }
                     // Stop one subagent without stopping anything else.
                     _ if let Some(arg) = line.trim().strip_prefix("/stop") => {
                         match arg.trim().parse::<u64>() {
@@ -304,7 +315,7 @@ fn run(
                         let commands = if agent.mode() == ChatMode::Chat {
                             "/clear /rewind /resume /model /effort /perf /quit"
                         } else {
-                            "/clear /rewind /resume /model /plan /effort /agents /stop /perf /quit"
+                            "/clear /rewind /resume /model /plan /effort /agents /stop /perf /gpu /quit"
                         };
                         pane.note(format!(
                             "unknown command {} · {commands}",

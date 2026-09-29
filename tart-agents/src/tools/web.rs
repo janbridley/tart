@@ -145,7 +145,7 @@ pub(super) struct Search {
 pub(super) fn parse_search(arguments: &str) -> anyhow::Result<Search> {
     let args = parse_arguments(arguments)?;
     Ok(Search {
-        query: string_field(&args, "WebSearch", "query")?,
+        query: string_field(&args, "search", "query")?,
         max_results: args["max_results"]
             .as_u64()
             .unwrap_or(DEFAULT_SEARCH_RESULTS)
@@ -173,7 +173,7 @@ pub(super) struct Fetch {
 pub(super) fn parse_fetch(arguments: &str) -> anyhow::Result<Fetch> {
     let args = parse_arguments(arguments)?;
     Ok(Fetch {
-        url: string_field(&args, "WebFetch", "url")?,
+        url: string_field(&args, "fetch", "url")?,
         raw: args["raw"].as_bool().unwrap_or(false),
     })
 }

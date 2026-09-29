@@ -1,7 +1,8 @@
 //! Startup: the session the command line describes, and the pane over it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use tart_agents::{
     Agent, CHAT_PROJECT, ChatMode, SESSIONS_ROOT, Session, Transcript, prompts, sandbox::Policy,
 };
@@ -9,6 +10,27 @@ use tart_agents::{
 use crate::cli;
 use crate::config;
 use crate::pane::Pane;
+
+const REFUSAL: &str = "cd into a project directory, or pass --chat for a session \
+                   with no filesystem access";
+
+/// Refuse the coding session when its writable root would cover the user's home dir.
+fn refuse_bare_root(dir: &Path) -> anyhow::Result<()> {
+    let canonical = std::fs::canonicalize(dir)
+        .with_context(|| format!("failed to resolve the working directory: {}", dir.display()))?;
+    if canonical == Path::new("/") {
+        anyhow::bail!("refusing to run at the filesystem root: {REFUSAL}");
+    }
+    // `home.starts_with(&canonical)` is containment: the working directory is
+    // home, or an ancestor of it.
+    if let Some(home) = std::env::home_dir()
+        && let Ok(home) = std::fs::canonicalize(&home)
+        && home.starts_with(&canonical)
+    {
+        anyhow::bail!("tart should not be run in or above $HOME: {REFUSAL}");
+    }
+    Ok(())
+}
 
 /// The session kind the command line selects.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,18 +65,23 @@ impl Kind {
     }
 
     /// Where this kind's sessions record and resume from.
-    fn project(self) -> anyhow::Result<PathBuf> {
+    fn project(self, cwd: &Path) -> PathBuf {
         match self {
-            Self::Coding => Ok(std::env::current_dir()?),
             // Chat sessions live under their own CHAT directory, not the cwd's.
-            Self::Chat => Ok(PathBuf::from(CHAT_PROJECT)),
+            Self::Chat => PathBuf::from(CHAT_PROJECT),
+            Self::Coding => cwd.to_path_buf(),
         }
     }
 
-    /// The policy this kind's agent is built with.
-    fn policy(self) -> anyhow::Result<Policy> {
+    /// The policy this kind of agent is built with. The coding root has already
+    /// been screened by `refuse_bare_root` by the time this runs; `gpu` opts
+    /// the coding sandbox into Metal compute.
+    fn policy(self, cwd: &Path, gpu: bool) -> anyhow::Result<Policy> {
         match self {
-            Self::Coding => Ok(Policy::new(std::env::current_dir()?)?.exclude_git()),
+            Self::Coding => {
+                let policy = Policy::new(cwd)?.exclude_git();
+                Ok(if gpu { policy.allow_gpu() } else { policy })
+            }
             Self::Chat => Ok(Policy::no_access()),
         }
     }
@@ -93,13 +120,19 @@ impl TryFrom<&cli::Cli> for Tui {
     type Error = anyhow::Error;
 
     fn try_from(cli: &cli::Cli) -> Result<Self, Self::Error> {
-        let config = config::Config::load(&cli.agents)?;
         let kind = Kind::of(cli.chat);
+        // The coding grant root, fetched once and screened before anything else
+        // loads, so a bare-cwd invocation reports its own error, not a config one.
+        let cwd = std::env::current_dir()?;
+        if kind == Kind::Coding {
+            refuse_bare_root(&cwd)?;
+        }
+        let config = config::Config::load(&cli.agents)?;
         let agent_config = kind.agent(&config)?;
         let label = agent_config.to_string();
         let context_tokens = agent_config.context_tokens;
-        let project = kind.project()?;
-        let mut agent = agent_config.into_agent(kind.policy()?);
+        let project = kind.project(&cwd);
+        let mut agent = agent_config.into_agent(kind.policy(&cwd, cli.gpu)?);
         agent.set_mode(kind.mode());
         Ok(Self {
             session: Session::start(&SESSIONS_ROOT, &project),
@@ -160,6 +193,7 @@ mod tests {
         let cli = cli::Cli {
             agents: providers(dir.path()),
             chat: true,
+            gpu: false,
         };
 
         let tui = Tui::try_from(&cli).unwrap();
@@ -171,6 +205,45 @@ mod tests {
         assert_eq!(items[0]["content"], prompts::CHAT);
     }
 
+    /// The gpu flag reaches the coding policy, and only the coding policy:
+    /// chat is no-access whatever the flag says.
+    #[test]
+    fn the_gpu_flag_wires_into_the_coding_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gpu = Kind::Coding.policy(dir.path(), true).unwrap().render();
+        assert!(gpu.contains("AGXDeviceUserClient"), "{gpu}");
+        let plain = Kind::Coding.policy(dir.path(), false).unwrap().render();
+        assert!(!plain.contains("AGXDeviceUserClient"), "{plain}");
+        let chat = Kind::Chat.policy(dir.path(), true).unwrap().render();
+        assert!(!chat.contains("AGXDeviceUserClient"), "{chat}");
+    }
+
+    #[test]
+    fn coding_refuses_roots_covering_home() {
+        let err = refuse_bare_root(Path::new("/")).unwrap_err().to_string();
+        assert!(err.contains("filesystem root"), "{err}");
+
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        let home = std::fs::canonicalize(&home).unwrap();
+        for root in [home.as_path(), home.parent().expect("home has a parent")] {
+            let err = refuse_bare_root(root).unwrap_err().to_string();
+            assert!(err.contains("in or above $HOME"), "{root:?}: {err}");
+        }
+
+        // A symlink to home resolves to home and is refused identically;
+        // sibling branches of home and scratch directories are not its ancestors.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(refuse_bare_root(&link).is_err());
+        if Path::new("/Volumes").is_dir() {
+            refuse_bare_root(Path::new("/Volumes")).unwrap();
+        }
+        refuse_bare_root(dir.path()).unwrap();
+    }
+
     /// The bare command line stays the coding kind.
     #[test]
     fn a_bare_cli_builds_a_coding_tui() {
@@ -178,6 +251,7 @@ mod tests {
         let cli = cli::Cli {
             agents: providers(dir.path()),
             chat: false,
+            gpu: false,
         };
 
         let tui = Tui::try_from(&cli).unwrap();
