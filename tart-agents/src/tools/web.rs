@@ -513,7 +513,7 @@ fn fetch_args(fetch: &Fetch, url: &str) -> Vec<OsString> {
     args
 }
 
-/// Curl command to fetches one PDF, writing the output to `dest` instead of stdout.
+/// The curl command that fetches one PDF, writing output to `dest` instead of stdout
 fn pdf_curl(binary: PathBuf, dest: &Path, url: &str) -> Command {
     let mut curl = web_command(binary);
     curl.args([
@@ -571,7 +571,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
         };
         // A PDF address bypasses the reader service.
         if is_pdf_url(&url) {
-            return pdf_fetch(&binary, &url);
+            return pdf_fetch(binary, &url);
         }
         let mut curl = web_command(binary);
         curl.args(fetch_args(&fetch, &url));
@@ -628,30 +628,32 @@ fn private_redirect(final_url: &str) -> Option<String> {
 /// Whether a URL names a PDF: a `.pdf` path, or an arxiv paper address.
 fn is_pdf_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url);
-    if path.to_ascii_lowercase().ends_with(".pdf") {
-        return true;
+    path.to_ascii_lowercase().ends_with(".pdf") || arxiv_paper_id(path).is_some()
+}
+
+/// The arxiv paper id a URL path names, as the `/pdf/<id>` pair in it: an
+/// id starts with a digit and contains a dot, so `/pdf/manual` stays a page.
+fn arxiv_paper_id(path: &str) -> Option<&str> {
+    let mut previous = "";
+    for segment in path.split('/') {
+        if previous == "pdf"
+            && segment.starts_with(|c: char| c.is_ascii_digit())
+            && segment.contains('.')
+        {
+            return Some(segment);
+        }
+        previous = segment;
     }
-    let segments: Vec<&str> = path.split('/').collect();
-    segments.windows(2).any(|pair| {
-        pair[0] == "pdf"
-            && pair[1].starts_with(|c: char| c.is_ascii_digit())
-            && pair[1].contains('.')
-    })
+    None
 }
 
 /// A readable title for a PDF address.
 fn pdf_title(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
-    let segments: Vec<&str> = path.split('/').collect();
-    let paper = segments.windows(2).find(|pair| {
-        pair[0] == "pdf"
-            && pair[1].starts_with(|c: char| c.is_ascii_digit())
-            && pair[1].contains('.')
-    });
-    if let Some([_, id, ..]) = paper {
+    if let Some(id) = arxiv_paper_id(path) {
         return format!("arxiv-{id}");
     }
-    let name = segments.last().copied().unwrap_or_default();
+    let name = path.rsplit('/').next().unwrap_or_default();
     let stem = name
         .strip_suffix(".pdf")
         .or_else(|| name.strip_suffix(".PDF"))
@@ -754,7 +756,22 @@ fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String
     if std::fs::write(&saved, &document).is_ok() {
         let _ = write!(document, "\n\nSaved to: {}", saved.display());
     }
-    Ok(head_cap(&document, PDF_TEXT_CAP))
+    // Move the inline copy: under `head_cap`, we would only have cloned the full doc
+    Ok(if document.len() > PDF_TEXT_CAP {
+        head_cap(&document, PDF_TEXT_CAP)
+    } else {
+        document
+    })
+}
+
+/// The downloaded file's first kilobyte and its full size, for the magic check.
+fn pdf_head(path: &Path) -> std::io::Result<(Vec<u8>, u64)> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut head = Vec::with_capacity(1024);
+    file.take(1024).read_to_end(&mut head)?;
+    Ok((head, size))
 }
 
 /// Fetch a PDF address and return its text layer as markdown.
@@ -762,7 +779,7 @@ fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String
 /// The bytes go to a temp file under curl's raw-mode protections, are
 /// verified as a PDF before anything parses them, and are extracted by the
 /// locally installed poppler tools.
-fn pdf_fetch(curl_binary: &Path, url: &str) -> (String, String, Option<i32>) {
+fn pdf_fetch(curl_binary: PathBuf, url: &str) -> (String, String, Option<i32>) {
     let Some(extractor) = pdftotext_binary() else {
         let text = "fetch: no pdftotext found; install poppler with `brew install poppler` \
                     or point TART_PDFTOTEXT_BIN at it"
@@ -770,7 +787,7 @@ fn pdf_fetch(curl_binary: &Path, url: &str) -> (String, String, Option<i32>) {
         return (text.clone(), text, None);
     };
     let downloaded = pdf_path("pdf");
-    let mut curl = pdf_curl(curl_binary.to_path_buf(), &downloaded, url);
+    let mut curl = pdf_curl(curl_binary, &downloaded, url);
     let run = match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
         Ok(run) => run,
         Err(error) => {
@@ -801,11 +818,10 @@ fn pdf_fetch(curl_binary: &Path, url: &str) -> (String, String, Option<i32>) {
         return (refused.clone(), refused, exit);
     }
     // Magic bytes within the first kilobyte: never hand poppler anything else.
-    let verdict = match std::fs::read(&downloaded) {
-        Ok(bytes) if bytes[..bytes.len().min(1024)].windows(5).any(|w| w == b"%PDF-") => Ok(()),
-        Ok(bytes) => Err(format!(
-            "fetch: {url} served {} bytes that are not a PDF (no %PDF- header)",
-            bytes.len()
+    let verdict = match pdf_head(&downloaded) {
+        Ok((head, _)) if head.windows(5).any(|w| w == b"%PDF-") => Ok(()),
+        Ok((_, size)) => Err(format!(
+            "fetch: {url} served {size} bytes that are not a PDF (no %PDF- header)"
         )),
         Err(error) => Err(format!("error: {error}")),
     };
@@ -1387,6 +1403,9 @@ mod tests {
             "{document}"
         );
         assert!(document.contains("Saved to: "), "{document}");
+        if let Some((_, saved)) = document.split_once("Saved to: ") {
+            let _ = std::fs::remove_file(saved.trim());
+        }
     }
 
     /// Live: reaches the network, so it needs connectivity, plus poppler.
