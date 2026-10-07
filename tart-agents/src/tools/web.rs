@@ -6,6 +6,7 @@
 //! curl hands it back, so no HTML is ever parsed here.
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,8 @@ use std::time::Duration;
 use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
-    CancelToken, WatchedRun, combined_output, command_text_inline, misuse, parse_arguments,
-    run_watched, string_field, timeout_text, tool, traced,
+    CancelToken, WatchedRun, combined_output, command_text_inline, head_cap, misuse,
+    parse_arguments, run_watched, string_field, timeout_text, tool, traced,
 };
 use crate::Progress;
 
@@ -58,6 +59,21 @@ const FINAL_URL: &str = "\\n[tart-url]\\n%{url_effective}";
 
 /// Where that trailer starts in a captured body.
 const FINAL_URL_MARKER: &str = "\n[tart-url]\n";
+
+/// The poppler text extractor looked for on `PATH`.
+const PDF_DEFAULT_EXTRACTOR: &str = "pdftotext";
+
+/// The most pages one PDF fetch may extract.
+const PDF_MAX_PAGES: usize = 100;
+
+/// The size cap on one fetched PDF.
+const PDF_MAX_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
+
+/// The longest PDF text handed to the model inline, in bytes.
+const PDF_TEXT_CAP: usize = 150_000;
+
+/// The timeout the poppler tools run under; a text layer should not need more.
+const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The search tool's definition, offered only when a ddgs CLI is installed.
 fn search_definition() -> Tool {
@@ -103,7 +119,9 @@ fn fetch_definition() -> Tool {
         r.jina.ai reader service, which strips scripts, styles, and markup. When the \
         reader errors (i.e. rate limit or auth) retry with raw=true, which fetches the URL \
         directly and suits JSON or plain-text endpoints. Runs outside the sandbox, so it \
-        has network access but cannot read or write files; refuses non-public hosts",
+        has network access but cannot read or write files; refuses non-public hosts. \
+        PDF addresses (a .pdf path, or an arxiv /pdf/ paper) are fetched directly and \
+        their text layer extracted locally as markdown with <!-- Page N --> markers",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -203,6 +221,24 @@ fn fetch_binary() -> Option<PathBuf> {
         .find(|path| is_executable(path))
 }
 
+/// Locate the PDF text extractor: the `TART_PDFTOTEXT_BIN` override, then `PATH`.
+fn pdftotext_binary() -> Option<PathBuf> {
+    let pinned = std::env::var_os("TART_PDFTOTEXT_BIN").map(PathBuf::from);
+    pinned
+        .into_iter()
+        .find(|path| is_executable(path))
+        .or_else(|| find_on_path(PDF_DEFAULT_EXTRACTOR))
+}
+
+/// Locate pdfinfo for page counts and metadata.
+fn pdfinfo_binary() -> Option<PathBuf> {
+    let pinned = std::env::var_os("TART_PDFINFO_BIN").map(PathBuf::from);
+    pinned
+        .into_iter()
+        .find(|path| is_executable(path))
+        .or_else(|| find_on_path("pdfinfo"))
+}
+
 /// The first executable `name` on `PATH`, if any.
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -217,9 +253,7 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && (meta.permissions().mode() & 0o111) != 0)
 }
 
-/// A command for one of the web binaries: cleared like the sandboxed tools, so
-/// nothing in our environment can reach the child, with only the variables a
-/// CLI needs to run re-added.
+/// A command for one of the web binaries, with a clean working environment.
 fn web_command(binary: PathBuf) -> Command {
     let mut command = Command::new(binary);
     command.env_clear();
@@ -243,6 +277,13 @@ fn results_path() -> PathBuf {
     static CALLS: AtomicU64 = AtomicU64::new(0);
     let call = CALLS.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("tart-search-{}-{call}.json", std::process::id()))
+}
+
+/// A fresh path under the system temp directory for one PDF fetch's files.
+fn pdf_path(extension: &str) -> PathBuf {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("tart-pdf-{}-{call}.{extension}", std::process::id()))
 }
 
 /// The ddgs argv for one search: the subcommand, the query as a single argv
@@ -472,6 +513,44 @@ fn fetch_args(fetch: &Fetch, url: &str) -> Vec<OsString> {
     args
 }
 
+/// Curl command to fetches one PDF, writing the output to `dest` instead of stdout.
+fn pdf_curl(binary: PathBuf, dest: &Path, url: &str) -> Command {
+    let mut curl = web_command(binary);
+    curl.args([
+        "-q", // must be separate or we try and fail to read .curlrc
+        "-fsSL",
+        "--max-redirs",
+        "5",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        CURL_MAX_TIME,
+        "--compressed",
+        "--proto",
+        "=http,https",
+        "--proto-redir",
+        "=http,https",
+        "--max-filesize",
+    ])
+    .arg(PDF_MAX_BYTES.to_string())
+    .args(["-A", USER_AGENT, "-w", FINAL_URL, "-o"])
+    .arg(dest)
+    .arg("--")
+    .arg(url);
+    curl
+}
+
+/// The pdftotext command: keep the layout, bound the pages, write to stdout.
+fn pdftotext_command(binary: PathBuf, downloaded: &Path, last_page: usize) -> Command {
+    let mut pdftotext = web_command(binary);
+    pdftotext
+        .args(["-layout", "-enc", "UTF-8", "-f", "1", "-l"])
+        .arg(last_page.to_string())
+        .arg(downloaded)
+        .arg("-");
+    pdftotext
+}
+
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
 /// Like `search` this runs outside the sandbox.
@@ -490,6 +569,10 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
             Ok(url) => url,
             Err(text) => return (text.clone(), text, None),
         };
+        // A PDF address bypasses the reader service.
+        if is_pdf_url(&url) {
+            return pdf_fetch(&binary, &url);
+        }
         let mut curl = web_command(binary);
         curl.args(fetch_args(&fetch, &url));
         match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
@@ -540,6 +623,205 @@ fn private_redirect(final_url: &str) -> Option<String> {
     let rest = final_url.split_once("://").map_or(final_url, |(_, rest)| rest);
     is_private_host(authority_host(rest))
         .then(|| format!("fetch: refusing redirect to non-public host {final_url}"))
+}
+
+/// Whether a URL names a PDF: a `.pdf` path, or an arxiv paper address.
+fn is_pdf_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    if path.to_ascii_lowercase().ends_with(".pdf") {
+        return true;
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    segments.windows(2).any(|pair| {
+        pair[0] == "pdf"
+            && pair[1].starts_with(|c: char| c.is_ascii_digit())
+            && pair[1].contains('.')
+    })
+}
+
+/// A readable title for a PDF address.
+fn pdf_title(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let segments: Vec<&str> = path.split('/').collect();
+    let paper = segments.windows(2).find(|pair| {
+        pair[0] == "pdf"
+            && pair[1].starts_with(|c: char| c.is_ascii_digit())
+            && pair[1].contains('.')
+    });
+    if let Some([_, id, ..]) = paper {
+        return format!("arxiv-{id}");
+    }
+    let name = segments.last().copied().unwrap_or_default();
+    let stem = name
+        .strip_suffix(".pdf")
+        .or_else(|| name.strip_suffix(".PDF"))
+        .unwrap_or(name);
+    let spaced = stem.replace(['_', '-'], " ");
+    let trimmed = spaced.trim();
+    if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Turn pdftotext's form-feed separated pages into marker-delimited text.
+///
+/// Returns the marked text and the page count it covers.
+fn mark_pages(text: &str) -> (String, usize) {
+    let trimmed = text.trim_matches('\x0c');
+    if trimmed.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut pages = trimmed.split('\x0c');
+    let mut rendered = format!("<!-- Page 1 -->\n{}", pages.next().unwrap_or_default().trim_end());
+    let mut count = 1;
+    for page in pages {
+        count += 1;
+        let _ = write!(rendered, "\n\n<!-- Page {count} -->\n\n");
+        rendered.push_str(page.trim_end());
+    }
+    (rendered, count)
+}
+
+/// One `Key: value` field of pdfinfo's report, when present and non-empty.
+fn pdfinfo_field(report: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    report.lines().find_map(|line| {
+        let value = line.strip_prefix(&prefix)?.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// pdfinfo's report on `downloaded`, or nothing when it is not installed.
+fn pdf_report(downloaded: &Path) -> String {
+    let Some(binary) = pdfinfo_binary() else {
+        return String::new();
+    };
+    let mut pdfinfo = web_command(binary);
+    pdfinfo.arg(downloaded);
+    run_watched(&mut pdfinfo, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new())
+        .ok()
+        .map(|run| combined_output(&run.output))
+        .unwrap_or_default()
+}
+
+/// Extract one downloaded PDF's text layer and wrap it as markdown.
+///
+/// The document is titled from pdfinfo's metadata or the address, its pages
+/// marked `<!-- Page N -->`, and the extraction bounded to [`PDF_MAX_PAGES`]
+/// with the truncation said out loud (after pi-web-access's wrapper).
+fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String, String> {
+    let mut pdftotext = pdftotext_command(extractor.to_path_buf(), downloaded, PDF_MAX_PAGES);
+    let run = match run_watched(&mut pdftotext, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new()) {
+        Ok(run) => run,
+        Err(error) => return Err(format!("error: {error}")),
+    };
+    if !run.output.status.success() {
+        return Err(combined_output(&run.output));
+    }
+    let text = combined_output(&run.output);
+    let (body, extracted) = mark_pages(&text);
+    if body.is_empty() {
+        return Err(
+            "no text layer: the PDF is likely scanned images, and OCR is out of scope".to_string(),
+        );
+    }
+    let report = pdf_report(downloaded);
+    let title = pdfinfo_field(&report, "Title").unwrap_or_else(|| pdf_title(url));
+    let pages = pdfinfo_field(&report, "Pages")
+        .and_then(|pages| pages.parse::<usize>().ok())
+        .filter(|pages| *pages > 0)
+        .unwrap_or(extracted);
+    let truncated = pages > PDF_MAX_PAGES;
+    let mut document = format!("# {title}\n\n> Source: {url}\n> Pages: {pages}");
+    if truncated {
+        let _ = write!(document, " (extracted first {PDF_MAX_PAGES})");
+    }
+    if let Some(author) = pdfinfo_field(&report, "Author") {
+        let _ = write!(document, "\n> Author: {author}");
+    }
+    document.push_str("\n\n---\n\n");
+    document.push_str(&body);
+    if truncated {
+        let _ = write!(
+            document,
+            "\n\n---\n\n*[Truncated: only first {PDF_MAX_PAGES} of {pages} pages extracted]*"
+        );
+    }
+    // The full document stays on disk for re-reading; only the inline copy is capped.
+    let saved = pdf_path("md");
+    if std::fs::write(&saved, &document).is_ok() {
+        let _ = write!(document, "\n\nSaved to: {}", saved.display());
+    }
+    Ok(head_cap(&document, PDF_TEXT_CAP))
+}
+
+/// Fetch a PDF address and return its text layer as markdown.
+///
+/// The bytes go to a temp file under curl's raw-mode protections, are
+/// verified as a PDF before anything parses them, and are extracted by the
+/// locally installed poppler tools.
+fn pdf_fetch(curl_binary: &Path, url: &str) -> (String, String, Option<i32>) {
+    let Some(extractor) = pdftotext_binary() else {
+        let text = "fetch: no pdftotext found; install poppler with `brew install poppler` \
+                    or point TART_PDFTOTEXT_BIN at it"
+            .to_string();
+        return (text.clone(), text, None);
+    };
+    let downloaded = pdf_path("pdf");
+    let mut curl = pdf_curl(curl_binary.to_path_buf(), &downloaded, url);
+    let run = match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
+        Ok(run) => run,
+        Err(error) => {
+            let _ = std::fs::remove_file(&downloaded);
+            let text = format!("error: {error}");
+            return (text.clone(), text, None);
+        }
+    };
+    let WatchedRun { output, killed } = run;
+    if killed.is_some() || !output.status.success() {
+        let _ = std::fs::remove_file(&downloaded);
+        let text = combined_output(&output);
+        let marked = if killed.is_some() {
+            timeout_text(&text, FETCH_TIMEOUT)
+        } else {
+            command_text_inline(&text, output.status, false)
+        };
+        let exit = output.status.code();
+        return (marked.clone(), marked, exit);
+    }
+    // Redirects: under `-o` the trailer is all curl wrote to stdout.
+    let captured = combined_output(&output);
+    if let Some((_, final_url)) = separate_final_url(&captured)
+        && let Some(refused) = private_redirect(final_url)
+    {
+        let _ = std::fs::remove_file(&downloaded);
+        let exit = output.status.code();
+        return (refused.clone(), refused, exit);
+    }
+    // Magic bytes within the first kilobyte: never hand poppler anything else.
+    let verdict = match std::fs::read(&downloaded) {
+        Ok(bytes) if bytes[..bytes.len().min(1024)].windows(5).any(|w| w == b"%PDF-") => Ok(()),
+        Ok(bytes) => Err(format!(
+            "fetch: {url} served {} bytes that are not a PDF (no %PDF- header)",
+            bytes.len()
+        )),
+        Err(error) => Err(format!("error: {error}")),
+    };
+    if let Err(text) = verdict {
+        let _ = std::fs::remove_file(&downloaded);
+        return (text.clone(), text, Some(0));
+    }
+    let document = pdf_document(&extractor, &downloaded, url);
+    let _ = std::fs::remove_file(&downloaded);
+    match document {
+        Ok(text) => (text.clone(), text, Some(0)),
+        Err(error) => {
+            let text = format!("fetch: PDF extraction failed: {error}");
+            (text.clone(), text, None)
+        }
+    }
 }
 
 /// A non-empty, trimmed string field of a results record.
@@ -605,6 +887,68 @@ mod tests {
     use crate::sandbox::live::skip_unless_networked;
     use crate::tools::{Tooling, execute};
     use macro_rules_attribute::apply;
+
+    /// A minimal two-page PDF with a text layer: page one a heading over a paragraph,
+    /// page two a lone heading, and a correct xref table throughout.
+    fn fixture_pdf() -> Vec<u8> {
+        let contents = [
+            concat!(
+                "BT /F1 14 Tf 72 720 Td (Tart PDF Fetch Test) Tj ET\n",
+                "BT /F1 11 Tf 14 TL 72 696 Td (The text layer is extracted by poppler ",
+                "with no) Tj T* (network reader and no OCR involved at all.) Tj ET\n",
+            ),
+            "BT /F1 12 Tf 72 720 Td (Second Page Heading) Tj ET\n",
+        ];
+        let mut objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            Vec::new(), // The page tree, filled once every id is known.
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut content_ids = Vec::new();
+        for content in contents {
+            content_ids.push(objects.len() + 1);
+            let body = format!("<< /Length {} >>\nstream\n{content}endstream", content.len());
+            objects.push(body.into_bytes());
+        }
+        let mut kids = Vec::new();
+        for content_id in content_ids {
+            kids.push(format!("{} 0 R", objects.len() + 1));
+            let page = format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+            );
+            objects.push(page.into_bytes());
+        }
+        objects[1] = format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids.join(" "),
+            kids.len()
+        )
+        .into_bytes();
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
 
     /// A tool call for `name` with raw JSON `arguments`.
     fn call(name: &str, arguments: &str) -> FunctionToolCall {
@@ -888,6 +1232,198 @@ mod tests {
         assert!(private_redirect("http://printer.local/").is_some());
         assert!(private_redirect("https://example.com/final").is_none());
         assert!(private_redirect("https://[::1]/").is_some());
+    }
+
+    #[test]
+    fn is_pdf_url_matches_pdf_paths_and_arxiv_papers() {
+        for url in [
+            "https://example.com/paper.pdf",
+            "https://example.com/PAPER.PDF?download=1",
+            "https://arxiv.org/pdf/1234.01234",
+            "https://arxiv.org/pdf/1234.01234v2#page=2",
+        ] {
+            assert!(is_pdf_url(url), "expected a PDF address: {url}");
+        }
+        for url in [
+            "https://example.com/paper.pdfx",
+            "https://example.com/a.pdf/b",
+            "https://example.com/pdf/manual",
+            "https://arxiv.org/abs/1234.01234",
+            "https://example.com/",
+        ] {
+            assert!(!is_pdf_url(url), "expected a page address: {url}");
+        }
+    }
+
+    #[test]
+    fn pdf_title_derives_names_from_paths_and_arxiv_ids() {
+        assert_eq!(
+            pdf_title("https://example.com/some-report_v2.pdf?download=1"),
+            "some report v2"
+        );
+        assert_eq!(
+            pdf_title("https://arxiv.org/pdf/1234.01234v2"),
+            "arxiv-1234.01234v2"
+        );
+        assert_eq!(pdf_title("https://example.com/My_PDF.PDF"), "My PDF");
+        assert_eq!(pdf_title("https://example.com/"), "document");
+    }
+
+    #[test]
+    fn mark_pages_numbers_empty_pages_and_drops_trailing_feeds() {
+        let (rendered, pages) = mark_pages("first\x0c\x0cthird\x0c");
+
+        assert_eq!(pages, 3);
+        assert!(rendered.contains("<!-- Page 1 -->\nfirst"));
+        assert!(rendered.contains("<!-- Page 2 -->"));
+        assert!(rendered.contains("<!-- Page 3 -->\n\nthird"));
+
+        assert_eq!(mark_pages(""), (String::new(), 0));
+        assert_eq!(mark_pages("\x0c\x0c"), (String::new(), 0));
+    }
+
+    #[test]
+    fn pdfinfo_field_reads_trimmed_nonempty_values() {
+        let report = "Title:          A Paper\nPages:          2\nAuthor:   \
+                      \nProducer: poppler";
+
+        assert_eq!(pdfinfo_field(report, "Title").as_deref(), Some("A Paper"));
+        assert_eq!(pdfinfo_field(report, "Pages").as_deref(), Some("2"));
+        assert_eq!(pdfinfo_field(report, "Author"), None);
+        assert_eq!(pdfinfo_field(report, "Missing"), None);
+    }
+
+    #[test]
+    fn pdf_curl_fetches_to_the_file_under_the_pdf_cap() {
+        let curl = pdf_curl(
+            PathBuf::from("/usr/bin/curl"),
+            Path::new("/tmp/tart-pdf.pdf"),
+            "https://example.com/paper.pdf",
+        );
+
+        assert_eq!(curl.get_program(), "/usr/bin/curl");
+        assert_eq!(
+            curl.get_args().collect::<Vec<_>>(),
+            [
+                "-q",
+                "-fsSL",
+                "--max-redirs",
+                "5",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "40",
+                "--compressed",
+                "--proto",
+                "=http,https",
+                "--proto-redir",
+                "=http,https",
+                "--max-filesize",
+                "20971520",
+                "-A",
+                USER_AGENT,
+                "-w",
+                FINAL_URL,
+                "-o",
+                "/tmp/tart-pdf.pdf",
+                "--",
+                "https://example.com/paper.pdf",
+            ]
+        );
+    }
+
+    #[test]
+    fn pdftotext_command_keeps_layout_bounds_pages_writes_to_stdout() {
+        let pdftotext = pdftotext_command(
+            PathBuf::from("/opt/homebrew/bin/pdftotext"),
+            Path::new("/tmp/tart-pdf.pdf"),
+            PDF_MAX_PAGES,
+        );
+
+        assert_eq!(pdftotext.get_program(), "/opt/homebrew/bin/pdftotext");
+        assert_eq!(
+            pdftotext.get_args().collect::<Vec<_>>(),
+            [
+                "-layout",
+                "-enc",
+                "UTF-8",
+                "-f",
+                "1",
+                "-l",
+                "100",
+                "/tmp/tart-pdf.pdf",
+                "-"
+            ]
+        );
+    }
+
+    /// Offline, but real poppler: skips on machines without the tools.
+    #[test]
+    fn pdf_document_extracts_pages_with_markers() {
+        let Some(extractor) = pdftotext_binary() else {
+            return;
+        };
+        let downloaded = pdf_path("pdf");
+        std::fs::write(&downloaded, fixture_pdf()).unwrap();
+
+        let document =
+            pdf_document(&extractor, &downloaded, "https://example.com/tart-fixture.pdf");
+
+        let _ = std::fs::remove_file(&downloaded);
+        let document = document.unwrap();
+
+        assert!(document.contains("# tart fixture\n"), "{document}");
+        assert!(
+            document.contains("> Source: https://example.com/tart-fixture.pdf\n"),
+            "{document}"
+        );
+        assert!(document.contains("> Pages: 2"), "{document}");
+        assert!(
+            document.contains("<!-- Page 1 -->\nTart PDF Fetch Test"),
+            "{document}"
+        );
+        assert!(
+            document.contains("<!-- Page 2 -->\n\nSecond Page Heading"),
+            "{document}"
+        );
+        assert!(document.contains("Saved to: "), "{document}");
+    }
+
+    /// Live: reaches the network, so it needs connectivity, plus poppler.
+    #[apply(skip_unless_networked!)]
+    #[test]
+    fn run_fetch_extracts_a_pdf_address() {
+        let Some(_) = pdftotext_binary() else {
+            return;
+        };
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
+        let arguments = format!(r#"{{"url":"{url}"}}"#);
+        let request = call("fetch", &arguments);
+
+        let output = execute(&request, &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
+
+        assert!(output.contains("<!-- Page 1 -->"), "{output}");
+        assert!(output.contains("Dummy PDF"), "{output}");
+        assert!(output.contains("> Pages: 1"), "{output}");
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                Progress::ToolStart { name, .. },
+                Progress::ToolOutput { exit: Some(0), .. }
+            ] if name == "fetch"
+        ));
     }
 
     #[test]
