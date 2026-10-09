@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::backends::{FunctionToolCall, Tool};
+use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
+use rten::Model;
 
 use super::{
     CancelToken, WatchedRun, combined_output, command_text_inline, head_cap, misuse,
@@ -75,6 +77,13 @@ const PDF_TEXT_CAP: usize = 150_000;
 /// The timeout the poppler tools run under; a text layer should not need more.
 const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The most pages the OCR fallback may chew: it renders and then OCRs each
+/// page, seconds apiece, so scanned documents are bounded harder than text.
+const PDF_OCR_PAGES: usize = 10;
+
+/// The rendering resolution the OCR fallback feeds ocrs, in dots per inch.
+const PDF_OCR_DPI: &str = "150";
+
 /// The search tool's definition, offered only when a ddgs CLI is installed.
 fn search_definition() -> Tool {
     tool(
@@ -121,7 +130,9 @@ fn fetch_definition() -> Tool {
         directly and suits JSON or plain-text endpoints. Runs outside the sandbox, so it \
         has network access but cannot read or write files; refuses non-public hosts. \
         PDF addresses (a .pdf path, or an arxiv /pdf/ paper) are fetched directly and \
-        their text layer extracted locally as markdown with <!-- Page N --> markers",
+        their text layer extracted locally as markdown with <!-- Page N --> markers; when \
+        the layer is empty (scanned images) the pages fall back to local OCR: poppler's \
+        pdftoppm renders them and ocrs reads them, when its models are cached",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -237,6 +248,81 @@ fn pdfinfo_binary() -> Option<PathBuf> {
         .into_iter()
         .find(|path| is_executable(path))
         .or_else(|| find_on_path("pdfinfo"))
+}
+
+/// Locate the page renderer poppler ships, overridable with
+/// `TART_PDFTOPPM_BIN`: the OCR fallback's input.
+fn pdftoppm_binary() -> Option<PathBuf> {
+    let pinned = std::env::var_os("TART_PDFTOPPM_BIN").map(PathBuf::from);
+    pinned
+        .into_iter()
+        .find(|path| is_executable(path))
+        .or_else(|| find_on_path("pdftoppm"))
+}
+
+/// The OCR engine ocrs provides, with its models from `TART_OCR_MODELS` or ocrs cache.
+fn ocr_engine() -> Option<OcrEngine> {
+    let dir = match std::env::var_os("TART_OCR_MODELS") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".cache/ocrs"),
+    };
+    let model = |stem: &str| -> Option<Model> {
+        ["onnx", "rten"]
+            .iter()
+            .find_map(|ext| Model::load_file(dir.join(format!("{stem}.{ext}"))).ok())
+    };
+    let detection = model("text-detection")?;
+    let recognition = model("text-recognition")?;
+    OcrEngine::new(OcrEngineParams {
+        detection_model: Some(detection),
+        recognition_model: Some(recognition),
+        ..OcrEngineParams::default()
+    })
+    .ok()
+}
+
+/// One rendered page as raw RGB plus its size, from the PPM (P6) pixels pdftoppm writes
+fn read_ppm(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut rest = bytes.strip_prefix(b"P6")?;
+    let mut header = [0u32; 3];
+    for field in &mut header {
+        loop {
+            while rest.first().is_some_and(u8::is_ascii_whitespace) {
+                rest = &rest[1..];
+            }
+            if rest.first() == Some(&b'#') {
+                let end = rest.iter().position(|byte| *byte == b'\n')?;
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+        let end = rest.iter().position(|byte| !byte.is_ascii_digit())?;
+        *field = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+        rest = &rest[end..];
+    }
+    let [width, height, maxval] = header;
+    // Exactly one whitespace separates the header from the pixel run.
+    rest = rest.strip_prefix(b"\n").or_else(|| rest.strip_prefix(b" "))?;
+    let size = width as usize * height as usize * 3;
+    (maxval == 255 && rest.len() == size).then(|| (rest.to_vec(), width, height))
+}
+
+/// Read one rendered page's text with the engine, lines joined by newlines.
+fn ocr_page(engine: &OcrEngine, page: &Path) -> Option<String> {
+    let (rgb, width, height) = read_ppm(&std::fs::read(page).ok()?)?;
+    let source = ImageSource::from_bytes(&rgb, (width, height)).ok()?;
+    let input = engine.prepare_input(source).ok()?;
+    let words = engine.detect_words(&input).ok()?;
+    let lines = engine.find_text_lines(&input, &words);
+    let text = engine.recognize_text(&input, &lines).ok()?;
+    let joined = text
+        .iter()
+        .flatten()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// The first executable `name` on `PATH`, if any.
@@ -551,6 +637,72 @@ fn pdftotext_command(binary: PathBuf, downloaded: &Path, last_page: usize) -> Co
     pdftotext
 }
 
+/// The pdftoppm command that renders a PDF's first pages as PNGs under `prefix`
+fn pdftoppm_command(binary: PathBuf, downloaded: &Path, prefix: &Path, last: usize) -> Command {
+    let mut pdftoppm = web_command(binary);
+    pdftoppm
+        .args(["-r", PDF_OCR_DPI, "-f", "1", "-l"])
+        .arg(last.to_string())
+        .arg(downloaded)
+        .arg(prefix);
+    pdftoppm
+}
+
+/// The page images pdftoppm wrote under `prefix`, in page order.
+fn rendered_pages(prefix: &Path) -> Vec<PathBuf> {
+    let stem = prefix
+        .file_name()
+        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+    let mut pages: Vec<(usize, PathBuf)> =
+        std::fs::read_dir(prefix.parent().unwrap_or_else(|| Path::new(".")))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "ppm")
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(&stem))
+            })
+            .filter_map(|path| {
+                let number = path.file_stem()?.to_string_lossy();
+                let number = number.rsplit_once('-')?.1.parse::<usize>().ok()?;
+                Some((number, path))
+            })
+            .collect();
+    pages.sort_by_key(|(number, _)| *number);
+    pages.into_iter().map(|(_, path)| path).collect()
+}
+
+/// OCR a PDF whose text layer is empty: render the first pages with poppler
+/// and read them with ocrs, one page per run, joined by form feeds so
+/// [`mark_pages`] numbers OCR'd pages as it numbers extracted ones.
+///
+/// `None` when a piece is missing, a step fails, or no text emerges: the
+/// caller then reports the document as unreadable rather than guessing.
+fn pdf_ocr(downloaded: &Path) -> Option<(String, usize)> {
+    let renderer = pdftoppm_binary()?;
+    let engine = ocr_engine()?;
+    let prefix = pdf_path("page");
+    let mut pdftoppm = pdftoppm_command(renderer, downloaded, &prefix, PDF_OCR_PAGES);
+    let rendered = run_watched(&mut pdftoppm, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new())
+        .is_ok_and(|run| run.output.status.success());
+    if !rendered {
+        return None;
+    }
+    let mut text = Vec::new();
+    for page in rendered_pages(&prefix) {
+        // The page is ours once read; a page OCR cannot read stays empty, so
+        // the numbering around it survives.
+        let read = ocr_page(&engine, &page);
+        let _ = std::fs::remove_file(&page);
+        text.push(read.unwrap_or_default());
+    }
+    let (body, pages) = mark_pages(&text.join("\x0c"));
+    (!body.is_empty()).then_some((body, pages))
+}
+
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
 /// Like `search` this runs outside the sandbox.
@@ -724,21 +876,34 @@ fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String
     }
     let text = combined_output(&run.output);
     let (body, extracted) = mark_pages(&text);
-    if body.is_empty() {
-        return Err(
-            "no text layer: the PDF is likely scanned images, and OCR is out of scope".to_string(),
-        );
-    }
+    // An empty layer means scanned images: fall back to local OCR before
+    // giving up, so a scanned paper reads like any other.
+    let (body, extracted, ocr) = if body.is_empty() {
+        match pdf_ocr(downloaded) {
+            Some((body, extracted)) => (body, extracted, true),
+            None => {
+                return Err("no text layer: the PDF is scanned images, and ocrs's models \
+                     are missing: `cargo install ocrs-cli` and run it once to fetch them"
+                    .to_string());
+            }
+        }
+    } else {
+        (body, extracted, false)
+    };
     let report = pdf_report(downloaded);
     let title = pdfinfo_field(&report, "Title").unwrap_or_else(|| pdf_title(url));
     let pages = pdfinfo_field(&report, "Pages")
         .and_then(|pages| pages.parse::<usize>().ok())
         .filter(|pages| *pages > 0)
         .unwrap_or(extracted);
-    let truncated = pages > PDF_MAX_PAGES;
+    let bound = if ocr { PDF_OCR_PAGES } else { PDF_MAX_PAGES };
+    let truncated = pages > bound;
     let mut document = format!("# {title}\n\n> Source: {url}\n> Pages: {pages}");
     if truncated {
-        let _ = write!(document, " (extracted first {PDF_MAX_PAGES})");
+        let _ = write!(document, " (extracted first {bound})");
+    }
+    if ocr {
+        document.push_str("\n> OCR: ocrs");
     }
     if let Some(author) = pdfinfo_field(&report, "Author") {
         let _ = write!(document, "\n> Author: {author}");
@@ -748,7 +913,7 @@ fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String
     if truncated {
         let _ = write!(
             document,
-            "\n\n---\n\n*[Truncated: only first {PDF_MAX_PAGES} of {pages} pages extracted]*"
+            "\n\n---\n\n*[Truncated: only first {bound} of {pages} pages extracted]*"
         );
     }
     // The full document stays on disk for re-reading; only the inline copy is capped.
@@ -1373,6 +1538,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pdftoppm_command_renders_pngs_for_the_ocr_fallback() {
+        let pdftoppm = pdftoppm_command(
+            PathBuf::from("/opt/homebrew/bin/pdftoppm"),
+            Path::new("/tmp/tart-pdf.pdf"),
+            Path::new("/tmp/tart-pages"),
+            PDF_OCR_PAGES,
+        );
+
+        assert_eq!(pdftoppm.get_program(), "/opt/homebrew/bin/pdftoppm");
+        assert_eq!(
+            pdftoppm.get_args().collect::<Vec<_>>(),
+            [
+                "-r",
+                "150",
+                "-f",
+                "1",
+                "-l",
+                "10",
+                "/tmp/tart-pdf.pdf",
+                "/tmp/tart-pages"
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_pages_orders_by_number_not_name() {
+        let dir = std::env::temp_dir().join(format!("tart-pages-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "prefix-2.ppm",
+            "prefix-10.ppm",
+            "prefix-1.ppm",
+            "other-1.ppm",
+            "prefix-1.txt",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+
+        let pages = rendered_pages(&dir.join("prefix"));
+
+        let names: Vec<String> = pages
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names, ["prefix-1.ppm", "prefix-2.ppm", "prefix-10.ppm"]);
+    }
+
+    #[test]
+    fn read_ppm_parses_headers_and_rejects_bad_ones() {
+        let ppm = b"P6\n# a comment\n4 2 255\n\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18";
+
+        let (rgb, width, height) = read_ppm(ppm).unwrap();
+
+        assert_eq!((width, height), (4, 2));
+        assert_eq!(rgb, &ppm[ppm.len() - 24..]);
+        assert!(read_ppm(b"P5\n1 1 255\n\x00").is_none());
+        assert!(read_ppm(b"P6\n2 1 255\n\x00").is_none());
+        assert!(read_ppm(b"P6\n2 1 65535\n\x00\x00\x00\x00\x00\x00").is_none());
+    }
+
     /// Offline, but real poppler: skips on machines without the tools.
     #[test]
     fn pdf_document_extracts_pages_with_markers() {
@@ -1403,6 +1630,39 @@ mod tests {
             "{document}"
         );
         assert!(document.contains("Saved to: "), "{document}");
+        if let Some((_, saved)) = document.split_once("Saved to: ") {
+            let _ = std::fs::remove_file(saved.trim());
+        }
+    }
+
+    /// A scanned page: a crop of why-rust.png, the real text screenshot from ocrs tests
+    #[test]
+    fn pdf_document_ocrs_a_scanned_page_when_models_exist() {
+        let Some(extractor) = pdftotext_binary() else {
+            return;
+        };
+        if ocr_engine().is_none() {
+            return;
+        }
+        let downloaded = pdf_path("pdf");
+        std::fs::write(&downloaded, include_bytes!("../data/scanned.pdf")).unwrap();
+
+        let document = pdf_document(&extractor, &downloaded, "https://example.com/scanned.pdf");
+
+        let _ = std::fs::remove_file(&downloaded);
+        let document = document.unwrap();
+
+        assert!(document.contains("> OCR: ocrs"), "{document}");
+        assert!(document.contains("> Pages: 1"), "{document}");
+        assert!(document.contains("<!-- Page 1 -->"), "{document}");
+        // Any one of the drawn words proving the engine really read the
+        // raster, tolerant of OCR's spelling of the rest.
+        assert!(
+            document.contains("Why Rust")
+                || document.contains("Performance")
+                || document.contains("blazingly"),
+            "{document}"
+        );
         if let Some((_, saved)) = document.split_once("Saved to: ") {
             let _ = std::fs::remove_file(saved.trim());
         }
