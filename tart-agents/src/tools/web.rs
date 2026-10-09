@@ -11,10 +11,10 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::backends::{FunctionToolCall, Tool};
+use itertools::Itertools;
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use rten::Model;
 
@@ -234,8 +234,8 @@ fn fetch_binary() -> Option<PathBuf> {
 
 /// Locate the PDF text extractor: the `TART_PDFTOTEXT_BIN` override, then `PATH`.
 fn pdftotext_binary() -> Option<PathBuf> {
-    let pinned = std::env::var_os("TART_PDFTOTEXT_BIN").map(PathBuf::from);
-    pinned
+    std::env::var_os("TART_PDFTOTEXT_BIN")
+        .map(PathBuf::from)
         .into_iter()
         .find(|path| is_executable(path))
         .or_else(|| find_on_path(PDF_DEFAULT_EXTRACTOR))
@@ -243,8 +243,8 @@ fn pdftotext_binary() -> Option<PathBuf> {
 
 /// Locate pdfinfo for page counts and metadata.
 fn pdfinfo_binary() -> Option<PathBuf> {
-    let pinned = std::env::var_os("TART_PDFINFO_BIN").map(PathBuf::from);
-    pinned
+    std::env::var_os("TART_PDFINFO_BIN")
+        .map(PathBuf::from)
         .into_iter()
         .find(|path| is_executable(path))
         .or_else(|| find_on_path("pdfinfo"))
@@ -253,8 +253,8 @@ fn pdfinfo_binary() -> Option<PathBuf> {
 /// Locate the page renderer poppler ships, overridable with
 /// `TART_PDFTOPPM_BIN`: the OCR fallback's input.
 fn pdftoppm_binary() -> Option<PathBuf> {
-    let pinned = std::env::var_os("TART_PDFTOPPM_BIN").map(PathBuf::from);
-    pinned
+    std::env::var_os("TART_PDFTOPPM_BIN")
+        .map(PathBuf::from)
         .into_iter()
         .find(|path| is_executable(path))
         .or_else(|| find_on_path("pdftoppm"))
@@ -271,11 +271,9 @@ fn ocr_engine() -> Option<OcrEngine> {
             .iter()
             .find_map(|ext| Model::load_file(dir.join(format!("{stem}.{ext}"))).ok())
     };
-    let detection = model("text-detection")?;
-    let recognition = model("text-recognition")?;
     OcrEngine::new(OcrEngineParams {
-        detection_model: Some(detection),
-        recognition_model: Some(recognition),
+        detection_model: Some(model("text-detection")?),
+        recognition_model: Some(model("text-recognition")?),
         ..OcrEngineParams::default()
     })
     .ok()
@@ -287,15 +285,11 @@ fn read_ppm(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let mut header = [0u32; 3];
     for field in &mut header {
         loop {
-            while rest.first().is_some_and(u8::is_ascii_whitespace) {
-                rest = &rest[1..];
-            }
-            if rest.first() == Some(&b'#') {
-                let end = rest.iter().position(|byte| *byte == b'\n')?;
-                rest = &rest[end + 1..];
-            } else {
+            rest = rest.trim_ascii_start();
+            if rest.first() != Some(&b'#') {
                 break;
             }
+            rest = &rest[rest.iter().position(|byte| *byte == b'\n')? + 1..];
         }
         let end = rest.iter().position(|byte| !byte.is_ascii_digit())?;
         *field = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
@@ -316,12 +310,7 @@ fn ocr_page(engine: &OcrEngine, page: &Path) -> Option<String> {
     let words = engine.detect_words(&input).ok()?;
     let lines = engine.find_text_lines(&input, &words);
     let text = engine.recognize_text(&input, &lines).ok()?;
-    let joined = text
-        .iter()
-        .flatten()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let joined = text.iter().flatten().join("\n");
     (!joined.is_empty()).then_some(joined)
 }
 
@@ -353,23 +342,6 @@ fn web_command(binary: PathBuf) -> Command {
         command.env("PATH", path);
     }
     command
-}
-
-/// A fresh path under the system temp directory for one search's results.
-///
-/// ddgs writes structured results only to a file, never to stdout; the counter
-/// keeps concurrent searches apart without adding a dependency.
-fn results_path() -> PathBuf {
-    static CALLS: AtomicU64 = AtomicU64::new(0);
-    let call = CALLS.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tart-search-{}-{call}.json", std::process::id()))
-}
-
-/// A fresh path under the system temp directory for one PDF fetch's files.
-fn pdf_path(extension: &str) -> PathBuf {
-    static CALLS: AtomicU64 = AtomicU64::new(0);
-    let call = CALLS.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tart-pdf-{}-{call}.{extension}", std::process::id()))
 }
 
 /// The ddgs argv for one search: the subcommand, the query as a single argv
@@ -407,13 +379,20 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
                 .to_string();
             return (text.clone(), text, None);
         };
-        let results = results_path();
+        // ddgs writes results only to a file, never stdout: a drop-guarded
+        // temp file for them, removed however the run ends.
+        let results = tempfile::Builder::new()
+            .prefix("tart-search-")
+            .suffix(".json")
+            .tempfile();
+        let Ok(results) = results else {
+            let text = "search: could not create a temp file for results".to_string();
+            return (text.clone(), text, None);
+        };
         let mut ddgs = web_command(binary);
-        ddgs.args(ddgs_args(&search, &results));
+        ddgs.args(ddgs_args(&search, results.path()));
         let outcome = run_watched(&mut ddgs, Some(SEARCH_TIMEOUT), &CancelToken::new());
-        // The results file is ours whatever happened: read it, then drop it.
-        let json = std::fs::read_to_string(&results).ok();
-        let _ = std::fs::remove_file(&results);
+        let json = std::fs::read_to_string(results.path()).ok();
         match json.as_deref().and_then(|json| render_results(&search, json)) {
             Some(rendered) => (rendered.clone(), rendered, Some(0)),
             None => match outcome {
@@ -637,7 +616,7 @@ fn pdftotext_command(binary: PathBuf, downloaded: &Path, last_page: usize) -> Co
     pdftotext
 }
 
-/// The pdftoppm command that renders a PDF's first pages as PNGs under `prefix`
+/// The pdftoppm command that renders a PDF's first pages as PPMs under `prefix`
 fn pdftoppm_command(binary: PathBuf, downloaded: &Path, prefix: &Path, last: usize) -> Command {
     let mut pdftoppm = web_command(binary);
     pdftoppm
@@ -648,30 +627,34 @@ fn pdftoppm_command(binary: PathBuf, downloaded: &Path, prefix: &Path, last: usi
     pdftoppm
 }
 
-/// The page images pdftoppm wrote under `prefix`, in page order.
-fn rendered_pages(prefix: &Path) -> Vec<PathBuf> {
-    let stem = prefix
-        .file_name()
-        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
-    let mut pages: Vec<(usize, PathBuf)> =
-        std::fs::read_dir(prefix.parent().unwrap_or_else(|| Path::new(".")))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().is_some_and(|ext| ext == "ppm")
-                    && path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with(&stem))
-            })
-            .filter_map(|path| {
-                let number = path.file_stem()?.to_string_lossy();
-                let number = number.rsplit_once('-')?.1.parse::<usize>().ok()?;
-                Some((number, path))
-            })
-            .collect();
-    pages.sort_by_key(|(number, _)| *number);
+/// Run one poppler tool under [`PDF_EXTRACT_TIMEOUT`]: the tools are local
+/// and fast, so only their own deadline ever stops them.
+fn run_pdf_tool(command: &mut Command) -> std::io::Result<WatchedRun> {
+    run_watched(command, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new())
+}
+
+/// The page images pdftoppm wrote in `dir`, in page order: files named
+/// `page-<n>.ppm`, the number zero-padded to whatever pdftoppm chose, so
+/// ordering comes from the number and not the name.
+fn rendered_pages(dir: &Path) -> Vec<PathBuf> {
+    let mut pages = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter_map(|path| {
+            let number = path
+                .file_name()?
+                .to_string_lossy()
+                .strip_suffix(".ppm")?
+                .rsplit_once('-')?
+                .1
+                .parse::<usize>()
+                .ok()?;
+            Some((number, path))
+        })
+        .collect::<Vec<_>>();
+    pages.sort_by_key(|&(number, _)| number);
     pages.into_iter().map(|(_, path)| path).collect()
 }
 
@@ -684,20 +667,17 @@ fn rendered_pages(prefix: &Path) -> Vec<PathBuf> {
 fn pdf_ocr(downloaded: &Path) -> Option<(String, usize)> {
     let renderer = pdftoppm_binary()?;
     let engine = ocr_engine()?;
-    let prefix = pdf_path("page");
+    // A private, drop-guarded dir: a pdftoppm that dies mid-render cannot
+    // strand its partial pages in the temp filesystem.
+    let dir = tempfile::Builder::new().prefix("tart-pages-").tempdir().ok()?;
+    let prefix = dir.path().join("page");
     let mut pdftoppm = pdftoppm_command(renderer, downloaded, &prefix, PDF_OCR_PAGES);
-    let rendered = run_watched(&mut pdftoppm, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new())
-        .is_ok_and(|run| run.output.status.success());
-    if !rendered {
-        return None;
-    }
+    let rendered = run_pdf_tool(&mut pdftoppm).is_ok_and(|run| run.output.status.success());
+    rendered.then_some(())?;
     let mut text = Vec::new();
-    for page in rendered_pages(&prefix) {
-        // The page is ours once read; a page OCR cannot read stays empty, so
-        // the numbering around it survives.
-        let read = ocr_page(&engine, &page);
-        let _ = std::fs::remove_file(&page);
-        text.push(read.unwrap_or_default());
+    for page in rendered_pages(dir.path()) {
+        // A page OCR cannot read stays empty, so the numbering around it survives.
+        text.push(ocr_page(&engine, &page).unwrap_or_default());
     }
     let (body, pages) = mark_pages(&text.join("\x0c"));
     (!body.is_empty()).then_some((body, pages))
@@ -786,17 +766,14 @@ fn is_pdf_url(url: &str) -> bool {
 /// The arxiv paper id a URL path names, as the `/pdf/<id>` pair in it: an
 /// id starts with a digit and contains a dot, so `/pdf/manual` stays a page.
 fn arxiv_paper_id(path: &str) -> Option<&str> {
-    let mut previous = "";
-    for segment in path.split('/') {
-        if previous == "pdf"
-            && segment.starts_with(|c: char| c.is_ascii_digit())
-            && segment.contains('.')
-        {
-            return Some(segment);
-        }
-        previous = segment;
-    }
-    None
+    path.split('/')
+        .tuple_windows::<(&str, &str)>()
+        .find(|(previous, segment)| {
+            *previous == "pdf"
+                && segment.starts_with(|c: char| c.is_ascii_digit())
+                && segment.contains('.')
+        })
+        .map(|(_, segment)| segment)
 }
 
 /// A readable title for a PDF address.
@@ -810,13 +787,8 @@ fn pdf_title(url: &str) -> String {
         .strip_suffix(".pdf")
         .or_else(|| name.strip_suffix(".PDF"))
         .unwrap_or(name);
-    let spaced = stem.replace(['_', '-'], " ");
-    let trimmed = spaced.trim();
-    if trimmed.is_empty() {
-        "document".to_string()
-    } else {
-        trimmed.to_string()
-    }
+    let title = stem.replace(['_', '-'], " ").trim().to_string();
+    if title.is_empty() { "document".to_string() } else { title }
 }
 
 /// Turn pdftotext's form-feed separated pages into marker-delimited text.
@@ -832,17 +804,15 @@ fn mark_pages(text: &str) -> (String, usize) {
     let mut count = 1;
     for page in pages {
         count += 1;
-        let _ = write!(rendered, "\n\n<!-- Page {count} -->\n\n");
-        rendered.push_str(page.trim_end());
+        let _ = write!(rendered, "\n\n<!-- Page {count} -->\n\n{}", page.trim_end());
     }
     (rendered, count)
 }
 
 /// One `Key: value` field of pdfinfo's report, when present and non-empty.
 fn pdfinfo_field(report: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
     report.lines().find_map(|line| {
-        let value = line.strip_prefix(&prefix)?.trim();
+        let value = line.strip_prefix(key)?.strip_prefix(':')?.trim();
         (!value.is_empty()).then(|| value.to_string())
     })
 }
@@ -854,7 +824,7 @@ fn pdf_report(downloaded: &Path) -> String {
     };
     let mut pdfinfo = web_command(binary);
     pdfinfo.arg(downloaded);
-    run_watched(&mut pdfinfo, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new())
+    run_pdf_tool(&mut pdfinfo)
         .ok()
         .map(|run| combined_output(&run.output))
         .unwrap_or_default()
@@ -864,29 +834,24 @@ fn pdf_report(downloaded: &Path) -> String {
 ///
 /// The document is titled from pdfinfo's metadata or the address, its pages
 /// marked `<!-- Page N -->`, and the extraction bounded to [`PDF_MAX_PAGES`]
-/// with the truncation said out loud (after pi-web-access's wrapper).
+/// ([`PDF_OCR_PAGES`] when the OCR fallback ran) with the truncation said out
+/// loud (after pi-web-access's wrapper).
 fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String, String> {
     let mut pdftotext = pdftotext_command(extractor.to_path_buf(), downloaded, PDF_MAX_PAGES);
-    let run = match run_watched(&mut pdftotext, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new()) {
-        Ok(run) => run,
-        Err(error) => return Err(format!("error: {error}")),
-    };
+    let run = run_pdf_tool(&mut pdftotext).map_err(|error| format!("error: {error}"))?;
     if !run.output.status.success() {
         return Err(combined_output(&run.output));
     }
-    let text = combined_output(&run.output);
-    let (body, extracted) = mark_pages(&text);
+    let (body, extracted) = mark_pages(&combined_output(&run.output));
     // An empty layer means scanned images: fall back to local OCR before
     // giving up, so a scanned paper reads like any other.
     let (body, extracted, ocr) = if body.is_empty() {
-        match pdf_ocr(downloaded) {
-            Some((body, extracted)) => (body, extracted, true),
-            None => {
-                return Err("no text layer: the PDF is scanned images, and ocrs's models \
-                     are missing: `cargo install ocrs-cli` and run it once to fetch them"
-                    .to_string());
-            }
-        }
+        let Some((body, extracted)) = pdf_ocr(downloaded) else {
+            return Err("no text layer: the PDF is scanned images, and ocrs's models \
+                 are missing: `cargo install ocrs-cli` and run it once to fetch them"
+                .to_string());
+        };
+        (body, extracted, true)
     } else {
         (body, extracted, false)
     };
@@ -916,9 +881,18 @@ fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String
             "\n\n---\n\n*[Truncated: only first {bound} of {pages} pages extracted]*"
         );
     }
-    // The full document stays on disk for re-reading; only the inline copy is capped.
-    let saved = pdf_path("md");
-    if std::fs::write(&saved, &document).is_ok() {
+    // The full document stays on disk for re-reading; only the inline copy
+    // is capped. `keep` lifts the temp guard so the file outlives the return.
+    let saved = tempfile::Builder::new()
+        .prefix("tart-pdf-")
+        .suffix(".md")
+        .tempfile()
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(document.as_bytes())?;
+            file.keep().map(|kept| kept.1).map_err(|error| error.error)
+        });
+    if let Ok(saved) = &saved {
         let _ = write!(document, "\n\nSaved to: {}", saved.display());
     }
     // Move the inline copy: under `head_cap`, we would only have cloned the full doc
@@ -951,39 +925,43 @@ fn pdf_fetch(curl_binary: PathBuf, url: &str) -> (String, String, Option<i32>) {
             .to_string();
         return (text.clone(), text, None);
     };
-    let downloaded = pdf_path("pdf");
-    let mut curl = pdf_curl(curl_binary, &downloaded, url);
+    // Drop-guarded: the downloaded bytes leave the temp filesystem whatever
+    // way this ends.
+    let downloaded = tempfile::Builder::new()
+        .prefix("tart-pdf-")
+        .suffix(".pdf")
+        .tempfile();
+    let Ok(downloaded) = downloaded else {
+        let text = "fetch: could not create a temp file for the PDF".to_string();
+        return (text.clone(), text, None);
+    };
+    let mut curl = pdf_curl(curl_binary, downloaded.path(), url);
     let run = match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
         Ok(run) => run,
         Err(error) => {
-            let _ = std::fs::remove_file(&downloaded);
             let text = format!("error: {error}");
             return (text.clone(), text, None);
         }
     };
     let WatchedRun { output, killed } = run;
     if killed.is_some() || !output.status.success() {
-        let _ = std::fs::remove_file(&downloaded);
         let text = combined_output(&output);
         let marked = if killed.is_some() {
             timeout_text(&text, FETCH_TIMEOUT)
         } else {
             command_text_inline(&text, output.status, false)
         };
-        let exit = output.status.code();
-        return (marked.clone(), marked, exit);
+        return (marked.clone(), marked, output.status.code());
     }
     // Redirects: under `-o` the trailer is all curl wrote to stdout.
     let captured = combined_output(&output);
     if let Some((_, final_url)) = separate_final_url(&captured)
         && let Some(refused) = private_redirect(final_url)
     {
-        let _ = std::fs::remove_file(&downloaded);
-        let exit = output.status.code();
-        return (refused.clone(), refused, exit);
+        return (refused.clone(), refused, output.status.code());
     }
     // Magic bytes within the first kilobyte: never hand poppler anything else.
-    let verdict = match pdf_head(&downloaded) {
+    let verdict = match pdf_head(downloaded.path()) {
         Ok((head, _)) if head.windows(5).any(|w| w == b"%PDF-") => Ok(()),
         Ok((_, size)) => Err(format!(
             "fetch: {url} served {size} bytes that are not a PDF (no %PDF- header)"
@@ -991,17 +969,13 @@ fn pdf_fetch(curl_binary: PathBuf, url: &str) -> (String, String, Option<i32>) {
         Err(error) => Err(format!("error: {error}")),
     };
     if let Err(text) = verdict {
-        let _ = std::fs::remove_file(&downloaded);
         return (text.clone(), text, Some(0));
     }
-    let document = pdf_document(&extractor, &downloaded, url);
-    let _ = std::fs::remove_file(&downloaded);
+    let document = pdf_document(&extractor, downloaded.path(), url)
+        .map_err(|error| format!("fetch: PDF extraction failed: {error}"));
     match document {
         Ok(text) => (text.clone(), text, Some(0)),
-        Err(error) => {
-            let text = format!("fetch: PDF extraction failed: {error}");
-            (text.clone(), text, None)
-        }
+        Err(text) => (text.clone(), text, None),
     }
 }
 
@@ -1539,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn pdftoppm_command_renders_pngs_for_the_ocr_fallback() {
+    fn pdftoppm_command_renders_ppms_for_the_ocr_fallback() {
         let pdftoppm = pdftoppm_command(
             PathBuf::from("/opt/homebrew/bin/pdftoppm"),
             Path::new("/tmp/tart-pdf.pdf"),
@@ -1565,26 +1539,25 @@ mod tests {
 
     #[test]
     fn rendered_pages_orders_by_number_not_name() {
-        let dir = std::env::temp_dir().join(format!("tart-pages-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         for name in [
-            "prefix-2.ppm",
-            "prefix-10.ppm",
-            "prefix-1.ppm",
-            "other-1.ppm",
-            "prefix-1.txt",
+            "page-2.ppm",
+            "page-10.ppm",
+            "page-1.ppm",
+            "other.ppm",
+            "page-1.txt",
+            "7.ppm",
         ] {
-            std::fs::write(dir.join(name), b"").unwrap();
+            std::fs::write(dir.path().join(name), b"").unwrap();
         }
 
-        let pages = rendered_pages(&dir.join("prefix"));
+        let pages = rendered_pages(dir.path());
 
         let names: Vec<String> = pages
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(names, ["prefix-1.ppm", "prefix-2.ppm", "prefix-10.ppm"]);
+        assert_eq!(names, ["page-1.ppm", "page-2.ppm", "page-10.ppm"]);
     }
 
     #[test]
@@ -1606,13 +1579,19 @@ mod tests {
         let Some(extractor) = pdftotext_binary() else {
             return;
         };
-        let downloaded = pdf_path("pdf");
-        std::fs::write(&downloaded, fixture_pdf()).unwrap();
+        let downloaded = tempfile::Builder::new()
+            .prefix("tart-fixture-")
+            .suffix(".pdf")
+            .tempfile()
+            .unwrap();
+        std::fs::write(downloaded.path(), fixture_pdf()).unwrap();
 
-        let document =
-            pdf_document(&extractor, &downloaded, "https://example.com/tart-fixture.pdf");
+        let document = pdf_document(
+            &extractor,
+            downloaded.path(),
+            "https://example.com/tart-fixture.pdf",
+        );
 
-        let _ = std::fs::remove_file(&downloaded);
         let document = document.unwrap();
 
         assert!(document.contains("# tart fixture\n"), "{document}");
@@ -1644,12 +1623,16 @@ mod tests {
         if ocr_engine().is_none() {
             return;
         }
-        let downloaded = pdf_path("pdf");
-        std::fs::write(&downloaded, include_bytes!("../data/scanned.pdf")).unwrap();
+        let downloaded = tempfile::Builder::new()
+            .prefix("tart-fixture-")
+            .suffix(".pdf")
+            .tempfile()
+            .unwrap();
+        std::fs::write(downloaded.path(), include_bytes!("../data/scanned.pdf")).unwrap();
 
-        let document = pdf_document(&extractor, &downloaded, "https://example.com/scanned.pdf");
+        let document =
+            pdf_document(&extractor, downloaded.path(), "https://example.com/scanned.pdf");
 
-        let _ = std::fs::remove_file(&downloaded);
         let document = document.unwrap();
 
         assert!(document.contains("> OCR: ocrs"), "{document}");
