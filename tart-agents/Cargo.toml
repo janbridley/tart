@@ -18,10 +18,10 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 itertools = "0.15.0"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# Drop-guarded temp files and dirs for search/PDF scratch state.
+tempfile = "3"
 
 [dev-dependencies]
-# Test scratch files and directories; tempfile removes them on drop.
-tempfile = "3"
 macro_rules_attribute = "0.2.3"
 
 [lints]
