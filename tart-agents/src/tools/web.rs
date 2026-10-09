@@ -11,12 +11,9 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backends::{FunctionToolCall, Tool};
-use itertools::Itertools;
-use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
-use rten::Model;
 
 use super::{
     CancelToken, WatchedRun, combined_output, command_text_inline, head_cap, misuse,
@@ -81,8 +78,11 @@ const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 /// page, seconds apiece, so scanned documents are bounded harder than text.
 const PDF_OCR_PAGES: usize = 10;
 
-/// The rendering resolution the OCR fallback feeds ocrs, in dots per inch.
+/// The rendering resolution the OCR fallback feeds tesseract, in dots per inch.
 const PDF_OCR_DPI: &str = "150";
+
+/// The wall-clock bound on the whole OCR loop, checked between pages.
+const PDF_OCR_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The search tool's definition, offered only when a ddgs CLI is installed.
 fn search_definition() -> Tool {
@@ -132,7 +132,7 @@ fn fetch_definition() -> Tool {
         PDF addresses (a .pdf path, or an arxiv /pdf/ paper) are fetched directly and \
         their text layer extracted locally as markdown with <!-- Page N --> markers; when \
         the layer is empty (scanned images) the pages fall back to local OCR: poppler's \
-        pdftoppm renders them and ocrs reads them, when its models are cached",
+        pdftoppm renders them and tesseract reads them, when installed",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -260,58 +260,20 @@ fn pdftoppm_binary() -> Option<PathBuf> {
         .or_else(|| find_on_path("pdftoppm"))
 }
 
-/// The OCR engine ocrs provides, with its models from `TART_OCR_MODELS` or ocrs cache.
-fn ocr_engine() -> Option<OcrEngine> {
-    let dir = match std::env::var_os("TART_OCR_MODELS") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".cache/ocrs"),
-    };
-    let model = |stem: &str| -> Option<Model> {
-        ["onnx", "rten"]
-            .iter()
-            .find_map(|ext| Model::load_file(dir.join(format!("{stem}.{ext}"))).ok())
-    };
-    OcrEngine::new(OcrEngineParams {
-        detection_model: Some(model("text-detection")?),
-        recognition_model: Some(model("text-recognition")?),
-        ..OcrEngineParams::default()
-    })
-    .ok()
+/// Locate the tesseract CLI, overridable with `TART_TESSERACT_BIN`.
+fn tesseract_binary() -> Option<PathBuf> {
+    let pinned = std::env::var_os("TART_TESSERACT_BIN").map(PathBuf::from);
+    pinned
+        .into_iter()
+        .find(|path| is_executable(path))
+        .or_else(|| find_on_path("tesseract"))
 }
 
-/// One rendered page as raw RGB plus its size, from the PPM (P6) pixels pdftoppm writes
-fn read_ppm(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let mut rest = bytes.strip_prefix(b"P6")?;
-    let mut header = [0u32; 3];
-    for field in &mut header {
-        loop {
-            rest = rest.trim_ascii_start();
-            if rest.first() != Some(&b'#') {
-                break;
-            }
-            rest = &rest[rest.iter().position(|byte| *byte == b'\n')? + 1..];
-        }
-        let end = rest.iter().position(|byte| !byte.is_ascii_digit())?;
-        *field = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
-        rest = &rest[end..];
-    }
-    let [width, height, maxval] = header;
-    // Exactly one whitespace separates the header from the pixel run.
-    rest = rest.strip_prefix(b"\n").or_else(|| rest.strip_prefix(b" "))?;
-    let size = width as usize * height as usize * 3;
-    (maxval == 255 && rest.len() == size).then(|| (rest.to_vec(), width, height))
-}
-
-/// Read one rendered page's text with the engine, lines joined by newlines.
-fn ocr_page(engine: &OcrEngine, page: &Path) -> Option<String> {
-    let (rgb, width, height) = read_ppm(&std::fs::read(page).ok()?)?;
-    let source = ImageSource::from_bytes(&rgb, (width, height)).ok()?;
-    let input = engine.prepare_input(source).ok()?;
-    let words = engine.detect_words(&input).ok()?;
-    let lines = engine.find_text_lines(&input, &words);
-    let text = engine.recognize_text(&input, &lines).ok()?;
-    let joined = text.iter().flatten().join("\n");
-    (!joined.is_empty()).then_some(joined)
+/// The tesseract command that reads one rendered page to stdout.
+fn tesseract_command(binary: PathBuf, page: &Path) -> Command {
+    let mut tesseract = web_command(binary);
+    tesseract.arg(page).args(["stdout", "--psm", "3", "-l", "eng"]);
+    tesseract
 }
 
 /// The first executable `name` on `PATH`, if any.
@@ -418,8 +380,9 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
 
 /// Reject URLs that are not plain public web addresses.
 ///
-/// Anything but `http`/`https` is refused outright for security.
-fn check_url(url: &str) -> Result<String, String> {
+/// Anything but `http`/`https` is refused outright for security. The accepted
+/// URL comes back as the trimmed slice of the input, so no copy is made.
+fn check_url(url: &str) -> Result<&str, String> {
     let url = url.trim();
     if url.is_empty() || url.len() >= 2_048 {
         return Err("fetch: url is empty or longer than 2048 characters".to_string());
@@ -440,7 +403,7 @@ fn check_url(url: &str) -> Result<String, String> {
     if is_private_host(host) {
         return Err(format!("fetch: refusing non-public host {host}"));
     }
-    Ok(url.to_string())
+    Ok(url)
 }
 
 /// The host in a URL's authority: userinfo dropped, port dropped, IPv6
@@ -659,28 +622,61 @@ fn rendered_pages(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// OCR a PDF whose text layer is empty: render the first pages with poppler
-/// and read them with ocrs, one page per run, joined by form feeds so
+/// and read them with tesseract, one page per run, joined by form feeds so
 /// [`mark_pages`] numbers OCR'd pages as it numbers extracted ones.
 ///
 /// `None` when a piece is missing, a step fails, or no text emerges: the
 /// caller then reports the document as unreadable rather than guessing.
-fn pdf_ocr(downloaded: &Path) -> Option<(String, usize)> {
-    let renderer = pdftoppm_binary()?;
-    let engine = ocr_engine()?;
+fn pdf_ocr(downloaded: &Path) -> Result<(String, usize), String> {
+    let Some(renderer) = pdftoppm_binary() else {
+        return Err("the poppler renderer is missing (brew install poppler)".to_string());
+    };
+    let Some(ocr) = tesseract_binary() else {
+        return Err("tesseract is missing (brew install tesseract)".to_string());
+    };
     // A private, drop-guarded dir: a pdftoppm that dies mid-render cannot
     // strand its partial pages in the temp filesystem.
-    let dir = tempfile::Builder::new().prefix("tart-pages-").tempdir().ok()?;
+    let dir = tempfile::Builder::new()
+        .prefix("tart-pages-")
+        .tempdir()
+        .map_err(|error| format!("could not create a temp dir: {error}"))?;
     let prefix = dir.path().join("page");
     let mut pdftoppm = pdftoppm_command(renderer, downloaded, &prefix, PDF_OCR_PAGES);
     let rendered = run_pdf_tool(&mut pdftoppm).is_ok_and(|run| run.output.status.success());
-    rendered.then_some(())?;
+    if !rendered {
+        return Err("rendering the pages failed".to_string());
+    }
     let mut text = Vec::new();
+    let mut failures = 0;
+    let deadline = Instant::now() + PDF_OCR_TIMEOUT;
     for page in rendered_pages(dir.path()) {
-        // A page OCR cannot read stays empty, so the numbering around it survives.
-        text.push(ocr_page(&engine, &page).unwrap_or_default());
+        // A page OCR cannot read stays empty, so the numbering around it survives
+        let mut tesseract = tesseract_command(ocr.clone(), &page);
+        let read = match run_pdf_tool(&mut tesseract) {
+            Ok(run) if run.output.status.success() => {
+                String::from_utf8_lossy(&run.output.stdout).into_owned()
+            }
+            _ => {
+                failures += 1;
+                String::new()
+            }
+        };
+        text.push(read);
+        if Instant::now() > deadline {
+            break;
+        }
     }
     let (body, pages) = mark_pages(&text.join("\x0c"));
-    (!body.is_empty()).then_some((body, pages))
+    if body.is_empty() {
+        // Failing every page is an installation problem, not a blank scan.
+        if !text.is_empty() && failures == text.len() {
+            return Err(
+                "tesseract failed on every page (is its language data installed?)".to_string()
+            );
+        }
+        return Err("OCR found no text".to_string());
+    }
+    Ok((body, pages))
 }
 
 /// Run one fetch tool call, reporting its steps to `on_progress`.
@@ -702,11 +698,11 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
             Err(text) => return (text.clone(), text, None),
         };
         // A PDF address bypasses the reader service.
-        if is_pdf_url(&url) {
-            return pdf_fetch(binary, &url);
+        if is_pdf_url(url) {
+            return pdf_fetch(binary, url);
         }
         let mut curl = web_command(binary);
-        curl.args(fetch_args(&fetch, &url));
+        curl.args(fetch_args(&fetch, url));
         match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
             Err(error) => {
                 let text = format!("error: {error}");
@@ -765,15 +761,25 @@ fn is_pdf_url(url: &str) -> bool {
 
 /// The arxiv paper id a URL path names, as the `/pdf/<id>` pair in it: an
 /// id starts with a digit and contains a dot, so `/pdf/manual` stays a page.
-fn arxiv_paper_id(path: &str) -> Option<&str> {
-    path.split('/')
-        .tuple_windows::<(&str, &str)>()
-        .find(|(previous, segment)| {
-            *previous == "pdf"
-                && segment.starts_with(|c: char| c.is_ascii_digit())
-                && segment.contains('.')
+fn arxiv_paper_id(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('/').collect();
+    for pair in segments.windows(2) {
+        if pair[0] == "pdf"
+            && pair[1].starts_with(|c: char| c.is_ascii_digit())
+            && pair[1].contains('.')
+        {
+            return Some(pair[1].to_string());
+        }
+    }
+    // Pre-2007 ids: an archive name over a seven-digit number.
+    segments
+        .windows(3)
+        .find(|trio| {
+            trio[0] == "pdf"
+                && trio[2].len() == 7
+                && trio[2].bytes().all(|byte| byte.is_ascii_digit())
         })
-        .map(|(_, segment)| segment)
+        .map(|trio| format!("{}/{}", trio[1], trio[2]))
 }
 
 /// A readable title for a PDF address.
@@ -830,6 +836,36 @@ fn pdf_report(downloaded: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Whether extracted text is empty or nearly so.
+fn mostly_empty(text: &str) -> bool {
+    if text
+        .trim_matches(|c: char| c == '\x0c' || c.is_whitespace())
+        .is_empty()
+    {
+        return true;
+    }
+    // pdftotext ends every page with a separator, so feeds count pages, plus one final
+    let pages = text.matches('\x0c').count()
+        + usize::from(
+            !text
+                .rsplit('\x0c')
+                .next()
+                .is_some_and(|tail| tail.trim().is_empty()),
+        );
+    let with_text = text.split('\x0c').filter(|page| !page.trim().is_empty()).count();
+    with_text * 2 < pages
+}
+
+/// The `> Pages:` wording and truncation flag from what pdfinfo counted and
+/// what extraction covered.
+fn pages_header(counted: Option<usize>, extracted: usize, bound: usize) -> (String, bool) {
+    match counted {
+        Some(pages) => (pages.to_string(), pages > bound),
+        None if extracted == bound => (format!("at least {bound}"), false),
+        None => (extracted.to_string(), false),
+    }
+}
+
 /// Extract one downloaded PDF's text layer and wrap it as markdown.
 ///
 /// The document is titled from pdfinfo's metadata or the address, its pages
@@ -842,33 +878,36 @@ fn pdf_document(extractor: &Path, downloaded: &Path, url: &str) -> Result<String
     if !run.output.status.success() {
         return Err(combined_output(&run.output));
     }
-    let (body, extracted) = mark_pages(&combined_output(&run.output));
-    // An empty layer means scanned images: fall back to local OCR before
-    // giving up, so a scanned paper reads like any other.
-    let (body, extracted, ocr) = if body.is_empty() {
-        let Some((body, extracted)) = pdf_ocr(downloaded) else {
-            return Err("no text layer: the PDF is scanned images, and ocrs's models \
-                 are missing: `cargo install ocrs-cli` and run it once to fetch them"
-                .to_string());
-        };
-        (body, extracted, true)
+    let text = combined_output(&run.output);
+    let (body, extracted) = mark_pages(&text);
+    // Mostly-empty pages mean scanned images (possibly behind a thin text layer):
+    // fall back to OCR
+    let (body, extracted, ocr, ocr_note) = if mostly_empty(&text) {
+        match pdf_ocr(downloaded) {
+            Ok((body, extracted)) => (body, extracted, true, None),
+            // OCR could not run, but a thin text layer exists: keep it and
+            // say why the scan was not read, rather than dropping the text.
+            Err(why) if !body.is_empty() => (body, extracted, false, Some(why)),
+            Err(why) => return Err(format!("no text layer: the PDF is scanned images, and {why}")),
+        }
     } else {
-        (body, extracted, false)
+        (body, extracted, false, None)
     };
     let report = pdf_report(downloaded);
     let title = pdfinfo_field(&report, "Title").unwrap_or_else(|| pdf_title(url));
-    let pages = pdfinfo_field(&report, "Pages")
+    let counted = pdfinfo_field(&report, "Pages")
         .and_then(|pages| pages.parse::<usize>().ok())
-        .filter(|pages| *pages > 0)
-        .unwrap_or(extracted);
+        .filter(|pages| *pages > 0);
     let bound = if ocr { PDF_OCR_PAGES } else { PDF_MAX_PAGES };
-    let truncated = pages > bound;
+    let (pages, truncated) = pages_header(counted, extracted, bound);
     let mut document = format!("# {title}\n\n> Source: {url}\n> Pages: {pages}");
     if truncated {
         let _ = write!(document, " (extracted first {bound})");
     }
     if ocr {
-        document.push_str("\n> OCR: ocrs");
+        document.push_str("\n> OCR: tesseract");
+    } else if let Some(why) = ocr_note {
+        let _ = write!(document, "\n> OCR: unavailable ({why})");
     }
     if let Some(author) = pdfinfo_field(&report, "Author") {
         let _ = write!(document, "\n> Author: {author}");
@@ -1263,7 +1302,7 @@ mod tests {
             "http://192.0.2.10:8080/page",
             "https://[2001:db8::1]/",
         ] {
-            assert_eq!(check_url(url).ok().as_deref(), Some(url), "{url}");
+            assert_eq!(check_url(url).ok(), Some(url), "{url}");
         }
     }
 
@@ -1396,6 +1435,7 @@ mod tests {
             "https://example.com/PAPER.PDF?download=1",
             "https://arxiv.org/pdf/1234.01234",
             "https://arxiv.org/pdf/1234.01234v2#page=2",
+            "https://arxiv.org/pdf/hep-th/9901001",
         ] {
             assert!(is_pdf_url(url), "expected a PDF address: {url}");
         }
@@ -1404,6 +1444,8 @@ mod tests {
             "https://example.com/a.pdf/b",
             "https://example.com/pdf/manual",
             "https://arxiv.org/abs/1234.01234",
+            "https://arxiv.org/pdf/hep-th/99010",
+            "https://arxiv.org/pdf/hep-th/99010012",
             "https://example.com/",
         ] {
             assert!(!is_pdf_url(url), "expected a page address: {url}");
@@ -1420,6 +1462,10 @@ mod tests {
             pdf_title("https://arxiv.org/pdf/1234.01234v2"),
             "arxiv-1234.01234v2"
         );
+        assert_eq!(
+            pdf_title("https://arxiv.org/pdf/hep-th/9901001"),
+            "arxiv-hep-th/9901001"
+        );
         assert_eq!(pdf_title("https://example.com/My_PDF.PDF"), "My PDF");
         assert_eq!(pdf_title("https://example.com/"), "document");
     }
@@ -1435,6 +1481,25 @@ mod tests {
 
         assert_eq!(mark_pages(""), (String::new(), 0));
         assert_eq!(mark_pages("\x0c\x0c"), (String::new(), 0));
+    }
+
+    #[test]
+    fn mostly_empty_triggers_on_scanned_shapes_only() {
+        assert!(mostly_empty(""));
+        assert!(mostly_empty("\x0c\x0c"));
+        let one_of_ten = "only page has text".to_string() + &"\x0c".repeat(10);
+        assert!(mostly_empty(&one_of_ten));
+        let half = "text\x0c\x0ctext\x0c\x0c";
+        assert!(!mostly_empty(half));
+        assert!(!mostly_empty("plain single page"));
+    }
+
+    #[test]
+    fn pages_header_says_at_least_when_the_bound_was_hit_uncounted() {
+        assert_eq!(pages_header(Some(2), 2, 100), ("2".to_string(), false));
+        assert_eq!(pages_header(Some(150), 100, 100), ("150".to_string(), true));
+        assert_eq!(pages_header(None, 40, 100), ("40".to_string(), false));
+        assert_eq!(pages_header(None, 100, 100), ("at least 100".to_string(), false));
     }
 
     #[test]
@@ -1512,6 +1577,32 @@ mod tests {
         );
     }
 
+    /// Whether tesseract can actually run here: the binary present *and*
+    /// its language data reachable
+    fn ocr_ready() -> bool {
+        let Some(binary) = tesseract_binary() else {
+            return false;
+        };
+        let mut probe = web_command(binary);
+        probe.arg("--list-langs");
+        run_watched(&mut probe, Some(PDF_EXTRACT_TIMEOUT), &CancelToken::new())
+            .is_ok_and(|run| run.output.status.success())
+    }
+
+    #[test]
+    fn tesseract_command_reads_one_page_to_stdout() {
+        let tesseract = tesseract_command(
+            PathBuf::from("/opt/homebrew/bin/tesseract"),
+            Path::new("/tmp/t-1.ppm"),
+        );
+
+        assert_eq!(tesseract.get_program(), "/opt/homebrew/bin/tesseract");
+        assert_eq!(
+            tesseract.get_args().collect::<Vec<_>>(),
+            ["/tmp/t-1.ppm", "stdout", "--psm", "3", "-l", "eng"]
+        );
+    }
+
     #[test]
     fn pdftoppm_command_renders_ppms_for_the_ocr_fallback() {
         let pdftoppm = pdftoppm_command(
@@ -1560,19 +1651,6 @@ mod tests {
         assert_eq!(names, ["page-1.ppm", "page-2.ppm", "page-10.ppm"]);
     }
 
-    #[test]
-    fn read_ppm_parses_headers_and_rejects_bad_ones() {
-        let ppm = b"P6\n# a comment\n4 2 255\n\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18";
-
-        let (rgb, width, height) = read_ppm(ppm).unwrap();
-
-        assert_eq!((width, height), (4, 2));
-        assert_eq!(rgb, &ppm[ppm.len() - 24..]);
-        assert!(read_ppm(b"P5\n1 1 255\n\x00").is_none());
-        assert!(read_ppm(b"P6\n2 1 255\n\x00").is_none());
-        assert!(read_ppm(b"P6\n2 1 65535\n\x00\x00\x00\x00\x00\x00").is_none());
-    }
-
     /// Offline, but real poppler: skips on machines without the tools.
     #[test]
     fn pdf_document_extracts_pages_with_markers() {
@@ -1614,13 +1692,14 @@ mod tests {
         }
     }
 
-    /// A scanned page: a crop of why-rust.png, the real text screenshot from ocrs tests
+    /// A scanned page: the why-rust.png text screenshot from ocrs's test
+    /// suite, embedded as a `FlateDecode` raster.
     #[test]
-    fn pdf_document_ocrs_a_scanned_page_when_models_exist() {
+    fn pdf_document_reads_a_scanned_page_when_tesseract_works() {
         let Some(extractor) = pdftotext_binary() else {
             return;
         };
-        if ocr_engine().is_none() {
+        if !ocr_ready() {
             return;
         }
         let downloaded = tempfile::Builder::new()
@@ -1635,10 +1714,10 @@ mod tests {
 
         let document = document.unwrap();
 
-        assert!(document.contains("> OCR: ocrs"), "{document}");
+        assert!(document.contains("> OCR: tesseract"), "{document}");
         assert!(document.contains("> Pages: 1"), "{document}");
         assert!(document.contains("<!-- Page 1 -->"), "{document}");
-        // Any one of the drawn words proving the engine really read the
+        // Any one of the page's words proving the engine really read the
         // raster, tolerant of OCR's spelling of the rest.
         assert!(
             document.contains("Why Rust")
