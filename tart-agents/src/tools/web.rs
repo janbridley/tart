@@ -556,14 +556,12 @@ fn ocr_page(pdf: &Path, page: usize, pdftoppm: &Path, tesseract: &Path) -> Optio
     let png = temp_path("fetch", "png");
     let mut render = web_command(pdftoppm);
     render.args(format!("-singlefile -f {page} -l {page} -r 200 -png").split(' '));
-    render.arg(pdf);
-    render.arg(png.with_extension(""));
+    render.arg(pdf).arg(png.with_extension(""));
     let rendered = run_watched(&mut render, Some(PDF_TIMEOUT), &CancelToken::new())
         .is_ok_and(|run| run.output.status.success())
         && std::fs::metadata(&png).is_ok();
     let mut ocr = web_command(tesseract);
-    ocr.arg(&png);
-    ocr.arg("stdout");
+    ocr.arg(&png).arg("stdout");
     let text = if rendered {
         let run = run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
         run.output
@@ -588,8 +586,7 @@ fn pdf_text(path: &Path) -> String {
     };
     let mut extract = web_command(&pdftotext);
     extract.args(format!("-q -enc UTF-8 -l {PDF_MAX_PAGES}").split(' '));
-    extract.arg(path);
-    extract.arg("-");
+    extract.arg(path).arg("-");
     let Ok(WatchedRun { output, .. }) =
         run_watched(&mut extract, Some(PDF_TIMEOUT), &CancelToken::new())
     else {
