@@ -598,91 +598,131 @@ fn pdf_text(path: &Path) -> String {
     if !output.status.success() {
         return format!("fetch: pdftotext failed:\n{}", combined_output(&output));
     }
-    let mut pages: Vec<String> = String::from_utf8_lossy(&output.stdout)
+    let mut texts: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .split('\u{c}')
         .map(|page| page.trim().to_string())
         .collect();
     // One form feed after the last page leaves one trailing empty chunk.
-    pages.pop_if(|page| page.is_empty());
+    texts.pop_if(|page| page.is_empty());
+    let mut pages = Pages::new(&mut texts);
     // Only OCR if the pages appear empty
     let stack = find_on_path("pdftoppm").zip(find_on_path("tesseract"));
-    let (mut ocr, mut failed, mut skipped) = (0, 0, 0);
-    for (index, page) in pages.iter_mut().enumerate() {
+    for (index, page) in pages.text.iter_mut().enumerate() {
         if page.chars().filter(|c| c.is_alphanumeric()).count() >= PDF_MIN_ALNUM {
             continue;
         }
         if let Some((pdftoppm, tesseract)) = stack.as_ref()
-            && ocr + failed < PDF_OCR_PAGES
+            && pages.ocr + pages.failed < PDF_OCR_PAGES
         {
             match ocr_page(path, index + 1, pdftoppm, tesseract) {
                 Some(text) => {
                     *page = text;
-                    ocr += 1;
+                    pages.ocr += 1;
                 }
-                None => failed += 1,
+                None => pages.failed += 1,
             }
         } else {
             // No stack, or the cap reached: the thin layer is all we have.
-            skipped += 1;
+            pages.skipped += 1;
         }
     }
-    let total = page_count(path).unwrap_or(pages.len());
-    render_pdf(&pages, total, ocr, failed, skipped)
+    if let Some(total) = page_count(path) {
+        pages.total = total;
+    }
+    pages.render()
 }
 
-/// The page-marked, bounded rendering of one PDF:
-///
-/// Return is a `[pdf: ...]` header containing a status, then `--- page N ---` bodies.
-fn render_pdf(pages: &[String], total: usize, ocr: usize, failed: usize, skipped: usize) -> String {
-    let scanned = ocr + failed + skipped;
-    let mut parts = vec![match (scanned, ocr + failed) {
-        (0, _) => "embedded text".to_string(),
-        (_, 0) => "no text layer; install tesseract (brew) to OCR it".to_string(),
-        _ if scanned == pages.len() => format!("scanned: {ocr} pages OCR'd"),
-        _ => format!("embedded text on {}, {ocr} OCR'd", pages.len() - scanned),
-    }];
-    if failed > 0 {
-        parts.push(format!("({failed} OCR failed)"));
-    }
-    // Leftover pages only count against the cap when a stack ran at all; with
-    // none installed, the source line already says so.
-    if skipped > 0 && ocr + failed > 0 {
-        parts.push(format!("({skipped} scanned pages left: OCR cap)"));
-    }
-    let mut body = String::new();
-    let mut shown = 0;
-    let mut cut = false;
-    // The 160 reserves the header line's own budget, which the cap forgets.
-    let budget = PDF_MAX_CHARS.saturating_sub(160);
-    for (index, page) in pages.iter().enumerate() {
-        let text = if page.is_empty() {
-            "(no text extracted)"
-        } else {
-            page.as_str()
-        };
-        let marked = format!("\n--- page {} ---\n{text}", index + 1);
-        // Keep whole pages while they fit; a first page too big for the whole
-        // budget is cut on a character boundary rather than dropped.
-        if body.len() + marked.len() > budget {
-            if shown == 0 {
-                let (head, _) = preview_first_chars(&marked, budget);
-                body.push_str(head);
-                shown = 1;
-                cut = true;
-            }
-            break;
+/// One extracted PDF: the borrowed page texts, and the accounting of how they were read
+struct Pages<'a> {
+    /// The page texts in order, empty where nothing was extracted.
+    text: &'a mut [String],
+    /// The page count pdfinfo reported, or the pages held when it did not.
+    total: usize,
+    /// Thin pages the OCR ladder recovered.
+    ocr: usize,
+    /// Thin pages the OCR ladder failed on.
+    failed: usize,
+    /// Thin pages never attempted: no stack installed, or the cap reached.
+    skipped: usize,
+}
+
+impl<'a> Pages<'a> {
+    /// Wrap pages straight out of pdftotext, totals still unrefined.
+    fn new(text: &'a mut [String]) -> Self {
+        Self {
+            total: text.len(),
+            text,
+            ocr: 0,
+            failed: 0,
+            skipped: 0,
         }
-        body.push_str(&marked);
-        shown += 1;
     }
-    let note = if cut || shown < pages.len() {
-        format!("; first {shown} of {total} pages shown (character cap)")
-    } else if shown < total {
-        format!("; first {shown} of {total} pages shown (page cap)")
-    } else {
-        String::new()
-    };
-    format!("[pdf: {total} pages, {}{note}]\n{body}", parts.join(" "))
+
+    /// The pages the text layer left thin, whatever happened to them after.
+    fn scanned(&self) -> usize {
+        self.ocr + self.failed + self.skipped
+    }
+
+    /// The page-marked, bounded rendering: a `[pdf: ...]` header carrying the
+    /// status, then `--- page N ---` bodies the model can cite.
+    fn render(&self) -> String {
+        let mut parts = vec![match (self.scanned(), self.ocr + self.failed) {
+            (0, _) => "embedded text".to_string(),
+            (_, 0) => "no text layer; install tesseract (brew) to OCR it".to_string(),
+            _ if self.scanned() == self.text.len() => {
+                format!("scanned: {} pages OCR'd", self.ocr)
+            }
+            _ => {
+                format!(
+                    "embedded text on {}, {} OCR'd",
+                    self.text.len() - self.scanned(),
+                    self.ocr
+                )
+            }
+        }];
+        if self.failed > 0 {
+            parts.push(format!("({} OCR failed)", self.failed));
+        }
+        // Leftover pages only count against the cap when a stack ran at all;
+        // with none installed, the source line already says so.
+        if self.skipped > 0 && self.ocr + self.failed > 0 {
+            parts.push(format!("({} scanned pages left: OCR cap)", self.skipped));
+        }
+        let mut body = String::new();
+        let mut shown = 0;
+        let mut cut = false;
+        // The 160 reserves the header line's own budget, which the cap forgets.
+        let budget = PDF_MAX_CHARS.saturating_sub(160);
+        for (index, page) in self.text.iter().enumerate() {
+            let text = if page.is_empty() {
+                "(no text extracted)"
+            } else {
+                page.as_str()
+            };
+            let marked = format!("\n--- page {} ---\n{text}", index + 1);
+            // Keep whole pages while they fit; a first page too big for the
+            // whole budget is cut on a character boundary rather than dropped.
+            if body.len() + marked.len() > budget {
+                if shown == 0 {
+                    let (head, _) = preview_first_chars(&marked, budget);
+                    body.push_str(head);
+                    shown = 1;
+                    cut = true;
+                }
+                break;
+            }
+            body.push_str(&marked);
+            shown += 1;
+        }
+        let note = if cut || shown < self.text.len() {
+            format!("; first {shown} of {} pages shown (character cap)", self.total)
+        } else if shown < self.total {
+            format!("; first {shown} of {} pages shown (page cap)", self.total)
+        } else {
+            String::new()
+        };
+        format!("[pdf: {} pages, {}{note}]\n{body}", self.total, parts.join(" "))
+    }
 }
 
 /// One fetch's content: raw and PDF-hinted urls download first so the body
@@ -1123,27 +1163,55 @@ mod tests {
 
     #[test]
     fn render_pdf_marks_pages_and_reports_status() {
-        let pages = vec!["Dell PowerConnect 5548".to_string(), "Page two".to_string()];
-        let rendered = render_pdf(&pages, 2, 0, 0, 0);
+        let mut text = vec!["Dell PowerConnect 5548".to_string(), "Page two".to_string()];
+        let extracted = Pages {
+            total: 2,
+            text: &mut text,
+            ocr: 0,
+            failed: 0,
+            skipped: 0,
+        };
+        let rendered = extracted.render();
 
         assert_eq!(rendered.lines().next().unwrap(), "[pdf: 2 pages, embedded text]");
         assert!(rendered.contains("\n--- page 1 ---\nDell PowerConnect 5548"));
         assert!(rendered.contains("\n--- page 2 ---\nPage two"));
 
         // All pages thin, none OCR'd: the honest install hint, not silence.
-        let thin = vec![String::new(), String::new()];
-        let rendered = render_pdf(&thin, 2, 0, 0, 2);
+        let mut empty = vec![String::new(), String::new()];
+        let thin = Pages {
+            total: 2,
+            text: &mut empty,
+            ocr: 0,
+            failed: 0,
+            skipped: 2,
+        };
+        let rendered = thin.render();
         assert!(rendered.contains("no text layer; install tesseract"));
         assert!(rendered.contains("--- page 1 ---\n(no text extracted)"));
 
         // Scanned and OCR'd, one page left over the cap.
-        let scanned: Vec<String> = (0..4).map(|_| "scanned".to_string()).collect();
-        let rendered = render_pdf(&scanned, 4, 3, 0, 1);
+        let mut scanned = vec!["scanned".to_string(); 4];
+        let scanned = Pages {
+            total: 4,
+            text: &mut scanned,
+            ocr: 3,
+            failed: 0,
+            skipped: 1,
+        };
+        let rendered = scanned.render();
         assert!(rendered.contains("scanned: 3 pages OCR'd (1 scanned pages left: OCR cap)"));
 
         // Truncation is page-aligned and said so in the header.
-        let big: Vec<String> = (0..30).map(|_| "x".repeat(6_000)).collect();
-        let rendered = render_pdf(&big, 30, 0, 0, 0);
+        let mut big = vec!["x".repeat(6_000); 30];
+        let big = Pages {
+            total: 30,
+            text: &mut big,
+            ocr: 0,
+            failed: 0,
+            skipped: 0,
+        };
+        let rendered = big.render();
         assert!(rendered.contains("; first 19 of 30 pages shown (character cap)"));
         assert!(!rendered.contains("--- page 20 ---"));
     }
