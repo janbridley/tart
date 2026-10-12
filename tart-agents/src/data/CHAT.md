@@ -23,7 +23,7 @@ Call `fetch` with:
   Use it for JSON or plain-text endpoints, or when extraction comes back empty.
 
 The page comes back as markdown (the article body, stripped of boilerplate, comments
-kept), cut at 150,000 characters when it runs long.
+kept), cut to its first and last 32 KB when it runs long.
 
 ## Rules
 
