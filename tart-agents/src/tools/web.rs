@@ -2,8 +2,9 @@
 //!
 //! These are the only tools that run **outside** the seatbelt sandbox.
 //! `search` shells out to the locally installed ddgs CLI, which writes
-//! structured JSON we only render. `fetch` reads HTTP natively, passing it to either
-//! the `r.jina.ai`, poppler's text layer + tesseract's OCR.
+//! structured JSON we only render. `fetch` speaks http itself: pages go
+//! through the `r.jina.ai` reader, PDFs to poppler's text layer and
+//! tesseract's OCR, and no HTML is ever parsed here.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -118,7 +119,7 @@ pub(crate) fn search() -> Option<Tool> {
     search_binary().map(|_| search_definition())
 }
 
-/// The fetch tool's definition, offered only when a curl binary exists.
+/// The fetch tool's definition; the transport is in-process, so it is always offered.
 fn fetch_definition() -> Tool {
     tool(
         "fetch",
