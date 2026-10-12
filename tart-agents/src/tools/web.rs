@@ -435,6 +435,14 @@ fn is_global(ip: IpAddr) -> bool {
     }
 }
 
+/// An error with its causes on one line.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    std::iter::successors(Some(error), |error| error.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 /// The client every fetch shares, built on first use: connection pooling and
 /// the one background thread come with the first fetch and stay for the
 /// process. The build result is cached beside the client, so a failed build
@@ -450,7 +458,7 @@ static FETCH_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
         .timeout(FETCH_TIMEOUT)
         .no_proxy()
         .build()
-        .map_err(|error| format!("error: {error}"))
+        .map_err(|error| format!("error: {}", error_chain(&error)))
 });
 
 /// The redirect rule: at most [`MAX_REDIRECTS`] hops, and none into a host
@@ -506,7 +514,7 @@ fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
         .get(url)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| format!("error: {error}"))?;
+        .map_err(|error| format!("error: {}", error_chain(&error)))?;
     let mut body = Vec::new();
     response
         .take(PDF_MAX_DOWNLOAD as u64 + 1)
@@ -528,7 +536,7 @@ fn read_page(client: &Client, url: &str) -> Result<String, String> {
     request
         .send()
         .and_then(reqwest::blocking::Response::text)
-        .map_err(|error| format!("error: {error}"))
+        .map_err(|error| format!("error: {}", error_chain(&error)))
 }
 
 /// A fetched non-PDF body as inline text, at the streaming cap's bound.
@@ -1003,6 +1011,26 @@ mod tests {
         assert!(FETCH_CLIENT.is_ok());
     }
 
+    /// An error whose cause is another error, for the chain flattening.
+    #[derive(Debug)]
+    struct Wrapped(&'static str, std::io::Error);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "wrapped: {}", self.0)
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.1)
+        }
+    }
+
+    #[test]
+    fn error_chain_joins_causes_with_colons() {
+        let wrapped = Wrapped("hop", std::io::Error::other("refusing redirect"));
+        assert_eq!(error_chain(&wrapped), "wrapped: hop: refusing redirect");
+    }
+
     /// Serve `response` once on an ephemeral loopback port and get its address.
     fn serve_once(response: String) -> std::net::SocketAddr {
         use std::io::{Read as _, Write as _};
@@ -1033,13 +1061,15 @@ mod tests {
         assert!(error.contains("404"), "{error}");
 
         // The policy refusal happens on the hop, before any connection is
-        // made to the private address.
+        // made to the private address, and its text survives reqwest's
+        // error wrapper.
         let address = serve_once(
             "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.5/x\r\nContent-Length: 0\r\n\r\n"
                 .to_string(),
         );
         let error = download(&client, &format!("http://{address}/hop")).unwrap_err();
         assert!(error.contains("refusing redirect"), "{error}");
+        assert!(error.contains("10.0.0.5"), "{error}");
     }
 
     #[test]
