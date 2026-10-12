@@ -207,11 +207,8 @@ pub(super) fn parse_fetch(arguments: &str) -> anyhow::Result<Fetch> {
 /// (where `uv tool install ddgs` puts it), then `PATH`.
 fn search_binary() -> Option<PathBuf> {
     let pinned = std::env::var_os("TART_SEARCH_BIN").map(PathBuf::from);
-    let installed = std::env::var_os("HOME").map(|home| {
-        let mut path = PathBuf::from(home);
-        path.push(".local/bin/ddgs");
-        path
-    });
+    let installed =
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/ddgs"));
     pinned
         .into_iter()
         .chain(installed)
@@ -239,14 +236,10 @@ fn is_executable(path: &Path) -> bool {
 fn web_command(binary: &Path) -> Command {
     let mut command = Command::new(binary);
     command.env_clear();
-    if let Some(home) = std::env::var_os("HOME") {
-        command.env("HOME", home);
-    }
-    if let Some(temp) = std::env::var_os("TMPDIR") {
-        command.env("TMPDIR", temp);
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
+    for name in ["HOME", "TMPDIR", "PATH"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
     }
     command
 }
@@ -305,8 +298,7 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
         match json.as_deref().and_then(|json| render_results(&search, json)) {
             Some(rendered) => (rendered.clone(), rendered, Some(0)),
             None => match outcome {
-                Ok(run) => {
-                    let WatchedRun { output, killed } = run;
+                Ok(WatchedRun { output, killed }) => {
                     let text = combined_output(&output);
                     let exit = output.status.code();
                     if killed.is_some() {
@@ -352,8 +344,7 @@ fn check_url(url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
-/// The host in a URL's authority: userinfo dropped, port dropped, IPv6
-/// unbracketed.
+/// The host in a URL's authority: userinfo dropped, port dropped, IPv6 unbracketed.
 fn authority_host(rest: &str) -> &str {
     let host_port = rest
         .split(['/', '?', '#'])
@@ -531,7 +522,7 @@ fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
 fn read_page(client: &Client, url: &str) -> Result<String, String> {
     let mut request = client.get(format!("{READER}{url}"));
     if let Some(key) = std::env::var_os("TART_JINA_KEY") {
-        request = request.bearer_auth(key.to_string_lossy().into_owned());
+        request = request.bearer_auth(key.to_string_lossy());
     }
     request
         .send()
@@ -569,19 +560,21 @@ fn ocr_page(pdf: &Path, page: usize, pdftoppm: &Path, tesseract: &Path) -> Optio
     let rendered = run_watched(&mut render, Some(PDF_TIMEOUT), &CancelToken::new())
         .is_ok_and(|run| run.output.status.success())
         && std::fs::metadata(&png).is_ok();
-    let text = rendered.then(|| {
-        let mut ocr = web_command(tesseract);
-        ocr.arg(&png);
-        ocr.arg("stdout");
+    let mut ocr = web_command(tesseract);
+    ocr.arg(&png);
+    ocr.arg("stdout");
+    let text = if rendered {
         let run = run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
         run.output
             .status
             .success()
             .then(|| String::from_utf8_lossy(&run.output.stdout).trim().to_string())
-    });
+    } else {
+        None
+    };
     // The image is ours on every path, unlike the body file `download` hands back.
     let _ = std::fs::remove_file(&png);
-    text.flatten()
+    text
 }
 
 /// Extract one PDF for the model: poppler's embedded text layer, tesseract
@@ -608,17 +601,16 @@ fn pdf_text(path: &Path) -> String {
         .split('\u{c}')
         .map(|page| page.trim().to_string())
         .collect();
-    if pages.last().is_some_and(String::is_empty) {
-        pages.pop();
-    }
+    // One form feed after the last page leaves one trailing empty chunk.
+    pages.pop_if(|page| page.is_empty());
     // Only OCR if the pages appear empty
-    let (pdftoppm, tesseract) = (find_on_path("pdftoppm"), find_on_path("tesseract"));
+    let stack = find_on_path("pdftoppm").zip(find_on_path("tesseract"));
     let (mut ocr, mut failed, mut skipped) = (0, 0, 0);
     for (index, page) in pages.iter_mut().enumerate() {
         if page.chars().filter(|c| c.is_alphanumeric()).count() >= PDF_MIN_ALNUM {
             continue;
         }
-        if let (Some(pdftoppm), Some(tesseract)) = (&pdftoppm, &tesseract)
+        if let Some((pdftoppm, tesseract)) = stack.as_ref()
             && ocr + failed < PDF_OCR_PAGES
         {
             match ocr_page(path, index + 1, pdftoppm, tesseract) {
