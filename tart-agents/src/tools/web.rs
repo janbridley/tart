@@ -24,8 +24,8 @@ use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
     CancelToken, WatchedRun, combined_output, command_text_inline, create_private, misuse,
-    parse_arguments, preview_first_chars, run_watched, run_watched_bytes, string_field,
-    timeout_text, tool, traced,
+    parse_arguments, preview_first_chars, run_watched, run_watched_bytes, string_field, tool,
+    traced, watched_failure,
 };
 use crate::Progress;
 
@@ -301,15 +301,13 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
         match json.as_deref().and_then(|json| render_results(&search, json)) {
             Some(rendered) => (rendered.clone(), rendered, Some(0)),
             None => match outcome {
-                Ok(WatchedRun { output, killed }) => {
-                    let text = combined_output(&output);
-                    let exit = output.status.code();
-                    if killed.is_some() {
-                        let marked = timeout_text(&text, SEARCH_TIMEOUT);
-                        (marked.clone(), marked, exit)
-                    } else {
-                        (command_text_inline(&text, output.status, false), text, exit)
-                    }
+                Ok(run) => {
+                    let exit = run.output.status.code();
+                    // A success that rendered no results still reports the CLI's output.
+                    let text = watched_failure(&run, SEARCH_TIMEOUT).unwrap_or_else(|| {
+                        command_text_inline(&combined_output(&run.output), run.output.status, false)
+                    });
+                    (text.clone(), text, exit)
                 }
                 Err(error) => {
                     let text = format!("error: {error}");
@@ -546,25 +544,20 @@ fn extract_body(body: &[u8]) -> Result<String, String> {
     };
     let mut extract = web_command(&binary);
     extract.args(["--precision", "--markdown"]);
-    let Ok(WatchedRun { output, killed }) =
-        run_watched_bytes(&mut extract, body, Some(EXTRACT_TIMEOUT), &CancelToken::new())
+    let Ok(run) = run_watched_bytes(&mut extract, body, Some(EXTRACT_TIMEOUT), &CancelToken::new())
     else {
         return Err("fetch: trafilatura could not be run".to_string());
     };
-    let text = combined_output(&output);
-    Ok(if killed.is_some() {
-        timeout_text(&text, EXTRACT_TIMEOUT)
-    } else if !output.status.success() {
-        command_text_inline(&text, output.status, false)
+    if let Some(failure) = watched_failure(&run, EXTRACT_TIMEOUT) {
+        return Ok(failure);
+    }
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    Ok(if stdout.trim().is_empty() {
+        "fetch: no content extracted; the page may need JavaScript or have no \
+         article body. retry with raw=true for the unprocessed response"
+            .to_string()
     } else {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim().is_empty() {
-            "fetch: no content extracted; the page may need JavaScript or have no \
-             article body. retry with raw=true for the unprocessed response"
-                .to_string()
-        } else {
-            body_text(stdout.as_bytes())
-        }
+        body_text(stdout.as_bytes())
     })
 }
 

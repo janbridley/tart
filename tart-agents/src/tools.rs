@@ -671,6 +671,20 @@ enum KillReason {
     Cancelled,
 }
 
+/// A reaped child's failure as content: a kill marked as the timeout it was,
+/// any other bad exit carrying its own combined output. `None` on success,
+/// where the caller renders what the child actually produced.
+fn watched_failure(run: &WatchedRun, timeout: Duration) -> Option<String> {
+    let text = combined_output(&run.output);
+    if run.killed.is_some() {
+        Some(timeout_text(&text, timeout))
+    } else if !run.output.status.success() {
+        Some(command_text_inline(&text, run.output.status, false))
+    } else {
+        None
+    }
+}
+
 /// Model-facing explanation for a command the timeout killed.
 // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-semantics.ts#L105>
 fn timeout_text(text: &str, timeout: Duration) -> String {
