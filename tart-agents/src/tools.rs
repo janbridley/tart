@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write as _};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -750,12 +750,12 @@ pub fn bounded(text: String, cap: usize) -> String {
     )
 }
 
-/// Spawn `command` in its own process group with piped output and no input,
-/// returning the child and its group id.
-fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)> {
+/// Spawn `command` in its own process group with piped output, returning the
+/// child and its group id, with stdin piped only when `piped` asks.
+fn spawn_grouped(command: &mut Command, piped: bool) -> io::Result<(std::process::Child, Pid)> {
     command
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if piped { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn()?;
@@ -777,8 +777,30 @@ fn run_watched(
     deadline: Option<Duration>,
     cancel: &CancelToken,
 ) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command)?;
+    let (child, group) = spawn_grouped(command, false)?;
+    watched(child, group, None, deadline, cancel)
+}
 
+/// [`run_watched`], with `input` written to the command's stdin first.
+fn run_watched_bytes(
+    command: &mut Command,
+    input: &[u8],
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> io::Result<WatchedRun> {
+    let (child, group) = spawn_grouped(command, true)?;
+    watched(child, group, Some(input), deadline, cancel)
+}
+
+/// The shared watchdog and reap: `input`, when there is one, reaches the
+/// child's stdin while the deadline already runs.
+fn watched(
+    mut child: std::process::Child,
+    group: Pid,
+    input: Option<&[u8]>,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> io::Result<WatchedRun> {
     // The watchdog's kill reason, when it killed: sent before the kill lands
     // and read after the watchdog joins, so a killed group is never mistaken
     // for a natural exit.
@@ -808,6 +830,10 @@ fn run_watched(
             }
         }
     });
+
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let _ = stdin.write_all(input);
+    }
 
     let output = child.wait_with_output();
     drop(finished);
@@ -1528,6 +1554,15 @@ mod tests {
     }
 
     /// These drive `run_watched` with plain commands, so they run without the sandbox
+    #[test]
+    fn run_watched_bytes_feeds_stdin_and_collects_stdout() {
+        let mut command = Command::new("/bin/cat");
+        let run = run_watched_bytes(&mut command, b"through the pipe", None, &CancelToken::new())
+            .unwrap();
+        assert!(run.output.status.success());
+        assert_eq!(run.output.stdout, b"through the pipe");
+    }
+
     #[test]
     fn run_watched_kills_a_command_that_outruns_the_deadline() {
         let mut command = Command::new("/bin/sleep");

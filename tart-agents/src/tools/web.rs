@@ -2,9 +2,9 @@
 //!
 //! These are the only tools that run **outside** the seatbelt sandbox.
 //! `search` shells out to the locally installed ddgs CLI, which writes
-//! structured JSON we only render. `fetch` speaks http itself: pages go
-//! through the `r.jina.ai` reader, PDFs to poppler's text layer and
-//! tesseract's OCR, and no HTML is ever parsed here.
+//! structured JSON we only render. `fetch` speaks http itself: pages are
+//! extracted by the locally installed trafilatura CLI, PDFs go to poppler's
+//! text layer and tesseract's OCR, and no HTML is ever parsed here.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -24,7 +24,7 @@ use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
     CancelToken, WatchedRun, combined_output, command_text_inline, misuse, parse_arguments,
-    preview_first_chars, run_watched, string_field, timeout_text, tool, traced,
+    preview_first_chars, run_watched, run_watched_bytes, string_field, timeout_text, tool, traced,
 };
 use crate::Progress;
 
@@ -74,8 +74,8 @@ const RAW_MAX_CHARS: usize = 2_000_000;
 /// The budget for every poppler/tesseract stage of one PDF.
 const PDF_TIMEOUT: Duration = Duration::from_secs(150);
 
-/// The reader service: it renders a page as markdown before we see it.
-const READER: &str = "https://r.jina.ai/";
+/// The extractor stage's budget: Python startup and an lxml parse, atop the client's HTTP deadline.
+const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A browser-ish `User-Agent`.
 ///
@@ -123,11 +123,12 @@ pub(crate) fn search() -> Option<Tool> {
 fn fetch_definition() -> Tool {
     tool(
         "fetch",
-        "Read one web page as markdown (title, source url, then the text) through the \
-        r.jina.ai reader service, which strips scripts, styles, and markup. When the \
-        reader errors (i.e. rate limit or auth) retry with raw=true, which fetches the URL \
-        directly and suits JSON or plain-text endpoints. PDF urls (papers, product \
-        datasheets, scanned documents) are detected and read natively instead.\
+        "Read one web page as markdown, extracted automatically by the \
+        trafilatura CLI (article body, without boilerplate, retaining comments).\
+        An empty extraction \
+        usually means the page needs JavaScript: retry with raw=true, which fetches \
+        the URL directly and suits JSON or plain-text endpoints. PDF urls (papers, \
+        product datasheets, scanned documents) are detected and read natively instead.\
         Runs outside the sandbox, so it has network \
         access but cannot read or write files; refuses non-public hosts",
         serde_json::json!({
@@ -136,7 +137,7 @@ fn fetch_definition() -> Tool {
                 "url": {"type": "string", "description": "The absolute http(s) URL to read"},
                 "raw": {
                     "type": "boolean",
-                    "description": "Fetch the URL directly instead of through the reader; default false"
+                    "description": "Fetch the URL directly with no extraction; default false"
                 }
             },
             "required": ["url"]
@@ -189,7 +190,7 @@ pub(super) fn parse_search(arguments: &str) -> anyhow::Result<Search> {
 pub(super) struct Fetch {
     /// The URL to read, validated before anything runs.
     pub url: String,
-    /// Fetch the URL directly rather than through the reader service.
+    /// Fetch the URL directly with no local extraction.
     pub raw: bool,
 }
 
@@ -215,6 +216,20 @@ fn search_binary() -> Option<PathBuf> {
         .chain(installed)
         .find(|path| is_executable(path))
         .or_else(|| find_on_path(SEARCH_DEFAULT))
+}
+
+/// Locate the extractor CLI.
+///
+/// The `TART_READER_BIN` override, `~/.local/bin/trafilatura`, then `PATH`.
+fn reader_binary() -> Option<PathBuf> {
+    let pinned = std::env::var_os("TART_READER_BIN").map(PathBuf::from);
+    let installed =
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/trafilatura"));
+    pinned
+        .into_iter()
+        .chain(installed)
+        .find(|path| is_executable(path))
+        .or_else(|| find_on_path("trafilatura"))
 }
 
 /// The first executable `name` on `PATH`, if any.
@@ -440,6 +455,8 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 /// process. The build result is cached beside the client, so a failed build
 /// reports the same error every time rather than panicking a lock. Nothing
 /// here can be const: building spawns a thread and installs the TLS provider.
+/// The blocking client hosts its own runtime and panics inside an async one,
+/// so fetch only ever runs on plain threads, never the agent's.
 static FETCH_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     // Register a cryptography backend, otherwise reqwest rustls-no-provider panics.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -518,17 +535,54 @@ fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
-/// One reader fetch: the reader renders the page as markdown, and its error
-/// bodies stay content the model can act on, so http errors are not raised.
-fn read_page(client: &Client, url: &str) -> Result<String, String> {
-    let mut request = client.get(format!("{READER}{url}"));
-    if let Some(key) = std::env::var_os("TART_JINA_KEY") {
-        request = request.bearer_auth(key.to_string_lossy());
+/// One downloaded PDF as text: the poppler ladder reads the body from a file.
+fn pdf_from_body(body: &[u8]) -> String {
+    let pdf = temp_path("fetch", "pdf");
+    let text = std::fs::write(&pdf, body)
+        .map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
+    let _ = std::fs::remove_file(&pdf);
+    text
+}
+
+/// One downloaded page as markdown: the body to the local trafilatura CLI on
+/// stdin, failures as content for the model; PDF bytes go to poppler instead.
+fn extract_body(body: &[u8]) -> Result<String, String> {
+    if is_pdf(body) {
+        return Ok(pdf_from_body(body));
     }
-    request
-        .send()
-        .and_then(reqwest::blocking::Response::text)
-        .map_err(|error| format!("error: {}", error_chain(&error)))
+    let Some(binary) = reader_binary() else {
+        return Err(
+            "fetch: no trafilatura CLI found. use `raw=true` to fetch the page directly"
+                .to_string(),
+        );
+    };
+    let mut extract = web_command(&binary);
+    extract.args(["--precision", "--markdown"]);
+    let Ok(WatchedRun { output, killed }) =
+        run_watched_bytes(&mut extract, body, Some(EXTRACT_TIMEOUT), &CancelToken::new())
+    else {
+        return Err("fetch: trafilatura could not be run".to_string());
+    };
+    let text = combined_output(&output);
+    Ok(if killed.is_some() {
+        timeout_text(&text, EXTRACT_TIMEOUT)
+    } else if !output.status.success() {
+        command_text_inline(&text, output.status, false)
+    } else {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            "fetch: no content extracted; the page may need JavaScript or have no \
+             article body. retry with raw=true for the unprocessed response"
+                .to_string()
+        } else {
+            body_text(stdout.as_bytes())
+        }
+    })
+}
+
+/// One reader fetch: downloaded under raw mode's protections, then extracted locally.
+fn extract_page(client: &Client, url: &str) -> Result<String, String> {
+    download(client, url).and_then(|body| extract_body(&body))
 }
 
 /// A fetched non-PDF body as inline text, at the streaming cap's bound.
@@ -726,25 +780,20 @@ impl<'a> Pages<'a> {
 
 /// One fetch's content: raw and PDF-hinted urls download first so the body
 /// can be sniffed and, for PDFs, extracted; every other url, and a hint that
-/// proved wrong, is the reader's to render.
+/// proved wrong, is the local extractor's to render.
 fn fetch_body(fetch: &Fetch, url: &str, client: &Client) -> Result<String, String> {
     if !fetch.raw && !url_hints_pdf(url) {
-        return read_page(client, url);
+        return extract_page(client, url);
     }
     let body = download(client, url)?;
     if is_pdf(&body) {
-        // The poppler and tesseract ladder reads the body from a file.
-        let pdf = temp_path("fetch", "pdf");
-        let text = std::fs::write(&pdf, &body)
-            .map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
-        let _ = std::fs::remove_file(&pdf);
-        Ok(text)
+        Ok(pdf_from_body(&body))
     } else if fetch.raw {
         // Raw bodies are content.
         Ok(body_text(&body))
     } else {
-        // A hinted non-PDF was a guess, so the reader takes it instead.
-        read_page(client, url)
+        // A hinted non-PDF was a guess, so the extractor takes it instead.
+        extract_body(&body)
     }
 }
 
@@ -1271,6 +1320,28 @@ mod tests {
             text.chars().take(400).collect::<String>()
         );
         assert!(text.contains("--- page 8 ---"));
+    }
+
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn extract_page_extracts_through_a_local_cli() {
+        let stub = temp_path("fetch", "sh");
+        std::fs::write(&stub, "#!/bin/sh\ncat >/dev/null\nprintf '# Title'").unwrap();
+        let mut mode = std::fs::metadata(&stub).unwrap().permissions();
+        mode.set_mode(0o700);
+        std::fs::set_permissions(&stub, mode).unwrap();
+        let client = FETCH_CLIENT.clone().unwrap();
+        let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_string());
+        unsafe { std::env::set_var("TART_READER_BIN", &stub) };
+        let extracted = extract_page(&client, &format!("http://{address}/x")).unwrap();
+        let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_string());
+        unsafe { std::env::set_var("TART_READER_BIN", "/usr/bin/true") };
+        let empty = extract_page(&client, &format!("http://{address}/x")).unwrap();
+        unsafe { std::env::remove_var("TART_READER_BIN") };
+        let _ = std::fs::remove_file(&stub);
+
+        assert_eq!(extracted, "# Title");
+        assert!(empty.contains("raw=true"), "{empty}");
     }
 
     #[test]
