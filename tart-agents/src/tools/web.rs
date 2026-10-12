@@ -7,9 +7,9 @@
 //! text layer and tesseract's OCR, and no HTML is ever parsed here.
 
 use std::ffi::OsString;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, ToSocketAddrs};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -145,7 +145,7 @@ fn fetch_definition() -> Tool {
     )
 }
 
-/// The fetch tool; the transport is in-process, so it is always available.
+/// The fetch tool; always offered, though reading as markdown needs the extractor CLI.
 #[must_use]
 pub(crate) fn fetch() -> Tool {
     fetch_definition()
@@ -538,8 +538,17 @@ fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
 /// One downloaded PDF as text: the poppler ladder reads the body from a file.
 fn pdf_from_body(body: &[u8]) -> String {
     let pdf = temp_path("fetch", "pdf");
-    let text = std::fs::write(&pdf, body)
-        .map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
+    // `create_new` refuses pre-planted names, and 0600 keeps the file private until
+    // poppler reads it.
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&pdf)?;
+        file.write_all(body)
+    })();
+    let text = written.map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
     let _ = std::fs::remove_file(&pdf);
     text
 }
@@ -1326,7 +1335,7 @@ mod tests {
     #[test]
     fn extract_page_extracts_through_a_local_cli() {
         let stub = temp_path("fetch", "sh");
-        std::fs::write(&stub, "#!/bin/sh\ncat >/dev/null\nprintf '# Title'").unwrap();
+        std::fs::write(&stub, "#!/bin/sh\nprintf '# ';cat").unwrap();
         let mut mode = std::fs::metadata(&stub).unwrap().permissions();
         mode.set_mode(0o700);
         std::fs::set_permissions(&stub, mode).unwrap();
@@ -1340,7 +1349,7 @@ mod tests {
         unsafe { std::env::remove_var("TART_READER_BIN") };
         let _ = std::fs::remove_file(&stub);
 
-        assert_eq!(extracted, "# Title");
+        assert_eq!(extracted, "# abc");
         assert!(empty.contains("raw=true"), "{empty}");
     }
 

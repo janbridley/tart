@@ -781,7 +781,9 @@ fn run_watched(
     watched(child, group, None, deadline, cancel)
 }
 
-/// [`run_watched`], with `input` written to the command's stdin first.
+/// [`run_watched`], with `input` written to the command's stdin first. Set a
+/// deadline: the write outruns stdout draining, and only the deadline breaks a
+/// child that fills its pipe before its stdin ends.
 fn run_watched_bytes(
     command: &mut Command,
     input: &[u8],
