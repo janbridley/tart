@@ -546,7 +546,7 @@ impl<B: Backend> Agent<B> {
                         tools::CONTENT_CAP / 1024
                     )));
                 }
-                let bounded = tools::bounded(output, tools::CONTENT_CAP);
+                let bounded = tools::bounded(&output, tools::CONTENT_CAP);
                 exchanges.push((call, bounded));
             }
             // A round cut short before its first executed call records no

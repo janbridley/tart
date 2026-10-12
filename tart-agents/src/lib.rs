@@ -23,7 +23,7 @@ pub use session::{CHAT_PROJECT, SESSIONS_ROOT, Session};
 pub use agent::{Agent, ChatMode, TurnHandle};
 pub use agents::{AGENT_TOOL, AgentId, Agents, MAIN, MAX_SUBAGENTS, Outcome};
 
-pub use tools::{CONTENT_CAP, CancelToken, head_cap, manual_command};
+pub use tools::{CONTENT_CAP, CancelToken, bounded, manual_command};
 
 /// Most model rounds one generation may take before giving up.
 ///
