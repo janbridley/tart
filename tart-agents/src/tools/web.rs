@@ -3,9 +3,12 @@
 //! These are the only tools that run **outside** the seatbelt sandbox.
 //! Processing stays out of Rust where it can: ddgs writes structured JSON we
 //! only render, and the r.jina.ai reader turns a page into markdown before
-//! curl hands it back, so no HTML is ever parsed here.
+//! curl hands it back, so no HTML is ever parsed here. `fetch` automatically detects if
+//! a read file is a PDF an parses it, using `poppler` if it is pre-OCR'd and
+//! `tesseract` if manual OCR is required.
 
 use std::ffi::OsString;
+use std::io::Read as _;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -17,7 +20,7 @@ use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
     CancelToken, WatchedRun, combined_output, command_text_inline, misuse, parse_arguments,
-    run_watched, string_field, timeout_text, tool, traced,
+    preview_first_chars, run_watched, string_field, timeout_text, tool, traced,
 };
 use crate::Progress;
 
@@ -43,6 +46,28 @@ const DEFAULT_SEARCH_RESULTS: u64 = 8;
 
 /// Most results one search may return; more is noise the model cannot use.
 const MAX_SEARCH_RESULTS: u64 = 25;
+
+/// Pages one fetch will read from a PDF.
+const PDF_MAX_PAGES: usize = 60;
+
+/// Thin (probably scanned) pages one fetch will OCR, at roughly 1.5s each.
+const PDF_OCR_PAGES: usize = 20;
+
+/// Fewer alphanumerics than this in a page's text layer marks it scanned.
+const PDF_MIN_ALNUM: usize = 40;
+
+/// Characters of one PDF the model is handed, pages kept whole where they fit.
+const PDF_MAX_CHARS: usize = 120_000;
+
+/// Bytes curl may fetch to a file.
+const PDF_MAX_DOWNLOAD: &str = "33554432";
+
+/// Characters of a non-PDF raw body handed back inline, the streaming cap's
+/// equivalent now that bodies land in a file first.
+const RAW_MAX_CHARS: usize = 2_000_000;
+
+/// The budget for every poppler/tesseract stage of one PDF.
+const PDF_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// The reader service: it renders a page as markdown so curl hands back text.
 const READER: &str = "https://r.jina.ai/";
@@ -102,8 +127,10 @@ fn fetch_definition() -> Tool {
         "Read one web page as markdown (title, source url, then the text) through the \
         r.jina.ai reader service, which strips scripts, styles, and markup. When the \
         reader errors (i.e. rate limit or auth) retry with raw=true, which fetches the URL \
-        directly and suits JSON or plain-text endpoints. Runs outside the sandbox, so it \
-        has network access but cannot read or write files; refuses non-public hosts",
+        directly and suits JSON or plain-text endpoints. PDF urls (papers, product \
+        datasheets, scanned documents) are detected and read natively instead.\
+        Runs outside the sandbox, so it has network \
+        access but cannot read or write files; refuses non-public hosts",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -235,14 +262,13 @@ fn web_command(binary: PathBuf) -> Command {
     command
 }
 
-/// A fresh path under the system temp directory for one search's results.
-///
-/// ddgs writes structured results only to a file, never to stdout; the counter
-/// keeps concurrent searches apart without adding a dependency.
-fn results_path() -> PathBuf {
+/// A fresh path under the system temp directory for one call's scratch file:
+/// a search's ddgs results (ddgs writes them only to a file), a fetched body,
+/// or a rendered page image.
+fn temp_path(tool: &str, extension: &str) -> PathBuf {
     static CALLS: AtomicU64 = AtomicU64::new(0);
     let call = CALLS.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tart-search-{}-{call}.json", std::process::id()))
+    std::env::temp_dir().join(format!("tart-{tool}-{}-{call}.{extension}", std::process::id()))
 }
 
 /// The ddgs argv for one search: the subcommand, the query as a single argv
@@ -280,7 +306,7 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
                 .to_string();
             return (text.clone(), text, None);
         };
-        let results = results_path();
+        let results = temp_path("search", "json");
         let mut ddgs = web_command(binary);
         ddgs.args(ddgs_args(&search, &results));
         let outcome = run_watched(&mut ddgs, Some(SEARCH_TIMEOUT), &CancelToken::new());
@@ -420,61 +446,257 @@ fn is_global(ip: IpAddr) -> bool {
     }
 }
 
-/// The curl argv for one fetch.
+/// The curl argv every fetch starts with, as a shell line.
 ///
-/// `-q` comes first so a `~/.curlrc` cannot add flags of its own. Reader mode
-/// omits `-f` because the reader's error bodies are content the model can act
-/// on; raw mode takes it, plus the protocols held across redirects, a browser
-/// `User-Agent` (sites 403 curl's own), and the final-URL trailer.
-fn fetch_args(fetch: &Fetch, url: &str) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec![
-        "-q".into(),
-        "-sS".into(),
-        "-L".into(),
-        "--max-redirs".into(),
-        "5".into(),
-        "--connect-timeout".into(),
-        "10".into(),
-        "--max-time".into(),
-        CURL_MAX_TIME.into(),
-        "--compressed".into(),
-    ];
-    if fetch.raw {
+/// `-q` first so a `~/.curlrc` cannot add flags of its own, then the quiet, bounded,
+/// redirect-following rest.
+fn curl_args() -> Vec<OsString> {
+    format!("-q -sS -L --max-redirs 5 --connect-timeout 10 --max-time {CURL_MAX_TIME} --compressed")
+        .split(' ')
+        .map(OsString::from)
+        .collect()
+}
+
+/// The curl argv for one reader fetch.
+fn reader_args(url: &str) -> Vec<OsString> {
+    let mut args = curl_args();
+    if let Some(key) = std::env::var_os("TART_JINA_KEY") {
         args.extend([
-            "-f".into(),
-            "--proto".into(),
-            "=http,https".into(),
-            "--proto-redir".into(),
-            "=http,https".into(),
-            "--max-filesize".into(),
-            "2000000".into(),
-            "-A".into(),
-            USER_AGENT.into(),
-            "-w".into(),
-            FINAL_URL.into(),
-            "--".into(),
-            url.into(),
-        ]);
-    } else {
-        if let Some(key) = std::env::var_os("TART_JINA_KEY") {
-            args.extend([
-                "-H".into(),
-                format!("Authorization: Bearer {}", key.to_string_lossy()).into(),
-            ]);
-        }
-        args.extend([
-            "--proto".into(),
-            "=https".into(),
-            "--".into(),
-            format!("{READER}{url}").into(),
+            "-H".into(),
+            format!("Authorization: Bearer {}", key.to_string_lossy()).into(),
         ]);
     }
+    args.extend(["--proto", "=https", "--"].map(OsString::from));
+    args.push(format!("{READER}{url}").into());
     args
+}
+
+/// The curl argv for one download to `path`.
+///
+/// Raw mode's protections, a size cap that admits papers, and `-o` so the body arrives
+/// as bytes we can sniff rather than as lossy text on stdout.
+fn download_args(url: &str, path: &Path) -> Vec<OsString> {
+    let mut args = curl_args();
+    args.extend(
+        "-f --proto =http,https --proto-redir =http,https --max-filesize"
+            .split(' ')
+            .map(OsString::from),
+    );
+    args.extend([PDF_MAX_DOWNLOAD, "-A", USER_AGENT, "-w", FINAL_URL].map(OsString::from));
+    args.extend(["-o".into(), path.as_os_str().to_owned(), "--".into(), url.into()]);
+    args
+}
+
+/// Whether a url's path looks like a PDF: a `.pdf`-named leaf or path segment.
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "the leaf is lowercased first, so the extension test is already case-insensitive"
+)]
+fn url_hints_pdf(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let leaf = path.rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
+    leaf.ends_with(".pdf") || path.split('/').any(|seg| seg.eq_ignore_ascii_case("pdf"))
+}
+
+/// Whether a downloaded file starts like a PDF, within the leading kilobyte a
+/// damaged-but-readable file may pad with junk before the `%PDF-` header.
+fn is_pdf(path: &Path) -> bool {
+    let mut head = [0; 1024];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .unwrap_or(0);
+    head[..read].windows(5).any(|window| window == b"%PDF-")
+}
+
+/// Run one curl download to a file, handing back its path or the framed failure text.
+fn download(binary: &Path, url: &str) -> Result<PathBuf, (String, String, Option<i32>)> {
+    let body = temp_path("fetch", "pdf");
+    let mut curl = web_command(binary.to_path_buf());
+    curl.args(download_args(url, &body));
+    let failure = match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
+        Err(error) => Some((format!("error: {error}"), None)),
+        Ok(WatchedRun { output, killed }) if killed.is_some() => Some((
+            timeout_text(&combined_output(&output), FETCH_TIMEOUT),
+            output.status.code(),
+        )),
+        Ok(WatchedRun { output, .. }) if !output.status.success() => Some((
+            command_text_inline(&combined_output(&output), output.status, false),
+            output.status.code(),
+        )),
+        // Success: check where redirects landed before trusting the body.
+        Ok(WatchedRun { output, .. }) => {
+            let text = combined_output(&output);
+            separate_final_url(&text)
+                .and_then(|(_, final_url)| private_redirect(final_url))
+                .map(|refused| (refused, output.status.code()))
+        }
+    };
+    let Some((framed, exit)) = failure else {
+        return Ok(body);
+    };
+    let _ = std::fs::remove_file(&body);
+    Err((framed.clone(), framed, exit))
+}
+
+/// A downloaded non-PDF body as inline text, at the streaming cap's bound.
+fn body_text(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    match preview_first_chars(&String::from_utf8_lossy(&bytes), RAW_MAX_CHARS) {
+        (head, false) => head.to_string(),
+        (head, true) => format!("{head}\n[truncated: body over {RAW_MAX_CHARS} characters]"),
+    }
+}
+
+/// The page count `pdfinfo` reports, when pdfinfo and the file cooperate.
+fn page_count(pdf: &Path) -> Option<usize> {
+    let mut info = web_command(find_on_path("pdfinfo")?);
+    info.arg(pdf);
+    let run = run_watched(&mut info, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
+    String::from_utf8_lossy(&run.output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Pages:")?.trim().parse().ok())
+}
+
+/// Render one page of `pdf` to a PNG at 200 dpi and OCR it, trimmed.
+///
+/// `None` when either processing stage fails.
+fn ocr_page(pdf: &Path, page: usize, pdftoppm: &Path, tesseract: &Path) -> Option<String> {
+    let png = temp_path("fetch", "png");
+    let mut render = web_command(pdftoppm.to_path_buf());
+    render.args(format!("-singlefile -f {page} -l {page} -r 200 -png").split(' '));
+    render.arg(pdf);
+    render.arg(png.with_extension(""));
+    let rendered = run_watched(&mut render, Some(PDF_TIMEOUT), &CancelToken::new())
+        .is_ok_and(|run| run.output.status.success())
+        && std::fs::metadata(&png).is_ok();
+    let text = rendered.then(|| {
+        let mut ocr = web_command(tesseract.to_path_buf());
+        ocr.arg(&png);
+        ocr.arg("stdout");
+        let run = run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
+        run.output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&run.output.stdout).trim().to_string())
+    });
+    // The image is ours on every path, unlike the body file `download` hands back.
+    let _ = std::fs::remove_file(&png);
+    text.flatten()
+}
+
+/// Extract one PDF for the model: poppler's embedded text layer, tesseract
+/// for the pages it left thin, page-marked and bounded, status in a header.
+fn pdf_text(path: &Path) -> String {
+    let Some(pdftotext) = find_on_path("pdftotext") else {
+        return "fetch: PDF detected but pdftotext is not on PATH; install poppler \
+                (brew install poppler)"
+            .to_string();
+    };
+    let mut extract = web_command(pdftotext);
+    extract.args(format!("-q -enc UTF-8 -l {PDF_MAX_PAGES}").split(' '));
+    extract.arg(path);
+    extract.arg("-");
+    let Ok(WatchedRun { output, .. }) =
+        run_watched(&mut extract, Some(PDF_TIMEOUT), &CancelToken::new())
+    else {
+        return "fetch: pdftotext could not be run".to_string();
+    };
+    if !output.status.success() {
+        return format!("fetch: pdftotext failed:\n{}", combined_output(&output));
+    }
+    let mut pages: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split('\u{c}')
+        .map(|page| page.trim().to_string())
+        .collect();
+    if pages.last().is_some_and(String::is_empty) {
+        pages.pop();
+    }
+    // Only OCR if the pages appear empty
+    let (pdftoppm, tesseract) = (find_on_path("pdftoppm"), find_on_path("tesseract"));
+    let (mut ocr, mut failed, mut skipped) = (0, 0, 0);
+    for (index, page) in pages.iter_mut().enumerate() {
+        if page.chars().filter(|c| c.is_alphanumeric()).count() >= PDF_MIN_ALNUM {
+            continue;
+        }
+        if let (Some(pdftoppm), Some(tesseract)) = (&pdftoppm, &tesseract)
+            && ocr + failed < PDF_OCR_PAGES
+        {
+            match ocr_page(path, index + 1, pdftoppm, tesseract) {
+                Some(text) => {
+                    *page = text;
+                    ocr += 1;
+                }
+                None => failed += 1,
+            }
+        } else {
+            // No stack, or the cap reached: the thin layer is all we have.
+            skipped += 1;
+        }
+    }
+    let total = page_count(path).unwrap_or(pages.len());
+    render_pdf(&pages, total, ocr, failed, skipped)
+}
+
+/// The page-marked, bounded rendering of one PDF:
+///
+/// Return is a `[pdf: ...]` header containing a status, then `--- page N ---` bodies.
+fn render_pdf(pages: &[String], total: usize, ocr: usize, failed: usize, skipped: usize) -> String {
+    let scanned = ocr + failed + skipped;
+    let mut parts = vec![match (scanned, ocr + failed) {
+        (0, _) => "embedded text".to_string(),
+        (_, 0) => "no text layer; install tesseract (brew) to OCR it".to_string(),
+        _ if scanned == pages.len() => format!("scanned: {ocr} pages OCR'd"),
+        _ => format!("embedded text on {}, {ocr} OCR'd", pages.len() - scanned),
+    }];
+    if failed > 0 {
+        parts.push(format!("({failed} OCR failed)"));
+    }
+    // Leftover pages only count against the cap when a stack ran at all; with
+    // none installed, the source line already says so.
+    if skipped > 0 && ocr + failed > 0 {
+        parts.push(format!("({skipped} scanned pages left: OCR cap)"));
+    }
+    let mut body = String::new();
+    let mut shown = 0;
+    let mut cut = false;
+    let budget = PDF_MAX_CHARS.saturating_sub(160);
+    for (index, page) in pages.iter().enumerate() {
+        let text = if page.is_empty() {
+            "(no text extracted)"
+        } else {
+            page.as_str()
+        };
+        let marked = format!("\n--- page {} ---\n{text}", index + 1);
+        // Keep whole pages while they fit; a first page too big for the whole
+        // budget is cut on a character boundary rather than dropped.
+        if body.len() + marked.len() > budget {
+            if shown == 0 {
+                let (head, _) = preview_first_chars(&marked, budget);
+                body.push_str(head);
+                shown = 1;
+                cut = true;
+            }
+            break;
+        }
+        body.push_str(&marked);
+        shown += 1;
+    }
+    let note = if cut || shown < pages.len() {
+        format!("; first {shown} of {total} pages shown (character cap)")
+    } else if shown < total {
+        format!("; first {shown} of {total} pages shown (page cap)")
+    } else {
+        String::new()
+    };
+    format!("[pdf: {total} pages, {}{note}]\n{body}", parts.join(" "))
 }
 
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
-/// Like `search` this runs outside the sandbox.
+/// Like `search` this runs outside the sandbox. Raw fetches, and any url that
+/// hints at a PDF, land in a file first so the body can be sniffed: a PDF
+/// becomes local poppler/tesseract extraction, anything else the text it
+/// always was.
 pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
     let fetch = match parse_fetch(&call.arguments) {
         Ok(fetch) => fetch,
@@ -490,8 +712,26 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
             Ok(url) => url,
             Err(text) => return (text.clone(), text, None),
         };
+        if fetch.raw || url_hints_pdf(&url) {
+            match download(&binary, &url) {
+                Ok(path) => {
+                    let text = if is_pdf(&path) {
+                        Some(pdf_text(&path))
+                    } else {
+                        // Raw bodies are content; a hinted non-PDF was a guess,
+                        // so the reader takes that one instead.
+                        fetch.raw.then(|| body_text(&path))
+                    };
+                    let _ = std::fs::remove_file(&path);
+                    if let Some(text) = text {
+                        return (text.clone(), text, Some(0));
+                    }
+                }
+                Err((framed, text, exit)) => return (framed, text, exit),
+            }
+        }
         let mut curl = web_command(binary);
-        curl.args(fetch_args(&fetch, &url));
+        curl.args(reader_args(&url));
         match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
             Err(error) => {
                 let text = format!("error: {error}");
@@ -504,20 +744,7 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
             Ok(WatchedRun { output, .. }) => {
                 let exit = output.status.code();
                 let text = combined_output(&output);
-                if !output.status.success() {
-                    return (command_text_inline(&text, output.status, false), text, exit);
-                }
-                // Success: split and check where redirects landed.
-                if let Some((body, final_url)) = separate_final_url(&text) {
-                    if let Some(refused) = private_redirect(final_url) {
-                        (refused.clone(), refused, exit)
-                    } else {
-                        let text = body.to_string();
-                        (command_text_inline(&text, output.status, false), text, exit)
-                    }
-                } else {
-                    (command_text_inline(&text, output.status, false), text, exit)
-                }
+                (command_text_inline(&text, output.status, false), text, exit)
             }
         }
     })
@@ -810,13 +1037,12 @@ mod tests {
     }
 
     #[test]
-    fn fetch_args_reader_mode_routes_through_the_reader() {
+    fn reader_args_route_through_the_reader() {
         // An exact argv only when no key is configured; a configured machine
         // gets one more `-H` pair and nothing else changes.
         if std::env::var_os("TART_JINA_KEY").is_some() {
             return;
         }
-        let fetch = parse_fetch(r#"{"url":"https://example.com/page"}"#).unwrap();
         let expected: Vec<OsString> = vec![
             "-q".into(),
             "-sS".into(),
@@ -834,12 +1060,11 @@ mod tests {
             "https://r.jina.ai/https://example.com/page".into(),
         ];
 
-        assert_eq!(fetch_args(&fetch, "https://example.com/page"), expected);
+        assert_eq!(reader_args("https://example.com/page"), expected);
     }
 
     #[test]
-    fn fetch_args_raw_mode_hits_the_url_directly() {
-        let fetch = parse_fetch(r#"{"url":"https://example.com/x","raw":true}"#).unwrap();
+    fn download_args_fetch_to_a_file() {
         let expected: Vec<OsString> = vec![
             "-q".into(),
             "-sS".into(),
@@ -857,16 +1082,148 @@ mod tests {
             "--proto-redir".into(),
             "=http,https".into(),
             "--max-filesize".into(),
-            "2000000".into(),
+            PDF_MAX_DOWNLOAD.into(),
             "-A".into(),
             USER_AGENT.into(),
             "-w".into(),
             FINAL_URL.into(),
+            "-o".into(),
+            "/tmp/tart-fetch.pdf".into(),
             "--".into(),
-            "https://example.com/x".into(),
+            "https://arxiv.org/pdf/2401.14196".into(),
         ];
 
-        assert_eq!(fetch_args(&fetch, "https://example.com/x"), expected);
+        assert_eq!(
+            download_args(
+                "https://arxiv.org/pdf/2401.14196",
+                Path::new("/tmp/tart-fetch.pdf")
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn url_hints_pdf_matches_pdf_leaves_and_segments() {
+        for url in [
+            "https://dl.dell.com/manuals/x/powerconnect-5548_setup%20guide2_en-us.pdf",
+            "https://arxiv.org/pdf/2401.14196",
+            "https://arxiv.org/pdf/2401.14196v2.pdf",
+            "https://openreview.net/pdf?id=V6E3Yd6iic",
+            "https://example.com/paper.PDF",
+            "https://example.com/download.pdf?version=2",
+        ] {
+            assert!(url_hints_pdf(url), "expected a hint: {url}");
+        }
+
+        for url in [
+            "https://example.com/",
+            "https://example.com/pdf-tutorial",
+            "https://example.com/lib/pdfjs/reader",
+            "https://arxiv.org/abs/2401.14196",
+        ] {
+            assert!(!url_hints_pdf(url), "expected no hint: {url}");
+        }
+    }
+
+    #[test]
+    fn is_pdf_sniffs_the_magic_bytes() {
+        let pdf = std::env::temp_dir().join("tart-test-magic.pdf");
+        std::fs::write(&pdf, b"%PDF-1.7\nrest is opaque\n").unwrap();
+        assert!(is_pdf(&pdf));
+
+        std::fs::write(&pdf, b"<html>not a pdf</html>").unwrap();
+        assert!(!is_pdf(&pdf));
+
+        std::fs::write(&pdf, b"junk-before-header\n%PDF-1.4\n").unwrap();
+        assert!(is_pdf(&pdf));
+
+        let _ = std::fs::remove_file(&pdf);
+        assert!(!is_pdf(&pdf));
+    }
+
+    #[test]
+    fn render_pdf_marks_pages_and_reports_status() {
+        let pages = vec!["Dell PowerConnect 5548".to_string(), "Page two".to_string()];
+        let rendered = render_pdf(&pages, 2, 0, 0, 0);
+
+        assert_eq!(rendered.lines().next().unwrap(), "[pdf: 2 pages, embedded text]");
+        assert!(rendered.contains("\n--- page 1 ---\nDell PowerConnect 5548"));
+        assert!(rendered.contains("\n--- page 2 ---\nPage two"));
+
+        // All pages thin, none OCR'd: the honest install hint, not silence.
+        let thin = vec![String::new(), String::new()];
+        let rendered = render_pdf(&thin, 2, 0, 0, 2);
+        assert!(rendered.contains("no text layer; install tesseract"));
+        assert!(rendered.contains("--- page 1 ---\n(no text extracted)"));
+
+        // Scanned and OCR'd, one page left over the cap.
+        let scanned: Vec<String> = (0..4).map(|_| "scanned".to_string()).collect();
+        let rendered = render_pdf(&scanned, 4, 3, 0, 1);
+        assert!(rendered.contains("scanned: 3 pages OCR'd (1 scanned pages left: OCR cap)"));
+
+        // Truncation is page-aligned and said so in the header.
+        let big: Vec<String> = (0..30).map(|_| "x".repeat(6_000)).collect();
+        let rendered = render_pdf(&big, 30, 0, 0, 0);
+        assert!(rendered.contains("; first 19 of 30 pages shown (character cap)"));
+        assert!(!rendered.contains("--- page 20 ---"));
+    }
+
+    /// One of the real PDFs dropped in the workspace root, when present.
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(name)
+    }
+
+    #[test]
+    fn pdf_text_extracts_the_dell_guide_text_layer() {
+        let pdf = fixture(
+            "all-products_esuprt_ser_stor_net_esuprt_powerconnect_powerconnect-5548_setup%20guide2_en-us.pdf",
+        );
+        if !pdf.is_file() || find_on_path("pdftotext").is_none() {
+            return;
+        }
+
+        let text = pdf_text(&pdf);
+
+        assert!(text.starts_with("[pdf: 14 pages, embedded text]"), "{text}");
+        assert!(text.contains("--- page 1 ---"), "{text}");
+        assert!(text.contains("PowerConnect"), "{text}");
+        assert!(text.contains("CAUTION"), "{text}");
+    }
+
+    /// Whether tesseract can actually load its language data, so the OCR test
+    /// runs only where OCR can.
+    fn ocr_ready() -> bool {
+        let Some(tesseract) = find_on_path("tesseract") else {
+            return false;
+        };
+        let mut probe = web_command(tesseract);
+        probe.arg("--list-langs");
+        run_watched(&mut probe, Some(Duration::from_secs(10)), &CancelToken::new())
+            .is_ok_and(|run| run.output.status.success())
+    }
+
+    /// Live: OCRs eight scanned pages, so it needs tesseract with its language
+    /// data and the patience for ~20 seconds.
+    #[test]
+    fn pdf_text_ocrs_the_scanned_mailing() {
+        let pdf = fixture("PublicWaterMassMailing.pdf");
+        if !pdf.is_file() || !ocr_ready() {
+            return;
+        }
+
+        let text = pdf_text(&pdf);
+
+        assert!(
+            text.starts_with("[pdf: 8 pages, scanned: 8 pages OCR'd]"),
+            "{}",
+            text.chars().take(400).collect::<String>()
+        );
+        assert!(
+            text.contains("Missouri"),
+            "{}",
+            text.chars().take(400).collect::<String>()
+        );
+        assert!(text.contains("--- page 8 ---"));
     }
 
     #[test]
@@ -990,6 +1347,46 @@ mod tests {
                 Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { exit: Some(0), .. }
             ] if name == "fetch" && arguments == r#"{"url":"https://example.com","raw":true}"#
+        ));
+    }
+
+    #[apply(skip_unless_networked!)]
+    #[test]
+    fn run_fetch_extracts_a_pdf_url_natively() {
+        let Some(_) = fetch_binary() else {
+            return;
+        };
+        if find_on_path("pdftotext").is_none() {
+            return;
+        }
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let request = call(
+            "fetch",
+            r#"{"url":"https://dl.dell.com/manuals/all-products/esuprt_ser_stor_net/esuprt_powerconnect/powerconnect-5548_setup%20guide2_en-us.pdf"}"#,
+        );
+
+        let output = execute(&request, &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
+
+        assert!(output.starts_with("[pdf: 14 pages, embedded text]"), "{output}");
+        assert!(output.contains("--- page 2 ---"), "{output}");
+        assert!(output.contains("CAUTION"), "{output}");
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                Progress::ToolStart { name, .. },
+                Progress::ToolOutput { exit: Some(0), .. }
+            ] if name == "fetch"
         ));
     }
 }
