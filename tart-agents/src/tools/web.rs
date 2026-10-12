@@ -605,27 +605,7 @@ fn pdf_text(path: &Path) -> String {
     // One form feed after the last page leaves one trailing empty chunk.
     texts.pop_if(|page| page.is_empty());
     let mut pages = Pages::new(&mut texts);
-    // Only OCR if the pages appear empty
-    let stack = find_on_path("pdftoppm").zip(find_on_path("tesseract"));
-    for (index, page) in pages.text.iter_mut().enumerate() {
-        if page.chars().filter(|c| c.is_alphanumeric()).count() >= PDF_MIN_ALNUM {
-            continue;
-        }
-        if let Some((pdftoppm, tesseract)) = stack.as_ref()
-            && pages.ocr + pages.failed < PDF_OCR_PAGES
-        {
-            match ocr_page(path, index + 1, pdftoppm, tesseract) {
-                Some(text) => {
-                    *page = text;
-                    pages.ocr += 1;
-                }
-                None => pages.failed += 1,
-            }
-        } else {
-            // No stack, or the cap reached: the thin layer is all we have.
-            pages.skipped += 1;
-        }
-    }
+    pages.ocr_thin(path);
     if let Some(total) = page_count(path) {
         pages.total = total;
     }
@@ -655,6 +635,28 @@ impl<'a> Pages<'a> {
             ocr: 0,
             failed: 0,
             skipped: 0,
+        }
+    }
+
+    /// OCR the pages the text layer left thin, in place.
+    fn ocr_thin(&mut self, pdf: &Path) {
+        let stack = find_on_path("pdftoppm").zip(find_on_path("tesseract"));
+        for (index, page) in self.text.iter_mut().enumerate() {
+            if page.chars().filter(|c| c.is_alphanumeric()).count() >= PDF_MIN_ALNUM {
+                continue;
+            }
+            if let Some((pdftoppm, tesseract)) = stack.as_ref()
+                && self.ocr + self.failed < PDF_OCR_PAGES
+            {
+                if let Some(text) = ocr_page(pdf, index + 1, pdftoppm, tesseract) {
+                    *page = text;
+                    self.ocr += 1;
+                } else {
+                    self.failed += 1;
+                }
+            } else {
+                self.skipped += 1;
+            }
         }
     }
 
