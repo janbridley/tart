@@ -125,6 +125,8 @@ fn fetch_definition() -> Tool {
         usually means the page needs JavaScript: retry with raw=true, which fetches \
         the URL directly and suits JSON or plain-text endpoints. PDF urls (papers, \
         product datasheets, scanned documents) are detected and read natively instead.\
+        GitHub file, pull, and issue urls are fetched through their plain-text\
+        and API views automatically.\
         Runs outside the sandbox, so it has network \
         access but cannot read or write files; refuses non-public hosts",
         serde_json::json!({
@@ -499,6 +501,36 @@ fn is_pdf(body: &[u8]) -> bool {
         .any(|window| window == b"%PDF-")
 }
 
+/// A stable plain-text or JSON view of a github.com page, when one exists.
+///
+/// - `github.com/{o}/{r}/blob/{ref}/{path}` -> `raw.githubusercontent.com/{o}/{r}/{ref}/{path}`
+/// - `github.com/{o}/{r}/pull/{n}` -> `api.github.com/repos/{o}/{r}/pulls/{n}`
+/// - `github.com/{o}/{r}/issues/{n}` -> `api.github.com/repos/{o}/{r}/issues/{n}`
+///
+/// `None` for every other URL, including views themselves, so rewrites apply only once.
+fn github_text_view(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    if url.host_str()? != "github.com" {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    match segments.as_slice() {
+        // A blob names a file: the raw host serves its bytes verbatim, query
+        // and fragment dropped, path segments kept percent-encoded as parsed.
+        [owner, repo, "blob", reference, path @ ..] if !path.is_empty() => Some(format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/{reference}/{}",
+            path.join("/")
+        )),
+        [owner, repo, kind @ ("pull" | "issues"), number] if number.parse::<u64>().is_ok() => {
+            Some(format!(
+                "https://api.github.com/repos/{owner}/{repo}/{}/{number}",
+                if *kind == "pull" { "pulls" } else { "issues" }
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// One fetched body, with raw mode's protections: fail on http error
 /// statuses and refuse bodies over the download cap.
 fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
@@ -593,11 +625,14 @@ fn ocr_page(pdf: &Path, page: usize, pdftoppm: &Path, tesseract: &Path) -> Optio
     let mut ocr = web_command(tesseract);
     ocr.arg(&png).arg("stdout");
     let text = if rendered {
-        let run = run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
-        run.output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&run.output.stdout).trim().to_string())
+        run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new())
+            .ok()
+            .and_then(|WatchedRun { output, .. }| {
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            })
     } else {
         None
     };
@@ -615,7 +650,7 @@ fn pdf_text(path: &Path) -> String {
             .to_string();
     };
     let mut extract = web_command(&pdftotext);
-    extract.args(format!("-q -enc UTF-8 -l {PDF_MAX_PAGES}").split(' '));
+    extract.args(format!("-enc UTF-8 -l {PDF_MAX_PAGES}").split(' '));
     extract.arg(path).arg("-");
     let Ok(WatchedRun { output, .. }) =
         run_watched(&mut extract, Some(PDF_TIMEOUT), &CancelToken::new())
@@ -786,6 +821,17 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
             // The guard is content visible to the model, not an error.
             let url = check_url(&fetch.url)?;
             let client = FETCH_CLIENT.clone()?;
+            // A github.com page whose text view exists is fetched through it,
+            // raw (the view is plain text or JSON, never HTML to extract);
+            // a view that refuses falls back to the page itself. `raw=true`
+            // skips the detour: the model asked for its URL, byte for byte.
+            if !fetch.raw
+                && let Some(view) = github_text_view(&url)
+                && let raw = (Fetch { url: view.clone(), raw: true })
+                && let Ok(text) = fetch_body(&raw, &view, &client)
+            {
+                return Ok(text);
+            }
             fetch_body(&fetch, &url, &client)
         };
         match fetched() {
@@ -1166,6 +1212,50 @@ mod tests {
             "https://arxiv.org/abs/2401.14196",
         ] {
             assert!(!url_hints_pdf(url), "expected no hint: {url}");
+        }
+    }
+
+    #[test]
+    fn github_text_view_maps_blobs_pulls_and_issues() {
+        assert_eq!(
+            github_text_view(
+                "https://github.com/glotzerlab/hoomd-workflow/blob/trunk/workflow.toml"
+            )
+            .as_deref(),
+            Some("https://raw.githubusercontent.com/glotzerlab/hoomd-workflow/trunk/workflow.toml")
+        );
+        // Deep and percent-encoded paths survive the rebuild, query drops.
+        assert_eq!(
+            github_text_view("https://github.com/o/r/blob/main/a%20b/c.toml?plain=1").as_deref(),
+            Some("https://raw.githubusercontent.com/o/r/main/a%20b/c.toml")
+        );
+        assert_eq!(
+            github_text_view("https://github.com/janbridley/tart/pull/67").as_deref(),
+            Some("https://api.github.com/repos/janbridley/tart/pulls/67")
+        );
+        assert_eq!(
+            github_text_view("https://github.com/janbridley/tart/issues/68#issuecomment-1")
+                .as_deref(),
+            Some("https://api.github.com/repos/janbridley/tart/issues/68")
+        );
+    }
+
+    #[test]
+    fn github_text_view_leaves_everything_else_alone() {
+        for url in [
+            "https://github.com/janbridley/tart",
+            "https://github.com/janbridley/tart/tree/main/src",
+            "https://github.com/janbridley/tart/pull/67/files",
+            "https://github.com/janbridley/tart/pull/67.diff",
+            "https://github.com/janbridley/tart/pulls",
+            "https://github.com/janbridley/tart/pull/not-a-number",
+            "https://github.com/janbridley/tart/blob/trunk",
+            "https://raw.githubusercontent.com/o/r/main/f",
+            "https://api.github.com/repos/o/r",
+            "https://gitlab.com/o/r/blob/main/f",
+            "https://github.com/janbridley/tart/wiki",
+        ] {
+            assert!(github_text_view(url).is_none(), "expected no view: {url}");
         }
     }
 

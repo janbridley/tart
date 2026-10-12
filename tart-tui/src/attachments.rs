@@ -67,7 +67,7 @@ fn attach(mention: &str) -> (String, String) {
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
             let kept = bounded(&contents, CONTENT_CAP);
-            let note = if kept.len() < contents.len() {
+            let note = if contents.len() > CONTENT_CAP {
                 format!("attached {mention} (truncated to {} KiB)", CONTENT_CAP / 1024)
             } else {
                 format!("attached {mention} ({} bytes)", contents.len())
