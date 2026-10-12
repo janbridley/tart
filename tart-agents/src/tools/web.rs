@@ -64,7 +64,7 @@ const PDF_HEADER_WINDOW: usize = 1024;
 
 /// Bytes one fetch will download: papers and datasheets run well past the 2MB
 /// cap old streaming fetches had, so the body bounds itself instead.
-const PDF_MAX_DOWNLOAD: usize = 32 * 1024 * 1024;
+const DOWNLOAD_CAP: usize = 32 * 1024 * 1024;
 
 /// Characters of a non-PDF body handed back inline, the streaming cap's
 /// equivalent now that bodies arrive as bytes.
@@ -236,7 +236,7 @@ fn is_executable(path: &Path) -> bool {
 /// A command for one of the web binaries: cleared like the sandboxed tools, so
 /// nothing in our environment can reach the child, with only the variables a
 /// CLI needs to run re-added.
-fn web_command(binary: PathBuf) -> Command {
+fn web_command(binary: &Path) -> Command {
     let mut command = Command::new(binary);
     command.env_clear();
     if let Some(home) = std::env::var_os("HOME") {
@@ -296,7 +296,7 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
             return (text.clone(), text, None);
         };
         let results = temp_path("search", "json");
-        let mut ddgs = web_command(binary);
+        let mut ddgs = web_command(&binary);
         ddgs.args(ddgs_args(&search, &results));
         let outcome = run_watched(&mut ddgs, Some(SEARCH_TIMEOUT), &CancelToken::new());
         // The results file is ours whatever happened: read it, then drop it.
@@ -517,11 +517,11 @@ fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("error: {}", error_chain(&error)))?;
     let mut body = Vec::new();
     response
-        .take(PDF_MAX_DOWNLOAD as u64 + 1)
+        .take(DOWNLOAD_CAP as u64 + 1)
         .read_to_end(&mut body)
         .map_err(|error| format!("error: {error}"))?;
-    if body.len() > PDF_MAX_DOWNLOAD {
-        return Err(format!("error: body over {PDF_MAX_DOWNLOAD} bytes"));
+    if body.len() > DOWNLOAD_CAP {
+        return Err(format!("error: body over {DOWNLOAD_CAP} bytes"));
     }
     Ok(body)
 }
@@ -549,7 +549,7 @@ fn body_text(body: &[u8]) -> String {
 
 /// The page count `pdfinfo` reports, when pdfinfo and the file cooperate.
 fn page_count(pdf: &Path) -> Option<usize> {
-    let mut info = web_command(find_on_path("pdfinfo")?);
+    let mut info = web_command(&find_on_path("pdfinfo")?);
     info.arg(pdf);
     let run = run_watched(&mut info, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
     String::from_utf8_lossy(&run.output.stdout)
@@ -562,7 +562,7 @@ fn page_count(pdf: &Path) -> Option<usize> {
 /// `None` when either processing stage fails.
 fn ocr_page(pdf: &Path, page: usize, pdftoppm: &Path, tesseract: &Path) -> Option<String> {
     let png = temp_path("fetch", "png");
-    let mut render = web_command(pdftoppm.to_path_buf());
+    let mut render = web_command(pdftoppm);
     render.args(format!("-singlefile -f {page} -l {page} -r 200 -png").split(' '));
     render.arg(pdf);
     render.arg(png.with_extension(""));
@@ -570,7 +570,7 @@ fn ocr_page(pdf: &Path, page: usize, pdftoppm: &Path, tesseract: &Path) -> Optio
         .is_ok_and(|run| run.output.status.success())
         && std::fs::metadata(&png).is_ok();
     let text = rendered.then(|| {
-        let mut ocr = web_command(tesseract.to_path_buf());
+        let mut ocr = web_command(tesseract);
         ocr.arg(&png);
         ocr.arg("stdout");
         let run = run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
@@ -592,7 +592,7 @@ fn pdf_text(path: &Path) -> String {
                 (brew install poppler)"
             .to_string();
     };
-    let mut extract = web_command(pdftotext);
+    let mut extract = web_command(&pdftotext);
     extract.args(format!("-q -enc UTF-8 -l {PDF_MAX_PAGES}").split(' '));
     extract.arg(path);
     extract.arg("-");
@@ -659,6 +659,7 @@ fn render_pdf(pages: &[String], total: usize, ocr: usize, failed: usize, skipped
     let mut body = String::new();
     let mut shown = 0;
     let mut cut = false;
+    // The 160 reserves the header line's own budget, which the cap forgets.
     let budget = PDF_MAX_CHARS.saturating_sub(160);
     for (index, page) in pages.iter().enumerate() {
         let text = if page.is_empty() {
@@ -691,48 +692,47 @@ fn render_pdf(pages: &[String], total: usize, ocr: usize, failed: usize, skipped
     format!("[pdf: {total} pages, {}{note}]\n{body}", parts.join(" "))
 }
 
+/// One fetch's content: raw and PDF-hinted urls download first so the body
+/// can be sniffed and, for PDFs, extracted; every other url, and a hint that
+/// proved wrong, is the reader's to render.
+fn fetch_body(fetch: &Fetch, url: &str, client: &Client) -> Result<String, String> {
+    if !fetch.raw && !url_hints_pdf(url) {
+        return read_page(client, url);
+    }
+    let body = download(client, url)?;
+    if is_pdf(&body) {
+        // The poppler and tesseract ladder reads the body from a file.
+        let pdf = temp_path("fetch", "pdf");
+        let text = std::fs::write(&pdf, &body)
+            .map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
+        let _ = std::fs::remove_file(&pdf);
+        Ok(text)
+    } else if fetch.raw {
+        // Raw bodies are content.
+        Ok(body_text(&body))
+    } else {
+        // A hinted non-PDF was a guess, so the reader takes it instead.
+        read_page(client, url)
+    }
+}
+
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
-/// Like `search` this runs outside the sandbox. Raw fetches, and any url that
-/// hints at a PDF, download first so the body can be postprocessed.
+/// Like `search` this runs outside the sandbox. Every path is content for the
+/// model: the text on success, or the refusal or error that explains it.
 pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
     let fetch = match parse_fetch(&call.arguments) {
         Ok(fetch) => fetch,
         Err(error) => return misuse(call, on_progress, &error),
     };
     traced(call, on_progress, || {
-        // The guard is content visible to the model, not an error.
-        let url = match check_url(&fetch.url) {
-            Ok(url) => url,
-            Err(text) => return (text.clone(), text, None),
+        let fetched = || -> Result<String, String> {
+            // The guard is content visible to the model, not an error.
+            let url = check_url(&fetch.url)?;
+            let client = FETCH_CLIENT.clone()?;
+            fetch_body(&fetch, &url, &client)
         };
-        let client = match FETCH_CLIENT.clone() {
-            Ok(client) => client,
-            Err(text) => return (text.clone(), text, None),
-        };
-        if fetch.raw || url_hints_pdf(&url) {
-            match download(&client, &url) {
-                Ok(body) => {
-                    let text = if is_pdf(&body) {
-                        // PDFs go to a file so we can OCR and postprocess
-                        let pdf = temp_path("fetch", "pdf");
-                        let text = std::fs::write(&pdf, &body)
-                            .map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
-                        let _ = std::fs::remove_file(&pdf);
-                        Some(text)
-                    } else {
-                        // Raw bodies are content; a hinted non-PDF was a guess,
-                        // so the reader takes that one instead.
-                        fetch.raw.then(|| body_text(&body))
-                    };
-                    if let Some(text) = text {
-                        return (text.clone(), text, Some(0));
-                    }
-                }
-                Err(text) => return (text.clone(), text, None),
-            }
-        }
-        match read_page(&client, &url) {
+        match fetched() {
             Ok(text) => (text.clone(), text, Some(0)),
             Err(text) => (text.clone(), text, None),
         }
@@ -1183,7 +1183,7 @@ mod tests {
         let Some(tesseract) = find_on_path("tesseract") else {
             return false;
         };
-        let mut probe = web_command(tesseract);
+        let mut probe = web_command(&tesseract);
         probe.arg("--list-langs");
         run_watched(&mut probe, Some(Duration::from_secs(10)), &CancelToken::new())
             .is_ok_and(|run| run.output.status.success())
