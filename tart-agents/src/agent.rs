@@ -207,16 +207,17 @@ impl<B: Backend> Agent<B> {
         }
     }
 
-    /// The tools this agent offers the model. Plan mode withholds the `edit`
-    /// tool; chat mode offers the web pair alone, if their binaries exist.
+    /// The tools this agent offers the model.
+    ///
+    /// Plan mode withholds the `edit` tool, chat mode removes all but web tools.
     fn tools_for(&self) -> Vec<Tool> {
         if self.mode == ChatMode::Chat {
-            return [tools::search(), tools::fetch()].into_iter().flatten().collect();
+            return tools::search().into_iter().chain([tools::fetch()]).collect();
         }
         [tools::bash(), tools::read()]
             .into_iter()
             .chain((self.mode == ChatMode::Default).then_some(tools::edit()))
-            .chain([tools::search(), tools::fetch()].into_iter().flatten())
+            .chain(tools::search().into_iter().chain([tools::fetch()]))
             .chain(
                 self.subagents
                     .iter()

@@ -1,11 +1,9 @@
 //! The web tools: `search` and `fetch`.
 //!
 //! These are the only tools that run **outside** the seatbelt sandbox.
-//! Processing stays out of Rust where it can: ddgs writes structured JSON we
-//! only render, and the r.jina.ai reader turns a page into markdown before
-//! curl hands it back, so no HTML is ever parsed here. `fetch` automatically detects if
-//! a read file is a PDF an parses it, using `poppler` if it is pre-OCR'd and
-//! `tesseract` if manual OCR is required.
+//! `search` shells out to the locally installed ddgs CLI, which writes
+//! structured JSON we only render. `fetch` reads HTTP natively, passing it to either
+//! the `r.jina.ai`, poppler's text layer + tesseract's OCR.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -13,8 +11,13 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use reqwest::Url;
+use reqwest::blocking::Client;
+use reqwest::redirect::Policy as Redirects;
 
 use crate::backends::{FunctionToolCall, Tool};
 
@@ -27,19 +30,16 @@ use crate::Progress;
 /// Where a `ddgs` (or compatible) CLI is looked for, after `TART_SEARCH_BIN`.
 const SEARCH_DEFAULT: &str = "ddgs";
 
-/// The reader binary, overridable with `TART_FETCH_BIN`.
-const FETCH_DEFAULT: &str = "/usr/bin/curl";
-
 /// The timeout every search runs under: ddgs's `auto` backend can walk several
 /// engines before one answers, so a search needs more headroom than a command.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The timeout every fetch runs under; curl is told to give up just before, so
-/// its own exit message usually beats the watchdog's kill.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(45);
+/// The total budget for one fetch: connect, redirects, and body, enforced by
+/// the client rather than a watchdog now the transport is in-process.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(40);
 
-/// Seconds curl may spend on one fetch, as an argv element.
-const CURL_MAX_TIME: &str = "40";
+/// Hops one fetch will follow before giving up, as `--max-redirs` did.
+const MAX_REDIRECTS: usize = 5;
 
 /// Results returned when the model does not ask for a number.
 const DEFAULT_SEARCH_RESULTS: u64 = 8;
@@ -59,30 +59,28 @@ const PDF_MIN_ALNUM: usize = 40;
 /// Characters of one PDF the model is handed, pages kept whole where they fit.
 const PDF_MAX_CHARS: usize = 120_000;
 
-/// Bytes curl may fetch to a file.
-const PDF_MAX_DOWNLOAD: &str = "33554432";
+/// Bytes searched for the `%PDF-` header, matching poppler's `headerSearchSize`
+const PDF_HEADER_WINDOW: usize = 1024;
 
-/// Characters of a non-PDF raw body handed back inline, the streaming cap's
-/// equivalent now that bodies land in a file first.
+/// Bytes one fetch will download: papers and datasheets run well past the 2MB
+/// cap old streaming fetches had, so the body bounds itself instead.
+const PDF_MAX_DOWNLOAD: usize = 32 * 1024 * 1024;
+
+/// Characters of a non-PDF body handed back inline, the streaming cap's
+/// equivalent now that bodies arrive as bytes.
 const RAW_MAX_CHARS: usize = 2_000_000;
 
 /// The budget for every poppler/tesseract stage of one PDF.
 const PDF_TIMEOUT: Duration = Duration::from_secs(150);
 
-/// The reader service: it renders a page as markdown so curl hands back text.
+/// The reader service: it renders a page as markdown before we see it.
 const READER: &str = "https://r.jina.ai/";
 
-/// A browser-ish `User-Agent`: many sites serve nothing to `curl/x.y`.
+/// A browser-ish `User-Agent`.
+///
+/// The macOS Safari form from the MDN examples: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/User-Agent>
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
      (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
-
-/// The `--write-out` trailer raw fetches append after the body, so where
-/// redirects actually landed can be checked. Written with curl's `\n` escapes;
-/// [`FINAL_URL_MARKER`] is what they become in the captured output.
-const FINAL_URL: &str = "\\n[tart-url]\\n%{url_effective}";
-
-/// Where that trailer starts in a captured body.
-const FINAL_URL_MARKER: &str = "\n[tart-url]\n";
 
 /// The search tool's definition, offered only when a ddgs CLI is installed.
 fn search_definition() -> Tool {
@@ -145,10 +143,10 @@ fn fetch_definition() -> Tool {
     )
 }
 
-/// The fetch tool; `None` when no curl binary exists.
+/// The fetch tool; the transport is in-process, so it is always available.
 #[must_use]
-pub(crate) fn fetch() -> Option<Tool> {
-    fetch_binary().map(|_| fetch_definition())
+pub(crate) fn fetch() -> Tool {
+    fetch_definition()
 }
 
 /// One parsed search tool call.
@@ -219,15 +217,6 @@ fn search_binary() -> Option<PathBuf> {
         .chain(installed)
         .find(|path| is_executable(path))
         .or_else(|| find_on_path(SEARCH_DEFAULT))
-}
-
-/// Locate the reader CLI: the `TART_FETCH_BIN` override, then the system curl.
-fn fetch_binary() -> Option<PathBuf> {
-    let pinned = std::env::var_os("TART_FETCH_BIN").map(PathBuf::from);
-    pinned
-        .into_iter()
-        .chain([PathBuf::from(FETCH_DEFAULT)])
-        .find(|path| is_executable(path))
 }
 
 /// The first executable `name` on `PATH`, if any.
@@ -446,45 +435,50 @@ fn is_global(ip: IpAddr) -> bool {
     }
 }
 
-/// The curl argv every fetch starts with, as a shell line.
-///
-/// `-q` first so a `~/.curlrc` cannot add flags of its own, then the quiet, bounded,
-/// redirect-following rest.
-fn curl_args() -> Vec<OsString> {
-    format!("-q -sS -L --max-redirs 5 --connect-timeout 10 --max-time {CURL_MAX_TIME} --compressed")
-        .split(' ')
-        .map(OsString::from)
-        .collect()
+/// The client every fetch shares, built on first use: connection pooling and
+/// the one background thread come with the first fetch and stay for the
+/// process. The build result is cached beside the client, so a failed build
+/// reports the same error every time rather than panicking a lock. Nothing
+/// here can be const: building spawns a thread and installs the TLS provider.
+static FETCH_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
+    // Register a cryptography backend, otherwise reqwest rustls-no-provider panics.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(redirect_policy())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(FETCH_TIMEOUT)
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("error: {error}"))
+});
+
+/// The redirect rule: at most [`MAX_REDIRECTS`] hops, and none into a host
+/// this machine or a private network owns, checked on every hop.
+fn redirect_policy() -> Redirects {
+    Redirects::custom(|attempt| {
+        if let Some(refusal) = private_hop(attempt.url()) {
+            attempt.error(refusal)
+        } else if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
-/// The curl argv for one reader fetch.
-fn reader_args(url: &str) -> Vec<OsString> {
-    let mut args = curl_args();
-    if let Some(key) = std::env::var_os("TART_JINA_KEY") {
-        args.extend([
-            "-H".into(),
-            format!("Authorization: Bearer {}", key.to_string_lossy()).into(),
-        ]);
-    }
-    args.extend(["--proto", "=https", "--"].map(OsString::from));
-    args.push(format!("{READER}{url}").into());
-    args
-}
-
-/// The curl argv for one download to `path`.
+/// The refusal for one hop's url, when its host is not on the public web.
 ///
-/// Raw mode's protections, a size cap that admits papers, and `-o` so the body arrives
-/// as bytes we can sniff rather than as lossy text on stdout.
-fn download_args(url: &str, path: &Path) -> Vec<OsString> {
-    let mut args = curl_args();
-    args.extend(
-        "-f --proto =http,https --proto-redir =http,https --max-filesize"
-            .split(' ')
-            .map(OsString::from),
-    );
-    args.extend([PDF_MAX_DOWNLOAD, "-A", USER_AGENT, "-w", FINAL_URL].map(OsString::from));
-    args.extend(["-o".into(), path.as_os_str().to_owned(), "--".into(), url.into()]);
-    args
+/// Names go through the same resolver check as the original url in
+/// [`check_url`], so a rebinder answering for a private address is refused
+/// mid-chain instead of only at the end.
+fn private_hop(url: &Url) -> Option<String> {
+    let private = match url.host()? {
+        url::Host::Domain(host) => is_private_host(host),
+        url::Host::Ipv4(address) => !is_global(IpAddr::V4(address)),
+        url::Host::Ipv6(address) => !is_global(IpAddr::V6(address)),
+    };
+    private.then(|| format!("fetch: refusing redirect to non-public host {url}"))
 }
 
 /// Whether a url's path looks like a PDF: a `.pdf`-named leaf or path segment.
@@ -498,50 +492,48 @@ fn url_hints_pdf(url: &str) -> bool {
     leaf.ends_with(".pdf") || path.split('/').any(|seg| seg.eq_ignore_ascii_case("pdf"))
 }
 
-/// Whether a downloaded file starts like a PDF, within the leading kilobyte a
-/// damaged-but-readable file may pad with junk before the `%PDF-` header.
-fn is_pdf(path: &Path) -> bool {
-    let mut head = [0; 1024];
-    let read = std::fs::File::open(path)
-        .and_then(|mut file| file.read(&mut head))
-        .unwrap_or(0);
-    head[..read].windows(5).any(|window| window == b"%PDF-")
+/// Whether a body starts like a PDF, in poppler's own header-search window.
+fn is_pdf(body: &[u8]) -> bool {
+    body[..body.len().min(PDF_HEADER_WINDOW)]
+        .windows(5)
+        .any(|window| window == b"%PDF-")
 }
 
-/// Run one curl download to a file, handing back its path or the framed failure text.
-fn download(binary: &Path, url: &str) -> Result<PathBuf, (String, String, Option<i32>)> {
-    let body = temp_path("fetch", "pdf");
-    let mut curl = web_command(binary.to_path_buf());
-    curl.args(download_args(url, &body));
-    let failure = match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
-        Err(error) => Some((format!("error: {error}"), None)),
-        Ok(WatchedRun { output, killed }) if killed.is_some() => Some((
-            timeout_text(&combined_output(&output), FETCH_TIMEOUT),
-            output.status.code(),
-        )),
-        Ok(WatchedRun { output, .. }) if !output.status.success() => Some((
-            command_text_inline(&combined_output(&output), output.status, false),
-            output.status.code(),
-        )),
-        // Success: check where redirects landed before trusting the body.
-        Ok(WatchedRun { output, .. }) => {
-            let text = combined_output(&output);
-            separate_final_url(&text)
-                .and_then(|(_, final_url)| private_redirect(final_url))
-                .map(|refused| (refused, output.status.code()))
-        }
-    };
-    let Some((framed, exit)) = failure else {
-        return Ok(body);
-    };
-    let _ = std::fs::remove_file(&body);
-    Err((framed.clone(), framed, exit))
+/// One fetched body, with raw mode's protections: fail on http error statuses
+/// (`curl -f`'s behavior) and refuse bodies over the download cap.
+fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
+    let response = client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| format!("error: {error}"))?;
+    let mut body = Vec::new();
+    response
+        .take(PDF_MAX_DOWNLOAD as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("error: {error}"))?;
+    if body.len() > PDF_MAX_DOWNLOAD {
+        return Err(format!("error: body over {PDF_MAX_DOWNLOAD} bytes"));
+    }
+    Ok(body)
 }
 
-/// A downloaded non-PDF body as inline text, at the streaming cap's bound.
-fn body_text(path: &Path) -> String {
-    let bytes = std::fs::read(path).unwrap_or_default();
-    match preview_first_chars(&String::from_utf8_lossy(&bytes), RAW_MAX_CHARS) {
+/// One reader fetch: the reader renders the page as markdown, and its error
+/// bodies stay content the model can act on, so http errors are not raised.
+fn read_page(client: &Client, url: &str) -> Result<String, String> {
+    let mut request = client.get(format!("{READER}{url}"));
+    if let Some(key) = std::env::var_os("TART_JINA_KEY") {
+        request = request.bearer_auth(key.to_string_lossy().into_owned());
+    }
+    request
+        .send()
+        .and_then(reqwest::blocking::Response::text)
+        .map_err(|error| format!("error: {error}"))
+}
+
+/// A fetched non-PDF body as inline text, at the streaming cap's bound.
+fn body_text(body: &[u8]) -> String {
+    match preview_first_chars(&String::from_utf8_lossy(body), RAW_MAX_CHARS) {
         (head, false) => head.to_string(),
         (head, true) => format!("{head}\n[truncated: body over {RAW_MAX_CHARS} characters]"),
     }
@@ -694,79 +686,49 @@ fn render_pdf(pages: &[String], total: usize, ocr: usize, failed: usize, skipped
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
 /// Like `search` this runs outside the sandbox. Raw fetches, and any url that
-/// hints at a PDF, land in a file first so the body can be sniffed: a PDF
-/// becomes local poppler/tesseract extraction, anything else the text it
-/// always was.
+/// hints at a PDF, download first so the body can be postprocessed.
 pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
     let fetch = match parse_fetch(&call.arguments) {
         Ok(fetch) => fetch,
         Err(error) => return misuse(call, on_progress, &error),
     };
     traced(call, on_progress, || {
-        let Some(binary) = fetch_binary() else {
-            let text = format!("fetch: no curl found at {FETCH_DEFAULT}; set TART_FETCH_BIN");
-            return (text.clone(), text, None);
-        };
         // The guard is content visible to the model, not an error.
         let url = match check_url(&fetch.url) {
             Ok(url) => url,
             Err(text) => return (text.clone(), text, None),
         };
+        let client = match FETCH_CLIENT.clone() {
+            Ok(client) => client,
+            Err(text) => return (text.clone(), text, None),
+        };
         if fetch.raw || url_hints_pdf(&url) {
-            match download(&binary, &url) {
-                Ok(path) => {
-                    let text = if is_pdf(&path) {
-                        Some(pdf_text(&path))
+            match download(&client, &url) {
+                Ok(body) => {
+                    let text = if is_pdf(&body) {
+                        // PDFs go to a file so we can OCR and postprocess
+                        let pdf = temp_path("fetch", "pdf");
+                        let text = std::fs::write(&pdf, &body)
+                            .map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
+                        let _ = std::fs::remove_file(&pdf);
+                        Some(text)
                     } else {
                         // Raw bodies are content; a hinted non-PDF was a guess,
                         // so the reader takes that one instead.
-                        fetch.raw.then(|| body_text(&path))
+                        fetch.raw.then(|| body_text(&body))
                     };
-                    let _ = std::fs::remove_file(&path);
                     if let Some(text) = text {
                         return (text.clone(), text, Some(0));
                     }
                 }
-                Err((framed, text, exit)) => return (framed, text, exit),
+                Err(text) => return (text.clone(), text, None),
             }
         }
-        let mut curl = web_command(binary);
-        curl.args(reader_args(&url));
-        match run_watched(&mut curl, Some(FETCH_TIMEOUT), &CancelToken::new()) {
-            Err(error) => {
-                let text = format!("error: {error}");
-                (text.clone(), text, None)
-            }
-            Ok(WatchedRun { output, killed: Some(_) }) => {
-                let marked = timeout_text(&combined_output(&output), FETCH_TIMEOUT);
-                (marked.clone(), marked, output.status.code())
-            }
-            Ok(WatchedRun { output, .. }) => {
-                let exit = output.status.code();
-                let text = combined_output(&output);
-                (command_text_inline(&text, output.status, false), text, exit)
-            }
+        match read_page(&client, &url) {
+            Ok(text) => (text.clone(), text, Some(0)),
+            Err(text) => (text.clone(), text, None),
         }
     })
-}
-
-/// Split curl's final-URL trailer off a captured raw fetch, when present.
-///
-/// The trailer is the last thing curl writes to stdout, so the *last* marker
-/// wins: a page that happens to contain the marker text cannot lose its own
-/// tail. Only the first whitespace-free word is the URL; anything behind it is
-/// stderr arriving after the trailer.
-fn separate_final_url(text: &str) -> Option<(&str, &str)> {
-    let at = text.rfind(FINAL_URL_MARKER)?;
-    let final_url = text[at + FINAL_URL_MARKER.len()..].split_whitespace().next()?;
-    Some((&text[..at], final_url))
-}
-
-/// The refusal for a final URL that landed on a private host, if it did.
-fn private_redirect(final_url: &str) -> Option<String> {
-    let rest = final_url.split_once("://").map_or(final_url, |(_, rest)| rest);
-    is_private_host(authority_host(rest))
-        .then(|| format!("fetch: refusing redirect to non-public host {final_url}"))
 }
 
 /// A non-empty, trimmed string field of a results record.
@@ -829,7 +791,7 @@ mod tests {
     use super::*;
     use crate::Agent;
     use crate::sandbox::Policy;
-    use crate::sandbox::live::skip_unless_networked;
+    use crate::sandbox::live::{skip_unless_live, skip_unless_networked};
     use crate::tools::{Tooling, execute};
     use macro_rules_attribute::apply;
 
@@ -1037,69 +999,65 @@ mod tests {
     }
 
     #[test]
-    fn reader_args_route_through_the_reader() {
-        // An exact argv only when no key is configured; a configured machine
-        // gets one more `-H` pair and nothing else changes.
-        if std::env::var_os("TART_JINA_KEY").is_some() {
-            return;
-        }
-        let expected: Vec<OsString> = vec![
-            "-q".into(),
-            "-sS".into(),
-            "-L".into(),
-            "--max-redirs".into(),
-            "5".into(),
-            "--connect-timeout".into(),
-            "10".into(),
-            "--max-time".into(),
-            "40".into(),
-            "--compressed".into(),
-            "--proto".into(),
-            "=https".into(),
-            "--".into(),
-            "https://r.jina.ai/https://example.com/page".into(),
-        ];
+    fn http_client_builds() {
+        assert!(FETCH_CLIENT.is_ok());
+    }
 
-        assert_eq!(reader_args("https://example.com/page"), expected);
+    /// Serve `response` once on an ephemeral loopback port and get its address.
+    fn serve_once(response: String) -> std::net::SocketAddr {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0; 4_096];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        address
+    }
+
+    /// Live: needs the loopback socket a nested sandbox denies.
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn download_reads_bodies_statuses_and_refuses_private_redirects() {
+        let client = FETCH_CLIENT.clone().unwrap();
+
+        let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_string());
+        let body = download(&client, &format!("http://{address}/x")).unwrap();
+        assert_eq!(body, b"hello");
+
+        let address = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string());
+        let error = download(&client, &format!("http://{address}/gone")).unwrap_err();
+        assert!(error.contains("404"), "{error}");
+
+        // The policy refusal happens on the hop, before any connection is
+        // made to the private address.
+        let address = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.5/x\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        );
+        let error = download(&client, &format!("http://{address}/hop")).unwrap_err();
+        assert!(error.contains("refusing redirect"), "{error}");
     }
 
     #[test]
-    fn download_args_fetch_to_a_file() {
-        let expected: Vec<OsString> = vec![
-            "-q".into(),
-            "-sS".into(),
-            "-L".into(),
-            "--max-redirs".into(),
-            "5".into(),
-            "--connect-timeout".into(),
-            "10".into(),
-            "--max-time".into(),
-            "40".into(),
-            "--compressed".into(),
-            "-f".into(),
-            "--proto".into(),
-            "=http,https".into(),
-            "--proto-redir".into(),
-            "=http,https".into(),
-            "--max-filesize".into(),
-            PDF_MAX_DOWNLOAD.into(),
-            "-A".into(),
-            USER_AGENT.into(),
-            "-w".into(),
-            FINAL_URL.into(),
-            "-o".into(),
-            "/tmp/tart-fetch.pdf".into(),
-            "--".into(),
-            "https://arxiv.org/pdf/2401.14196".into(),
-        ];
+    fn private_hop_flags_private_redirects_only() {
+        for url in [
+            "http://127.0.0.1:8080/x",
+            "http://10.0.0.5/",
+            "http://[::1]/",
+            "http://[fe80::1]/",
+            "https://printer.local/",
+            "https://localhost/x",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert!(private_hop(&url).is_some(), "expected refusal: {url}");
+        }
 
-        assert_eq!(
-            download_args(
-                "https://arxiv.org/pdf/2401.14196",
-                Path::new("/tmp/tart-fetch.pdf")
-            ),
-            expected
-        );
+        let url = Url::parse("https://example.com/final").unwrap();
+        assert!(private_hop(&url).is_none());
     }
 
     #[test]
@@ -1127,18 +1085,17 @@ mod tests {
 
     #[test]
     fn is_pdf_sniffs_the_magic_bytes() {
-        let pdf = std::env::temp_dir().join("tart-test-magic.pdf");
-        std::fs::write(&pdf, b"%PDF-1.7\nrest is opaque\n").unwrap();
-        assert!(is_pdf(&pdf));
-
-        std::fs::write(&pdf, b"<html>not a pdf</html>").unwrap();
-        assert!(!is_pdf(&pdf));
-
-        std::fs::write(&pdf, b"junk-before-header\n%PDF-1.4\n").unwrap();
-        assert!(is_pdf(&pdf));
-
-        let _ = std::fs::remove_file(&pdf);
-        assert!(!is_pdf(&pdf));
+        assert!(is_pdf(b"%PDF-1.7\nrest is opaque\n"));
+        assert!(!is_pdf(b"<html>not a pdf</html>"));
+        // A damaged-but-readable file may pad junk before the header, as long
+        // as the header still starts inside poppler's 1024-byte search window.
+        assert!(is_pdf(b"junk-before-header\n%PDF-1.4\n"));
+        let mut junky = vec![b'x'; PDF_HEADER_WINDOW - 5];
+        junky.extend_from_slice(b"%PDF-");
+        assert!(is_pdf(&junky));
+        junky.insert(0, b'x');
+        assert!(!is_pdf(&junky));
+        assert!(!is_pdf(b""));
     }
 
     #[test]
@@ -1227,27 +1184,6 @@ mod tests {
     }
 
     #[test]
-    fn separate_final_url_takes_the_last_marker_and_first_word() {
-        let captured = "page body\n[tart-url]\nnot this\n[tart-url]\nhttps://final.example/x \
-                        curl: noise\n";
-
-        let (body, final_url) = separate_final_url(captured).unwrap();
-
-        // The newline before the marker belongs to the trailer, not the body.
-        assert_eq!(body, "page body\n[tart-url]\nnot this");
-        assert_eq!(final_url, "https://final.example/x");
-        assert!(separate_final_url("no trailer").is_none());
-    }
-
-    #[test]
-    fn private_redirect_flags_private_landings_only() {
-        assert!(private_redirect("http://127.0.0.1:8080/x").is_some());
-        assert!(private_redirect("http://printer.local/").is_some());
-        assert!(private_redirect("https://example.com/final").is_none());
-        assert!(private_redirect("https://[::1]/").is_some());
-    }
-
-    #[test]
     fn check_url_refuses_zone_ids_and_resolver_shorthand_addresses() {
         // A zone ID names a link-local interface address; it does not parse as
         // one, and curl would still fetch it, so it is refused lexically.
@@ -1321,9 +1257,6 @@ mod tests {
     #[apply(skip_unless_networked!)]
     #[test]
     fn run_fetch_returns_the_page() {
-        let Some(_) = fetch_binary() else {
-            return;
-        };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
         let token = CancelToken::new();
         let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
@@ -1353,9 +1286,6 @@ mod tests {
     #[apply(skip_unless_networked!)]
     #[test]
     fn run_fetch_extracts_a_pdf_url_natively() {
-        let Some(_) = fetch_binary() else {
-            return;
-        };
         if find_on_path("pdftotext").is_none() {
             return;
         }
