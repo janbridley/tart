@@ -488,24 +488,8 @@ fn exit_one_is_success(command: &str) -> bool {
 const BASH_SUCCESS_CAP: usize = 30_000;
 const BASH_FAILURE_CAP: usize = 10_000;
 
-/// How much of a spilled output previews inline, in characters.
+/// How much of a spilled output previews inline, in bytes.
 const SPILL_PREVIEW: usize = 2_000;
-
-/// The first `max_chars` characters of `text`, snapped back to a newline in the
-/// back half so a cut lands on a line boundary; the flag says it was cut.
-// <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/result-persistence-format.ts#L50>
-fn preview_first_chars(text: &str, max_chars: usize) -> (&str, bool) {
-    // `None` means at most `max_chars` characters: there is no cut to make.
-    let Some(end) = text.char_indices().nth(max_chars).map(|(index, _)| index) else {
-        return (text, false);
-    };
-    let head = &text[..end];
-    let snapped = head
-        .rfind('\n')
-        .filter(|&newline| 2 * head[..newline].chars().count() > max_chars)
-        .unwrap_or(end);
-    (&head[..snapped], true)
-}
 
 /// A size in binary units with one decimal, a trailing `.0` trimmed: `2KB`, `1.5MB`.
 // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts#L177>
@@ -597,15 +581,13 @@ fn spill_to_file(text: &str) -> String {
     if write_private(&dir, &path, text).is_err() {
         return excerpt(text);
     }
-    let (preview, more) = preview_first_chars(text, SPILL_PREVIEW);
     // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/result-persistence-format.ts#L29>
-    let tail = if more { "...\n" } else { "" };
     format!(
-        "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\nPreview (first \
-         {}):\n{preview}\n{tail}</persisted-output>",
+        "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\n{}\n\
+         </persisted-output>",
         bash_byte_size(text.len()),
         path.display(),
-        bash_byte_size(SPILL_PREVIEW),
+        bounded(text, SPILL_PREVIEW),
     )
 }
 
@@ -639,7 +621,7 @@ fn write_private(dir: &Path, path: &Path, text: &str) -> io::Result<()> {
 /// A head-and-tail excerpt of `text` at the failure cap: [`bounded`], whose
 /// marker keeps the seam from reading as contiguous output.
 fn excerpt(text: &str) -> String {
-    bounded(text.to_string(), BASH_FAILURE_CAP)
+    bounded(text, BASH_FAILURE_CAP)
 }
 
 /// Information required for a tool call, including sandbox and cancellation info.
@@ -711,60 +693,23 @@ fn cancel_text(text: &str) -> String {
     format!("[cancelled]{separator}{text}")
 }
 
-/// The first `head` and last `tail` bytes of `text`, both snapped to character
-/// boundaries so neither slice can split one; the two never overlap.
-fn ends(text: &str, head: usize, tail: usize) -> (&str, &str) {
-    // Slicing must land on a char boundary; lossy decoding made `text` valid.
-    let head_end = text.floor_char_boundary(head.min(text.len()));
-    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(tail));
-    let head_end = head_end.min(tail_start);
-    (&text[..head_end], &text[tail_start..])
-}
-
-/// Keep the first `cap` bytes of `text`, suffixing a marker when it cut: an
-/// attached file reads from the top, where its interesting part usually is.
+/// The harness's one way to bound text: keep the first and last `cap / 2` bytes.
 ///
-/// ```
-/// use tart_agents::head_cap;
-///
-/// assert_eq!(head_cap("hi\n", 10), "hi\n");
-///
-/// let text = "abcdef".repeat(1024); // 6 KB
-/// let capped = head_cap(&text, 1024);
-/// let (kept, marker) = capped.split_once('\n').unwrap();
-/// assert_eq!(kept, &text[..1024]);
-/// assert_eq!(marker, "[truncated; first 1 KB shown]");
-/// ```
+/// Bytes are snapped to a character boundary to handle larger symbols.
 #[inline]
-pub fn head_cap(text: &str, cap: usize) -> String {
-    if text.len() <= cap {
-        return text.to_string();
-    }
-    let (head, _) = ends(text, cap, 0);
-    format!("{head}\n[truncated; first {} KB shown]", cap / 1024)
-}
-
-/// Keep the last `cap` bytes of `text`, prefixing a marker when it cut.
-fn tail_cap(text: &str, cap: usize) -> String {
-    if text.len() <= cap {
-        return text.to_string();
-    }
-    let (_, tail) = ends(text, 0, cap);
-    format!("[truncated; last {} KB shown]\n{tail}", cap / 1024)
-}
-
-/// Keep the first and last `cap / 2` bytes of `text`, marking the omitted
-/// middle; under-cap text moves through untouched, so a caller handing over
-/// dead ownership pays nothing.
-pub fn bounded(text: String, cap: usize) -> String {
-    if text.len() <= cap {
-        return text;
-    }
+pub fn bounded(text: &str, cap: usize) -> String {
     let half = cap / 2;
-    let (head, tail) = ends(&text, half, half);
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    // Slicing must land on a char boundary; lossy decoding made `text` valid.
+    let head_end = text.floor_char_boundary(half.min(text.len()));
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(half));
+    let head = &text[..head_end.min(tail_start)];
+    let tail = &text[tail_start..];
     format!(
-        "{head}\n[truncated; first and last {} KB shown]\n{tail}",
-        half / 1024
+        "{head}\n[truncated; first and last {} shown]\n{tail}",
+        bash_byte_size(half)
     )
 }
 
@@ -885,7 +830,7 @@ fn traced<F: Fn(Progress)>(
     });
     let (result, output, exit) = run();
     // Display-only copy of the text is bounded to match the string we pass to the model
-    let output = bounded(output, CONTENT_CAP);
+    let output = bounded(&output, CONTENT_CAP);
     on_progress(Progress::ToolOutput {
         id: call.call_id.clone(),
         output,
@@ -965,7 +910,7 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     shell.arg("-c").arg(command);
     match run_watched(&mut shell, None, cancel) {
         Ok(WatchedRun { output, killed }) => {
-            let text = tail_cap(&combined_output(&output), CONTENT_CAP);
+            let text = bounded(&combined_output(&output), CONTENT_CAP);
             match killed {
                 Some(KillReason::Cancelled) => cancel_text(&text),
                 // No deadline exists to outlive, so nothing else kills it.
@@ -1374,10 +1319,14 @@ mod tests {
         let (size, saved) = lines[1].split_once(". Full output saved to: ").unwrap();
         assert_eq!(size, "Output too large (29.3KB)", "{framed}");
         assert_eq!(lines[2], "", "{framed}");
-        assert_eq!(lines[3], "Preview (first 2KB):", "{framed}");
-        assert_eq!(lines[4].chars().count(), SPILL_PREVIEW, "{framed}");
-        assert!(lines[4].chars().all(|c| c == 'x'), "{framed}");
-        assert_eq!(lines[5], "...", "{framed}");
+        assert_eq!(lines[3].chars().count(), SPILL_PREVIEW / 2, "{framed}");
+        assert!(lines[3].chars().all(|c| c == 'x'), "{framed}");
+        assert_eq!(
+            lines[4], "[truncated; first and last 1000 bytes shown]",
+            "{framed}"
+        );
+        assert_eq!(lines[5].chars().count(), SPILL_PREVIEW / 2, "{framed}");
+        assert!(lines[5].chars().all(|c| c == 'x'), "{framed}");
         assert_eq!(lines[6], "</persisted-output>", "{framed}");
         assert_eq!(lines.len(), 7, "{framed}");
         // The spill lives in tart's throwaway directory, not the temp root.
@@ -1426,7 +1375,7 @@ mod tests {
         // same truncation marker the display caps use.
         let (head, rest) = excerpted.split_once('\n').unwrap();
         let (marker, tail) = rest.split_once('\n').unwrap();
-        assert_eq!(marker, "[truncated; first and last 4 KB shown]", "{framed}");
+        assert_eq!(marker, "[truncated; first and last 4.9KB shown]", "{framed}");
         assert_eq!(head.chars().count(), BASH_FAILURE_CAP / 2);
         assert!(head.chars().all(|c| c == 'a'), "{head}");
         assert!(tail.chars().all(|c| c == 'b'), "{tail}");
@@ -1453,50 +1402,23 @@ mod tests {
 
     /// A multi-byte head must not split a character at the cut.
     #[test]
-    fn head_cap_cuts_on_a_character_boundary() {
-        let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
-        let capped = head_cap(&wide, 1024);
-        let (kept, marker) = capped.split_once('\n').unwrap();
-        assert_eq!(marker, "[truncated; first 1 KB shown]");
-        assert!(kept.chars().all(|c| c == '語'), "cut inside a character");
-    }
-
-    #[test]
-    fn tail_cap_keeps_the_tail_and_marks_the_cut() {
-        assert_eq!(tail_cap("hi\n", 10), "hi\n");
-
-        let text = "abcdef".repeat(1024); // 6 KB
-        let capped = tail_cap(&text, 1024);
-        let (marker, tail) = capped.split_once('\n').unwrap();
-        assert_eq!(marker, "[truncated; last 1 KB shown]");
-        assert_eq!(tail, &text[text.len() - 1024..]);
-
-        // A multi-byte tail must not split a character at the cut.
-        let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
-        let capped = tail_cap(&wide, 1024);
-        let (marker, tail) = capped.split_once('\n').unwrap();
-        assert_eq!(marker, "[truncated; last 1 KB shown]");
-        assert!(tail.chars().all(|c| c == '語'), "cut inside a character");
-    }
-
-    #[test]
     fn bounded_keeps_both_ends_and_marks_the_middle() {
-        assert_eq!(bounded("hi\n".to_string(), 10), "hi\n");
+        assert_eq!(bounded("hi\n", 10), "hi\n");
 
         let text = "abcdef".repeat(1024); // 6 KB
-        let capped = bounded(text.clone(), 2048);
+        let capped = bounded(&text, 2048);
         let (head, rest) = capped.split_once('\n').unwrap();
         let (marker, tail) = rest.split_once('\n').unwrap();
-        assert_eq!(marker, "[truncated; first and last 1 KB shown]");
+        assert_eq!(marker, "[truncated; first and last 1KB shown]");
         assert_eq!(head, &text[..1024]);
         assert_eq!(tail, &text[text.len() - 1024..]);
 
         // Multi-byte characters must not split at either cut.
         let wide = "語".repeat(4_000); // 12 KB of 3-byte characters
-        let capped = bounded(wide, 2048);
+        let capped = bounded(&wide, 2048);
         let (head, rest) = capped.split_once('\n').unwrap();
         let (marker, tail) = rest.split_once('\n').unwrap();
-        assert_eq!(marker, "[truncated; first and last 1 KB shown]");
+        assert_eq!(marker, "[truncated; first and last 1KB shown]");
         assert!(head.chars().all(|c| c == '語'), "cut inside a character");
         assert!(tail.chars().all(|c| c == '語'), "cut inside a character");
     }
@@ -1736,7 +1658,7 @@ mod tests {
                 events.borrow().as_slice(),
                 [Progress::ToolStart { .. }, Progress::ToolOutput { output, .. }]
                     if output.len() < 70_000
-                        && output.contains("[truncated; first and last 32 KB shown]")
+                        && output.contains("[truncated; first and last 32KB shown]")
             ),
             "the event's copy is capped like the model's history"
         );

@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use itertools::Itertools;
-use tart_agents::{CONTENT_CAP, head_cap};
+use tart_agents::{CONTENT_CAP, bounded};
 
 use crate::file_mentions;
 use crate::recorded::ATTACHMENTS_AT;
@@ -66,7 +66,7 @@ fn attach(mention: &str) -> (String, String) {
     };
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            let kept = head_cap(&contents, CONTENT_CAP);
+            let kept = bounded(&contents, CONTENT_CAP);
             let note = if kept.len() < contents.len() {
                 format!("attached {mention} (truncated to {} KiB)", CONTENT_CAP / 1024)
             } else {

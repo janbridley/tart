@@ -23,9 +23,8 @@ use reqwest::redirect::Policy as Redirects;
 use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
-    CancelToken, WatchedRun, combined_output, command_text_inline, create_private, misuse,
-    parse_arguments, preview_first_chars, run_watched, run_watched_bytes, string_field, tool,
-    traced, watched_failure,
+    CancelToken, WatchedRun, bounded, combined_output, command_text_inline, create_private, misuse,
+    parse_arguments, run_watched, run_watched_bytes, string_field, tool, traced, watched_failure,
 };
 use crate::Progress;
 
@@ -37,7 +36,7 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// the client rather than a watchdog now the transport is in-process.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(40);
 
-/// Hops one fetch will follow before giving up, as `--max-redirs` did.
+/// Hops one fetch will follow before giving up.
 const MAX_REDIRECTS: usize = 5;
 
 /// Results returned when the model does not ask for a number.
@@ -55,19 +54,18 @@ const PDF_OCR_PAGES: usize = 20;
 /// Fewer alphanumerics than this in a page's text layer marks it scanned.
 const PDF_MIN_ALNUM: usize = 40;
 
-/// Characters of one PDF the model is handed, pages kept whole where they fit.
-const PDF_MAX_CHARS: usize = 120_000;
+/// Bytes of one PDF the model is handed, pages kept whole where they fit.
+const PDF_MAX_BYTES: usize = 120_000;
 
 /// Bytes searched for the `%PDF-` header, matching poppler's `headerSearchSize`
 const PDF_HEADER_WINDOW: usize = 1024;
 
-/// Bytes one fetch will download: papers and datasheets run well past the 2MB
-/// cap old streaming fetches had, so the body bounds itself instead.
+/// Bytes one fetch will download: papers and datasheets run well past a
+/// couple of MB, so the body bounds itself.
 const DOWNLOAD_CAP: usize = 32 * 1024 * 1024;
 
-/// Characters of a non-PDF body handed back inline, the streaming cap's
-/// equivalent now that bodies arrive as bytes.
-const RAW_MAX_CHARS: usize = 2_000_000;
+/// Bytes of a non-PDF body handed back inline.
+const RAW_MAX_BYTES: usize = 2_000_000;
 
 /// The budget for every poppler/tesseract stage of one PDF.
 const PDF_TIMEOUT: Duration = Duration::from_secs(150);
@@ -194,7 +192,7 @@ pub(super) struct Fetch {
 
 /// Extract the fields from a fetch tool call's JSON arguments.
 ///
-/// `raw` is optional and defaults to the reader mode.
+/// `raw` is optional and defaults to local extraction.
 pub(super) fn parse_fetch(arguments: &str) -> anyhow::Result<Fetch> {
     let args = parse_arguments(arguments)?;
     Ok(Fetch {
@@ -392,9 +390,9 @@ fn is_private_host(host: &str) -> bool {
 ///
 /// Every record is checked: a rebinder answers with a public and a private
 /// address together, and either may come back first. A name that fails to
-/// resolve stays public: curl shares this resolver, so an unresolvable name
-/// fails there with the better error. Resolution blocks this thread for as
-/// long as the resolver takes, like the curl call it guards.
+/// resolve stays public: the client shares this resolver, so an unresolvable
+/// name fails there with the better error. Resolution blocks this thread for
+/// as long as the resolver takes, like the fetch it guards.
 fn resolves_to_private(host: &str) -> bool {
     (host, 0)
         .to_socket_addrs()
@@ -473,7 +471,7 @@ fn redirect_policy() -> Redirects {
 ///
 /// Names go through the same resolver check as the original url in
 /// [`check_url`], so a rebinder answering for a private address is refused
-/// mid-chain instead of only at the end.
+/// mid-chain.
 fn private_hop(url: &Url) -> Option<String> {
     let private = match url.host()? {
         url::Host::Domain(host) => is_private_host(host),
@@ -501,8 +499,8 @@ fn is_pdf(body: &[u8]) -> bool {
         .any(|window| window == b"%PDF-")
 }
 
-/// One fetched body, with raw mode's protections: fail on http error statuses
-/// (`curl -f`'s behavior) and refuse bodies over the download cap.
+/// One fetched body, with raw mode's protections: fail on http error
+/// statuses and refuse bodies over the download cap.
 fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
@@ -531,7 +529,7 @@ fn pdf_from_body(body: &[u8]) -> String {
 }
 
 /// One downloaded page as markdown: the body to the local trafilatura CLI on
-/// stdin, failures as content for the model; PDF bytes go to poppler instead.
+/// stdin, failures as content for the model; PDF bytes go to the poppler ladder.
 fn extract_body(body: &[u8]) -> Result<String, String> {
     if is_pdf(body) {
         return Ok(pdf_from_body(body));
@@ -561,17 +559,14 @@ fn extract_body(body: &[u8]) -> Result<String, String> {
     })
 }
 
-/// One reader fetch: downloaded under raw mode's protections, then extracted locally.
+/// One page fetch: downloaded under raw mode's protections, then extracted locally.
 fn extract_page(client: &Client, url: &str) -> Result<String, String> {
     download(client, url).and_then(|body| extract_body(&body))
 }
 
-/// A fetched non-PDF body as inline text, at the streaming cap's bound.
+/// A fetched non-PDF body as inline text, capped at [`RAW_MAX_BYTES`].
 fn body_text(body: &[u8]) -> String {
-    match preview_first_chars(&String::from_utf8_lossy(body), RAW_MAX_CHARS) {
-        (head, false) => head.to_string(),
-        (head, true) => format!("{head}\n[truncated: body over {RAW_MAX_CHARS} characters]"),
-    }
+    bounded(&String::from_utf8_lossy(body), RAW_MAX_BYTES)
 }
 
 /// The page count `pdfinfo` reports, when pdfinfo and the file cooperate.
@@ -726,7 +721,7 @@ impl<'a> Pages<'a> {
         let mut shown = 0;
         let mut cut = false;
         // The 160 reserves the header line's own budget, which the cap forgets.
-        let budget = PDF_MAX_CHARS.saturating_sub(160);
+        let budget = PDF_MAX_BYTES.saturating_sub(160);
         for (index, page) in self.text.iter().enumerate() {
             let text = if page.is_empty() {
                 "(no text extracted)"
@@ -738,8 +733,7 @@ impl<'a> Pages<'a> {
             // whole budget is cut on a character boundary rather than dropped.
             if body.len() + marked.len() > budget {
                 if shown == 0 {
-                    let (head, _) = preview_first_chars(&marked, budget);
-                    body.push_str(head);
+                    body.push_str(&bounded(&marked, budget));
                     shown = 1;
                     cut = true;
                 }
@@ -749,7 +743,7 @@ impl<'a> Pages<'a> {
             shown += 1;
         }
         let note = if cut || shown < self.text.len() {
-            format!("; first {shown} of {} pages shown (character cap)", self.total)
+            format!("; first {shown} of {} pages shown (byte cap)", self.total)
         } else if shown < self.total {
             format!("; first {shown} of {} pages shown (page cap)", self.total)
         } else {
@@ -1241,7 +1235,7 @@ mod tests {
             skipped: 0,
         };
         let rendered = big.render();
-        assert!(rendered.contains("; first 19 of 30 pages shown (character cap)"));
+        assert!(rendered.contains("; first 19 of 30 pages shown (byte cap)"));
         assert!(!rendered.contains("--- page 20 ---"));
     }
 
@@ -1395,7 +1389,7 @@ mod tests {
     }
 
     /// Live: reaches the network, so it needs connectivity. Raw mode, so it
-    /// stands on example.com alone and not on the reader service.
+    /// stands on example.com alone.
     #[apply(skip_unless_networked!)]
     #[test]
     fn run_fetch_returns_the_page() {
