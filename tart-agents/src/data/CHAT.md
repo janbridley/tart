@@ -19,12 +19,11 @@ Results come back as a numbered list of title, url, and snippet.
 Call `fetch` with:
 
 - `url` (string): the absolute http(s) URL to read.
-- `raw` (boolean, optional): fetch the URL directly instead of through the reader
-  service; default false. Use it for JSON or plain-text endpoints, or when the reader
-  errors.
+- `raw` (boolean, optional): fetch the URL directly with no extraction; default false.
+  Use it for JSON or plain-text endpoints, or when extraction comes back empty.
 
-The page comes back as markdown (title, source url, then the text), cut at 150,000
-characters when it runs long.
+The page comes back as markdown (the article body, stripped of boilerplate, comments
+kept), cut to its first and last 32 KB when it runs long.
 
 ## Rules
 

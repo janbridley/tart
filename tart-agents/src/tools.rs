@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write as _};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -609,6 +609,15 @@ fn spill_to_file(text: &str) -> String {
     )
 }
 
+/// Create `path` new and owner-only, refusing anything already there.
+fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
 /// Create `dir` and write `text` to `path` owner-only, so a command's output
 /// spilled out of the transcript cannot be read by other local users.
 fn write_private(dir: &Path, path: &Path, text: &str) -> io::Result<()> {
@@ -624,12 +633,7 @@ fn write_private(dir: &Path, path: &Path, text: &str) -> io::Result<()> {
         .mode(0o700)
         .create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(text.as_bytes())
+    create_private(path)?.write_all(text.as_bytes())
 }
 
 /// A head-and-tail excerpt of `text` at the failure cap: [`bounded`], whose
@@ -665,6 +669,20 @@ enum KillReason {
     Timeout,
     /// The cancel token fired.
     Cancelled,
+}
+
+/// A reaped child's failure as content: a kill marked as the timeout it was,
+/// any other bad exit carrying its own combined output. `None` on success,
+/// where the caller renders what the child actually produced.
+fn watched_failure(run: &WatchedRun, timeout: Duration) -> Option<String> {
+    let text = combined_output(&run.output);
+    if run.killed.is_some() {
+        Some(timeout_text(&text, timeout))
+    } else if !run.output.status.success() {
+        Some(command_text_inline(&text, run.output.status, false))
+    } else {
+        None
+    }
 }
 
 /// Model-facing explanation for a command the timeout killed.
@@ -750,12 +768,12 @@ pub fn bounded(text: String, cap: usize) -> String {
     )
 }
 
-/// Spawn `command` in its own process group with piped output and no input,
-/// returning the child and its group id.
-fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)> {
+/// Spawn `command` in its own process group with piped output, returning the
+/// child and its group id, with stdin piped only when `piped` asks.
+fn spawn_grouped(command: &mut Command, piped: bool) -> io::Result<(std::process::Child, Pid)> {
     command
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if piped { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn()?;
@@ -777,8 +795,32 @@ fn run_watched(
     deadline: Option<Duration>,
     cancel: &CancelToken,
 ) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command)?;
+    let (child, group) = spawn_grouped(command, false)?;
+    watched(child, group, None, deadline, cancel)
+}
 
+/// [`run_watched`], with `input` written to the command's stdin first. Set a
+/// deadline: the write outruns stdout draining, and only the deadline breaks a
+/// child that fills its pipe before its stdin ends.
+fn run_watched_bytes(
+    command: &mut Command,
+    input: &[u8],
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> io::Result<WatchedRun> {
+    let (child, group) = spawn_grouped(command, true)?;
+    watched(child, group, Some(input), deadline, cancel)
+}
+
+/// The shared watchdog and reap: `input`, when there is one, reaches the
+/// child's stdin while the deadline already runs.
+fn watched(
+    mut child: std::process::Child,
+    group: Pid,
+    input: Option<&[u8]>,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> io::Result<WatchedRun> {
     // The watchdog's kill reason, when it killed: sent before the kill lands
     // and read after the watchdog joins, so a killed group is never mistaken
     // for a natural exit.
@@ -808,6 +850,10 @@ fn run_watched(
             }
         }
     });
+
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let _ = stdin.write_all(input);
+    }
 
     let output = child.wait_with_output();
     drop(finished);
@@ -1528,6 +1574,15 @@ mod tests {
     }
 
     /// These drive `run_watched` with plain commands, so they run without the sandbox
+    #[test]
+    fn run_watched_bytes_feeds_stdin_and_collects_stdout() {
+        let mut command = Command::new("/bin/cat");
+        let run = run_watched_bytes(&mut command, b"through the pipe", None, &CancelToken::new())
+            .unwrap();
+        assert!(run.output.status.success());
+        assert_eq!(run.output.stdout, b"through the pipe");
+    }
+
     #[test]
     fn run_watched_kills_a_command_that_outruns_the_deadline() {
         let mut command = Command::new("/bin/sleep");
