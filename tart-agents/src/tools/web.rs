@@ -9,7 +9,7 @@
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, ToSocketAddrs};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -23,8 +23,9 @@ use reqwest::redirect::Policy as Redirects;
 use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
-    CancelToken, WatchedRun, combined_output, command_text_inline, misuse, parse_arguments,
-    preview_first_chars, run_watched, run_watched_bytes, string_field, timeout_text, tool, traced,
+    CancelToken, WatchedRun, combined_output, command_text_inline, create_private, misuse,
+    parse_arguments, preview_first_chars, run_watched, run_watched_bytes, string_field,
+    timeout_text, tool, traced,
 };
 use crate::Progress;
 
@@ -524,17 +525,9 @@ fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
 /// One downloaded PDF as text: the poppler ladder reads the body from a file.
 fn pdf_from_body(body: &[u8]) -> String {
     let pdf = temp_path("fetch", "pdf");
-    // `create_new` refuses pre-planted names, and 0600 keeps the file private until
-    // poppler reads it.
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&pdf)?;
-        file.write_all(body)
-    })();
-    let text = written.map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
+    let text = create_private(&pdf)
+        .and_then(|mut file| file.write_all(body))
+        .map_or_else(|error| format!("error: {error}"), |()| pdf_text(&pdf));
     let _ = std::fs::remove_file(&pdf);
     text
 }

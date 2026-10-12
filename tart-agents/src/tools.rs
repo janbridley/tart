@@ -609,6 +609,15 @@ fn spill_to_file(text: &str) -> String {
     )
 }
 
+/// Create `path` new and owner-only, refusing anything already there.
+fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
 /// Create `dir` and write `text` to `path` owner-only, so a command's output
 /// spilled out of the transcript cannot be read by other local users.
 fn write_private(dir: &Path, path: &Path, text: &str) -> io::Result<()> {
@@ -624,12 +633,7 @@ fn write_private(dir: &Path, path: &Path, text: &str) -> io::Result<()> {
         .mode(0o700)
         .create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(text.as_bytes())
+    create_private(path)?.write_all(text.as_bytes())
 }
 
 /// A head-and-tail excerpt of `text` at the failure cap: [`bounded`], whose
