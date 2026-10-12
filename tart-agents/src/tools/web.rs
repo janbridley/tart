@@ -28,9 +28,6 @@ use super::{
 };
 use crate::Progress;
 
-/// Where a `ddgs` (or compatible) CLI is looked for, after `TART_SEARCH_BIN`.
-const SEARCH_DEFAULT: &str = "ddgs";
-
 /// The timeout every search runs under: ddgs's `auto` backend can walk several
 /// engines before one answers, so a search needs more headroom than a command.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -116,7 +113,7 @@ fn search_definition() -> Tool {
 /// offered a tool that cannot run.
 #[must_use]
 pub(crate) fn search() -> Option<Tool> {
-    search_binary().map(|_| search_definition())
+    tool_binary("TART_SEARCH_BIN", "ddgs").map(|_| search_definition())
 }
 
 /// The fetch tool's definition; the transport is in-process, so it is always offered.
@@ -205,31 +202,20 @@ pub(super) fn parse_fetch(arguments: &str) -> anyhow::Result<Fetch> {
     })
 }
 
-/// Locate the search CLI: the `TART_SEARCH_BIN` override, `~/.local/bin/ddgs`
-/// (where `uv tool install ddgs` puts it), then `PATH`.
-fn search_binary() -> Option<PathBuf> {
-    let pinned = std::env::var_os("TART_SEARCH_BIN").map(PathBuf::from);
-    let installed =
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/ddgs"));
-    pinned
-        .into_iter()
-        .chain(installed)
-        .find(|path| is_executable(path))
-        .or_else(|| find_on_path(SEARCH_DEFAULT))
-}
-
-/// Locate the extractor CLI.
+/// Locate a CLI the web tools shell out to: its `TART_*_BIN` override,
+/// `~/.local/bin/<name>` (where `uv tool install` puts it), then `PATH`.
 ///
-/// The `TART_READER_BIN` override, `~/.local/bin/trafilatura`, then `PATH`.
-fn reader_binary() -> Option<PathBuf> {
-    let pinned = std::env::var_os("TART_READER_BIN").map(PathBuf::from);
+/// Looked up per call, never cached: the override must take effect from the
+/// moment it is set, tests included.
+fn tool_binary(override_var: &str, name: &str) -> Option<PathBuf> {
+    let pinned = std::env::var_os(override_var).map(PathBuf::from);
     let installed =
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/trafilatura"));
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(format!(".local/bin/{name}")));
     pinned
         .into_iter()
         .chain(installed)
         .find(|path| is_executable(path))
-        .or_else(|| find_on_path("trafilatura"))
+        .or_else(|| find_on_path(name))
 }
 
 /// The first executable `name` on `PATH`, if any.
@@ -298,7 +284,7 @@ pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: 
         Err(error) => return misuse(call, on_progress, &error),
     };
     traced(call, on_progress, || {
-        let Some(binary) = search_binary() else {
+        let Some(binary) = tool_binary("TART_SEARCH_BIN", "ddgs") else {
             let text = "search: no ddgs CLI found; install one with `uv tool install ddgs` \
                         or point TART_SEARCH_BIN at it"
                 .to_string();
@@ -559,7 +545,7 @@ fn extract_body(body: &[u8]) -> Result<String, String> {
     if is_pdf(body) {
         return Ok(pdf_from_body(body));
     }
-    let Some(binary) = reader_binary() else {
+    let Some(binary) = tool_binary("TART_READER_BIN", "trafilatura") else {
         return Err(
             "fetch: no trafilatura CLI found. use `raw=true` to fetch the page directly"
                 .to_string(),
@@ -1384,7 +1370,7 @@ mod tests {
     #[apply(skip_unless_networked!)]
     #[test]
     fn run_search_returns_rendered_results() {
-        let Some(_) = search_binary() else {
+        let Some(_) = tool_binary("TART_SEARCH_BIN", "ddgs") else {
             return;
         };
         let policy = Policy::new(std::env::temp_dir()).unwrap();
