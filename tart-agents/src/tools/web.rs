@@ -593,11 +593,14 @@ fn ocr_page(pdf: &Path, page: usize, pdftoppm: &Path, tesseract: &Path) -> Optio
     let mut ocr = web_command(tesseract);
     ocr.arg(&png).arg("stdout");
     let text = if rendered {
-        let run = run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new()).ok()?;
-        run.output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&run.output.stdout).trim().to_string())
+        run_watched(&mut ocr, Some(PDF_TIMEOUT), &CancelToken::new())
+            .ok()
+            .and_then(|WatchedRun { output, .. }| {
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            })
     } else {
         None
     };
@@ -615,7 +618,7 @@ fn pdf_text(path: &Path) -> String {
             .to_string();
     };
     let mut extract = web_command(&pdftotext);
-    extract.args(format!("-q -enc UTF-8 -l {PDF_MAX_PAGES}").split(' '));
+    extract.args(format!("-enc UTF-8 -l {PDF_MAX_PAGES}").split(' '));
     extract.arg(path).arg("-");
     let Ok(WatchedRun { output, .. }) =
         run_watched(&mut extract, Some(PDF_TIMEOUT), &CancelToken::new())
