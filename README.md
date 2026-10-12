@@ -41,12 +41,15 @@ thread-safe (meaning parallel agents cannot read or create partial modifications
 The web pair lives in `tart-agents/src/tools/web.rs` and runs outside the sandbox (see
 above). `Search` shells out to the locally installed
 [ddgs](https://github.com/deedy5/ddgs) CLI and returns a numbered list of title, url,
-and snippet. `Fetch` reads one URL through the [r.jina.ai](https://r.jina.ai) reader
-service, which returns the page as markdown, or directly with `raw=true` for JSON and
-plain-text endpoints. Results are refused for non-public hosts. Each is offered to the
-model only when its binary is installed. `TART_SEARCH_BIN` and `TART_FETCH_BIN` override
-the binary lookups, and `TART_JINA_KEY` adds a bearer token if your reader account needs
-one.
+and snippet. `Fetch` downloads one URL and extracts it locally with the
+[trafilatura](https://github.com/adbar/trafilatura) CLI (the body on stdin, markdown
+out), or fetches directly with `raw=true` for JSON and plain-text endpoints. PDFs are
+detected heuristically (a `.pdf` leaf, an arxiv-style `/pdf/` segment, or the `%PDF-`
+magic bytes of a downloaded body) and extracted locally instead. We use poppler's
+`pdftotext` for the embedded text layer and `pdftoppm` + `tesseract` OCR for scanned
+pages. Requests are refused for non-public hosts. Each CLI-backed path needs its binary
+installed: `TART_SEARCH_BIN` and `TART_READER_BIN` override the lookups
+(`uv tool install ddgs trafilatura`).
 
 ### Plan Mode
 
