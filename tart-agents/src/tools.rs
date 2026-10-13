@@ -574,7 +574,7 @@ fn nanos() -> u128 {
         .map_or(0, |since| since.as_nanos())
 }
 
-/// Write `text` to a private scratch file and point the model at it, previewing head.
+/// Write `text` to a private scratch file, previewing head and tail.
 ///
 /// The one way an oversized tool output is kept whole: bash successes spill
 /// here on the way out of [`frame`](command_text), and the agent loop spills
@@ -1627,7 +1627,7 @@ mod tests {
 
     /// An output past the cap reaches the front end capped with the marker;
     /// the model's own copy is spilled whole by the agent loop, so the
-    /// expanded view shows the spill's preview plus ends, not a pointer.
+    /// expanded view shows the capped excerpt rather than a pointer.
     #[test]
     fn oversized_output_reaches_the_front_end_capped() {
         let events = std::cell::RefCell::new(Vec::new());

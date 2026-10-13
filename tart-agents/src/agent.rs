@@ -1023,7 +1023,7 @@ mod tests {
 
         let _ = std::fs::remove_file(saved);
         let _ = std::fs::remove_file(&big);
-        let _ = server.join();
+        server.join().expect("the server exits");
     }
 
     #[test]
