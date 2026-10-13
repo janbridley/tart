@@ -7,6 +7,7 @@
 //! PDFs are read via `poppler` and OCR'd using `tesseract` if necessary.
 
 use std::io::{Read as _, Write as _};
+use std::iter::successors;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -302,7 +303,7 @@ fn is_global(ip: IpAddr) -> bool {
 
 /// An error with its causes on one line.
 fn error_chain(error: &dyn std::error::Error) -> String {
-    std::iter::successors(Some(error), |error| error.source())
+    successors(Some(error), |error| error.source())
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
@@ -450,25 +451,21 @@ impl DownloadedBody {
         body_text(&self.bytes)
     }
 
-    /// Returns whether the DOM nesting is shallow enough to process safely.
-    ///
-    /// Non-UTF-8 bodies pass without a nesting check, as parsing a general character
-    /// set is too much effort for such a narrow risk.
+    /// Returns whether the tag nesting is shallow enough to process safely.
     fn nesting_ok(&self) -> bool {
-        let Ok(html) = std::str::from_utf8(&self.bytes) else {
-            return true;
-        };
-        let doc = Document::from(html);
-        let mut depth: usize = 0;
-        let mut level = doc.select("body").first();
-        while !level.is_empty() {
-            depth += 1;
-            if depth > NESTING_CAP as usize {
-                return false;
-            }
-            level = level.children();
-        }
-        true
+        let html = String::from_utf8_lossy(&self.bytes);
+        let doc = Document::from(html.as_ref());
+        // The levels under `body`, one per generation, ending at the first
+        // empty one. A level at the cap's index means the tree is deeper
+        // than allowed, and `nth` stops right there rather than walking the
+        // rest of a page it is about to refuse.
+        let too_deep = successors(Some(doc.select("body").first()), |level| {
+            let children = level.children();
+            (!children.is_empty()).then_some(children)
+        })
+        .nth(NESTING_CAP as usize)
+        .is_some();
+        !too_deep
     }
 
     /// Returns whether no colspan/rowspan attribute claims an absurd value.
@@ -1261,6 +1258,36 @@ mod tests {
         assert_eq!(none, "plain");
         let barren = extraction_text(None, String::new());
         assert_eq!(barren, "");
+    }
+
+    #[test]
+    fn the_nesting_guard_covers_non_utf8_bodies() {
+        // One invalid byte kept the old strict-decode guard from ever
+        // running; the lossy decode must refuse the page regardless.
+        let mut deep =
+            format!("<body>{}</body>", "<div>".repeat(NESTING_CAP as usize + 1)).into_bytes();
+        deep.push(0xff);
+        let body = DownloadedBody {
+            bytes: deep,
+            final_url: "https://example.com".to_string(),
+        };
+        let out = body.read();
+        assert!(
+            out.contains(&format!("page nesting exceeds {NESTING_CAP} tags")),
+            "deep non-UTF-8 body must be refused: {out}"
+        );
+        assert!(out.contains("raw=true"), "{out}");
+
+        // A shallow non-UTF-8 body still goes to the reader, not the guard.
+        let shallow = DownloadedBody {
+            bytes: b"<body>caf\xe9</body>".to_vec(),
+            final_url: "https://example.com".to_string(),
+        };
+        let out = shallow.read();
+        assert!(
+            !out.contains("page nesting"),
+            "shallow body must not refuse: {out}"
+        );
     }
 
     #[test]
