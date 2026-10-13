@@ -569,7 +569,7 @@ fn extract_markdown(body: &[u8], url: &str) -> String {
                 rs_trafilatura::extract_with_options(&preprocessed, &options)
             }))
             .unwrap_or(Err(rs_trafilatura::Error::NoContent))
-            .map(|result| result.content_markdown.unwrap_or(result.content_text))
+            .map(|result| extraction_text(result.content_markdown, result.content_text))
             .unwrap_or_default()
         }
         // Non-utf8 data cannot be handled by extract_with_options so we don't try
@@ -578,9 +578,14 @@ fn extract_markdown(body: &[u8], url: &str) -> String {
             rs_trafilatura::extract_bytes_with_options(body, &options)
         }))
         .unwrap_or(Err(rs_trafilatura::Error::NoContent))
-        .map(|result| result.content_markdown.unwrap_or(result.content_text))
+        .map(|result| extraction_text(result.content_markdown, result.content_text))
         .unwrap_or_default(),
     }
+}
+
+/// The model-facing text of one extraction result.
+fn extraction_text(markdown: Option<String>, text: String) -> String {
+    markdown.filter(|md| !md.trim().is_empty()).unwrap_or(text)
 }
 
 /// Formats the model-facing suggestion to bypass extraction and fetch raw bytes.
@@ -1236,6 +1241,26 @@ mod tests {
             "over-cap body must say the cap: {out}"
         );
         assert!(out.contains("raw=true"), "over-cap body must hint: {out}");
+    }
+
+    #[test]
+    fn an_empty_markdown_some_falls_back_to_the_extracted_text() {
+        // Real markdown wins over the text, as before.
+        let kept = extraction_text(Some("# Title".to_string()), "plain".to_string());
+        assert_eq!(kept, "# Title");
+
+        // An empty or whitespace-only `Some` beside text: the text wins,
+        // not the emptiness.
+        let empty = extraction_text(Some(String::new()), "plain".to_string());
+        assert_eq!(empty, "plain");
+        let blank = extraction_text(Some("  \n".to_string()), "plain".to_string());
+        assert_eq!(blank, "plain");
+
+        // No markdown at all stays the text; an empty extraction stays empty.
+        let none = extraction_text(None, "plain".to_string());
+        assert_eq!(none, "plain");
+        let barren = extraction_text(None, String::new());
+        assert_eq!(barren, "");
     }
 
     #[test]
