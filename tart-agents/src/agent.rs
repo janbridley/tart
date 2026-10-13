@@ -616,7 +616,7 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test assertions")]
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
 
     use super::*;
     use crate::backends::openai_responses::{
@@ -953,6 +953,7 @@ mod tests {
         // A file whose numbered rendering passes the content cap.
         let big = std::env::temp_dir().join("tart-spill-test-input.txt");
         std::fs::write(&big, "x".repeat(tools::CONTENT_CAP + 4_096)).unwrap();
+        let arguments = serde_json::json!({ "file_path": &big }).to_string();
 
         // The first round calls read on the big file; the second answers.
         let server = std::thread::spawn(move || {
@@ -962,7 +963,20 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("the first client arrives");
             read_request(&mut stream);
             let _ = stream.write_all(head.as_bytes());
-            let call = serde_json::to_string(&call_done(0)).expect("serializes");
+            let call = serde_json::to_string(&call_done_with(
+                0,
+                FunctionToolCall {
+                    namespace: None,
+                    name: "read".to_string(),
+                    arguments,
+                    call_id: "call_0".to_string(),
+                    id: Some("item_0".to_string()),
+                    status: None,
+                    caller: None,
+                    r#async: None,
+                },
+            ))
+            .expect("serializes");
             let _ = stream.write_all(format!("data: {call}\n\n").as_bytes());
             let _ = stream.flush();
             drop(stream);
@@ -986,10 +1000,12 @@ mod tests {
         let items = items.as_array().expect("the record is a list of items");
         let output = items[3]["output"].as_str().expect("the call's output");
         assert!(output.starts_with("<persisted-output>"), "{output}");
+        // The pointer carries its path mid-line: "Output too large (68.0KB).
+        // Full output saved to: {path}".
         let saved = output
-            .lines()
-            .find_map(|line| line.strip_prefix("Full output saved to: "))
-            .expect("the pointer names its file");
+            .split_once("Full output saved to: ")
+            .and_then(|(_, rest)| rest.lines().next())
+            .unwrap_or_else(|| panic!("the pointer names its file: {output}"));
         let spilled = std::fs::read_to_string(saved).expect("the spill file exists");
         assert!(
             spilled.len() > tools::CONTENT_CAP,
@@ -1345,10 +1361,9 @@ mod tests {
     /// `read` without the required `file_path`; `index` keeps concurrent calls'
     /// ids distinct.
     fn call_done(index: usize) -> ResponseStreamEvent {
-        ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
-            sequence_number: index as u64,
-            output_index: index as u32,
-            item: OutputItem::FunctionCall(FunctionToolCall {
+        call_done_with(
+            index,
+            FunctionToolCall {
                 namespace: None,
                 name: "read".to_string(),
                 arguments: r#"{"start_line": 1}"#.to_string(),
@@ -1357,7 +1372,17 @@ mod tests {
                 status: None,
                 caller: None,
                 r#async: None,
-            }),
+            },
+        )
+    }
+
+    /// An output-item-done event carrying any finished function call, for
+    /// tests whose calls must be well formed.
+    fn call_done_with(index: usize, call: FunctionToolCall) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+            sequence_number: index as u64,
+            output_index: index as u32,
+            item: OutputItem::FunctionCall(call),
         })
     }
 
