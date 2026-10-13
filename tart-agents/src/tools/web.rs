@@ -1,10 +1,10 @@
 //! The web tools: `search` and `fetch`.
 //!
 //! These are the only tools that run **outside** the seatbelt sandbox.
-//! `search` shells out to the locally installed ddgs CLI, which writes
-//! structured JSON we only render. `fetch` speaks http itself: pages are
-//! extracted by the locally installed trafilatura CLI, PDFs go to poppler's
-//! text layer and tesseract's OCR, and no HTML is ever parsed here.
+//! `search` shells out to the locally installed ddgs CLI, which writes structured
+//! JSON we render. `fetch` uses native http via `reqwest`, which pre-processes HTML to
+//! surface LaTeX equations and then extracts the article body via `rs-trafilatura.`
+//! PDFs are read via `poppler` and OCR'd using `tesseract` if necessary.
 
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
@@ -24,9 +24,14 @@ use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
     CancelToken, WatchedRun, bounded, combined_output, command_text_inline, create_private, misuse,
-    parse_arguments, run_watched, run_watched_bytes, string_field, tool, traced, watched_failure,
+    parse_arguments, run_watched, string_field, tool, traced, watched_failure,
 };
 use crate::Progress;
+
+mod preprocessing;
+
+use dom_query::Document;
+use preprocessing::math_to_text;
 
 /// The timeout every search runs under: ddgs's `auto` backend can walk several
 /// engines before one answers, so a search needs more headroom than a command.
@@ -64,14 +69,20 @@ const PDF_HEADER_WINDOW: usize = 1024;
 /// couple of MB, so the body bounds itself.
 const DOWNLOAD_CAP: usize = 32 * 1024 * 1024;
 
+/// Bytes one extraction will process before refusing. Larger files are very slow.
+const EXTRACT_CAP: usize = 5 * 1024 * 1024;
+
+/// Maximum tag-nesting depth before a body is rejected as pathological.
+const NESTING_CAP: i64 = 1_000;
+
+/// Maximum colspan/rowspan value before a body is rejected.
+const TABLE_SPAN_CAP: usize = 1_000;
+
 /// Bytes of a non-PDF body handed back inline.
 const RAW_MAX_BYTES: usize = 2_000_000;
 
 /// The budget for every poppler/tesseract stage of one PDF.
 const PDF_TIMEOUT: Duration = Duration::from_secs(150);
-
-/// The extractor stage's budget: Python startup and an lxml parse, atop the client's HTTP deadline.
-const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A browser-ish `User-Agent`.
 ///
@@ -120,7 +131,7 @@ fn fetch_definition() -> Tool {
     tool(
         "fetch",
         "Read one web page as markdown, extracted automatically by the \
-        trafilatura CLI (article body, without boilerplate, retaining comments).\
+        built-in reader (article body, without boilerplate).\
         An empty extraction \
         usually means the page needs JavaScript: retry with raw=true, which fetches \
         the URL directly and suits JSON or plain-text endpoints. PDF urls (papers, \
@@ -143,7 +154,7 @@ fn fetch_definition() -> Tool {
     )
 }
 
-/// The fetch tool; always offered, though reading as markdown needs the extractor CLI.
+/// The fetch tool; always offered: the reader runs in-process, no CLI needed.
 #[must_use]
 pub(crate) fn fetch() -> Tool {
     fetch_definition()
@@ -531,26 +542,141 @@ fn github_text_view(url: &str) -> Option<String> {
     }
 }
 
-/// One fetched body, with raw mode's protections: fail on http error
-/// statuses and refuse bodies over the download cap.
-fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
-    let response = client
-        .get(url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| format!("error: {}", error_chain(&error)))?;
-    let mut body = Vec::new();
-    response
-        .take(DOWNLOAD_CAP as u64 + 1)
-        .read_to_end(&mut body)
-        .map_err(|error| format!("error: {error}"))?;
-    if body.len() > DOWNLOAD_CAP {
-        return Err(format!("error: body over {DOWNLOAD_CAP} bytes"));
-    }
-    Ok(body)
+/// One successfully downloaded body, with the URL it landed on.
+///
+/// The landing URL is the post-redirect destination (`response.url()`), which
+/// is more accurate for the page-type classifier than the request URL.
+#[derive(Debug, PartialEq)]
+struct DownloadedBody {
+    /// The response bytes, verified under [`DOWNLOAD_CAP`].
+    bytes: Vec<u8>,
+    /// The URL the response actually landed on (after redirects).
+    final_url: String,
 }
 
-/// One downloaded PDF as text: the poppler ladder reads the body from a file.
+impl DownloadedBody {
+    /// Downloads one URL and captures the post-redirect landing URL.
+    ///
+    /// Fails on http errors, or if the body exceeds [`DOWNLOAD_CAP`], returning a
+    /// string that gets passed through to the model.
+    fn try_download(client: &Client, url: &str) -> Result<Self, String> {
+        let response = client
+            .get(url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| format!("error: {}", error_chain(&error)))?;
+        // The landing URL: the response knows where redirects actually went.
+        let final_url = response.url().to_string();
+        let mut bytes = Vec::new();
+        response
+            .take(DOWNLOAD_CAP as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("error: {error}"))?;
+        if bytes.len() > DOWNLOAD_CAP {
+            return Err(format!("error: body over {DOWNLOAD_CAP} bytes"));
+        }
+        Ok(Self { bytes, final_url })
+    }
+
+    /// Whether the first kilobyte contains `%PDF-`.
+    fn is_pdf(&self) -> bool {
+        is_pdf(&self.bytes)
+    }
+
+    /// Returns the raw bytes as bounded text, up to [`RAW_MAX_BYTES`].
+    fn raw_text(&self) -> String {
+        body_text(&self.bytes)
+    }
+
+    /// Returns whether the DOM nesting is shallow enough to process safely.
+    ///
+    /// Non-UTF-8 bodies pass without a nesting check, as parsing a general character
+    /// set is too much effort for such a narrow risk.
+    fn nesting_ok(&self) -> bool {
+        let Ok(html) = std::str::from_utf8(&self.bytes) else {
+            return true;
+        };
+        let doc = Document::from(html);
+        let mut depth: usize = 0;
+        let mut level = doc.select("body").first();
+        while !level.is_empty() {
+            depth += 1;
+            if depth > NESTING_CAP as usize {
+                return false;
+            }
+            level = level.children();
+        }
+        true
+    }
+
+    /// Returns whether no colspan/rowspan attribute claims an absurd value.
+    ///
+    /// This catches degenerate or placeholder text like `colspan="1000000000000000"`,
+    /// which attempts to allocate too much memory. We allow up to [`TABLE_SPAN_CAP`].
+    fn table_spans_ok(&self) -> bool {
+        let text = String::from_utf8_lossy(&self.bytes);
+        for attr in ["colspan", "rowspan"] {
+            let mut search = 0;
+            while let Some(pos) = text[search..].find(attr) {
+                let rest = &text[search + pos + attr.len()..];
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Ok(value) = digits.parse::<usize>()
+                    && value > TABLE_SPAN_CAP
+                {
+                    return false;
+                }
+                search += pos + attr.len();
+            }
+        }
+        true
+    }
+
+    /// Guards against pathological inputs before any parsing begins.
+    ///
+    /// Both the math pre-pass and the reader are superlinear in nesting depth, so we
+    /// check to make sure that the page seems safe. Returns a model-facing hint
+    /// when the body is unsafe to parse, or `None` when it can proceed.
+    fn setup(&self) -> Option<String> {
+        if self.bytes.len() > EXTRACT_CAP {
+            return Some(raw_hint("body over {EXTRACT_CAP} bytes"));
+        }
+        if !self.nesting_ok() {
+            return Some(raw_hint("page nesting exceeds {NESTING_CAP} tags"));
+        }
+        if !self.table_spans_ok() {
+            return Some(raw_hint("table colspan/rowspan exceeds {TABLE_SPAN_CAP}"));
+        }
+        None
+    }
+
+    /// Produce the model-facing text for this body.
+    ///
+    /// PDF bytes go to poppler or tesseract; everything else gets HTML preprocessed
+    /// and then send into the reader if [`raw=true`](raw_hint), otherwise returned raw.
+    fn read(&self) -> String {
+        if self.is_pdf() {
+            return pdf_from_body(&self.bytes);
+        }
+        if let Some(hint) = self.setup() {
+            return hint;
+        }
+        let markdown = extract_markdown(&self.bytes, &self.final_url);
+        if markdown.trim().is_empty() {
+            raw_hint("no content extracted; the page may need JavaScript or have no article body")
+        } else {
+            body_text(markdown.as_bytes())
+        }
+    }
+}
+
+/// Extract one downloaded PDF as text via the poppler/tesseract.
+///
+/// The body is written to a private temp file (0600) that poppler reads; pages with
+/// little text are OCR'd by tesseract at 200 dpi, bounded by [`PDF_TIMEOUT`] per stage.
 fn pdf_from_body(body: &[u8]) -> String {
     let pdf = temp_path("fetch", "pdf");
     let text = create_private(&pdf)
@@ -560,40 +686,46 @@ fn pdf_from_body(body: &[u8]) -> String {
     text
 }
 
-/// One downloaded page as markdown: the body to the local trafilatura CLI on
-/// stdin, failures as content for the model; PDF bytes go to the poppler ladder.
-fn extract_body(body: &[u8]) -> Result<String, String> {
-    if is_pdf(body) {
-        return Ok(pdf_from_body(body));
-    }
-    let Some(binary) = tool_binary("TART_READER_BIN", "trafilatura") else {
-        return Err(
-            "fetch: no trafilatura CLI found. use `raw=true` to fetch the page directly"
-                .to_string(),
-        );
+/// Extract one downloaded page as markdown.
+///
+/// NOTE: short (~100 char) entries are doubled - this is a bug in (rs)-trafilatura, but
+/// is mostly harmless
+fn extract_markdown(body: &[u8], url: &str) -> String {
+    let options = rs_trafilatura::Options {
+        output_markdown: true,
+        include_links: true,
+        url: Some(url.to_string()),
+        ..rs_trafilatura::Options::default()
     };
-    let mut extract = web_command(&binary);
-    extract.args(["--precision", "--markdown"]);
-    let Ok(run) = run_watched_bytes(&mut extract, body, Some(EXTRACT_TIMEOUT), &CancelToken::new())
-    else {
-        return Err("fetch: trafilatura could not be run".to_string());
-    };
-    if let Some(failure) = watched_failure(&run, EXTRACT_TIMEOUT) {
-        return Ok(failure);
+    // Always run the math_to_text preprocessor on utf8 pages.
+    match std::str::from_utf8(body) {
+        Ok(html) => {
+            let preprocessed = math_to_text(html);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rs_trafilatura::extract_with_options(&preprocessed, &options)
+            }))
+            .unwrap_or(Err(rs_trafilatura::Error::NoContent))
+            .map(|result| result.content_markdown.unwrap_or(result.content_text))
+            .unwrap_or_default()
+        }
+        // Non-utf8 data cannot be handled by extract_with_options so we don't try
+        // to preprocess it
+        Err(_) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rs_trafilatura::extract_bytes_with_options(body, &options)
+        }))
+        .unwrap_or(Err(rs_trafilatura::Error::NoContent))
+        .map(|result| result.content_markdown.unwrap_or(result.content_text))
+        .unwrap_or_default(),
     }
-    let stdout = String::from_utf8_lossy(&run.output.stdout);
-    Ok(if stdout.trim().is_empty() {
-        "fetch: no content extracted; the page may need JavaScript or have no \
-         article body. retry with raw=true for the unprocessed response"
-            .to_string()
-    } else {
-        body_text(stdout.as_bytes())
-    })
 }
 
-/// One page fetch: downloaded under raw mode's protections, then extracted locally.
-fn extract_page(client: &Client, url: &str) -> Result<String, String> {
-    download(client, url).and_then(|body| extract_body(&body))
+/// Formats the model-facing suggestion to bypass extraction and fetch raw bytes.
+///
+/// Every guard and extraction failure funnels through this single message
+/// shape, so the model always sees the same remedy regardless of which
+/// stage refused the page.
+fn raw_hint(reason: &str) -> String {
+    format!("fetch: {reason}; use `raw=true` for the unprocessed response")
 }
 
 /// A fetched non-PDF body as inline text, capped at [`RAW_MAX_BYTES`].
@@ -788,29 +920,25 @@ impl<'a> Pages<'a> {
     }
 }
 
-/// One fetch's content: raw and PDF-hinted urls download first so the body
-/// can be sniffed and, for PDFs, extracted; every other url, and a hint that
-/// proved wrong, is the local extractor's to render.
+/// Get the content for a single fetch, handling special case filetypes.
 fn fetch_body(fetch: &Fetch, url: &str, client: &Client) -> Result<String, String> {
     if !fetch.raw && !url_hints_pdf(url) {
-        return extract_page(client, url);
+        return DownloadedBody::try_download(client, url).map(|body| body.read());
     }
-    let body = download(client, url)?;
-    if is_pdf(&body) {
-        Ok(pdf_from_body(&body))
-    } else if fetch.raw {
-        // Raw bodies are content.
-        Ok(body_text(&body))
+    let body = DownloadedBody::try_download(client, url)?;
+    if fetch.raw && !body.is_pdf() {
+        // Raw non-PDF bodies are content, unprocessed.
+        Ok(body.raw_text())
     } else {
-        // A hinted non-PDF was a guess, so the extractor takes it instead.
-        extract_body(&body)
+        // PDF bytes (raw or not) go to poppler+OCR; hinted non-PDFs go to the reader.
+        Ok(body.read())
     }
 }
 
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
-/// Like `search` this runs outside the sandbox. Every path is content for the
-/// model: the text on success, or the refusal or error that explains it.
+/// Like `search` this runs outside the sandbox. Every path is content for the model:
+/// text on success, or a refusal or error that explains it.
 pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
     let fetch = match parse_fetch(&call.arguments) {
         Ok(fetch) => fetch,
@@ -1155,11 +1283,12 @@ mod tests {
         let client = FETCH_CLIENT.clone().unwrap();
 
         let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_string());
-        let body = download(&client, &format!("http://{address}/x")).unwrap();
-        assert_eq!(body, b"hello");
+        let body = DownloadedBody::try_download(&client, &format!("http://{address}/x")).unwrap();
+        assert_eq!(body.bytes, b"hello");
 
         let address = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string());
-        let error = download(&client, &format!("http://{address}/gone")).unwrap_err();
+        let error =
+            DownloadedBody::try_download(&client, &format!("http://{address}/gone")).unwrap_err();
         assert!(error.contains("404"), "{error}");
 
         // The policy refusal happens on the hop, before any connection is
@@ -1169,7 +1298,8 @@ mod tests {
             "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.5/x\r\nContent-Length: 0\r\n\r\n"
                 .to_string(),
         );
-        let error = download(&client, &format!("http://{address}/hop")).unwrap_err();
+        let error =
+            DownloadedBody::try_download(&client, &format!("http://{address}/hop")).unwrap_err();
         assert!(error.contains("refusing redirect"), "{error}");
         assert!(error.contains("10.0.0.5"), "{error}");
     }
@@ -1387,26 +1517,15 @@ mod tests {
         assert!(text.contains("--- page 8 ---"));
     }
 
-    #[apply(skip_unless_live!)]
     #[test]
-    fn extract_page_extracts_through_a_local_cli() {
-        let stub = temp_path("fetch", "sh");
-        std::fs::write(&stub, "#!/bin/sh\nprintf '# ';cat").unwrap();
-        let mut mode = std::fs::metadata(&stub).unwrap().permissions();
-        mode.set_mode(0o700);
-        std::fs::set_permissions(&stub, mode).unwrap();
-        let client = FETCH_CLIENT.clone().unwrap();
-        let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_string());
-        unsafe { std::env::set_var("TART_READER_BIN", &stub) };
-        let extracted = extract_page(&client, &format!("http://{address}/x")).unwrap();
-        let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_string());
-        unsafe { std::env::set_var("TART_READER_BIN", "/usr/bin/true") };
-        let empty = extract_page(&client, &format!("http://{address}/x")).unwrap();
-        unsafe { std::env::remove_var("TART_READER_BIN") };
-        let _ = std::fs::remove_file(&stub);
-
-        assert_eq!(extracted, "# abc");
-        assert!(empty.contains("raw=true"), "{empty}");
+    fn extract_body_caps_extraction_input() {
+        let big = vec![b'<'; 11 * 1024 * 1024];
+        let body = DownloadedBody {
+            bytes: big,
+            final_url: "https://example.com".to_string(),
+        };
+        let out = body.read();
+        assert!(out.contains("raw=true"), "over-cap body must hint: {out}");
     }
 
     #[test]
@@ -1506,6 +1625,42 @@ mod tests {
                 Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { exit: Some(0), .. }
             ] if name == "fetch" && arguments == r#"{"url":"https://example.com","raw":true}"#
+        ));
+    }
+
+    #[apply(skip_unless_networked!)]
+    #[test]
+    fn run_fetch_extracts_a_page_to_markdown() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let request = call("fetch", r#"{"url":"https://example.com"}"#);
+
+        let output = execute(&request, &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
+
+        // Extraction, not passthrough
+        assert!(!output.trim().is_empty(), "must extract text: {output}");
+        assert!(!output.contains("<html"), "{output}");
+        assert!(!output.contains("<body"), "{output}");
+        assert!(
+            output.contains("domain") && output.len() > 50,
+            "must be the example.com body text: {output}"
+        );
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                Progress::ToolStart { name, arguments, .. },
+                Progress::ToolOutput { exit: Some(0), .. }
+            ] if name == "fetch" && arguments == r#"{"url":"https://example.com"}"#
         ));
     }
 
