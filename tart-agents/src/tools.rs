@@ -1,7 +1,7 @@
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -519,7 +519,8 @@ fn command_text(text: &str, status: ExitStatus, one_is_success: bool) -> String 
 }
 
 /// The framing for callers whose text is returned inline however large: the web
-/// tools and the user's own manual commands.
+/// tools and the user's own manual commands. The framing itself never spills;
+/// the agent loop spills what later outgrows [`CONTENT_CAP`].
 fn command_text_inline(text: &str, status: ExitStatus, one_is_success: bool) -> String {
     frame(text, status, one_is_success, false)
 }
@@ -530,7 +531,7 @@ fn frame(text: &str, status: ExitStatus, one_is_success: bool, spill: bool) -> S
     let success = status.success() || (one_is_success && status.code() == Some(1));
     if success {
         if spill && text.len() > BASH_SUCCESS_CAP {
-            return spill_to_file(text);
+            return spill_to_file(text).map_or_else(|| excerpt(text), |(pointer, _)| pointer);
         }
         return if text.is_empty() {
             "(Bash completed with no output)".to_string()
@@ -578,22 +579,28 @@ fn nanos() -> u128 {
 /// The one way an oversized tool output is kept whole: bash successes spill
 /// here on the way out of [`frame`](command_text), and the agent loop spills
 /// any tool output past [`CONTENT_CAP`] the same way, so nothing the model
-/// may still need is lost to truncation.
-pub(crate) fn spill_to_file(text: &str) -> String {
-    let dir = std::env::temp_dir().join("tart");
+/// may still need is lost to truncation. `None` when the file cannot be
+/// written, so each caller falls back to the framing it can afford.
+pub(crate) fn spill_to_file(text: &str) -> Option<(String, PathBuf)> {
+    spill_to_dir(&std::env::temp_dir().join("tart"), text)
+}
+
+/// [`spill_to_file`] against an explicit scratch directory, for tests.
+fn spill_to_dir(dir: &Path, text: &str) -> Option<(String, PathBuf)> {
     let name = format!("tart-output-{}-{}.output", std::process::id(), nanos());
     let path = dir.join(name);
-    if write_private(&dir, &path, text).is_err() {
-        return excerpt(text);
-    }
-    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/result-persistence-format.ts#L29>
-    format!(
-        "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\n{}\n\
-         </persisted-output>",
-        bash_byte_size(text.len()),
-        path.display(),
-        bounded(text, SPILL_PREVIEW),
-    )
+    write_private(dir, &path, text).ok()?;
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts#L177>
+    Some((
+        format!(
+            "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\n{}\n\
+             </persisted-output>",
+            bash_byte_size(text.len()),
+            path.display(),
+            bounded(text, SPILL_PREVIEW),
+        ),
+        path,
+    ))
 }
 
 /// Create `path` new and owner-only, refusing anything already there.
@@ -806,7 +813,8 @@ fn traced<F: Fn(Progress)>(
         arguments: call.arguments.clone(),
     });
     let (result, output, exit) = run();
-    // Display-only copy of the text is bounded to match the string we pass to the model
+    // Display-only copy of the text, bounded to the content cap; past it the
+    // model instead receives a spill pointer, so the two views diverge there.
     let output = bounded(&output, CONTENT_CAP);
     on_progress(Progress::ToolOutput {
         id: call.call_id.clone(),
@@ -1325,8 +1333,20 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The web tools and manual runs return their text inline however large, so a
-    /// fetched page is never silently replaced by a scratch-file pointer.
+    /// A scratch directory that cannot be created - here because the path is
+    /// occupied by a regular file - spills nothing, and says so, rather than
+    /// returning a pointer to a file that was never written.
+    #[test]
+    fn a_failed_spill_returns_none_rather_than_a_dead_pointer() {
+        let blocker = tempfile::tempdir().unwrap();
+        let in_the_way = blocker.path().join("tart");
+        std::fs::write(&in_the_way, "occupied").unwrap();
+
+        assert!(spill_to_dir(&in_the_way, &"x".repeat(4_096)).is_none());
+    }
+
+    /// The web tools and manual runs return their text inline however large:
+    /// the framing never spills, the agent loop does, past the content cap.
     #[test]
     fn inline_framing_never_spills() {
         let text = "x".repeat(BASH_SUCCESS_CAP + 1);
@@ -1605,9 +1625,9 @@ mod tests {
         ));
     }
 
-    /// An output past the cap reaches the model whole but the front end capped,
-    /// with the marker the model's own history carries: expanded view shows
-    /// exactly what the model saw.
+    /// An output past the cap reaches the front end capped with the marker;
+    /// the model's own copy is spilled whole by the agent loop, so the
+    /// expanded view shows the spill's preview plus ends, not a pointer.
     #[test]
     fn oversized_output_reaches_the_front_end_capped() {
         let events = std::cell::RefCell::new(Vec::new());
