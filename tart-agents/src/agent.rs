@@ -538,16 +538,20 @@ impl<B: Backend> Agent<B> {
                 }
                 // Tool calls exit with errors/denial text/parse failures if they fail
                 let output = tools::execute(&call, &tooling, on_progress);
-                // History keeps no more than the cap, noted when it cut.
-                if output.len() > tools::CONTENT_CAP {
+                // History keeps no more than the cap: an oversized output is
+                // spilled whole to a file the model can read back, noted as
+                // it happens, rather than amputated head-and-tail.
+                let kept = if output.len() > tools::CONTENT_CAP {
                     on_progress(Progress::Note(format!(
-                        "{} output truncated to {} KiB",
+                        "{} output spilled to a file (over {} KiB)",
                         call.name,
                         tools::CONTENT_CAP / 1024
                     )));
-                }
-                let bounded = tools::bounded(&output, tools::CONTENT_CAP);
-                exchanges.push((call, bounded));
+                    tools::spill_to_file(&output)
+                } else {
+                    output
+                };
+                exchanges.push((call, kept));
             }
             // A round cut short before its first executed call records no
             // reasoning: without its calls the item would dangle in the replay.

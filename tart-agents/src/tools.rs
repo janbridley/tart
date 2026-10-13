@@ -574,9 +574,14 @@ fn nanos() -> u128 {
 }
 
 /// Write `text` to a private scratch file and point the model at it, previewing head.
-fn spill_to_file(text: &str) -> String {
+///
+/// The one way an oversized tool output is kept whole: bash successes spill
+/// here on the way out of [`frame`](command_text), and the agent loop spills
+/// any tool output past [`CONTENT_CAP`] the same way, so nothing the model
+/// may still need is lost to truncation.
+pub(crate) fn spill_to_file(text: &str) -> String {
     let dir = std::env::temp_dir().join("tart");
-    let name = format!("tart-bash-{}-{}.output", std::process::id(), nanos());
+    let name = format!("tart-output-{}-{}.output", std::process::id(), nanos());
     let path = dir.join(name);
     if write_private(&dir, &path, text).is_err() {
         return excerpt(text);
