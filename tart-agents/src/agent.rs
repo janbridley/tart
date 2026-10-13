@@ -538,16 +538,34 @@ impl<B: Backend> Agent<B> {
                 }
                 // Tool calls exit with errors/denial text/parse failures if they fail
                 let output = tools::execute(&call, &tooling, on_progress);
-                // History keeps no more than the cap, noted when it cut.
-                if output.len() > tools::CONTENT_CAP {
+                // History keeps no more than the cap: an oversized output is
+                // spilled whole to a file the model can read back, noted with
+                // where it landed. A spill that cannot be written falls back
+                // to the head-and-tail excerpt rather than promising a file
+                // that does not exist.
+                let kept = if output.len() > tools::CONTENT_CAP
+                    && let Some((pointer, path)) = tools::spill_to_file(&output)
+                {
+                    on_progress(Progress::Note(format!(
+                        "{} output spilled to {} (over {} KiB)",
+                        call.name,
+                        path.display(),
+                        tools::CONTENT_CAP / 1024
+                    )));
+                    pointer
+                } else if output.len() > tools::CONTENT_CAP {
+                    // The spill could not be written: say truncated, and
+                    // deliver the head-and-tail excerpt that implies.
                     on_progress(Progress::Note(format!(
                         "{} output truncated to {} KiB",
                         call.name,
                         tools::CONTENT_CAP / 1024
                     )));
-                }
-                let bounded = tools::bounded(&output, tools::CONTENT_CAP);
-                exchanges.push((call, bounded));
+                    tools::bounded(&output, tools::CONTENT_CAP)
+                } else {
+                    output
+                };
+                exchanges.push((call, kept));
             }
             // A round cut short before its first executed call records no
             // reasoning: without its calls the item would dangle in the replay.
@@ -598,7 +616,7 @@ fn terminate_and_log<F: Fn(Progress)>(on_progress: &F, event: Progress) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test assertions")]
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
 
     use super::*;
     use crate::backends::openai_responses::{
@@ -913,6 +931,99 @@ mod tests {
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         assert_eq!(items.as_array().map(Vec::len), Some(3));
         assert_eq!(items[2]["content"], "Once upon a time");
+    }
+
+    /// One round whose `read` output passes the content cap: history records
+    /// a pointer to a private scratch file holding the whole output, and the
+    /// turn's notes say where it landed. The bash tool's own 30 KiB spill
+    /// never reaches this branch, so `read` is the tool that exercises it.
+    #[test]
+    fn an_oversized_tool_output_spills_into_history() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(listener) = loopback() else { return };
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let address = listener.local_addr().expect("a bound address");
+        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user("read it all".to_string())
+            .expect("the user turn records");
+
+        // A file whose numbered rendering passes the content cap.
+        let big = std::env::temp_dir().join("tart-spill-test-input.txt");
+        std::fs::write(&big, "x".repeat(tools::CONTENT_CAP + 4_096)).unwrap();
+        let arguments = serde_json::json!({ "file_path": &big }).to_string();
+
+        // The first round calls read on the big file; the second answers.
+        let server = std::thread::spawn(move || {
+            let head = "HTTP/1.1 200 OK\r\n\
+                        content-type: text/event-stream\r\n\
+                        connection: close\r\n\r\n";
+            let (mut stream, _) = listener.accept().expect("the first client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            let call = serde_json::to_string(&call_done_with(
+                0,
+                FunctionToolCall {
+                    namespace: None,
+                    name: "read".to_string(),
+                    arguments,
+                    call_id: "call_0".to_string(),
+                    id: Some("item_0".to_string()),
+                    status: None,
+                    caller: None,
+                    r#async: None,
+                },
+            ))
+            .expect("serializes");
+            let _ = stream.write_all(format!("data: {call}\n\n").as_bytes());
+            let _ = stream.flush();
+            drop(stream);
+            let (mut stream, _) = listener.accept().expect("the second client arrives");
+            read_request(&mut stream);
+            let _ = stream.write_all(head.as_bytes());
+            let event = serde_json::to_string(&delta("done")).expect("serializes");
+            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            let _ = stream.flush();
+        });
+
+        let log = drive(&agent, &transcript);
+        assert!(
+            log.last().is_some_and(|entry| entry.starts_with("Done")),
+            "the turn must finish: {log:?}"
+        );
+
+        // The recorded output is the pointer, and the file it names is the
+        // whole output, private to its owner.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().expect("the record is a list of items");
+        let output = items[3]["output"].as_str().expect("the call's output");
+        assert!(output.starts_with("<persisted-output>"), "{output}");
+        // The pointer carries its path mid-line: "Output too large (68.0KB).
+        // Full output saved to: {path}".
+        let saved = output
+            .split_once("Full output saved to: ")
+            .and_then(|(_, rest)| rest.lines().next())
+            .unwrap_or_else(|| panic!("the pointer names its file: {output}"));
+        let spilled = std::fs::read_to_string(saved).expect("the spill file exists");
+        assert!(
+            spilled.len() > tools::CONTENT_CAP,
+            "the whole output: {}",
+            spilled.len()
+        );
+        let mode = std::fs::metadata(saved).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{saved}");
+
+        // The note told the user where it went, after the fact.
+        assert!(
+            log.iter().any(|entry| entry.contains("output spilled to ")),
+            "the spill is noted with its path: {log:?}"
+        );
+
+        let _ = std::fs::remove_file(saved);
+        let _ = std::fs::remove_file(&big);
+        server.join().expect("the server exits");
     }
 
     #[test]
@@ -1250,10 +1361,9 @@ mod tests {
     /// `read` without the required `file_path`; `index` keeps concurrent calls'
     /// ids distinct.
     fn call_done(index: usize) -> ResponseStreamEvent {
-        ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
-            sequence_number: index as u64,
-            output_index: index as u32,
-            item: OutputItem::FunctionCall(FunctionToolCall {
+        call_done_with(
+            index,
+            FunctionToolCall {
                 namespace: None,
                 name: "read".to_string(),
                 arguments: r#"{"start_line": 1}"#.to_string(),
@@ -1262,7 +1372,17 @@ mod tests {
                 status: None,
                 caller: None,
                 r#async: None,
-            }),
+            },
+        )
+    }
+
+    /// An output-item-done event carrying any finished function call, for
+    /// tests whose calls must be well formed.
+    fn call_done_with(index: usize, call: FunctionToolCall) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+            sequence_number: index as u64,
+            output_index: index as u32,
+            item: OutputItem::FunctionCall(call),
         })
     }
 

@@ -79,13 +79,14 @@ Results come back as a numbered list of title, url, and snippet.
 Call `fetch` with:
 
 - `url` (string): the absolute http(s) URL to read.
-- `raw` (boolean, optional): fetch the URL directly with no extraction. Default false.
+- `raw` (boolean, optional): fetch the URL directly and return its exact bytes, with no
+  extraction. Default false.
 
-The page comes back as markdown (the article body, stripped of boilerplate, comments
-kept; no title or url header) so prefer it over `raw` for documentation and articles.
-Pass `raw=true` for JSON or plain-text endpoints. An empty extraction usually means the
-page needs JavaScript: retry the same URL with `raw=true`. A result over 64 KB reaches
-you cut to its first and last 32 KB, with the dropped middle marked.
+The page comes back as markdown (the article body, stripped of boilerplate; no title or
+url header), extracted by the built-in reader. Prefer this over `raw` for documentation
+and articles. Use `raw=true` for JSON or plain-text endpoints, or when extraction comes
+back empty or appears to lack content. A result over 64 KB reaches you cut to its first
+and last 32 KB, with the dropped middle marked.
 
 ## The Spawn Agent Tool
 
@@ -138,6 +139,8 @@ progress when you check, defer to the user or end your turn.
 - A success that prints more than 30,000 bytes spills to a file holding the full output
   and previews its start and end. A failure over 10,000 bytes is cut to its first and
   last 5,000 bytes, with a marker where the middle was dropped.
+- Any tool result over 64 KiB is likewise spilled whole to a scratch file, with the path
+  and a preview inline.
 
 ## Sandbox
 

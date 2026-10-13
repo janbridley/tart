@@ -1,13 +1,13 @@
 //! The web tools: `search` and `fetch`.
 //!
 //! These are the only tools that run **outside** the seatbelt sandbox.
-//! `search` shells out to the locally installed ddgs CLI, which writes
-//! structured JSON we only render. `fetch` speaks http itself: pages are
-//! extracted by the locally installed trafilatura CLI, PDFs go to poppler's
-//! text layer and tesseract's OCR, and no HTML is ever parsed here.
+//! `search` shells out to the locally installed ddgs CLI, which writes structured
+//! JSON we render. `fetch` uses native http via `reqwest`, which pre-processes HTML to
+//! surface LaTeX equations and then extracts the article body via `rs-trafilatura.`
+//! PDFs are read via `poppler` and OCR'd using `tesseract` if necessary.
 
-use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
+use std::iter::successors;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -23,14 +23,20 @@ use reqwest::redirect::Policy as Redirects;
 use crate::backends::{FunctionToolCall, Tool};
 
 use super::{
-    CancelToken, WatchedRun, bounded, combined_output, command_text_inline, create_private, misuse,
-    parse_arguments, run_watched, run_watched_bytes, string_field, tool, traced, watched_failure,
+    CancelToken, WatchedRun, bounded, combined_output, create_private, misuse, parse_arguments,
+    run_watched, string_field, tool, traced,
 };
 use crate::Progress;
 
-/// The timeout every search runs under: ddgs's `auto` backend can walk several
-/// engines before one answers, so a search needs more headroom than a command.
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
+mod preprocessing;
+
+mod search;
+
+pub(super) use search::run_search;
+pub(crate) use search::search;
+
+use dom_query::Document;
+use preprocessing::math_to_text;
 
 /// The total budget for one fetch: connect, redirects, and body, enforced by
 /// the client rather than a watchdog now the transport is in-process.
@@ -38,12 +44,6 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Hops one fetch will follow before giving up.
 const MAX_REDIRECTS: usize = 5;
-
-/// Results returned when the model does not ask for a number.
-const DEFAULT_SEARCH_RESULTS: u64 = 8;
-
-/// Most results one search may return; more is noise the model cannot use.
-const MAX_SEARCH_RESULTS: u64 = 25;
 
 /// Pages one fetch will read from a PDF.
 const PDF_MAX_PAGES: usize = 60;
@@ -64,14 +64,20 @@ const PDF_HEADER_WINDOW: usize = 1024;
 /// couple of MB, so the body bounds itself.
 const DOWNLOAD_CAP: usize = 32 * 1024 * 1024;
 
+/// Bytes one extraction will process before refusing. Larger files are very slow.
+const EXTRACT_CAP: usize = 5 * 1024 * 1024;
+
+/// Maximum tag-nesting depth before a body is rejected as pathological.
+const NESTING_CAP: i64 = 1_000;
+
+/// Maximum colspan/rowspan value before a body is rejected.
+const TABLE_SPAN_CAP: usize = 1_000;
+
 /// Bytes of a non-PDF body handed back inline.
 const RAW_MAX_BYTES: usize = 2_000_000;
 
 /// The budget for every poppler/tesseract stage of one PDF.
 const PDF_TIMEOUT: Duration = Duration::from_secs(150);
-
-/// The extractor stage's budget: Python startup and an lxml parse, atop the client's HTTP deadline.
-const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A browser-ish `User-Agent`.
 ///
@@ -79,48 +85,12 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
      (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
 
-/// The search tool's definition, offered only when a ddgs CLI is installed.
-fn search_definition() -> Tool {
-    tool(
-        "search",
-        "Search the web and return ranked results (title, url, snippet). Runs the \
-        locally installed ddgs CLI outside the sandbox, so it has network access but \
-        cannot read or write files",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "What to search for"},
-                "max_results": {
-                    "type": "integer",
-                    "description": "Results to return, 1-25; default 8"
-                },
-                "timelimit": {
-                    "type": "string",
-                    "description": "Only results from the past d(ay), w(eek), m(onth), or y(ear)"
-                },
-                "news": {
-                    "type": "boolean",
-                    "description": "Search news articles instead of web pages"
-                }
-            },
-            "required": ["query"]
-        }),
-    )
-}
-
-/// The search tool; `None` when no ddgs CLI is installed, so the model is never
-/// offered a tool that cannot run.
-#[must_use]
-pub(crate) fn search() -> Option<Tool> {
-    tool_binary("TART_SEARCH_BIN", "ddgs").map(|_| search_definition())
-}
-
 /// The fetch tool's definition; the transport is in-process, so it is always offered.
 fn fetch_definition() -> Tool {
     tool(
         "fetch",
         "Read one web page as markdown, extracted automatically by the \
-        trafilatura CLI (article body, without boilerplate, retaining comments).\
+        built-in reader (article body, without boilerplate).\
         An empty extraction \
         usually means the page needs JavaScript: retry with raw=true, which fetches \
         the URL directly and suits JSON or plain-text endpoints. PDF urls (papers, \
@@ -143,44 +113,10 @@ fn fetch_definition() -> Tool {
     )
 }
 
-/// The fetch tool; always offered, though reading as markdown needs the extractor CLI.
+/// The fetch tool; always offered: the reader runs in-process, no CLI needed.
 #[must_use]
 pub(crate) fn fetch() -> Tool {
     fetch_definition()
-}
-
-/// One parsed search tool call.
-#[derive(Debug)]
-pub(super) struct Search {
-    /// The query, passed to ddgs as a single argv element.
-    pub query: String,
-    /// Results to return, clamped to 1-25.
-    pub max_results: u64,
-    /// Recency window, one of the letters ddgs understands; `None` is any time.
-    pub timelimit: Option<String>,
-    /// Search news articles rather than web pages.
-    pub news: bool,
-}
-
-/// Extract the fields from a search tool call's JSON arguments.
-///
-/// Optional fields fall back to ddgs's own defaults, wrong-typed values are
-/// ignored, and `timelimit` is validated against the four letters ddgs accepts
-/// so a nonsense value cannot become a CLI error.
-pub(super) fn parse_search(arguments: &str) -> anyhow::Result<Search> {
-    let args = parse_arguments(arguments)?;
-    Ok(Search {
-        query: string_field(&args, "search", "query")?,
-        max_results: args["max_results"]
-            .as_u64()
-            .unwrap_or(DEFAULT_SEARCH_RESULTS)
-            .clamp(1, MAX_SEARCH_RESULTS),
-        timelimit: args["timelimit"]
-            .as_str()
-            .filter(|limit| matches!(*limit, "d" | "w" | "m" | "y"))
-            .map(str::to_string),
-        news: args["news"].as_bool().unwrap_or(false),
-    })
 }
 
 /// One parsed fetch tool call.
@@ -254,68 +190,6 @@ fn temp_path(tool: &str, extension: &str) -> PathBuf {
     static CALLS: AtomicU64 = AtomicU64::new(0);
     let call = CALLS.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("tart-{tool}-{}-{call}.{extension}", std::process::id()))
-}
-
-/// The ddgs argv for one search: the subcommand, the query as a single argv
-/// element, the result count, any recency window, and the results file.
-fn ddgs_args(search: &Search, results: &Path) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec![
-        if search.news { "news" } else { "text" }.into(),
-        "-q".into(),
-        search.query.as_str().into(),
-        "-m".into(),
-        search.max_results.to_string().into(),
-    ];
-    if let Some(timelimit) = &search.timelimit {
-        args.push("-t".into());
-        args.push(timelimit.as_str().into());
-    }
-    args.push("-o".into());
-    args.push(results.as_os_str().to_owned());
-    args
-}
-
-/// Run one search tool call, reporting its steps to `on_progress`.
-///
-/// As with bash, a failure (no CLI, a rate-limited backend, a timeout) is
-/// content for the model, not an error.
-pub(super) fn run_search<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
-    let search = match parse_search(&call.arguments) {
-        Ok(search) => search,
-        Err(error) => return misuse(call, on_progress, &error),
-    };
-    traced(call, on_progress, || {
-        let Some(binary) = tool_binary("TART_SEARCH_BIN", "ddgs") else {
-            let text = "search: no ddgs CLI found; install one with `uv tool install ddgs` \
-                        or point TART_SEARCH_BIN at it"
-                .to_string();
-            return (text.clone(), text, None);
-        };
-        let results = temp_path("search", "json");
-        let mut ddgs = web_command(&binary);
-        ddgs.args(ddgs_args(&search, &results));
-        let outcome = run_watched(&mut ddgs, Some(SEARCH_TIMEOUT), &CancelToken::new());
-        // The results file is ours whatever happened: read it, then drop it.
-        let json = std::fs::read_to_string(&results).ok();
-        let _ = std::fs::remove_file(&results);
-        match json.as_deref().and_then(|json| render_results(&search, json)) {
-            Some(rendered) => (rendered.clone(), rendered, Some(0)),
-            None => match outcome {
-                Ok(run) => {
-                    let exit = run.output.status.code();
-                    // A success that rendered no results still reports the CLI's output.
-                    let text = watched_failure(&run, SEARCH_TIMEOUT).unwrap_or_else(|| {
-                        command_text_inline(&combined_output(&run.output), run.output.status, false)
-                    });
-                    (text.clone(), text, exit)
-                }
-                Err(error) => {
-                    let text = format!("error: {error}");
-                    (text.clone(), text, None)
-                }
-            },
-        }
-    })
 }
 
 /// Reject URLs that are not plain public web addresses.
@@ -429,7 +303,7 @@ fn is_global(ip: IpAddr) -> bool {
 
 /// An error with its causes on one line.
 fn error_chain(error: &dyn std::error::Error) -> String {
-    std::iter::successors(Some(error), |error| error.source())
+    successors(Some(error), |error| error.source())
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
@@ -531,26 +405,139 @@ fn github_text_view(url: &str) -> Option<String> {
     }
 }
 
-/// One fetched body, with raw mode's protections: fail on http error
-/// statuses and refuse bodies over the download cap.
-fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
-    let response = client
-        .get(url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| format!("error: {}", error_chain(&error)))?;
-    let mut body = Vec::new();
-    response
-        .take(DOWNLOAD_CAP as u64 + 1)
-        .read_to_end(&mut body)
-        .map_err(|error| format!("error: {error}"))?;
-    if body.len() > DOWNLOAD_CAP {
-        return Err(format!("error: body over {DOWNLOAD_CAP} bytes"));
-    }
-    Ok(body)
+/// One successfully downloaded body, with the URL it landed on.
+///
+/// The landing URL is the post-redirect destination (`response.url()`), which
+/// is more accurate for the page-type classifier than the request URL.
+#[derive(Debug, PartialEq)]
+struct DownloadedBody {
+    /// The response bytes, verified under [`DOWNLOAD_CAP`].
+    bytes: Vec<u8>,
+    /// The URL the response actually landed on (after redirects).
+    final_url: String,
 }
 
-/// One downloaded PDF as text: the poppler ladder reads the body from a file.
+impl DownloadedBody {
+    /// Downloads one URL and captures the post-redirect landing URL.
+    ///
+    /// Fails on http errors, or if the body exceeds [`DOWNLOAD_CAP`], returning a
+    /// string that gets passed through to the model.
+    fn try_download(client: &Client, url: &str) -> Result<Self, String> {
+        let response = client
+            .get(url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| format!("error: {}", error_chain(&error)))?;
+        // The landing URL: the response knows where redirects actually went.
+        let final_url = response.url().to_string();
+        let mut bytes = Vec::new();
+        response
+            .take(DOWNLOAD_CAP as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("error: {error}"))?;
+        if bytes.len() > DOWNLOAD_CAP {
+            return Err(format!("error: body over {DOWNLOAD_CAP} bytes"));
+        }
+        Ok(Self { bytes, final_url })
+    }
+
+    /// Whether the first kilobyte contains `%PDF-`.
+    fn is_pdf(&self) -> bool {
+        is_pdf(&self.bytes)
+    }
+
+    /// Returns the raw bytes as bounded text, up to [`RAW_MAX_BYTES`].
+    fn raw_text(&self) -> String {
+        body_text(&self.bytes)
+    }
+
+    /// Returns whether the tag nesting is shallow enough to process safely.
+    fn nesting_ok(&self) -> bool {
+        let html = String::from_utf8_lossy(&self.bytes);
+        let doc = Document::from(html.as_ref());
+        // The levels under `body`, one per generation, ending at the first
+        // empty one. A level at the cap's index means the tree is deeper
+        // than allowed, and `nth` stops right there rather than walking the
+        // rest of a page it is about to refuse.
+        let too_deep = successors(Some(doc.select("body").first()), |level| {
+            let children = level.children();
+            (!children.is_empty()).then_some(children)
+        })
+        .nth(NESTING_CAP as usize)
+        .is_some();
+        !too_deep
+    }
+
+    /// Returns whether no colspan/rowspan attribute claims an absurd value.
+    ///
+    /// This catches degenerate or placeholder text like `colspan="1000000000000000"`,
+    /// which attempts to allocate too much memory. We allow up to [`TABLE_SPAN_CAP`].
+    fn table_spans_ok(&self) -> bool {
+        let text = String::from_utf8_lossy(&self.bytes);
+        for attr in ["colspan", "rowspan"] {
+            let mut search = 0;
+            while let Some(pos) = text[search..].find(attr) {
+                let rest = &text[search + pos + attr.len()..];
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Ok(value) = digits.parse::<usize>()
+                    && value > TABLE_SPAN_CAP
+                {
+                    return false;
+                }
+                search += pos + attr.len();
+            }
+        }
+        true
+    }
+
+    /// Guards against pathological inputs before any parsing begins.
+    ///
+    /// Both the math pre-pass and the reader are superlinear in nesting depth, so we
+    /// check to make sure that the page seems safe. Returns a model-facing hint
+    /// when the body is unsafe to parse, or `None` when it can proceed.
+    fn setup(&self) -> Option<String> {
+        if self.bytes.len() > EXTRACT_CAP {
+            return Some(raw_hint(&format!("body over {EXTRACT_CAP} bytes")));
+        }
+        if !self.nesting_ok() {
+            return Some(raw_hint(&format!("page nesting exceeds {NESTING_CAP} tags")));
+        }
+        if !self.table_spans_ok() {
+            return Some(raw_hint(&format!(
+                "table colspan/rowspan exceeds {TABLE_SPAN_CAP}"
+            )));
+        }
+        None
+    }
+
+    /// Produce the model-facing text for this body.
+    ///
+    /// PDF bytes go to poppler or tesseract; everything else gets HTML preprocessed
+    /// and then send into the reader if [`raw=true`](raw_hint), otherwise returned raw.
+    fn read(&self) -> String {
+        if self.is_pdf() {
+            return pdf_from_body(&self.bytes);
+        }
+        if let Some(hint) = self.setup() {
+            return hint;
+        }
+        let markdown = extract_markdown(&self.bytes, &self.final_url);
+        if markdown.trim().is_empty() {
+            raw_hint("no content extracted; the page may need JavaScript or have no article body")
+        } else {
+            body_text(markdown.as_bytes())
+        }
+    }
+}
+
+/// Extract one downloaded PDF as text via the poppler/tesseract.
+///
+/// The body is written to a private temp file (0600) that poppler reads; pages with
+/// little text are OCR'd by tesseract at 200 dpi, bounded by [`PDF_TIMEOUT`] per stage.
 fn pdf_from_body(body: &[u8]) -> String {
     let pdf = temp_path("fetch", "pdf");
     let text = create_private(&pdf)
@@ -560,40 +547,51 @@ fn pdf_from_body(body: &[u8]) -> String {
     text
 }
 
-/// One downloaded page as markdown: the body to the local trafilatura CLI on
-/// stdin, failures as content for the model; PDF bytes go to the poppler ladder.
-fn extract_body(body: &[u8]) -> Result<String, String> {
-    if is_pdf(body) {
-        return Ok(pdf_from_body(body));
-    }
-    let Some(binary) = tool_binary("TART_READER_BIN", "trafilatura") else {
-        return Err(
-            "fetch: no trafilatura CLI found. use `raw=true` to fetch the page directly"
-                .to_string(),
-        );
+/// Extract one downloaded page as markdown.
+///
+/// NOTE: short (~100 char) entries are doubled - this is a bug in (rs)-trafilatura, but
+/// is mostly harmless
+fn extract_markdown(body: &[u8], url: &str) -> String {
+    let options = rs_trafilatura::Options {
+        output_markdown: true,
+        include_links: true,
+        url: Some(url.to_string()),
+        ..rs_trafilatura::Options::default()
     };
-    let mut extract = web_command(&binary);
-    extract.args(["--precision", "--markdown"]);
-    let Ok(run) = run_watched_bytes(&mut extract, body, Some(EXTRACT_TIMEOUT), &CancelToken::new())
-    else {
-        return Err("fetch: trafilatura could not be run".to_string());
-    };
-    if let Some(failure) = watched_failure(&run, EXTRACT_TIMEOUT) {
-        return Ok(failure);
+    // Always run the math_to_text preprocessor on utf8 pages.
+    match std::str::from_utf8(body) {
+        Ok(html) => {
+            let preprocessed = math_to_text(html);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rs_trafilatura::extract_with_options(&preprocessed, &options)
+            }))
+            .unwrap_or(Err(rs_trafilatura::Error::NoContent))
+            .map(|result| extraction_text(result.content_markdown, result.content_text))
+            .unwrap_or_default()
+        }
+        // Non-utf8 data cannot be handled by extract_with_options so we don't try
+        // to preprocess it
+        Err(_) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rs_trafilatura::extract_bytes_with_options(body, &options)
+        }))
+        .unwrap_or(Err(rs_trafilatura::Error::NoContent))
+        .map(|result| extraction_text(result.content_markdown, result.content_text))
+        .unwrap_or_default(),
     }
-    let stdout = String::from_utf8_lossy(&run.output.stdout);
-    Ok(if stdout.trim().is_empty() {
-        "fetch: no content extracted; the page may need JavaScript or have no \
-         article body. retry with raw=true for the unprocessed response"
-            .to_string()
-    } else {
-        body_text(stdout.as_bytes())
-    })
 }
 
-/// One page fetch: downloaded under raw mode's protections, then extracted locally.
-fn extract_page(client: &Client, url: &str) -> Result<String, String> {
-    download(client, url).and_then(|body| extract_body(&body))
+/// The model-facing text of one extraction result.
+fn extraction_text(markdown: Option<String>, text: String) -> String {
+    markdown.filter(|md| !md.trim().is_empty()).unwrap_or(text)
+}
+
+/// Formats the model-facing suggestion to bypass extraction and fetch raw bytes.
+///
+/// Every guard and extraction failure funnels through this single message
+/// shape, so the model always sees the same remedy regardless of which
+/// stage refused the page.
+fn raw_hint(reason: &str) -> String {
+    format!("fetch: {reason}; use `raw=true` for the unprocessed response")
 }
 
 /// A fetched non-PDF body as inline text, capped at [`RAW_MAX_BYTES`].
@@ -788,29 +786,25 @@ impl<'a> Pages<'a> {
     }
 }
 
-/// One fetch's content: raw and PDF-hinted urls download first so the body
-/// can be sniffed and, for PDFs, extracted; every other url, and a hint that
-/// proved wrong, is the local extractor's to render.
+/// Get the content for a single fetch, handling special case filetypes.
 fn fetch_body(fetch: &Fetch, url: &str, client: &Client) -> Result<String, String> {
     if !fetch.raw && !url_hints_pdf(url) {
-        return extract_page(client, url);
+        return DownloadedBody::try_download(client, url).map(|body| body.read());
     }
-    let body = download(client, url)?;
-    if is_pdf(&body) {
-        Ok(pdf_from_body(&body))
-    } else if fetch.raw {
-        // Raw bodies are content.
-        Ok(body_text(&body))
+    let body = DownloadedBody::try_download(client, url)?;
+    if fetch.raw && !body.is_pdf() {
+        // Raw non-PDF bodies are content, unprocessed.
+        Ok(body.raw_text())
     } else {
-        // A hinted non-PDF was a guess, so the extractor takes it instead.
-        extract_body(&body)
+        // PDF bytes (raw or not) go to poppler+OCR; hinted non-PDFs go to the reader.
+        Ok(body.read())
     }
 }
 
 /// Run one fetch tool call, reporting its steps to `on_progress`.
 ///
-/// Like `search` this runs outside the sandbox. Every path is content for the
-/// model: the text on success, or the refusal or error that explains it.
+/// Like `search` this runs outside the sandbox. Every path is content for the model:
+/// text on success, or a refusal or error that explains it.
 pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &F) -> String {
     let fetch = match parse_fetch(&call.arguments) {
         Ok(fetch) => fetch,
@@ -841,59 +835,6 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
     })
 }
 
-/// A non-empty, trimmed string field of a results record.
-///
-/// Looked up with `get` rather than indexing: a missing key in a `Map` panics,
-/// and news records carry no `href` for the url lookup to find.
-fn field<'a>(
-    record: &'a serde_json::Map<String, serde_json::Value>,
-    name: &str,
-) -> Option<&'a str> {
-    record
-        .get(name)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-/// Turn ddgs's results file into the numbered list the model reads, or `None`.
-fn render_results(search: &Search, json: &str) -> Option<String> {
-    let Ok(serde_json::Value::Array(records)) = serde_json::from_str(json) else {
-        return None;
-    };
-    if records.is_empty() {
-        return Some(format!("no results for {:?}", search.query));
-    }
-    let mut rendered = format!(
-        "{} results for {:?} (ddgs {})\n",
-        records.len(),
-        search.query,
-        if search.news { "news" } else { "text" }
-    );
-    for (index, record) in records.iter().enumerate() {
-        rendered.push_str(&render_result(index + 1, record.as_object()?));
-    }
-    Some(rendered)
-}
-
-/// One result: the title, an indented url, an indented date for news records,
-/// and the snippet. Text records carry their address as `href`, news ones as
-/// `url`.
-fn render_result(index: usize, record: &serde_json::Map<String, serde_json::Value>) -> String {
-    let url = field(record, "href").or_else(|| field(record, "url"));
-    let mut lines = vec![format!(
-        "{index}. {}",
-        field(record, "title").unwrap_or("(untitled)")
-    )];
-    for line in [url, field(record, "date"), field(record, "body")]
-        .into_iter()
-        .flatten()
-    {
-        lines.push(format!("   {line}"));
-    }
-    lines.join("\n") + "\n"
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
@@ -917,111 +858,6 @@ mod tests {
             caller: None,
             r#async: None,
         }
-    }
-
-    #[test]
-    fn search_definition_requires_query() {
-        let tool = serde_json::to_value(search_definition()).unwrap();
-
-        assert_eq!(tool["type"], "function");
-        assert_eq!(tool["name"], "search");
-        assert_eq!(tool["parameters"]["required"][0], "query");
-    }
-
-    #[test]
-    fn parse_search_reads_the_query_and_defaults_the_rest() {
-        let search = parse_search(r#"{"query":"rust regex crate"}"#).unwrap();
-
-        assert_eq!(search.query, "rust regex crate");
-        assert_eq!(search.max_results, DEFAULT_SEARCH_RESULTS);
-        assert_eq!(search.timelimit, None);
-        assert!(!search.news);
-    }
-
-    #[test]
-    fn parse_search_clamps_results_and_drops_unknown_timelimits() {
-        let clamped =
-            parse_search(r#"{"query":"q","max_results":9000,"timelimit":"century","news":true}"#)
-                .unwrap();
-        assert_eq!(clamped.max_results, MAX_SEARCH_RESULTS);
-        assert_eq!(clamped.timelimit, None);
-        assert!(clamped.news);
-
-        let window = parse_search(r#"{"query":"q","timelimit":"w"}"#).unwrap();
-        assert_eq!(window.timelimit.as_deref(), Some("w"));
-    }
-
-    #[test]
-    fn parse_search_rejects_a_missing_query() {
-        let error = parse_search(r#"{"timelimit":"d"}"#).unwrap_err().to_string();
-
-        assert!(
-            error.contains("The required parameter `query` is missing"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn ddgs_args_pass_the_subcommand_query_bounds_and_results_file() {
-        let search = parse_search(r#"{"query":"rust web","max_results":5}"#).unwrap();
-        let results = PathBuf::from("/tmp/tart-search.json");
-        let text: Vec<OsString> = vec![
-            "text".into(),
-            "-q".into(),
-            "rust web".into(),
-            "-m".into(),
-            "5".into(),
-            "-o".into(),
-            "/tmp/tart-search.json".into(),
-        ];
-
-        assert_eq!(ddgs_args(&search, &results), text);
-
-        let news = parse_search(r#"{"query":"q","news":true,"timelimit":"d"}"#).unwrap();
-        let news_args: Vec<OsString> = vec![
-            "news".into(),
-            "-q".into(),
-            "q".into(),
-            "-m".into(),
-            "8".into(),
-            "-t".into(),
-            "d".into(),
-            "-o".into(),
-            "/tmp/tart-search.json".into(),
-        ];
-
-        assert_eq!(ddgs_args(&news, &results), news_args);
-    }
-
-    #[test]
-    fn render_results_formats_text_and_news_records() {
-        let search = parse_search(r#"{"query":"rust"}"#).unwrap();
-        let json = r#"[
-            {"title":"Rust","href":"https://www.rust-lang.org","body":"  A systems language  "},
-            {"title":"News","url":"https://example.com/n","date":"2026-08-01","body":"Today"}
-        ]"#;
-
-        let rendered = render_results(&search, json).unwrap();
-
-        assert!(
-            rendered.starts_with("2 results for \"rust\" (ddgs text)\n"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("1. Rust\n   https://www.rust-lang.org\n   A systems language\n")
-        );
-        assert!(rendered.contains("2. News\n   https://example.com/n\n   2026-08-01\n   Today\n"));
-    }
-
-    #[test]
-    fn render_results_reports_no_results_and_rejects_non_json() {
-        let search = parse_search(r#"{"query":"q"}"#).unwrap();
-
-        assert!(render_results(&search, "[]").unwrap().contains("no results"));
-        // ddgs's own failure mode: nothing written, its error on stdout.
-        assert!(render_results(&search, "RatelimitException: ...").is_none());
-        // The contract is an array; anything else is not ours to interpret.
-        assert!(render_results(&search, r#"{"results":[]}"#).is_none());
     }
 
     #[test]
@@ -1155,11 +991,12 @@ mod tests {
         let client = FETCH_CLIENT.clone().unwrap();
 
         let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_string());
-        let body = download(&client, &format!("http://{address}/x")).unwrap();
-        assert_eq!(body, b"hello");
+        let body = DownloadedBody::try_download(&client, &format!("http://{address}/x")).unwrap();
+        assert_eq!(body.bytes, b"hello");
 
         let address = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string());
-        let error = download(&client, &format!("http://{address}/gone")).unwrap_err();
+        let error =
+            DownloadedBody::try_download(&client, &format!("http://{address}/gone")).unwrap_err();
         assert!(error.contains("404"), "{error}");
 
         // The policy refusal happens on the hop, before any connection is
@@ -1169,7 +1006,8 @@ mod tests {
             "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.5/x\r\nContent-Length: 0\r\n\r\n"
                 .to_string(),
         );
-        let error = download(&client, &format!("http://{address}/hop")).unwrap_err();
+        let error =
+            DownloadedBody::try_download(&client, &format!("http://{address}/hop")).unwrap_err();
         assert!(error.contains("refusing redirect"), "{error}");
         assert!(error.contains("10.0.0.5"), "{error}");
     }
@@ -1387,26 +1225,69 @@ mod tests {
         assert!(text.contains("--- page 8 ---"));
     }
 
-    #[apply(skip_unless_live!)]
     #[test]
-    fn extract_page_extracts_through_a_local_cli() {
-        let stub = temp_path("fetch", "sh");
-        std::fs::write(&stub, "#!/bin/sh\nprintf '# ';cat").unwrap();
-        let mut mode = std::fs::metadata(&stub).unwrap().permissions();
-        mode.set_mode(0o700);
-        std::fs::set_permissions(&stub, mode).unwrap();
-        let client = FETCH_CLIENT.clone().unwrap();
-        let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_string());
-        unsafe { std::env::set_var("TART_READER_BIN", &stub) };
-        let extracted = extract_page(&client, &format!("http://{address}/x")).unwrap();
-        let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_string());
-        unsafe { std::env::set_var("TART_READER_BIN", "/usr/bin/true") };
-        let empty = extract_page(&client, &format!("http://{address}/x")).unwrap();
-        unsafe { std::env::remove_var("TART_READER_BIN") };
-        let _ = std::fs::remove_file(&stub);
+    fn extract_body_caps_extraction_input() {
+        let big = vec![b'<'; 11 * 1024 * 1024];
+        let body = DownloadedBody {
+            bytes: big,
+            final_url: "https://example.com".to_string(),
+        };
+        let out = body.read();
+        assert!(
+            out.contains(&format!("body over {EXTRACT_CAP} bytes")),
+            "over-cap body must say the cap: {out}"
+        );
+        assert!(out.contains("raw=true"), "over-cap body must hint: {out}");
+    }
 
-        assert_eq!(extracted, "# abc");
-        assert!(empty.contains("raw=true"), "{empty}");
+    #[test]
+    fn an_empty_markdown_some_falls_back_to_the_extracted_text() {
+        // Real markdown wins over the text, as before.
+        let kept = extraction_text(Some("# Title".to_string()), "plain".to_string());
+        assert_eq!(kept, "# Title");
+
+        // An empty or whitespace-only `Some` beside text: the text wins,
+        // not the emptiness.
+        let empty = extraction_text(Some(String::new()), "plain".to_string());
+        assert_eq!(empty, "plain");
+        let blank = extraction_text(Some("  \n".to_string()), "plain".to_string());
+        assert_eq!(blank, "plain");
+
+        // No markdown at all stays the text; an empty extraction stays empty.
+        let none = extraction_text(None, "plain".to_string());
+        assert_eq!(none, "plain");
+        let barren = extraction_text(None, String::new());
+        assert_eq!(barren, "");
+    }
+
+    #[test]
+    fn the_nesting_guard_covers_non_utf8_bodies() {
+        // One invalid byte kept the old strict-decode guard from ever
+        // running; the lossy decode must refuse the page regardless.
+        let mut deep =
+            format!("<body>{}</body>", "<div>".repeat(NESTING_CAP as usize + 1)).into_bytes();
+        deep.push(0xff);
+        let body = DownloadedBody {
+            bytes: deep,
+            final_url: "https://example.com".to_string(),
+        };
+        let out = body.read();
+        assert!(
+            out.contains(&format!("page nesting exceeds {NESTING_CAP} tags")),
+            "deep non-UTF-8 body must be refused: {out}"
+        );
+        assert!(out.contains("raw=true"), "{out}");
+
+        // A shallow non-UTF-8 body still goes to the reader, not the guard.
+        let shallow = DownloadedBody {
+            bytes: b"<body>caf\xe9</body>".to_vec(),
+            final_url: "https://example.com".to_string(),
+        };
+        let out = shallow.read();
+        assert!(
+            !out.contains("page nesting"),
+            "shallow body must not refuse: {out}"
+        );
     }
 
     #[test]
@@ -1506,6 +1387,42 @@ mod tests {
                 Progress::ToolStart { name, arguments, .. },
                 Progress::ToolOutput { exit: Some(0), .. }
             ] if name == "fetch" && arguments == r#"{"url":"https://example.com","raw":true}"#
+        ));
+    }
+
+    #[apply(skip_unless_networked!)]
+    #[test]
+    fn run_fetch_extracts_a_page_to_markdown() {
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let token = CancelToken::new();
+        let agent = Agent::new("http://localhost:9", "key", "model", policy.clone());
+        let tools = Tooling {
+            policy: &policy,
+            cancel: &token,
+            agents: None,
+            template: &agent,
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let request = call("fetch", r#"{"url":"https://example.com"}"#);
+
+        let output = execute(&request, &tools, &|progress| {
+            events.borrow_mut().push(progress);
+        });
+
+        // Extraction, not passthrough
+        assert!(!output.trim().is_empty(), "must extract text: {output}");
+        assert!(!output.contains("<html"), "{output}");
+        assert!(!output.contains("<body"), "{output}");
+        assert!(
+            output.contains("domain") && output.len() > 50,
+            "must be the example.com body text: {output}"
+        );
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [
+                Progress::ToolStart { name, arguments, .. },
+                Progress::ToolOutput { exit: Some(0), .. }
+            ] if name == "fetch" && arguments == r#"{"url":"https://example.com"}"#
         ));
     }
 

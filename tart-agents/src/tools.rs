@@ -1,7 +1,7 @@
-use std::io::{self, Write as _};
+use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -519,7 +519,8 @@ fn command_text(text: &str, status: ExitStatus, one_is_success: bool) -> String 
 }
 
 /// The framing for callers whose text is returned inline however large: the web
-/// tools and the user's own manual commands.
+/// tools and the user's own manual commands. The framing itself never spills;
+/// the agent loop spills what later outgrows [`CONTENT_CAP`].
 fn command_text_inline(text: &str, status: ExitStatus, one_is_success: bool) -> String {
     frame(text, status, one_is_success, false)
 }
@@ -530,7 +531,7 @@ fn frame(text: &str, status: ExitStatus, one_is_success: bool, spill: bool) -> S
     let success = status.success() || (one_is_success && status.code() == Some(1));
     if success {
         if spill && text.len() > BASH_SUCCESS_CAP {
-            return spill_to_file(text);
+            return spill_to_file(text).map_or_else(|| excerpt(text), |(pointer, _)| pointer);
         }
         return if text.is_empty() {
             "(Bash completed with no output)".to_string()
@@ -573,22 +574,33 @@ fn nanos() -> u128 {
         .map_or(0, |since| since.as_nanos())
 }
 
-/// Write `text` to a private scratch file and point the model at it, previewing head.
-fn spill_to_file(text: &str) -> String {
-    let dir = std::env::temp_dir().join("tart");
-    let name = format!("tart-bash-{}-{}.output", std::process::id(), nanos());
+/// Write `text` to a private scratch file, previewing head and tail.
+///
+/// The one way an oversized tool output is kept whole: bash successes spill
+/// here on the way out of [`frame`](command_text), and the agent loop spills
+/// any tool output past [`CONTENT_CAP`] the same way, so nothing the model
+/// may still need is lost to truncation. `None` when the file cannot be
+/// written, so each caller falls back to the framing it can afford.
+pub(crate) fn spill_to_file(text: &str) -> Option<(String, PathBuf)> {
+    spill_to_dir(&std::env::temp_dir().join("tart"), text)
+}
+
+/// [`spill_to_file`] against an explicit scratch directory, for tests.
+fn spill_to_dir(dir: &Path, text: &str) -> Option<(String, PathBuf)> {
+    let name = format!("tart-output-{}-{}.output", std::process::id(), nanos());
     let path = dir.join(name);
-    if write_private(&dir, &path, text).is_err() {
-        return excerpt(text);
-    }
-    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/result-persistence-format.ts#L29>
-    format!(
-        "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\n{}\n\
-         </persisted-output>",
-        bash_byte_size(text.len()),
-        path.display(),
-        bounded(text, SPILL_PREVIEW),
-    )
+    write_private(dir, &path, text).ok()?;
+    // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/bash-model-content.ts#L177>
+    Some((
+        format!(
+            "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\n{}\n\
+             </persisted-output>",
+            bash_byte_size(text.len()),
+            path.display(),
+            bounded(text, SPILL_PREVIEW),
+        ),
+        path,
+    ))
 }
 
 /// Create `path` new and owner-only, refusing anything already there.
@@ -713,12 +725,12 @@ pub fn bounded(text: &str, cap: usize) -> String {
     )
 }
 
-/// Spawn `command` in its own process group with piped output, returning the
-/// child and its group id, with stdin piped only when `piped` asks.
-fn spawn_grouped(command: &mut Command, piped: bool) -> io::Result<(std::process::Child, Pid)> {
+/// Spawn `command` in its own process group with piped output and no input,
+/// returning the child and its group id.
+fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)> {
     command
         .process_group(0)
-        .stdin(if piped { Stdio::piped() } else { Stdio::null() })
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn()?;
@@ -740,32 +752,8 @@ fn run_watched(
     deadline: Option<Duration>,
     cancel: &CancelToken,
 ) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command, false)?;
-    watched(child, group, None, deadline, cancel)
-}
+    let (child, group) = spawn_grouped(command)?;
 
-/// [`run_watched`], with `input` written to the command's stdin first. Set a
-/// deadline: the write outruns stdout draining, and only the deadline breaks a
-/// child that fills its pipe before its stdin ends.
-fn run_watched_bytes(
-    command: &mut Command,
-    input: &[u8],
-    deadline: Option<Duration>,
-    cancel: &CancelToken,
-) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command, true)?;
-    watched(child, group, Some(input), deadline, cancel)
-}
-
-/// The shared watchdog and reap: `input`, when there is one, reaches the
-/// child's stdin while the deadline already runs.
-fn watched(
-    mut child: std::process::Child,
-    group: Pid,
-    input: Option<&[u8]>,
-    deadline: Option<Duration>,
-    cancel: &CancelToken,
-) -> io::Result<WatchedRun> {
     // The watchdog's kill reason, when it killed: sent before the kill lands
     // and read after the watchdog joins, so a killed group is never mistaken
     // for a natural exit.
@@ -796,10 +784,6 @@ fn watched(
         }
     });
 
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        let _ = stdin.write_all(input);
-    }
-
     let output = child.wait_with_output();
     drop(finished);
     // Double check we've killed everything even if the wait errors.
@@ -829,7 +813,8 @@ fn traced<F: Fn(Progress)>(
         arguments: call.arguments.clone(),
     });
     let (result, output, exit) = run();
-    // Display-only copy of the text is bounded to match the string we pass to the model
+    // Display-only copy of the text, bounded to the content cap; past it the
+    // model instead receives a spill pointer, so the two views diverge there.
     let output = bounded(&output, CONTENT_CAP);
     on_progress(Progress::ToolOutput {
         id: call.call_id.clone(),
@@ -1348,8 +1333,20 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The web tools and manual runs return their text inline however large, so a
-    /// fetched page is never silently replaced by a scratch-file pointer.
+    /// A scratch directory that cannot be created - here because the path is
+    /// occupied by a regular file - spills nothing, and says so, rather than
+    /// returning a pointer to a file that was never written.
+    #[test]
+    fn a_failed_spill_returns_none_rather_than_a_dead_pointer() {
+        let blocker = tempfile::tempdir().unwrap();
+        let in_the_way = blocker.path().join("tart");
+        std::fs::write(&in_the_way, "occupied").unwrap();
+
+        assert!(spill_to_dir(&in_the_way, &"x".repeat(4_096)).is_none());
+    }
+
+    /// The web tools and manual runs return their text inline however large:
+    /// the framing never spills, the agent loop does, past the content cap.
     #[test]
     fn inline_framing_never_spills() {
         let text = "x".repeat(BASH_SUCCESS_CAP + 1);
@@ -1497,15 +1494,6 @@ mod tests {
 
     /// These drive `run_watched` with plain commands, so they run without the sandbox
     #[test]
-    fn run_watched_bytes_feeds_stdin_and_collects_stdout() {
-        let mut command = Command::new("/bin/cat");
-        let run = run_watched_bytes(&mut command, b"through the pipe", None, &CancelToken::new())
-            .unwrap();
-        assert!(run.output.status.success());
-        assert_eq!(run.output.stdout, b"through the pipe");
-    }
-
-    #[test]
     fn run_watched_kills_a_command_that_outruns_the_deadline() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
@@ -1637,9 +1625,9 @@ mod tests {
         ));
     }
 
-    /// An output past the cap reaches the model whole but the front end capped,
-    /// with the marker the model's own history carries: expanded view shows
-    /// exactly what the model saw.
+    /// An output past the cap reaches the front end capped with the marker;
+    /// the model's own copy is spilled whole by the agent loop, so the
+    /// expanded view shows the capped excerpt rather than a pointer.
     #[test]
     fn oversized_output_reaches_the_front_end_capped() {
         let events = std::cell::RefCell::new(Vec::new());
