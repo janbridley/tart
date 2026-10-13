@@ -504,13 +504,15 @@ impl DownloadedBody {
     /// when the body is unsafe to parse, or `None` when it can proceed.
     fn setup(&self) -> Option<String> {
         if self.bytes.len() > EXTRACT_CAP {
-            return Some(raw_hint("body over {EXTRACT_CAP} bytes"));
+            return Some(raw_hint(&format!("body over {EXTRACT_CAP} bytes")));
         }
         if !self.nesting_ok() {
-            return Some(raw_hint("page nesting exceeds {NESTING_CAP} tags"));
+            return Some(raw_hint(&format!("page nesting exceeds {NESTING_CAP} tags")));
         }
         if !self.table_spans_ok() {
-            return Some(raw_hint("table colspan/rowspan exceeds {TABLE_SPAN_CAP}"));
+            return Some(raw_hint(&format!(
+                "table colspan/rowspan exceeds {TABLE_SPAN_CAP}"
+            )));
         }
         None
     }
@@ -1229,6 +1231,10 @@ mod tests {
             final_url: "https://example.com".to_string(),
         };
         let out = body.read();
+        assert!(
+            out.contains(&format!("body over {EXTRACT_CAP} bytes")),
+            "over-cap body must say the cap: {out}"
+        );
         assert!(out.contains("raw=true"), "over-cap body must hint: {out}");
     }
 
