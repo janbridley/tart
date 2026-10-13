@@ -137,8 +137,9 @@ progress when you check, defer to the user or end your turn.
   `Command timed out after Nm Ns` after whatever output was captured before the kill.
   Plan long work (full builds, long test suites) as steps that finish inside the limit.
 - A success that prints more than 30,000 bytes spills to a file holding the full output
-  and previews its start and end. A failure over 10,000 bytes is cut to its first and
-  last 5,000 bytes, with a marker where the middle was dropped.
+- Any tool result over 64 KiB is likewise spilled whole to a scratch file, with the path
+  and a preview inline and previews its start and end. A failure over 10,000 bytes is
+  cut to its first and last 5,000 bytes, with a marker where the middle was dropped.
 
 ## Sandbox
 
