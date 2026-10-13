@@ -42,14 +42,12 @@ The web pair lives in `tart-agents/src/tools/web.rs` and runs outside the sandbo
 above). `Search` shells out to the locally installed
 [ddgs](https://github.com/deedy5/ddgs) CLI and returns a numbered list of title, url,
 and snippet. `Fetch` downloads one URL and extracts it locally with the
-[trafilatura](https://github.com/adbar/trafilatura) CLI (the body on stdin, markdown
-out), or fetches directly with `raw=true` for JSON and plain-text endpoints. PDFs are
-detected heuristically (a `.pdf` leaf, an arxiv-style `/pdf/` segment, or the `%PDF-`
-magic bytes of a downloaded body) and extracted locally instead. We use poppler's
-`pdftotext` for the embedded text layer and `pdftoppm` + `tesseract` OCR for scanned
-pages. Requests are refused for non-public hosts. Each CLI-backed path needs its binary
-installed: `TART_SEARCH_BIN` and `TART_READER_BIN` override the lookups
-(`uv tool install ddgs trafilatura`).
+[rs-trafilatura](https://crates.io/crates/rs-trafilatura) reader, plus some extra
+preprocessing to efficiently extract embedded LaTeX. PDFs are detected heuristically (a
+`.pdf` leaf, an arxiv-style `/pdf/` segment, or the `%PDF-` magic bytes of a downloaded
+body) and extracted locally instead. We use poppler's `pdftotext` for the embedded text
+layer and `pdftoppm` + `tesseract` OCR for scanned pages. The search path needs its
+binary installed: `TART_SEARCH_BIN` overrides the lookup (`uv tool install ddgs`).
 
 ### Plan Mode
 
