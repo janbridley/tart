@@ -25,6 +25,7 @@ unicode-segmentation = "1"
 [dev-dependencies]
 # Test scratch directories; tempfile removes them on drop.
 tempfile = "3"
+flate2 = "1"
 
 [lints]
 workspace = true

@@ -1,13 +1,16 @@
-//! Serialize transcripts as jsonl files to allow resumable tart sessions.
+//! Serialize transcripts as gzipped jsonl to allow resumable tart sessions.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use crate::backends::{InputItem, Item, Role};
 use anyhow::Context;
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
+use flate2::{Compression, GzBuilder};
 use time::OffsetDateTime;
 
 use crate::history::{LineMetadata, RecordLine, Transcript, stamp_utc_at};
@@ -84,23 +87,20 @@ impl Session {
     /// Open a session, returning its transcript and location data.
     #[inline]
     pub fn open(root: &Path, project: &Path, path: &Path) -> anyhow::Result<(Transcript, Self)> {
-        let mut loaded = load(path)?;
+        let mut loaded = Loaded::read(path)?;
         if loaded.lines.is_empty() {
             anyhow::bail!("session file {} has no items", path.display());
         }
         // Try and trim a broken transcript into one we can send back to a provider.
         let recorded = loaded.lines.len();
         trim_unpaired(&mut loaded.lines);
-        // Rewrite the file ONLY if its damaged or missing entries
-        if loaded.damaged || loaded.lines.len() != recorded {
-            rewrite(path, &loaded.lines)?;
-        }
+        let path = reconcile(path, &loaded, recorded)?;
         let written = loaded.lines.len();
         let transcript = Transcript::from_lines(loaded.lines);
         let session = Self {
             root: root.to_path_buf(),
             project: project.to_path_buf(),
-            path: Some(path.to_path_buf()),
+            path: Some(path),
             written,
         };
         // Tests hold the ledger's session slot themselves; production names
@@ -122,6 +122,10 @@ impl Session {
         // A cleared record can end before the flushed prefix; flush from there.
         self.written = self.written.min(transcript.len());
         let fresh = transcript.recorded_after(self.written);
+        // Nothing fresh means nothing to flush.
+        if fresh.is_empty() {
+            return Ok(());
+        }
         // If the session is empty (no user input), we don't need to save a record.
         if self.path.is_none()
             && !fresh
@@ -141,15 +145,32 @@ impl Session {
             usage::set_session(self.stem());
             path
         };
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .append(true)
             .create(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
+        // One writer at a time.
+        let mut writer = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, error)| error)
+            .with_context(|| format!("locking {}", path.display()))?;
         let moment = OffsetDateTime::now_utc();
+        // One gzip member per flush; the file stays a plain concatenation.
+        let mtime = u32::try_from(moment.unix_timestamp()).unwrap_or(0);
+        let mut member = GzBuilder::new()
+            .mtime(mtime)
+            .write(&mut *writer, Compression::new(6));
         for line in &fresh {
-            write_line(&mut file, &path, line, moment)?;
+            write_line(&mut member, &path, line, moment)?;
+            // The sync flush keeps the tear guarantee: a crash mid-member
+            // loses at most the line being written, never the turn before.
+            member
+                .flush()
+                .with_context(|| format!("flushing {}", path.display()))?;
         }
+        member
+            .finish()
+            .with_context(|| format!("sealing {}", path.display()))?;
         self.written += fresh.len();
         Ok(())
     }
@@ -161,7 +182,9 @@ impl Session {
         self.path
             .as_deref()
             .and_then(Path::file_stem)
-            .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned())
+            .map_or_else(String::new, |stem| {
+                stem.to_string_lossy().trim_end_matches(".jsonl").to_owned()
+            })
     }
 
     /// Forget the current file; the next record starts a fresh session.
@@ -181,8 +204,7 @@ pub(crate) fn slug(path: &Path) -> String {
     stripped.replace('/', "-")
 }
 
-/// Enumerate the project's session files, newest first, each paired with the
-/// first line of its opening user message, uncapped
+/// Enumerate the project's sessions, newest first, each paired with its first line.
 #[inline]
 pub fn list(root: &Path, project: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
     let dir = root.join(slug(project));
@@ -191,7 +213,10 @@ pub fn list(root: &Path, project: &Path) -> anyhow::Result<Vec<(PathBuf, String)
     let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter(|path| {
+            let name = path.to_string_lossy();
+            name.ends_with(".jsonl.gz") || name.ends_with(".jsonl")
+        })
         // A zero-length file is a crash between creation and the first line;
         // there is nothing to resume.
         .filter(|path| fs::metadata(path).is_ok_and(|meta| meta.len() > 0))
@@ -210,14 +235,22 @@ pub fn list(root: &Path, project: &Path) -> anyhow::Result<Vec<(PathBuf, String)
         .collect())
 }
 
-/// The first line of the session in `path`'s opening user message, or empty
-/// when it never got one.
+/// The first line of the session in `path`'s opening user message, or empty if none.
 fn opening(path: &Path) -> String {
     std::fs::File::open(path)
         .ok()
-        .and_then(|file| {
-            std::io::BufReader::new(file)
+        .and_then(|mut file| {
+            let mut magic = [0; 2];
+            let gz = file.read_exact(&mut magic).is_ok() && magic == GZIP;
+            let stream = std::io::Cursor::new(magic).chain(file);
+            let source: Box<dyn std::io::Read> = if gz {
+                Box::new(MultiGzDecoder::new(stream))
+            } else {
+                Box::new(stream)
+            };
+            std::io::BufReader::new(source)
                 .lines()
+                .take(500)
                 .map_while(Result::ok)
                 .find_map(|line| first_user_text(&line))
         })
@@ -232,45 +265,98 @@ fn first_user_text(line: &str) -> Option<String> {
     Some(text.split_once('\n').map_or(text, |(line, _)| line).to_string())
 }
 
-/// A session file as [`load`] read it: its lines, and whether it held damage
-/// past them.
+/// The encoding a session file holds.
+#[derive(Clone, Copy, Debug)]
+enum FileFormat {
+    /// Concatenated gzip members, one per recorded turn.
+    Gzip,
+    /// An uncompressed file, which will be converted on open.
+    Legacy,
+}
+
+/// A session file as [`Loaded::read`] leaves it.
 struct Loaded {
     /// Every line up to the first damaged one.
     lines: Vec<RecordLine>,
+    /// The encoding the file arrived in.
+    format: FileFormat,
     /// A torn final write or an unparseable line ends the record early.
     damaged: bool,
 }
 
-/// The items in a session file, stopping at the first damaged line.
-///
-/// The file is left exactly as it lies; [`Session::open`] decides whether the
-/// damage is worth a rewrite. A `timestamp` or `usage` sibling of the wrong
-/// type or shape is treated as absent.
-fn load(path: &Path) -> anyhow::Result<Loaded> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("reading session {}", path.display()))?;
-    let mut lines = Vec::new();
-    let mut good = 0;
-    for line in text.split_inclusive('\n') {
-        // A final line without its newline is a torn write.
-        if !line.ends_with('\n') {
-            break;
-        }
-        if line.trim().is_empty() {
+impl Loaded {
+    /// The items in a session file, stopping at the first damaged line.
+    ///
+    /// The file is left exactly as it lies; [`Session::open`] decides whether
+    /// the damage is worth a rewrite. A `timestamp` or `usage` sibling of the
+    /// wrong type or shape is treated as absent.
+    fn read(path: &Path) -> anyhow::Result<Self> {
+        let raw = fs::read(path).with_context(|| format!("reading session {}", path.display()))?;
+        let (text, format, torn) = decode(&raw);
+        let mut lines = Vec::new();
+        let mut good = 0;
+        for line in text.split_inclusive('\n') {
+            // A final line without its newline is a torn write.
+            if !line.ends_with('\n') {
+                break;
+            }
+            if line.trim().is_empty() {
+                good += line.len();
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                break;
+            };
+            let meta = peel(&value);
+            let Ok(item) = serde_json::from_value(value) else {
+                break;
+            };
+            lines.push(RecordLine { item, meta });
             good += line.len();
-            continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            break;
-        };
-        let meta = peel(&value);
-        let Ok(item) = serde_json::from_value(value) else {
-            break;
-        };
-        lines.push(RecordLine { item, meta });
-        good += line.len();
+        Ok(Self {
+            lines,
+            format,
+            damaged: torn || good < text.len(),
+        })
     }
-    Ok(Loaded { lines, damaged: good < text.len() })
+}
+
+/// The two bytes every gzip stream starts with.
+const GZIP: [u8; 2] = [0x1f, 0x8b];
+
+/// The session's text: concatenated gzip members when the magic bytes say so,
+/// the bytes themselves when a legacy plain file predates compression. A
+/// member torn by a crash ends the stream there; the turns before it survive,
+/// flagged as damage for the repair path.
+fn decode(raw: &[u8]) -> (String, FileFormat, bool) {
+    if raw.starts_with(&GZIP) {
+        let mut decoder = MultiGzDecoder::new(raw);
+        let mut bytes = Vec::with_capacity(raw.len() * 4);
+        let mut chunk = vec![0; 64 * 1024];
+        let mut torn = false;
+        loop {
+            match decoder.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                Err(_) => {
+                    torn = true;
+                    break;
+                }
+            }
+        }
+        (
+            String::from_utf8_lossy(&bytes).into_owned(),
+            FileFormat::Gzip,
+            torn,
+        )
+    } else {
+        (
+            String::from_utf8_lossy(raw).into_owned(),
+            FileFormat::Legacy,
+            false,
+        )
+    }
 }
 
 /// The metadata sibling a session line carried: its `timestamp` as written,
@@ -286,16 +372,62 @@ fn peel(value: &serde_json::Value) -> LineMetadata {
 
 /// Rewrite `path` with exactly `lines`, keeping each line's recorded metadata.
 fn rewrite(path: &Path, lines: &[RecordLine]) -> anyhow::Result<()> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .truncate(true)
         .create(true)
         .open(path)
         .with_context(|| format!("rewriting session {}", path.display()))?;
-    let moment = OffsetDateTime::now_utc();
-    for line in lines {
-        write_line(&mut file, path, line, moment)?;
+    write_member(file, path, lines)
+}
+
+/// Bring the session file in line with what parsing kept, and name the
+/// path the session records from here on. Legacy files are compressed to gzip.
+fn reconcile(path: &Path, loaded: &Loaded, recorded: usize) -> anyhow::Result<PathBuf> {
+    if matches!(loaded.format, FileFormat::Legacy) {
+        return convert(path, &loaded.lines);
     }
+    if loaded.damaged || loaded.lines.len() != recorded {
+        rewrite(path, &loaded.lines)?;
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Convert a legacy plain session to its compressed name.
+fn convert(path: &Path, lines: &[RecordLine]) -> anyhow::Result<PathBuf> {
+    let gz = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".jsonl"))
+        .map(|stem| path.with_file_name(format!("{stem}.jsonl.gz")));
+    let Some(gz) = gz.filter(|gz| !gz.exists()) else {
+        rewrite(path, lines)?;
+        return Ok(path.to_path_buf());
+    };
+    let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok();
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gz)
+        .with_context(|| format!("converting session {}", gz.display()))?;
+    write_member(file, &gz, lines)?;
+    if let Some(modified) = modified {
+        OpenOptions::new().write(true).open(&gz)?.set_modified(modified)?;
+    }
+    fs::remove_file(path).with_context(|| format!("packing away {}", path.display()))?;
+    Ok(gz)
+}
+
+/// Every line sealed into one fresh gzip member over `file`.
+fn write_member(file: fs::File, path: &Path, lines: &[RecordLine]) -> anyhow::Result<()> {
+    let moment = OffsetDateTime::now_utc();
+    let mut member = GzEncoder::new(file, Compression::new(6));
+    for line in lines {
+        write_line(&mut member, path, line, moment)?;
+    }
+    member
+        .finish()
+        .with_context(|| format!("sealing {}", path.display()))?;
     Ok(())
 }
 
@@ -303,8 +435,8 @@ fn rewrite(path: &Path, lines: &[RecordLine]) -> anyhow::Result<()> {
 /// at `moment`.
 ///
 /// One write per line: a crash tears at most the last line.
-fn write_line(
-    file: &mut fs::File,
+fn write_line<W: std::io::Write>(
+    file: &mut W,
     path: &Path,
     line: &RecordLine,
     moment: OffsetDateTime,
@@ -364,13 +496,14 @@ fn unused(dir: &Path, stem: &str) -> PathBuf {
     loop {
         suffix += 1;
         let name = if suffix == 1 {
-            format!("{stem}.jsonl")
+            format!("{stem}.jsonl.gz")
         } else {
-            format!("{stem}-{suffix}.jsonl")
+            format!("{stem}-{suffix}.jsonl.gz")
         };
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return candidate;
+        // A legacy twin of the name counts as taken too: two sessions of one
+        // stem would list as confusing neighbors.
+        if !dir.join(&name).exists() && !dir.join(name.trim_end_matches(".gz")).exists() {
+            return dir.join(name);
         }
     }
 }
@@ -381,26 +514,42 @@ mod tests {
 
     use super::*;
     use crate::backends::FunctionToolCall;
+    use std::time::{Duration, SystemTime};
+
+    /// The session's text, gzip members and all.
+    fn text_of(path: &Path) -> String {
+        let mut text = String::new();
+        MultiGzDecoder::new(std::fs::File::open(path).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    }
 
     /// A session file's line count.
     fn line_count(path: &Path) -> usize {
-        std::fs::read_to_string(path).unwrap().lines().count()
+        text_of(path).lines().count()
     }
 
-    /// Write `transcript`'s items to `path`, one JSON line each.
+    /// The gzip member `text` makes.
+    fn member(text: &str) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
+        encoder.write_all(text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Write `transcript`'s items to `path`, one JSON line each, as one member.
     fn write_session(path: &Path, transcript: &Transcript) {
         let mut text = String::new();
         for item in transcript.request_items() {
             text.push_str(&serde_json::to_string(&item).unwrap());
             text.push('\n');
         }
-        std::fs::write(path, text).unwrap();
+        std::fs::write(path, member(&text)).unwrap();
     }
 
     /// The parsed lines of a session file, in order.
     fn parsed_lines(path: &Path) -> Vec<serde_json::Value> {
-        std::fs::read_to_string(path)
-            .unwrap()
+        text_of(path)
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
@@ -552,32 +701,96 @@ mod tests {
         assert!(lines.iter().all(|line| line.meta.timestamp.is_some()));
     }
 
+    /// A legacy plain session opens, converts to its compressed name with its
+    /// mtime riding across, and takes new turns as members on top.
     #[test]
-    fn mixed_format_files_merge_cleanly() {
+    fn legacy_plain_files_convert_and_take_members() {
         let root = tempfile::tempdir().unwrap();
         let legacy = root.path().join("legacy.jsonl");
         let transcript = Transcript::new().unwrap();
         transcript.push_user("hello".to_string()).unwrap();
         transcript.push_assistant("hi".to_string()).unwrap();
-        write_session(&legacy, &transcript);
+        // The old format: plain JSON lines, no compression.
+        let mut text = String::new();
+        for item in transcript.request_items() {
+            text.push_str(&serde_json::to_string(&item).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(&legacy, &text).unwrap();
+        let moment = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&legacy)
+            .unwrap()
+            .set_modified(moment)
+            .unwrap();
 
-        // A new turn recorded onto an old file: the old lines stay as they
-        // were, the new ones are stamped, and one file holds both.
         let (resumed, mut session) =
             Session::open(root.path(), Path::new("/tmp/other"), &legacy).unwrap();
+        // The file converted to its compressed name; the legacy one unlinked.
+        assert!(!legacy.exists(), "the legacy name is gone");
+        let converted = session.path.clone().unwrap();
+        assert_eq!(converted, root.path().join("legacy.jsonl.gz"));
+        assert_eq!(&std::fs::read(&converted).unwrap()[..2], &[0x1f, 0x8b]);
+        assert_eq!(
+            fs::metadata(&converted).unwrap().modified().unwrap(),
+            moment,
+            "the listing order rides across the conversion"
+        );
+        assert_eq!(resumed.request_items(), transcript.request_items());
+
+        // A new turn recorded onto it lands as its own member.
         resumed.push_user("again".to_string()).unwrap();
         resumed.push_assistant("ok".to_string()).unwrap();
         session.record(&resumed).unwrap();
 
-        let stamps = stamps(&legacy);
-        assert_eq!(
-            stamps[..3],
-            [None, None, None],
-            "the legacy lines load metadata-free"
+        let stamps = stamps(&converted);
+        assert!(
+            all_stamped(&stamps),
+            "conversion stamps the legacy lines once, the member its own"
         );
-        assert!(all_stamped(&stamps[3..]));
-        let (reopened, _) = Session::open(root.path(), Path::new("/tmp/other"), &legacy).unwrap();
+        let (reopened, _) =
+            Session::open(root.path(), Path::new("/tmp/other"), &converted).unwrap();
         assert_eq!(reopened.request_items().len(), 5);
+    }
+
+    /// Recording the same state twice appends nothing: no empty member rides
+    /// along for the no-op.
+    #[test]
+    fn recording_nothing_appends_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+        let file = session.path.clone().unwrap();
+        let was = fs::metadata(&file).unwrap().len();
+
+        session.record(&transcript).unwrap();
+
+        assert_eq!(
+            fs::metadata(&file).unwrap().len(),
+            was,
+            "nothing fresh, nothing written"
+        );
+    }
+
+    /// A line bigger than the decode chunk round-trips: the loop empties the
+    /// member across many chunks.
+    #[test]
+    fn a_line_bigger_than_the_decode_chunk_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("x".repeat(200_000)).unwrap();
+        transcript.push_assistant("y".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+        let file = session.path.clone().unwrap();
+
+        let (resumed, _) = Session::open(root.path(), Path::new("/tmp/proj"), &file).unwrap();
+
+        assert_eq!(resumed.request_items(), transcript.request_items());
     }
 
     #[test]
@@ -592,7 +805,9 @@ mod tests {
             r#"{"content":"run it","role":"user","timestamp":123,"usage":"lots","type":"message"}"#,
             "\n"
         );
-        std::fs::write(&mangled, std::fs::read_to_string(&mangled).unwrap() + extra).unwrap();
+        let mut whole = std::fs::read(&mangled).unwrap();
+        whole.extend_from_slice(&member(extra));
+        std::fs::write(&mangled, whole).unwrap();
 
         let (resumed, _) = Session::open(root.path(), Path::new("/tmp/other"), &mangled).unwrap();
 
@@ -603,11 +818,7 @@ mod tests {
             LineMetadata::default(),
             "the mangled siblings vanish"
         );
-        assert!(
-            std::fs::read_to_string(&mangled)
-                .unwrap()
-                .contains(r#""timestamp":123"#)
-        );
+        assert!(text_of(&mangled).contains(r#""timestamp":123"#));
     }
 
     #[test]
@@ -678,7 +889,7 @@ mod tests {
         transcript.push_assistant("here is the plan".to_string()).unwrap();
         session.record(&transcript).unwrap();
 
-        let file = std::fs::read_to_string(session.path.clone().unwrap()).unwrap();
+        let file = text_of(&session.path.clone().unwrap());
         assert_eq!(file.lines().count(), 3, "system, user, assistant: {file}");
         assert!(
             !file.contains("plan mode is on"),
@@ -699,18 +910,21 @@ mod tests {
     #[test]
     fn load_leaves_a_damaged_file_as_it_lies() {
         let root = tempfile::tempdir().unwrap();
-        let torn = root.path().join("torn.jsonl");
+        let torn = root.path().join("torn.jsonl.gz");
         let transcript = Transcript::new().unwrap();
         transcript.push_user("hello".to_string()).unwrap();
         write_session(&torn, &transcript);
-        let ripped = std::fs::read_to_string(&torn).unwrap() + r#"{"type":"message","role":"ass"#;
+        // Garbage after a whole member: the member's turns survive, and the
+        // tail is damage past them.
+        let mut ripped = std::fs::read(&torn).unwrap();
+        ripped.extend_from_slice(b"not gzip");
         std::fs::write(&torn, &ripped).unwrap();
 
-        let loaded = load(&torn).unwrap();
+        let loaded = Loaded::read(&torn).unwrap();
 
         assert_eq!(loaded.lines.len(), 2);
         assert!(loaded.damaged, "the torn tail is damage past the prefix");
-        assert_eq!(std::fs::read_to_string(&torn).unwrap(), ripped);
+        assert_eq!(std::fs::read(&torn).unwrap(), ripped);
     }
 
     #[test]
@@ -751,13 +965,24 @@ mod tests {
             moment,
         )
         .unwrap();
-        std::fs::write(&both, format!("{stamped}{orphan}\n{{\"type\":\"me")).unwrap();
+        // The orphan rides in its own member, and a garbage tail makes the
+        // damage the repair path trims back through.
+        std::fs::write(
+            &both,
+            [
+                member(&stamped),
+                member(&format!("{orphan}\n")),
+                b"not gzip".to_vec(),
+            ]
+            .concat(),
+        )
+        .unwrap();
 
         let (resumed, mut session) =
             Session::open(root.path(), Path::new("/tmp/other"), &both).unwrap();
 
         assert_eq!(resumed.request_items().len(), 2);
-        let after = std::fs::read_to_string(&both).unwrap();
+        let after = text_of(&both);
         assert_eq!(after.lines().count(), 2, "system and turn only: {after}");
         assert!(after.ends_with('\n'), "every line is terminated");
         assert!(!after.contains("function_call"), "the orphan is gone: {after}");
@@ -785,22 +1010,22 @@ mod tests {
         let old = Transcript::new().unwrap();
         old.push_user("from the old session\nwith a second line".to_string())
             .unwrap();
-        write_session(&dir.join("20260101-000000.jsonl"), &old);
+        write_session(&dir.join("20260101-000000.jsonl.gz"), &old);
         let recent = Transcript::new().unwrap();
         recent.push_user("from the new session".to_string()).unwrap();
-        write_session(&dir.join("20260102-000000.jsonl"), &recent);
+        write_session(&dir.join("20260102-000000.jsonl.gz"), &recent);
         // A session that never got a message, and one whose opening runs long.
-        write_session(&dir.join("20260102-000001.jsonl"), &Transcript::new().unwrap());
+        write_session(&dir.join("20260102-000001.jsonl.gz"), &Transcript::new().unwrap());
         let chatty = Transcript::new().unwrap();
         chatty.push_user("x".repeat(80)).unwrap();
-        write_session(&dir.join("20260102-000002.jsonl"), &chatty);
+        write_session(&dir.join("20260102-000002.jsonl.gz"), &chatty);
 
         let listed = list(root.path(), project).unwrap();
 
         // The opening text arrives raw and uncapped: formatting it is the
         // front end's business.
         assert_eq!(listed.len(), 4);
-        assert!(listed[0].0.ends_with("20260102-000002.jsonl"));
+        assert!(listed[0].0.ends_with("20260102-000002.jsonl.gz"));
         assert_eq!(listed[0].1, "x".repeat(80));
         assert_eq!(listed[1].1, "");
         assert_eq!(listed[2].1, "from the new session");
@@ -856,7 +1081,7 @@ mod tests {
         let mut session = Session::start(root.path(), project);
         session.record(&transcript).unwrap();
         let abandoned = session.path.clone().unwrap();
-        let was = std::fs::read_to_string(&abandoned).unwrap();
+        let was = text_of(&abandoned);
 
         // The `/clear` flow: the record empties back to its system items and
         // the session forgets its file.
@@ -869,7 +1094,7 @@ mod tests {
         let fresh = session.path.clone().unwrap();
         assert_ne!(fresh, abandoned);
         assert_eq!(line_count(&fresh), 3, "the fresh file holds the new turn only");
-        assert_eq!(std::fs::read_to_string(&abandoned).unwrap(), was);
+        assert_eq!(text_of(&abandoned), was);
 
         let fresh_stamps = stamps(&fresh);
         assert_eq!(fresh_stamps[0], stamps(&abandoned)[0]);
@@ -890,7 +1115,7 @@ mod tests {
         let mut session = Session::start(root.path(), project);
         session.record(&transcript).unwrap();
         let abandoned = session.path.clone().unwrap();
-        let was = std::fs::read_to_string(&abandoned).unwrap();
+        let was = text_of(&abandoned);
 
         // The `/rewind` flow: the record cuts back to a turn's start, and
         // the session forgets its file.
@@ -921,16 +1146,16 @@ mod tests {
         resumed_session.record(&resumed).unwrap();
         // Five lines seeded the file; the resumed turn appends the sixth.
         assert_eq!(line_count(&fresh), 6, "the fresh session appends from there");
-        assert_eq!(std::fs::read_to_string(&abandoned).unwrap(), was);
+        assert_eq!(text_of(&abandoned), was);
     }
 
     #[test]
     fn unused_bumps_a_suffix_on_collision() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("20260101-000000.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("20260101-000000.jsonl.gz"), "").unwrap();
 
         let next = unused(dir.path(), "20260101-000000");
 
-        assert_eq!(next, dir.path().join("20260101-000000-2.jsonl"));
+        assert_eq!(next, dir.path().join("20260101-000000-2.jsonl.gz"));
     }
 }
