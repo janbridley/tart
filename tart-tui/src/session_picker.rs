@@ -14,7 +14,10 @@ fn label(path: &Path, opening: &str) -> String {
     let name = path
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let stamp = name.strip_suffix(".jsonl").unwrap_or(&name);
+    let stamp = name
+        .strip_suffix(".jsonl.gz")
+        .or_else(|| name.strip_suffix(".jsonl"))
+        .unwrap_or(&name);
     let opening = if opening.is_empty() {
         "(no messages)".to_string()
     } else {
@@ -45,4 +48,22 @@ pub(crate) fn session_picker(
 /// `/resume` alone opens the chooser unfiltered and `/resume fix` filters results
 pub(crate) fn derive_query(editor: &Editor) -> Option<String> {
     command_query(editor, "/resume")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+
+    use super::*;
+
+    /// Both session names label as their bare stamp.
+    #[test]
+    fn labels_show_the_stamp_for_either_name() {
+        assert!(
+            label(Path::new("/s/20260101-000000.jsonl.gz"), "hi").starts_with("20260101-000000  ")
+        );
+        assert!(
+            label(Path::new("/s/20260101-000000.jsonl"), "hi").starts_with("20260101-000000  ")
+        );
+    }
 }

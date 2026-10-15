@@ -2537,13 +2537,12 @@ mod tests {
         let project = PathBuf::from("/tmp/proj");
         let dir = root.path().join("tmp-proj");
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("20260101-000000.jsonl");
-        std::fs::write(
-            &file,
-            "{\"type\":\"message\",\"role\":\"system\",\"content\":\"s\"}\n\
-             {\"type\":\"message\",\"role\":\"user\",\"content\":\"fix the login flow\"}\n",
-        )
-        .unwrap();
+        let file = dir.join("20260101-000000.jsonl.gz");
+        let text = "{\"type\":\"message\",\"role\":\"system\",\"content\":\"s\"}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"fix the login flow\"}\n";
+        let mut member = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        std::io::Write::write_all(&mut member, text.as_bytes()).unwrap();
+        std::fs::write(&file, member.finish().unwrap()).unwrap();
         let mut pane = Pane::default();
         pane.set_session_dir(root.path().to_path_buf(), project);
 
