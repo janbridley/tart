@@ -331,20 +331,8 @@ const GZIP: [u8; 2] = [0x1f, 0x8b];
 /// flagged as damage for the repair path.
 fn decode(raw: &[u8]) -> (String, FileFormat, bool) {
     if raw.starts_with(&GZIP) {
-        let mut decoder = MultiGzDecoder::new(raw);
         let mut bytes = Vec::with_capacity(raw.len() * 4);
-        let mut chunk = vec![0; 64 * 1024];
-        let mut torn = false;
-        loop {
-            match decoder.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => bytes.extend_from_slice(&chunk[..read]),
-                Err(_) => {
-                    torn = true;
-                    break;
-                }
-            }
-        }
+        let torn = MultiGzDecoder::new(raw).read_to_end(&mut bytes).is_err();
         (
             String::from_utf8_lossy(&bytes).into_owned(),
             FileFormat::Gzip,
@@ -537,14 +525,19 @@ mod tests {
         encoder.finish().unwrap()
     }
 
-    /// Write `transcript`'s items to `path`, one JSON line each, as one member.
-    fn write_session(path: &Path, transcript: &Transcript) {
+    /// The transcript's items as one plain JSON line each, the legacy format.
+    fn plain_lines(transcript: &Transcript) -> String {
         let mut text = String::new();
         for item in transcript.request_items() {
             text.push_str(&serde_json::to_string(&item).unwrap());
             text.push('\n');
         }
-        std::fs::write(path, member(&text)).unwrap();
+        text
+    }
+
+    /// Write `transcript`'s items to `path`, one JSON line each, as one member.
+    fn write_session(path: &Path, transcript: &Transcript) {
+        std::fs::write(path, member(&plain_lines(transcript))).unwrap();
     }
 
     /// The parsed lines of a session file, in order.
@@ -711,12 +704,7 @@ mod tests {
         transcript.push_user("hello".to_string()).unwrap();
         transcript.push_assistant("hi".to_string()).unwrap();
         // The old format: plain JSON lines, no compression.
-        let mut text = String::new();
-        for item in transcript.request_items() {
-            text.push_str(&serde_json::to_string(&item).unwrap());
-            text.push('\n');
-        }
-        std::fs::write(&legacy, &text).unwrap();
+        std::fs::write(&legacy, plain_lines(&transcript)).unwrap();
         let moment = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         fs::OpenOptions::new()
             .write(true)
@@ -776,10 +764,31 @@ mod tests {
         );
     }
 
-    /// A line bigger than the decode chunk round-trips: the loop empties the
-    /// member across many chunks.
+    /// Opening a clean session touches nothing: same bytes, same mtime.
     #[test]
-    fn a_line_bigger_than_the_decode_chunk_round_trips() {
+    fn a_clean_session_opens_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let project = Path::new("/tmp/proj");
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        let mut session = Session::start(root.path(), project);
+        session.record(&transcript).unwrap();
+        let file = session.path.clone().unwrap();
+        let (was, moment) = (
+            std::fs::read(&file).unwrap(),
+            fs::metadata(&file).unwrap().modified().unwrap(),
+        );
+
+        let _ = Session::open(root.path(), project, &file).unwrap();
+
+        assert_eq!(std::fs::read(&file).unwrap(), was, "no rewrite, no conversion");
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), moment);
+    }
+
+    /// A very long line round-trips: the member's text grows past any single read.
+    #[test]
+    fn a_very_long_line_round_trips() {
         let root = tempfile::tempdir().unwrap();
         let transcript = Transcript::new().unwrap();
         transcript.push_user("x".repeat(200_000)).unwrap();
