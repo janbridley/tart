@@ -33,6 +33,7 @@ use crate::config::AgentChoice;
 use crate::file_mentions::{self, FilePopup, Picker};
 use crate::recorded::REPORTS_AT;
 use crate::session_picker::{derive_query as session_query, session_picker};
+use crate::slash;
 use crate::turn_picker::rewind_picker;
 use copy::{CopyCursor, clamp_cell, window_top};
 use transcript::Transcript;
@@ -523,7 +524,13 @@ impl Pane {
                 self.mode = Mode::Bang;
             }
             KeyCode::Char(c) => self.prompt.insert_char(c),
-            KeyCode::Tab => self.prompt.insert_char('\t'),
+            // Tab completes a typed `/`-command word, else stays a literal tab
+            KeyCode::Tab
+                if !slash::TabComplete::live(&self.prompt, self.chat)
+                    .is_some_and(|completion| completion.complete(&mut self.prompt)) =>
+            {
+                self.prompt.insert_char('\t');
+            }
             // An empty draft's backspace leaves the mode instead of deleting.
             KeyCode::Backspace if matches!(self.mode, Mode::Bang) && self.draft_is_empty() => {
                 self.mode = Mode::Default;
@@ -1229,6 +1236,22 @@ impl Pane {
             &layout.rows[top..top + shown],
             width,
         );
+        // A typed `/`-command ghosts its completion, dim, from the caret.
+        if !matches!(self.mode, Mode::Bang)
+            && let Some(ghost) =
+                slash::TabComplete::live(&self.prompt, self.chat).and_then(|c| c.ghost())
+            // Only draw if it will fit
+            && layout.caret_col < width as usize
+        {
+            let budget = width as usize - layout.caret_col;
+            buf.set_stringn(
+                prompt_area.x + GUTTER + layout.caret_col as u16,
+                prompt_area.y + (layout.caret_row - top) as u16,
+                ghost,
+                budget,
+                DIM_STYLE,
+            );
+        }
         // A caret at the end of a full row inverts the row's last cell.
         let col = layout.caret_col.min(width.saturating_sub(1) as usize) as u16;
         let pos = (
@@ -1732,6 +1755,31 @@ mod tests {
             assert_eq!(pane.prompt.text(), waitlisted, "the draft waits");
             pane.clear_prompt();
         }
+    }
+
+    #[test]
+    fn slash_commands_complete_in_the_prompt() {
+        let (mut pane, _agent, _record, _wake, _agents) = setup_tests();
+        pane.type_keys("/re");
+        let screen = render(&mut pane, (40, 12));
+        assert!(screen.contains("/resume,wind"), "{screen}");
+        let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
+        assert!(styles.contains("dddddddddd"), "the ghost is dim: {styles}");
+
+        // Ambiguous: Tab types only the shared part, typing disambiguates.
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "/re");
+        pane.type_keys("su");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "/resume ");
+
+        pane.clear_prompt();
+        pane.set_chat(true);
+        pane.type_keys("/pl");
+        let screen = render(&mut pane, (40, 12));
+        assert!(!screen.contains("plan"), "{screen}");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(pane.prompt.text(), "/pl\t");
     }
 
     /// Delivering the observed subagent's report returns the main view;
