@@ -323,14 +323,10 @@ fn run(
                         pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ if line.trim().starts_with('/') => {
-                        let commands = if agent.mode() == ChatMode::Chat {
-                            "/clear /rewind /resume /model /effort /perf /quit"
-                        } else {
-                            "/clear /rewind /resume /model /plan /effort /agents /agent /stop /perf /gpu /quit"
-                        };
                         pane.note(format!(
-                            "unknown command {} · {commands}",
-                            line.split_whitespace().next().unwrap_or_default()
+                            "unknown command {} · {}",
+                            line.split_whitespace().next().unwrap_or_default(),
+                            slash::hint(agent.mode() == ChatMode::Chat)
                         ));
                     }
                     _ => {
