@@ -66,9 +66,12 @@ fn command() -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Chat mode: web tools only, no shell or filesystem access"),
         )
-        .arg(Arg::new("gpu").long("gpu").action(clap::ArgAction::SetTrue).help(
-            "Grant the coding sandbox GPU access for Metal compute (toggle at runtime with /gpu)",
-        ))
+        .arg(
+            Arg::new("gpu")
+                .long("gpu")
+                .action(clap::ArgAction::SetTrue)
+                .help("Grant the coding sandbox GPU access for Metal compute"),
+        )
 }
 
 #[cfg(test)]

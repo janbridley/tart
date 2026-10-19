@@ -209,7 +209,7 @@ fn run(
                     }
                     manual_cancel = Some(token);
                 }
-                // Shift+Tab: toggle plan mode, exactly as `/plan` does.
+                // Shift+Tab: toggle plan mode, read-only research and planning.
                 Some(PaneEvent::Plan) => {
                     let on = !pane.is_plan();
                     pending_plan = pane.set_plan(agent, &mut transcript, on)?;
@@ -243,17 +243,6 @@ fn run(
                         perf_on = !perf_on;
                         perf = Perf::default();
                     }
-                    // Toggle the coding sandbox's GPU grants for this session.
-                    "/gpu" => {
-                        if agent.mode() == ChatMode::Chat {
-                            pane.note("chat has no sandbox to grant");
-                        } else {
-                            pane.note(format!(
-                                "gpu: {}",
-                                if agent.toggle_gpu() { "on" } else { "off" }
-                            ));
-                        }
-                    }
                     // Stop one subagent without stopping anything else.
                     _ if let Some(arg) = line.trim().strip_prefix("/stop") => {
                         match arg.trim().parse::<u64>() {
@@ -261,31 +250,17 @@ fn run(
                                 agents.cancel(AgentId::from(id));
                                 pane.note(format!("stop sent to subagent {id}"));
                             }
-                            Err(_) => pane.note("usage: /stop <id> · /agents to list"),
+                            Err(_) => pane.note("usage: /stop <id>"),
                         }
-                    }
-                    // List the running subagents.
-                    "/agents" => {
-                        let running = agents.running();
-                        let listed = if running.is_empty() {
-                            "none".to_string()
-                        } else {
-                            running
-                                .into_iter()
-                                .map(|(id, task)| format!("{id}: {task}"))
-                                .collect::<Vec<_>>()
-                                .join(" · ")
-                        };
-                        pane.note(format!("subagents: {listed}"));
                     }
                     // Observe one subagent by swapping in its view temporarily.
                     _ if let Some(arg) = line.trim().strip_prefix("/agent") => {
                         match arg.trim().parse::<u64>() {
                             Ok(id) => match agents.task(AgentId::from(id)) {
                                 Some(task) => pane.observe(AgentId::from(id), &task),
-                                None => pane.note(format!("no subagent {id} · /agents to list")),
+                                None => pane.note(format!("no subagent {id}")),
                             },
-                            Err(_) => pane.note("usage: /agent <id> · /agents to list"),
+                            Err(_) => pane.note("usage: /agent <id>"),
                         }
                     }
                     // A submitted `/resume` line means the chooser was closed;
@@ -316,11 +291,6 @@ fn run(
                                 pane.note("usage: /effort none|minimal|low|medium|high|xhigh|max");
                             }
                         }
-                    }
-                    // Toggle plan mode: read-only research and planning.
-                    "/plan" => {
-                        let on = !pane.is_plan();
-                        pending_plan = pane.set_plan(agent, &mut transcript, on)?;
                     }
                     _ if line.trim().starts_with('/') => {
                         pane.note(format!(

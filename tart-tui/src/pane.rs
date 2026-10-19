@@ -88,7 +88,7 @@ pub enum PaneEvent {
     Model(AgentChoice),
     /// Esc with nothing open, with a turn or a manual command in flight.
     Cancel,
-    /// Shift+Tab or `/plan`: toggle plan mode, moving the agent's mode with it.
+    /// Shift+Tab: toggle plan mode, moving the agent's mode with it.
     Plan,
     /// Enter on an empty draft approved the drafted plan.
     Approve,
@@ -1751,7 +1751,7 @@ mod tests {
             pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(PaneEvent::Submit("/agent 3".to_string()))
         );
-        for waitlisted in ["/stop 3", "/agents"] {
+        for waitlisted in ["/stop 3", "/effort high"] {
             pane.type_keys(waitlisted);
             assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
             assert_eq!(pane.prompt.text(), waitlisted, "the draft waits");
@@ -1781,13 +1781,15 @@ mod tests {
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(pane.prompt.text(), "/resume ");
 
+        // Chat mode knows no subagent commands, so the word stays unknown and
+        // Tab stays a literal tab rather than inventing a completion.
         pane.clear_prompt();
         pane.set_chat(true);
-        pane.type_keys("/pl");
+        pane.type_keys("/ag");
         let screen = render(&mut pane, (40, 12));
-        assert!(!screen.contains("plan"), "{screen}");
+        assert!(!screen.contains("agent"), "{screen}");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(pane.prompt.text(), "/pl\t");
+        assert_eq!(pane.prompt.text(), "/ag\t");
     }
 
     /// The `!` mode's drafts never ghost or complete a command: a slash there

@@ -4,12 +4,13 @@ use itertools::Itertools;
 
 use crate::pane::{Editor, graphemes};
 
-/// Every command, sorted.
+/// Every command, sorted. Plan mode rides Shift+Tab, subagent slots show in
+/// the status bar, and the sandbox's GPU grant rides `--gpu`.
 const COMMANDS: &[&str] = &[
-    "/agent", "/agents", "/clear", "/effort", "/exit", "/gpu", "/model", "/perf", "/plan", "/quit",
-    "/resume", "/rewind", "/stop",
+    "/agent", "/clear", "/effort", "/exit", "/model", "/perf", "/quit", "/resume", "/rewind",
+    "/stop",
 ];
-/// Chat mode's subset: no plan mode, subagents, or sandbox.
+/// Chat mode's subset: no subagent commands.
 const CHAT_COMMANDS: &[&str] = &[
     "/clear", "/effort", "/exit", "/model", "/perf", "/quit", "/resume", "/rewind",
 ];
@@ -53,7 +54,8 @@ impl TabComplete {
         (!remainders.is_empty()).then(|| remainders.join(","))
     }
 
-    /// `Tab` on the typed word: insert the unique candidate's remainder, or multiple.
+    /// `Tab` on the typed word: insert the unique candidate's remainder, or as
+    /// far as the candidates agree (nothing, when the word is already whole).
     ///
     /// Returns whether the word was a real cmd, so an unknown one keeps `Tab` literal.
     pub(crate) fn complete(self, editor: &mut Editor) -> bool {
@@ -110,18 +112,15 @@ mod tests {
         assert_eq!(ghost("/re", false).as_deref(), Some("sume,wind"));
         assert_eq!(
             ghost("/", false).as_deref(),
-            Some("agent,agents,clear,effort,exit,gpu,model,perf,plan,quit,resume,rewind,stop")
+            Some("agent,clear,effort,exit,model,perf,quit,resume,rewind,stop")
         );
         // A whole command, an argument, and an unknown word all end the ghost.
         assert_eq!(ghost("/resume", false), None);
         assert_eq!(ghost("/resume fix", false), None);
         assert_eq!(ghost("/nope", false), None);
-        // A word that is itself a command still ghosts its longer kin.
-        assert_eq!(ghost("/agent", false).as_deref(), Some("s"));
-        // Chat mode has no subagents, plan mode, or sandbox.
-        assert_eq!(ghost("/pl", true), None);
-        assert_eq!(ghost("/cl", true).as_deref(), Some("ear"));
+        // Chat mode has no subagent commands.
         assert_eq!(ghost("/ag", true), None);
+        assert_eq!(ghost("/cl", true).as_deref(), Some("ear"));
         assert_eq!(ghost("/ex", true).as_deref(), Some("it"));
     }
 
@@ -168,14 +167,14 @@ mod tests {
         // Unique: the remainder and a space, readying the argument.
         assert_eq!(tab("/mod", false), (true, "/model ".to_string()));
         // Ambiguous: only as far as they agree, then the ghost narrows.
-        assert_eq!(tab("/a", false), (true, "/agent".to_string()));
+        assert_eq!(tab("/re", false), (true, "/re".to_string()));
         // A whole command already typed swallows the Tab without a space.
-        assert_eq!(tab("/plan", false), (true, "/plan".to_string()));
+        assert_eq!(tab("/quit", false), (true, "/quit".to_string()));
         // No `/`-word live: Tab keeps its old meaning.
         assert_eq!(tab("hello", false), (false, "hello".to_string()));
         assert_eq!(tab("/nope", false), (false, "/nope".to_string()));
         assert_eq!(tab("/model ", false), (false, "/model ".to_string()));
-        // Chat mode has no subagents, plan mode, or sandbox.
+        // Chat mode has no subagent commands.
         assert_eq!(tab("/st", true), (false, "/st".to_string()));
         assert_eq!(tab("/cl", true), (true, "/clear ".to_string()));
     }
