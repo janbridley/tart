@@ -524,10 +524,12 @@ impl Pane {
                 self.mode = Mode::Bang;
             }
             KeyCode::Char(c) => self.prompt.insert_char(c),
-            // Tab completes a typed `/`-command word, else stays a literal tab
+            // Tab completes a typed `/`-command word, else stays a literal tab.
+            // ALT is left alone, as for the popups, so Alt+Tab never completes.
             KeyCode::Tab
-                if !slash::TabComplete::live(&self.prompt, self.chat)
-                    .is_some_and(|completion| completion.complete(&mut self.prompt)) =>
+                if !key.modifiers.contains(KeyModifiers::ALT)
+                    && !slash::TabComplete::live(&self.prompt, self.chat)
+                        .is_some_and(|completion| completion.complete(&mut self.prompt)) =>
             {
                 self.prompt.insert_char('\t');
             }
@@ -1763,8 +1765,14 @@ mod tests {
         pane.type_keys("/re");
         let screen = render(&mut pane, (40, 12));
         assert!(screen.contains("/resume,wind"), "{screen}");
+        // The ghost, and only the ghost, is dim on the prompt row: the gutter
+        // is bold cyan, the typed word unstyled, the rules elsewhere.
         let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
-        assert!(styles.contains("dddddddddd"), "the ghost is dim: {styles}");
+        let prompt_row = styles.split('\n').nth(10).unwrap();
+        assert!(
+            prompt_row.starts_with("BB...ddddddddd"),
+            "the ghost is dim: {styles}"
+        );
 
         // Ambiguous: Tab types only the shared part, typing disambiguates.
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
@@ -1780,6 +1788,20 @@ mod tests {
         assert!(!screen.contains("plan"), "{screen}");
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(pane.prompt.text(), "/pl\t");
+    }
+
+    /// The `!` mode's drafts never ghost or complete a command: a slash there
+    /// starts a path, and Tab stays the mode's own file completion.
+    #[test]
+    fn bang_mode_never_completes_slash_commands() {
+        let (mut pane, _agent, _record, _wake, _agents) = setup_tests();
+        pane.type_keys("!/re"); // the `!` is the mode, not draft text
+        assert_eq!(pane.prompt.text(), "/re");
+        let screen = render(&mut pane, (40, 12));
+        assert!(!screen.contains("sume,wind"), "{screen}");
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::ALT));
+        pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_ne!(pane.prompt.text(), "/resume ", "Bang keeps its own Tab");
     }
 
     /// Delivering the observed subagent's report returns the main view;
