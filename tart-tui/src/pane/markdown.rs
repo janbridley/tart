@@ -3,8 +3,10 @@
 //! Only [`Progress::Answer`](tart_agents::Progress::Answer) fragments are pretty-
 //! rendered, all others stay base text. Copy mode reads the rendered rows so that a
 //! copied answer carries the styled form, markers stripped. Lines wrap to the
-//! display width with their block's hanging indent, so a wrapped list item or
-//! quotation keeps its marker column on every row.
+//! display width with its block's hanging indent, so a wrapped list item or
+//! quotation keeps its marker column on every row. Math renders as its Unicode reading.
+//! LaTeX is traded for glyphs where `unicodeit` is able to, falling back to source in
+//! most cases (or ocassionally mangling strings with specific prefixes).
 
 use itertools::Itertools;
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
@@ -55,9 +57,9 @@ pub(crate) fn render(raw: &str, width: usize) -> Vec<Line<'static>> {
     blocks.finish()
 }
 
-/// Enable `CommonMark` core plus GitHub's tables and strikethroughs.
+/// Enable `CommonMark` core plus GitHub's tables, strikethroughs, and math.
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
+    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH
 }
 
 /// The event walk's state: the rows out, the inline row and line context
@@ -232,6 +234,14 @@ impl Blocks {
                 let style = self.inline.style().patch(INLINE_CODE);
                 self.inline.push(&text, style);
             }
+            // Math renders as its Unicode reading
+            // Newlines flatten to spaces; a row holds no breaks.
+            Event::InlineMath(math) | Event::DisplayMath(math) => {
+                self.inline.trim = false;
+                let flat = math.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                let glyphs = glyphs(flat.trim());
+                self.inline.push(&glyphs, self.inline.style());
+            }
             Event::SoftBreak | Event::HardBreak => self.line_break(),
             Event::Rule => {
                 self.gap();
@@ -254,7 +264,7 @@ impl Blocks {
                 let style = self.inline.style();
                 self.inline.push(&html, style);
             }
-            // Task lists, footnotes, and math don't render specially.
+            // Task lists and footnotes don't render specially.
             _ => {}
         }
     }
@@ -709,6 +719,79 @@ fn row_line(
     line
 }
 
+/// The Unicode reading of one equation.
+fn glyphs(math: &str) -> String {
+    let prepared = prepare(math);
+    let _window = WINDOW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A caught panic still trips the app's hook, which restores the terminal:
+    // a no-op stand-in holds the screen for the caught instant.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let converted = std::panic::catch_unwind(|| unicodeit::replace(&prepared));
+    std::panic::set_hook(hook);
+    converted.unwrap_or_else(|_| math.to_string())
+}
+
+/// The caught-panic window, serialized.
+static WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sizing commands (`\left`, `\middle`, the `\big` kin), prefix ordered.
+const SIZING: [&str; 19] = [
+    "\\middle", "\\biggl", "\\Biggl", "\\biggr", "\\Biggr", "\\biggm", "\\Biggm", "\\bigl",
+    "\\Bigl", "\\bigr", "\\Bigr", "\\bigm", "\\Bigm", "\\bigg", "\\Bigg", "\\big", "\\Big",
+    "\\left", "\\right",
+];
+
+/// Words the table's prefixes would mangle, prefix ordered.
+///
+/// This helps avoid preemptively parsing a longer command's head:
+/// (`\inf` -> `\infty`, `\ln` `\lneq`).
+const WORDS: [(&str, &str); 17] = [
+    ("\\operatorname", "operatorname"),
+    ("\\nolimits", ""),
+    ("\\limsup", "lim sup"),
+    ("\\liminf", "lim inf"),
+    ("\\limits", ""),
+    ("\\lVert", "\\Vert"),
+    ("\\rVert", "\\Vert"),
+    ("\\lvert", "\\vert"),
+    ("\\rvert", "\\vert"),
+    ("\\pmod", "mod"),
+    ("\\lim", "lim"),
+    ("\\log", "log"),
+    ("\\Pr", "Pr"),
+    ("\\ln", "ln"),
+    ("\\lg", "lg"),
+    ("\\hom", "hom"),
+    ("\\inf", "inf"),
+];
+
+/// Clear the way for the table, applying the swaps above and copying all else.
+fn prepare(math: &str) -> String {
+    let mut out = String::with_capacity(math.len());
+    let mut at = 0;
+    while let Some(head) = math[at..].chars().next() {
+        let rest = &math[at..];
+        // A swap applies only where no longer command follows the current one
+        let swaps_here = |from: &str| {
+            rest.starts_with(from)
+                && !rest[from.len()..].starts_with(|c: char| c.is_ascii_alphabetic())
+        };
+        if let Some(token) = SIZING.iter().find(|token| swaps_here(token)) {
+            at += token.len() + usize::from(rest[token.len()..].starts_with('.'));
+            continue;
+        }
+        if let Some(&(from, to)) = WORDS.iter().find(|&(from, _)| swaps_here(from)) {
+            out.push_str(to);
+            at += from.len();
+            continue;
+        }
+        out.push(head);
+        at += head.len_utf8();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +1023,46 @@ mod tests {
         assert_eq!(rows("[**x**](x)"), ["x"]);
         // An image renders its alt text in brackets with the destination.
         assert_eq!(rows("![alt text](img.png)"), ["[alt text] (img.png)"]);
+    }
+
+    #[test]
+    fn math_renders_as_unicode() {
+        assert_eq!(rows("cost is $a^* + \\alpha_1$ here"), ["cost is a* + α₁ here"]);
+        assert_eq!(rows("$E = mc^2$"), ["E = mc²"]);
+        assert_eq!(rows("$5-$10 range"), ["5−10 range"]);
+        assert_eq!(rows("$a * b * c$"), ["a * b * c"]);
+        assert_eq!(rows("pay $5"), ["pay $5"]);
+        assert_eq!(rows("$$\\frac{a}{b}$$"), ["\\frac{a}{b}"]);
+        assert_eq!(rows("$\\left(a\\right)^2$"), ["(a)²"]);
+        assert_eq!(rows("$a \\rightarrow b$"), ["a → b"]);
+        assert_eq!(rows("$a \\leftarrow b$"), ["a ← b"]);
+        assert_eq!(rows("$x \\rightleftharpoons y$"), ["x ⇌ y"]);
+        assert_eq!(rows("$\\log xy$"), ["log xy"]);
+        assert_eq!(rows("$\\lVert x \\rVert$"), ["‖ x ‖"]);
+        assert_eq!(rows("$\\infty$"), ["∞"]);
+        assert_eq!(rows("$\\lim_{n \\to \\infty}$"), ["lim_{n → ∞}"]);
+        assert_eq!(rows("$\\operatorname{sgn}(x)$"), ["operatorname{sgn}(x)"]);
+        assert_eq!(rows("$a \\equiv b \\pmod{n}$"), ["a ≡ b mod{n}"]);
+        assert_eq!(rows("$\\Pr(A \\mid B)$"), ["Pr(A ∣ B)"]);
+        assert_eq!(rows("$$\\sum\\limits_{i=1}^n a_i$$"), ["∑ᵢ₌₁ⁿ aᵢ"]);
+        assert_eq!(rows("$\\left\\{ x \\middle| y \\right\\}$"), ["{ x | y }"]);
+        assert_eq!(rows("$\\bigl(x\\bigr)$"), ["(x)"]);
+        assert_eq!(rows("$\\left.x\\right|_0$"), ["x|₀"]);
+        assert_eq!(rows("$$\r\nE = mc^2\r\n$$"), ["E = mc²"]);
+        assert_eq!(
+            rows(
+                "$$x = 1
+ y = 2$$"
+            ),
+            ["x = 1  y = 2"]
+        );
+    }
+
+    /// An equation that panics unicodeit renders verbatim, screen intact.
+    #[test]
+    fn a_panicking_equation_renders_verbatim() {
+        let panicking = r"Z^{(\ell)}_{\mathbf{x}}({\mathbf{y}}) = \sum_{j=1}^{\dim(\mathbf{H}_\ell)}\overline{Y_j({\mathbf{x}})}";
+        assert_eq!(rows(&format!("$${panicking}$$")), [panicking]);
     }
 
     #[test]
