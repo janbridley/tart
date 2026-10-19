@@ -216,6 +216,14 @@ pub(crate) struct Transcript {
 }
 
 impl Transcript {
+    /// A fresh transcript under a highlighted title line, spaced with a newline.
+    pub(crate) fn titled(title: &str) -> Self {
+        let mut transcript = Self::default();
+        transcript.push(Line::from(Span::styled(title.to_owned(), HIGHLIGHT_STYLE)));
+        transcript.blank();
+        transcript
+    }
+
     /// Append a committed line.
     pub(crate) fn push(&mut self, line: impl Into<Line<'static>>) {
         self.push_hanging(line, 0);
@@ -233,6 +241,11 @@ impl Transcript {
         if !self.messages.is_empty() && !ends_blank {
             self.push(Line::from(""));
         }
+    }
+
+    /// Append a dim system line, excluded from the session record.
+    pub(crate) fn note<S: Into<String>>(&mut self, text: S) {
+        self.push(Span::styled(text.into(), DIM_STYLE));
     }
 
     /// Record a tool invocation's start; it renders as a running header until

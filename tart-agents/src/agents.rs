@@ -230,6 +230,14 @@ impl Agents {
         })
     }
 
+    /// The subagent's task as spawned, for its box and its observed view.
+    ///
+    /// `None` when no such child is registered.
+    #[inline]
+    pub fn task(&self, id: AgentId) -> Option<String> {
+        self.inner.with_child(id, |child| child.task.clone())
+    }
+
     /// The running subagents, as (id, task) for listing.
     #[inline]
     pub fn running(&self) -> Vec<(AgentId, String)> {
@@ -343,6 +351,30 @@ mod tests {
 
     use super::*;
     use crate::sandbox::Policy;
+
+    #[test]
+    fn task_names_the_registered_child() {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let template = Agent::new("http://127.0.0.1:1", "key", "model", policy);
+        let registry = Agents::new(|_, _| ());
+        let id = registry.spawn(&template, "probe").expect("the child spawns");
+        registry.cancel(id);
+        assert_eq!(registry.task(id).as_deref(), Some("probe"));
+
+        assert!(
+            registry.task(AgentId::from(99)).is_none(),
+            "an unknown id has no child"
+        );
+
+        // The delivered report retires the task along with the child.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !registry.done(id) {
+            assert!(std::time::Instant::now() < deadline, "the child ends");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        registry.take_outcome(id);
+        assert_eq!(registry.task(id), None, "delivery closes the child");
+    }
 
     #[test]
     fn cancel_main_leaves_the_children_running() {

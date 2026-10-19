@@ -277,6 +277,16 @@ fn run(
                         };
                         pane.note(format!("subagents: {listed}"));
                     }
+                    // Observe one subagent by swapping in its view temporarily.
+                    _ if let Some(arg) = line.trim().strip_prefix("/agent") => {
+                        match arg.trim().parse::<u64>() {
+                            Ok(id) => match agents.task(AgentId::from(id)) {
+                                Some(task) => pane.observe(AgentId::from(id), &task),
+                                None => pane.note(format!("no subagent {id} · /agents to list")),
+                            },
+                            Err(_) => pane.note("usage: /agent <id> · /agents to list"),
+                        }
+                    }
                     // A submitted `/resume` line means the chooser was closed;
                     // it opens by itself while the line is being typed.
                     _ if file_mentions::is_command(line.trim(), "/resume") => {
@@ -315,7 +325,7 @@ fn run(
                         let commands = if agent.mode() == ChatMode::Chat {
                             "/clear /rewind /resume /model /effort /perf /quit"
                         } else {
-                            "/clear /rewind /resume /model /plan /effort /agents /stop /perf /gpu /quit"
+                            "/clear /rewind /resume /model /plan /effort /agents /agent /stop /perf /gpu /quit"
                         };
                         pane.note(format!(
                             "unknown command {} · {commands}",
@@ -373,6 +383,15 @@ fn run(
                     let running = agents.running();
                     for (id, task) in &running {
                         pane.start_agent(*id, task);
+                        // Re-open subagent transcripts so they're not just blank.
+                        pane.child_event(
+                            *id,
+                            &Progress::ToolStart {
+                                id: id.tag(),
+                                name: AGENT_TOOL.to_string(),
+                                arguments: task.clone(),
+                            },
+                        );
                     }
                     // Attachments are cut back to the line the user typed, so
                     // a resubmit does not attach them twice.
@@ -509,6 +528,7 @@ fn on_child_event(
     id: AgentId,
     progress: &Progress,
 ) -> anyhow::Result<()> {
+    pane.child_event(id, progress);
     match progress {
         Progress::ToolStart { name, arguments, .. } => {
             if name == AGENT_TOOL {
@@ -518,20 +538,20 @@ fn on_child_event(
             }
         }
         _ if progress.is_terminal() => {
-            // The peek resolves the box and queues the id; the
-            // claim happens at delivery, so a `wait` inside this
-            // turn can still take the report for itself.
-            match agents.with_outcome(id, |outcome| {
-                (outcome.report(), matches!(outcome, Outcome::Done(_)).then_some(0))
-            }) {
-                Some((report, exit)) => {
-                    pane.report(id);
-                    pane.finish_agent(id, report, exit);
-                }
-                None => pane.finish_agent(id, "report delivered through wait".to_string(), Some(0)),
-            }
-            // Idle: the reports start their turn now. Busy: the
-            // running turn's end delivers them.
+            // Peek, don't claim: the outcome is read for the box, and claiming waits
+            // for delivery, — so a `wait` inside this turn could still take the report
+            // for itself.
+            let (report, exit) = agents
+                .with_outcome(id, |outcome| {
+                    (outcome.report(), matches!(outcome, Outcome::Done(_)).then_some(0))
+                })
+                .unwrap_or(("report delivered through wait".to_string(), Some(0)));
+            // The id queues either way: the report's delivery ends any observation of
+            // ion of it, and a `wait`-claimed one still retires its view in the sweep.
+            pane.report(id);
+            pane.finish_agent(id, report, exit);
+            // Idle: the reports start their turn now.
+            // Busy: the running turn's end delivers them.
             if !pane.is_generating() {
                 pane.deliver_reports(agents, agent, transcript, wake)?;
             }
