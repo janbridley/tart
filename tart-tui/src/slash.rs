@@ -53,7 +53,9 @@ impl TabComplete {
         (!remainders.is_empty()).then(|| remainders.join(","))
     }
 
-    /// `Tab` on the typed word to insert the user hint. Returns whether command is real.
+    /// `Tab` on the typed word: insert the unique candidate's remainder, or multiple.
+    ///
+    /// Returns whether the word was a real cmd, so an unknown one keeps `Tab` literal.
     pub(crate) fn complete(self, editor: &mut Editor) -> bool {
         let mut candidates = self.candidates();
         let Some(first) = candidates.next() else {
@@ -69,6 +71,13 @@ impl TabComplete {
         }
         true
     }
+}
+
+/// The commands the unknown-command hint prints, so it cannot drift from
+/// the tables.
+pub(crate) fn hint(chat: bool) -> String {
+    let table = if chat { CHAT_COMMANDS } else { COMMANDS };
+    table.join(" ")
 }
 
 /// The longest prefix every word shares, borrowed from the first.
@@ -107,9 +116,35 @@ mod tests {
         assert_eq!(ghost("/resume", false), None);
         assert_eq!(ghost("/resume fix", false), None);
         assert_eq!(ghost("/nope", false), None);
+        // A word that is itself a command still ghosts its longer kin.
+        assert_eq!(ghost("/agent", false).as_deref(), Some("s"));
         // Chat mode has no subagents, plan mode, or sandbox.
         assert_eq!(ghost("/pl", true), None);
         assert_eq!(ghost("/cl", true).as_deref(), Some("ear"));
+        assert_eq!(ghost("/ag", true), None);
+        assert_eq!(ghost("/ex", true).as_deref(), Some("it"));
+    }
+
+    #[test]
+    fn only_a_caret_at_the_words_end_is_live() {
+        let mut caret_moved = editor("/re");
+        caret_moved.left();
+        let multi_line = editor("fix\n/re");
+        assert!(TabComplete::live(&caret_moved, false).is_none());
+        assert!(TabComplete::live(&multi_line, false).is_none());
+        let mut editor = editor("/р");
+        let handled = TabComplete::live(&editor, false).is_some_and(|c| c.complete(&mut editor));
+        assert!(!handled, "the unknown word is not completed");
+        assert_eq!(editor.text(), "/р");
+    }
+
+    /// The tables stay sorted, which the ghost's determinism rests on.
+    #[test]
+    fn the_tables_stay_sorted() {
+        for table in [COMMANDS, CHAT_COMMANDS] {
+            assert!(table.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        assert_eq!(hint(true), CHAT_COMMANDS.join(" "));
     }
 
     /// The shared prefix cuts on char boundaries, multibyte included, and an
