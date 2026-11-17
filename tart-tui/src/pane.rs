@@ -475,7 +475,7 @@ impl Pane {
             KeyCode::Enter if matches!(self.mode, Mode::Bang) => return self.submit_bang(),
             // A draft mid-generation queues for the next turn, interrupting it,
             // but slash commands still have to wait.
-            // `/agent` is the an exception, as it only modifies the user's view.
+            // `/agent` is an exception, as it only modifies the user's view.
             KeyCode::Enter if self.spin.is_some() => {
                 let text = self.prompt.text();
                 let trimmed = text.trim();
@@ -970,7 +970,7 @@ impl Pane {
     ) -> anyhow::Result<bool> {
         let reported = std::mem::take(&mut self.reports);
         // Every reported child retires, delivering its report or getting claimed with a
-        // `wait, so its view goes with it.
+        // `wait`, so its view goes with it.
         if let Some(watched) = self.observing
             && reported.contains(&watched)
         {
@@ -1739,7 +1739,7 @@ mod tests {
         assert!(pane.observing.is_none(), "ctrl+left walks back out");
     }
 
-    /// `/agent` runs mid-generation, where observing matters; every other
+    /// `/agent` runs mid-generation, where observing matters. Every other
     /// slash command waits out the turn with its draft kept.
     #[test]
     fn the_agent_command_submits_mid_generation() {

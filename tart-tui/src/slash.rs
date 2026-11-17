@@ -4,8 +4,8 @@ use itertools::Itertools;
 
 use crate::pane::{Editor, graphemes};
 
-/// Every command, sorted. Plan mode rides Shift+Tab, subagent slots show in
-/// the status bar, and the sandbox's GPU grant rides `--gpu`.
+/// Every command, sorted. Plan mode is Shift+Tab, subagents show as running
+/// boxes in the transcript, and the sandbox's GPU grant is `--gpu`.
 const COMMANDS: &[&str] = &[
     "/agent", "/clear", "/effort", "/exit", "/model", "/perf", "/quit", "/resume", "/rewind",
     "/stop",
@@ -57,7 +57,7 @@ impl TabComplete {
     /// `Tab` on the typed word: insert the unique candidate's remainder, or as
     /// far as the candidates agree (nothing, when the word is already whole).
     ///
-    /// Returns whether the word was a real cmd, so an unknown one keeps `Tab` literal.
+    /// Returns whether the word was a real command, so an unknown one keeps `Tab` literal.
     pub(crate) fn complete(self, editor: &mut Editor) -> bool {
         let mut candidates = self.candidates();
         let Some(first) = candidates.next() else {
