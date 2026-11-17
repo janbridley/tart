@@ -505,16 +505,13 @@ fn on_child_event(
             }
         }
         _ if progress.is_terminal() => {
-            // Peek, don't claim: the outcome is read for the box, and claiming waits
-            // for delivery, — so a `wait` inside this turn could still take the report
-            // for itself.
+            // If this cycle would end the agent's turn, claim the agent's report and
+            // tear down the agent. We then update (or queue) the resulting message
             let (report, exit) = agents
                 .with_outcome(id, |outcome| {
                     (outcome.report(), matches!(outcome, Outcome::Done(_)).then_some(0))
                 })
                 .unwrap_or(("report delivered through wait".to_string(), Some(0)));
-            // The id queues either way: the report's delivery ends any observation of
-            // ion of it, and a `wait`-claimed one still retires its view in the sweep.
             pane.report(id);
             pane.finish_agent(id, report, exit);
             // Idle: the reports start their turn now.
