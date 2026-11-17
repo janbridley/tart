@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 use tart_agents::{
-    Agent, AgentId, Agents, ChatMode, MAIN, Progress, ReasoningEffort, Transcript as Conversation,
-    TurnHandle, prompts,
+    AGENT_TOOL, Agent, AgentId, Agents, ChatMode, MAIN, Progress, ReasoningEffort,
+    Transcript as Conversation, TurnHandle, prompts,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -231,6 +231,14 @@ pub struct Pane {
     spin: Option<Instant>,
     /// The subagents with a box open, one per spinner slot.
     slots: [Option<(AgentId, Instant)>; spinners::AGENTS.len()],
+    /// The subagent whose view the transcript area shows in place of the main
+    /// one; see [`Pane::observe`].
+    observing: Option<AgentId>,
+    /// Every subagent's view, painting from its spawn: the registry's record
+    /// holds only completed rounds, so the round in flight — the very one
+    /// worth watching — lives here or nowhere. A view retires with its
+    /// child's report.
+    children: Vec<(AgentId, Transcript)>,
     /// The composer's mode: ordinary chat, `!` commands, or plan mode.
     mode: Mode,
     /// A plan has landed in plan mode, so Enter would approve it.
@@ -409,9 +417,19 @@ impl Pane {
             }
             return None;
         }
+        // The observed subagent takes plain keys so Esc or `q` quit to main convo.
+        if self.observing.is_some() && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'Q')) {
+                self.observing = None;
+            }
+            return None;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
+                // Ctrl+Left walks back out of an observed subagent, mirroring
+                // the hint row; the composer claims no ctrl+arrow of its own.
+                KeyCode::Left if self.observing.is_some() => self.observing = None,
                 KeyCode::Char('u') => self.clear_prompt(),
                 // The rendered row's edges, crossing onto the neighboring row
                 // when already at one.
@@ -419,10 +437,10 @@ impl Pane {
                 KeyCode::Char('e') => self.prompt.end(),
                 // ⌃Y steps the draft back one edit group
                 KeyCode::Char('y') => self.prompt.undo(),
-                // Toggle the thinking run's visibility (only in normal mode)
-                KeyCode::Char('t') => self.transcript.toggle_thinking(),
-                // Toggle expanding the tool outputs' collapsed middles
-                KeyCode::Char('o') => self.transcript.toggle_expand(),
+                // Toggle the thinking run's visibility for the currently viewed agent
+                KeyCode::Char('t') => self.view().toggle_thinking(),
+                // Toggle expanding the tool outputs' collapsed middles.
+                KeyCode::Char('o') => self.view().toggle_expand(),
                 _ => {}
             }
             return None;
@@ -455,11 +473,16 @@ impl Pane {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.prompt.new_line(),
             // Classify manual commands BEFORE queueing
             KeyCode::Enter if matches!(self.mode, Mode::Bang) => return self.submit_bang(),
-            // A draft mid-generation queues for the next turn, interrupting
-            // it, but slash commands still have to wait
+            // A draft mid-generation queues for the next turn, interrupting it,
+            // but slash commands still have to wait.
+            // `/agent` is the an exception, as it only modifies the user's view.
             KeyCode::Enter if self.spin.is_some() => {
                 let text = self.prompt.text();
-                if !text.trim().is_empty() && !text.trim().starts_with('/') {
+                let trimmed = text.trim();
+                if file_mentions::is_command(trimmed, "/agent") {
+                    return self.submit();
+                }
+                if !trimmed.is_empty() && !trimmed.starts_with('/') {
                     self.queue_message(text);
                     self.clear_prompt();
                     self.prompt.forget_undo();
@@ -519,7 +542,7 @@ impl Pane {
 
     /// Pastes end up in the prompt box, newlines included.
     pub fn on_paste(&mut self, text: &str) {
-        if self.copy.is_none() {
+        if self.copy.is_none() && self.observing.is_none() {
             // A pasted command starting with the marker enters the mode.
             if !matches!(self.mode, Mode::Bang)
                 && self.draft_is_empty()
@@ -547,36 +570,38 @@ impl Pane {
                 self.echo(text);
                 self.begin_response();
             }
-            Progress::Thinking(text) => self.append_thinking(text),
-            Progress::Answer(text) => self.append_answer(text),
-            Progress::ToolStart { id, name, arguments } => {
-                self.start_tool(id.clone(), name.clone(), arguments.clone());
-            }
-            Progress::ToolOutput { id, output, exit } => {
-                self.finish_tool(id, output.clone(), *exit);
-            }
             Progress::Usage { input, cached, output } => {
                 self.set_usage(*input, *cached, *output);
             }
-            // A transient note sits in the status line until sent.
-            Progress::Note(text) => self.note(text),
-            // `Progress` is non-exhaustive; later variants need no handling yet.
+            // A transient note sits in the status line until sent, and every other arm
+            // is the conversation's own, shared with the observed views below.
+            _ => Self::paint(&mut self.transcript, progress),
+        }
+    }
+
+    /// Paint one event into a conversation's view.
+    #[inline]
+    fn paint(view: &mut Transcript, progress: &Progress) {
+        match progress {
+            Progress::Thinking(text) => view.append_thinking(text),
+            Progress::Answer(text) => view.append(text),
+            Progress::Note(text) => view.note(text),
+            Progress::ToolStart { id, name, arguments } if name != AGENT_TOOL => {
+                view.start_tool(id.clone(), name.clone(), arguments.clone());
+            }
+            Progress::ToolOutput { id, output, exit } => {
+                view.finish_tool(id, output.clone(), *exit);
+            }
+            Progress::Done { .. } => view.note("done"),
+            Progress::Failed(error) => view.note(format!("failed: {error}")),
+            Progress::Cancelled => view.note("cancelled"),
             _ => {}
         }
     }
 
-    pub fn push<L: Into<Line<'static>>>(&mut self, line: L) {
-        self.transcript.push(line);
-    }
-
     /// Append a dim system line to the UI that is excluded from the sessions record.
     pub fn note<S: Into<String>>(&mut self, text: S) {
-        self.push(Span::styled(text.into(), DIM_STYLE));
-    }
-
-    /// Append a fragment of the model's streamed answer; see [`Transcript::append`].
-    pub fn append_answer(&mut self, text: &str) {
-        self.transcript.append(text);
+        self.transcript.note(text);
     }
 
     /// Append a styled streaming fragment outside the answer.
@@ -584,19 +609,9 @@ impl Pane {
         self.transcript.append_span(span);
     }
 
-    /// Append a streaming chain-of-thought fragment to the current thinking block
-    pub fn append_thinking(&mut self, fragment: &str) {
-        self.transcript.append_thinking(fragment);
-    }
-
     /// Retire the previous response's thinking; see [`Transcript::begin_response`].
     pub fn begin_response(&mut self) {
         self.transcript.begin_response();
-    }
-
-    /// Record a tool invocation's start; see [`Transcript::start_tool`].
-    pub fn start_tool(&mut self, id: String, name: String, arguments: String) {
-        self.transcript.start_tool(id, name, arguments);
     }
 
     /// Open a subagent's running box on its task; see [`Transcript::start_agent`].
@@ -627,6 +642,45 @@ impl Pane {
             *slot = None;
         }
         self.finish_tool(&id.tag(), output, exit);
+    }
+
+    /// Show the subagent `id`'s view in place of the main one.
+    pub fn observe(&mut self, id: AgentId, task: &str) {
+        if !self.children.iter().any(|(bid, _)| *bid == id) {
+            self.children.push((
+                id,
+                Transcript::titled(&format!("{} · {}", id.tag(), clip_line(task, ONE_LINE_CAP))),
+            ));
+        }
+        self.observing = Some(id);
+    }
+
+    /// Take one of a subagent's events into its view, painting as it arrives.
+    pub fn child_event(&mut self, id: AgentId, progress: &Progress) {
+        if let Some((_, view)) = self.children.iter_mut().find(|(bid, _)| *bid == id) {
+            Self::paint(view, progress);
+            return;
+        }
+        let Progress::ToolStart { name, arguments, .. } = progress else {
+            return;
+        };
+        if name == AGENT_TOOL {
+            self.children.push((
+                id,
+                Transcript::titled(&format!(
+                    "{} · {}",
+                    id.tag(),
+                    clip_line(arguments, ONE_LINE_CAP)
+                )),
+            ));
+        }
+    }
+
+    /// The currently-visible transcript: the observed subagent's, or the main one's.
+    fn view(&mut self) -> &mut Transcript {
+        self.observing
+            .and_then(|id| self.children.iter_mut().find(|(bid, _)| *bid == id))
+            .map_or(&mut self.transcript, |(_, view)| view)
     }
 
     /// Fill in the pending invocation; see [`Transcript::finish_tool`].
@@ -760,6 +814,8 @@ impl Pane {
         self.reports.clear();
         self.plan_ready = false;
         self.slots = Default::default();
+        self.observing = None;
+        self.children.clear();
     }
 
     /// Update the `/perf` stats line; `None` restores the bottom rule.
@@ -904,8 +960,18 @@ impl Pane {
         transcript: &Conversation,
         wake: &Sender<Wake>,
     ) -> anyhow::Result<bool> {
-        let text = std::mem::take(&mut self.reports)
-            .into_iter()
+        let reported = std::mem::take(&mut self.reports);
+        // Every reported child retires, delivering its report or getting claimed with a
+        // `wait, so its view goes with it.
+        if let Some(watched) = self.observing
+            && reported.contains(&watched)
+        {
+            self.observing = None;
+        }
+        self.children.retain(|(bid, _)| !reported.contains(bid));
+        let text = reported
+            .iter()
+            .copied()
             .filter_map(|id| agents.take_outcome(id).map(|(task, outcome)| (id, task, outcome)))
             .map(|(id, task, outcome)| {
                 format!(
@@ -1095,10 +1161,11 @@ impl Pane {
             return;
         }
         // The prompt grows with its wrapped content, always leaving space for the
-        // transcript and the two rules. Copy mode swaps the prompt for a one-row hint,
-        // so the draft is only wrapped when the prompt actually renders.
+        // transcript and the two rules. Copy mode and an observed subagent both
+        // swap the prompt for a one-row hint, so the draft is only wrapped when
+        // the prompt actually renders.
         let cap = area.height.saturating_sub(4).max(1) as usize;
-        let (prompt_height, layout) = if self.copy.is_some() {
+        let (prompt_height, layout) = if self.copy.is_some() || self.observing.is_some() {
             (1, None)
         } else {
             let width = area.width.saturating_sub(GUTTER) as usize;
@@ -1116,9 +1183,17 @@ impl Pane {
         .areas(area);
 
         self.render_transcript(transcript, bar_top, bar_bottom, frame);
-        // No layout means copy mode: show the scrollback hint instead.
+        // No layout means the composer is swapped for a hint.
         let Some(layout) = layout else {
-            Self::render_scrollback_hint(frame, prompt_area);
+            let (text, style) = if self.observing.is_some() {
+                ("◀ ctrl+← or esc/q return", PROMPT_STYLE)
+            } else {
+                (
+                    "▲ scrollback · ←↑↓→/PgUp/Home/End · Space select · Enter copy · q to exit",
+                    Style::new().fg(Color::Yellow),
+                )
+            };
+            Self::render_hint(frame, prompt_area, text, style);
             return;
         };
 
@@ -1127,9 +1202,8 @@ impl Pane {
         }
         let buf = frame.buffer_mut();
         // Live prompt: the "❯ " gutter (or "! " in the manual-command mode),
-        // then the wrapped draft. The inverted caret cell marks the cursor, so
-        // the terminal cursor stays hidden and the prompt viewport can never
-        // misplace it.
+        // then the wrapped draft. The inverted caret cell marks the cursor, so the
+        // terminal cursor stays hidden and the prompt viewport can never misplace it.
         let width = prompt_area.width - GUTTER;
         let (glyph, glyph_style) = match self.mode {
             Mode::Bang => (BANG_PROMPT, BANG_STYLE),
@@ -1178,8 +1252,16 @@ impl Pane {
     ) {
         // Queued snippet reads the queue before `sync` borrows the transcript
         let queued = self.queued_text(bar_top.width);
-        // Wrap only what is new at an unchanged width, or rewrap if width changed.
-        let rows = self.transcript.sync(area.width as usize);
+        // Wrap only what is new at an unchanged width, or rewrap if width
+        // changed. While a subagent is observed, its view takes the main
+        // conversation's place.
+        let rows = match self
+            .observing
+            .and_then(|id| self.children.iter_mut().find(|(bid, _)| *bid == id))
+        {
+            Some((_, view)) => view.sync(area.width as usize),
+            None => self.transcript.sync(area.width as usize),
+        };
         // Clamp to the wrapped rows, moving the cursor to (0, 0) when empty.
         if let Some(cursor) = &mut self.copy {
             (cursor.row, cursor.col) = clamp_cell(rows, cursor.row, cursor.col);
@@ -1235,16 +1317,13 @@ impl Pane {
         }
     }
 
-    /// In copy mode the prompt area shows the scrollback keybindings.
-    fn render_scrollback_hint(frame: &mut Frame, prompt_area: Rect) {
+    /// The prompt row's stand-in when the composer is swapped out.
+    fn render_hint(frame: &mut Frame, prompt_area: Rect, text: &str, style: Style) {
         if prompt_area.height > 0 {
             frame.buffer_mut().set_line(
                 prompt_area.x,
                 prompt_area.y,
-                &Line::from(Span::styled(
-                    "▲ scrollback · ←↑↓→/PgUp/Home/End · Space select · Enter copy · q to exit",
-                    Style::new().fg(Color::Yellow),
-                )),
+                &Line::from(Span::styled(text, style)),
                 prompt_area.width,
             );
         }
@@ -1541,6 +1620,165 @@ mod tests {
         assert!(before.ends_with(&tail), "{before} vs {tail}");
     }
 
+    #[test]
+    fn observing_shows_the_childs_conversation_live() {
+        let (mut pane, _agent, _record, _wake, _agents) = setup_tests();
+        pane.note("main only");
+        let id = AgentId::from(3);
+        // What arrived before the swap: the opener (which opens the view on the task it
+        // carries), an answer, and a call still running, plus a subagent's view
+        pane.child_event(
+            id,
+            &Progress::ToolStart {
+                id: id.tag(),
+                name: AGENT_TOOL.to_string(),
+                arguments: "map the module".to_string(),
+            },
+        );
+        pane.child_event(id, &Progress::User("preamble\n\nmap the module".into()));
+        pane.child_event(id, &Progress::Answer("on it".into()));
+        pane.child_event(
+            id,
+            &Progress::ToolStart {
+                id: "t1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"cargo test"}"#.into(),
+            },
+        );
+        pane.child_event(
+            AgentId::from(4),
+            &Progress::ToolStart {
+                id: AgentId::from(4).tag(),
+                name: AGENT_TOOL.to_string(),
+                arguments: "elsewhere task".to_string(),
+            },
+        );
+        pane.child_event(AgentId::from(4), &Progress::Answer("elsewhere".into()));
+        pane.observe(id, "map the module");
+
+        // The view opens on the header and what has painted so far, the
+        // in-flight box running among it, hiding the main conversation's rows
+        // and standing the composer down for its hint row: nothing looks
+        // writable, and the way back is named. The opener headed the view
+        // rather than opening a box in it.
+        let screen = render(&mut pane, (40, 12));
+        assert!(screen.contains("agent-3 · map the module"), "{screen}");
+        assert!(screen.contains("on it"), "{screen}");
+        assert!(screen.contains("Bash(cargo test)"), "{screen}");
+        assert!(!screen.contains("main only"), "{screen}");
+        assert!(!screen.contains("elsewhere"), "{screen}");
+        assert!(!screen.contains("Agent("), "{screen}");
+        assert!(screen.contains("◀ ctrl+← or esc/q return"), "{screen}");
+        assert!(!screen.contains("❯"), "{screen}");
+
+        // Live events land, outputs included; another subagent's do not.
+        pane.child_event(
+            id,
+            &Progress::ToolOutput {
+                id: "t1".into(),
+                output: "ok\n1 passed".into(),
+                exit: Some(0),
+            },
+        );
+        pane.child_event(AgentId::from(4), &Progress::Answer("also elsewhere".into()));
+        let screen = render(&mut pane, (40, 12));
+        assert!(screen.contains("1 passed"), "{screen}");
+        assert!(!screen.contains("also elsewhere"), "{screen}");
+
+        // The control bindings still run while observing, quit among them,
+        // and they leave the view open; the thinking toggle works on the
+        // observed view, placeholder giving way to the reasoning itself.
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(PaneEvent::Quit)
+        );
+        assert!(pane.observing.is_some(), "the quit key leaves the view alone");
+        pane.child_event(id, &Progress::Thinking("reasoning".into()));
+        let screen = render(&mut pane, (40, 12));
+        assert!(screen.contains("[Thinking… ctrl+t to toggle]"), "{screen}");
+        pane.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let screen = render(&mut pane, (40, 12));
+        assert!(screen.contains("reasoning"), "{screen}");
+        assert!(!screen.contains("[Thinking…"), "{screen}");
+
+        // Esc returns to the main rows; Ctrl+Left returns too, as the hint
+        // row promises.
+        pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(pane.observing.is_none());
+        let screen = render(&mut pane, (40, 12));
+        assert!(screen.contains("main only"), "{screen}");
+        assert!(!screen.contains("on it"), "{screen}");
+        assert!(screen.contains("❯"), "the composer returns");
+
+        pane.observe(id, "map the module");
+        pane.on_key(key(KeyCode::Left, KeyModifiers::CONTROL));
+        assert!(pane.observing.is_none(), "ctrl+left walks back out");
+    }
+
+    /// `/agent` runs mid-generation, where observing matters; every other
+    /// slash command waits out the turn with its draft kept.
+    #[test]
+    fn the_agent_command_submits_mid_generation() {
+        let (mut pane, _agent, _record, _wake, _agents) = setup_tests();
+        pane.set_generating(true);
+        pane.type_keys("/agent 3");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(PaneEvent::Submit("/agent 3".to_string()))
+        );
+        for waitlisted in ["/stop 3", "/agents"] {
+            pane.type_keys(waitlisted);
+            assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+            assert_eq!(pane.prompt.text(), waitlisted, "the draft waits");
+            pane.clear_prompt();
+        }
+    }
+
+    /// Delivering the observed subagent's report returns the main view;
+    /// another subagent's delivery leaves the observation alone.
+    #[test]
+    fn delivering_the_observed_report_returns_to_the_main_view() {
+        let (mut pane, agent, transcript, wake, agents) = setup_tests();
+        let ids = [
+            agents.spawn(&agent, "first").expect("the first child spawns"),
+            agents.spawn(&agent, "watched").expect("the second child spawns"),
+        ];
+        // The dead endpoint never answers on its own, so cancel both: the
+        // outcomes arrive as `Cancelled`, which delivers like any other.
+        for id in ids {
+            agents.cancel(id);
+        }
+        await_outcome(&agents, &ids);
+        let task = agents.task(ids[1]).expect("the watched child is registered");
+        for id in ids {
+            pane.child_event(
+                id,
+                &Progress::ToolStart {
+                    id: id.tag(),
+                    name: AGENT_TOOL.to_string(),
+                    arguments: "tick".to_string(),
+                },
+            );
+        }
+        pane.observe(ids[1], &task);
+
+        pane.report(ids[0]);
+        pane.deliver_reports(&agents, &agent, &transcript, &wake).unwrap();
+        assert!(pane.observing.is_some(), "an unrelated delivery keeps the view");
+        assert_eq!(pane.children.len(), 1, "only the delivered child's view goes");
+
+        // A report claimed through a `wait` retires just the same: the sweep
+        // keys on the reported ids, delivered or not.
+        agents.take_outcome(ids[1]);
+        pane.report(ids[1]);
+        pane.deliver_reports(&agents, &agent, &transcript, &wake).unwrap();
+        assert!(pane.observing.is_none(), "the observed report's delivery returns");
+        assert!(
+            pane.children.is_empty(),
+            "every reported child's view goes with it"
+        );
+    }
+
     /// Type `text` into the pane, one plain keypress per character.
     impl Pane {
         fn type_keys(&mut self, text: &str) {
@@ -1568,7 +1806,7 @@ mod tests {
     #[test]
     fn the_bottom_rule_carries_the_usage_badge() {
         let mut pane = Pane::default();
-        pane.push(Line::from("text"));
+        pane.transcript.push(Line::from("text"));
         assert!(!render(&mut pane, (60, 8)).contains('['));
 
         pane.set_context_tokens(Some(200_000));
@@ -1596,7 +1834,7 @@ mod tests {
 
         // No window configured drops the ratio.
         let mut bare = Pane::default();
-        bare.push(Line::from("text"));
+        bare.transcript.push(Line::from("text"));
         bare.set_usage(45_000, 0, 3_000);
         assert!(render(&mut bare, (60, 8)).contains("[ 48k ]"));
     }
@@ -1881,8 +2119,8 @@ mod tests {
         let (wake, _wake_receiver) = std::sync::mpsc::channel();
         let mut pane = Pane::default();
         pane.begin_response();
-        pane.append_thinking("doomed reasoning");
-        pane.append_answer("partial");
+        pane.transcript.append_thinking("doomed reasoning");
+        pane.transcript.append("partial");
         pane.transcript.toggle_thinking(); // reveal the run
         assert!(render(&mut pane, (60, 10)).contains("doomed"));
         pane.queue_message("go faster".to_string());
@@ -1892,7 +2130,7 @@ mod tests {
         assert!(pane.requeue(&agent, &transcript, Path::new("."), &wake).unwrap());
         assert!(pane.queued.is_empty(), "the requeue takes the message");
         assert!(pane.is_generating(), "the next turn is running");
-        pane.append_answer(" more");
+        pane.transcript.append(" more");
         let screen = render(&mut pane, (60, 10));
         assert!(screen.contains("❯ go faster"), "{screen}");
         assert!(screen.contains("partial"), "{screen}");
@@ -1909,7 +2147,7 @@ mod tests {
     #[test]
     fn bang_on_an_empty_draft_swaps_the_glyph_and_the_rules() {
         let mut pane = Pane::default();
-        pane.push(Line::from("text"));
+        pane.transcript.push(Line::from("text"));
         let idle_styles = draw_styles(|frame, area| pane.render(frame, area), (40, 8));
         let idle: Vec<&str> = idle_styles.lines().collect();
         // Rows: five of transcript, top rule, prompt, bottom rule.
@@ -2435,7 +2673,7 @@ mod tests {
     #[test]
     fn the_top_rule_shows_the_queued_snippet() {
         let mut pane = Pane::default();
-        pane.push(Line::from("text"));
+        pane.transcript.push(Line::from("text"));
         let idle = render(&mut pane, (60, 8));
         assert!(!idle.contains("queued:"), "{idle}");
 
@@ -2491,9 +2729,9 @@ mod tests {
     #[test]
     fn a_cancelled_turn_keeps_its_partial_answer() {
         let mut pane = Pane::default();
-        pane.push(Line::from("earlier"));
+        pane.transcript.push(Line::from("earlier"));
         pane.begin_response();
-        pane.append_answer("earlier answer");
+        pane.transcript.append("earlier answer");
 
         // The next turn, as main drives it: submit echoes the draft, the
         // response begins, then the stream arrives and Esc lands.
@@ -2504,8 +2742,8 @@ mod tests {
         );
         pane.begin_response();
         pane.set_generating(true);
-        pane.append_thinking("thinking");
-        pane.append_answer("Once upon");
+        pane.transcript.append_thinking("thinking");
+        pane.transcript.append("Once upon");
         pane.set_generating(false);
         pane.note("⎋ cancelled");
 
@@ -2519,7 +2757,7 @@ mod tests {
     #[test]
     fn echo_renders_the_prompt_and_indents_continuations() {
         let mut pane = Pane::default();
-        pane.push(Line::from("banner"));
+        pane.transcript.push(Line::from("banner"));
 
         pane.echo("first\nsecond");
 
@@ -2663,7 +2901,7 @@ mod tests {
     #[test]
     fn replayed_turns_render_like_live_ones() {
         let mut pane = Pane::default();
-        pane.push(Line::from("banner"));
+        pane.transcript.push(Line::from("banner"));
         let replay = [
             Progress::User("run it".to_string()),
             Progress::Thinking("thinking".to_string()),
@@ -2698,7 +2936,8 @@ mod tests {
     fn copy_mode_swallows_keys_and_survives_resizes() {
         let mut pane = Pane::default();
         for i in 0..10 {
-            pane.push(Line::from(format!("message {i} aaaa bbbb cccc dddd")));
+            pane.transcript
+                .push(Line::from(format!("message {i} aaaa bbbb cccc dddd")));
         }
         render(&mut pane, (14, 24)); // narrow: several wrapped rows each
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
@@ -2722,7 +2961,7 @@ mod tests {
     #[test]
     fn enter_copies_the_selection_and_exits() {
         let mut pane = Pane::default();
-        pane.push(Line::from("abc def"));
+        pane.transcript.push(Line::from("abc def"));
         render(&mut pane, (20, 8)); // rows exist before the cursor walks them
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // enter, at (0, 0)
         pane.on_key(key(KeyCode::Right, KeyModifiers::NONE)); // to (0, 1)
@@ -2743,7 +2982,7 @@ mod tests {
     #[test]
     fn leaving_without_a_selection_copies_nothing() {
         let mut pane = Pane::default();
-        pane.push(Line::from("abc"));
+        pane.transcript.push(Line::from("abc"));
         render(&mut pane, (20, 8));
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
         pane.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
@@ -2767,7 +3006,7 @@ mod tests {
     #[test]
     fn selection_paints_a_dark_gray_band() {
         let mut pane = Pane::default();
-        pane.push(Line::from("abc def"));
+        pane.transcript.push(Line::from("abc def"));
         render(&mut pane, (20, 8)); // rows exist before the cursor walks them
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
         pane.on_key(key(KeyCode::Home, KeyModifiers::NONE));
@@ -2788,8 +3027,8 @@ mod tests {
     #[test]
     fn anchored_selection_survives_a_rewrap() {
         let mut pane = Pane::default();
-        pane.push(Line::from("abcdef"));
-        pane.push(Line::from("z"));
+        pane.transcript.push(Line::from("abcdef"));
+        pane.transcript.push(Line::from("z"));
         render(&mut pane, (40, 8)); // rows: ["abcdef", "z"]
         pane.on_key(key(KeyCode::Up, KeyModifiers::SHIFT)); // (1, 0)
         pane.on_key(key(KeyCode::Up, KeyModifiers::NONE)); // (0, 0)
@@ -2808,7 +3047,7 @@ mod tests {
     #[test]
     fn tiny_terminal_renders_without_panic() {
         let mut pane = Pane::default();
-        pane.push(Line::from("text"));
+        pane.transcript.push(Line::from("text"));
         render(&mut pane, (6, 3));
         render(&mut pane, (2, 1));
         render(&mut pane, (1, 0));
@@ -2830,7 +3069,7 @@ mod tests {
     #[test]
     fn ctrl_o_expands_tool_output_in_live_mode_only() {
         let mut pane = Pane::default();
-        pane.start_tool(
+        pane.transcript.start_tool(
             "call_0".to_string(),
             "bash".to_string(),
             r#"{"command":"seq 20"}"#.to_string(),
@@ -2859,10 +3098,10 @@ mod tests {
     #[test]
     fn ctrl_t_toggles_in_live_mode_and_is_inert_in_copy_mode() {
         let mut pane = Pane::default();
-        pane.push(Line::from("❯ hi"));
+        pane.transcript.push(Line::from("❯ hi"));
         pane.begin_response();
-        pane.append_thinking("visible reasoning");
-        pane.append_answer("answer");
+        pane.transcript.append_thinking("visible reasoning");
+        pane.transcript.append("answer");
 
         // Hidden by default: the placeholder shows, the reasoning does not.
         let hidden = render(&mut pane, (40, 12));
@@ -2965,5 +3204,46 @@ mod tests {
         assert!(text.contains("Done"), "{text}");
         assert!(text.contains("• item one"), "{text}");
         assert!(!text.contains("**"), "{text}");
+    }
+    /// A background child's view never draws
+    #[test]
+    fn unobserved_views_never_fold() {
+        let (mut pane, _agent, _record, _wake, _agents) = setup_tests();
+        let id = AgentId::from(1);
+        pane.child_event(
+            id,
+            &Progress::ToolStart {
+                id: id.tag(),
+                name: AGENT_TOOL.to_string(),
+                arguments: "probe".to_string(),
+            },
+        );
+        for round in 0..10 {
+            pane.child_event(id, &Progress::Thinking(format!("round {round} reasoning ")));
+            pane.child_event(
+                id,
+                &Progress::ToolStart {
+                    id: format!("t{round}"),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"cargo test"}"#.into(),
+                },
+            );
+            pane.child_event(
+                id,
+                &Progress::ToolOutput {
+                    id: format!("t{round}"),
+                    output: "ok".into(),
+                    exit: Some(0),
+                },
+            );
+            pane.child_event(id, &Progress::Answer(format!("round {round} answer ")));
+        }
+        let view = &pane.children.first().expect("the view exists").1;
+        assert!(view.rows().is_empty(), "no rows were ever folded");
+
+        // And rendering draws the main conversation only: the child's
+        // content stays off the screen until it is observed.
+        let screen = render(&mut pane, (40, 12));
+        assert!(!screen.contains("round 5 answer"), "{screen}");
     }
 }
