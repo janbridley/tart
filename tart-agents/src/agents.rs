@@ -230,7 +230,7 @@ impl Agents {
         })
     }
 
-    /// The subagent's task as spawned, for its box and its observed view.
+    /// The subagent's task as it was spawned, for its box and its observed view.
     ///
     /// `None` when no such child is registered.
     #[inline]
@@ -366,7 +366,7 @@ mod tests {
             "an unknown id has no child"
         );
 
-        // The delivered report retires the task along with the child.
+        // The delivered report removes the task along with the child.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !registry.done(id) {
             assert!(std::time::Instant::now() < deadline, "the child ends");
