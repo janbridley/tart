@@ -19,7 +19,7 @@ const CHAT_COMMANDS: &[&str] = &[
 /// still become, shared by the prompt's ghost and its `Tab`.
 pub(crate) struct TabComplete {
     /// The typed `/`-word: the draft's whole text, live only while the caret
-    /// rides its end.
+    /// sits at its end.
     word: String,
     /// Whether chat mode's smaller command table applies.
     chat: bool,
@@ -64,7 +64,7 @@ impl TabComplete {
             return false;
         };
         let insert = match candidates.next() {
-            // Unique: the whole remainder, readying the command's argument.
+            // Unique: the whole remainder, plus the space before its argument.
             None => format!("{} ", &first[self.word.len()..]),
             Some(_) => shared(self.candidates())[self.word.len()..].to_string(),
         };
@@ -82,11 +82,11 @@ pub(crate) fn hint(chat: bool) -> String {
     table.join(" ")
 }
 
-/// The longest prefix every word shares, borrowed from the first.
+/// The longest prefix every word shares, sliced from the first word.
 fn shared<'a>(words: impl Iterator<Item = &'a str>) -> &'a str {
     words
         .reduce(|a, b| {
-            // How many leading chars agree, as their byte offset in `a`.
+            // How many leading chars agree, as a byte offset into `a`.
             let agreed = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
             &a[..a.char_indices().nth(agreed).map_or(a.len(), |(i, _)| i)]
         })
@@ -137,7 +137,7 @@ mod tests {
         assert_eq!(editor.text(), "/р");
     }
 
-    /// The tables stay sorted, which the ghost's determinism rests on.
+    /// The tables stay sorted, which the ghost's determinism relies on.
     #[test]
     fn the_tables_stay_sorted() {
         for table in [COMMANDS, CHAT_COMMANDS] {
@@ -155,8 +155,9 @@ mod tests {
         assert_eq!(shared(std::iter::empty::<&str>()), "");
     }
 
-    /// Tab completes the unique remainder with a space for the argument, the
-    /// shared prefix when ambiguous, and leaves other drafts to the tab key.
+    /// Tab completes the unique remainder with a space for the argument, or
+    /// the shared prefix when ambiguous. Other drafts keep the tab key's
+    /// usual meaning.
     #[test]
     fn tab_completes_the_shared_prefix() {
         let tab = |text, chat| {
@@ -164,11 +165,11 @@ mod tests {
             let handled = TabComplete::live(&editor, chat).is_some_and(|c| c.complete(&mut editor));
             (handled, editor.text())
         };
-        // Unique: the remainder and a space, readying the argument.
+        // Unique: the remainder and a space, ready for the argument.
         assert_eq!(tab("/mod", false), (true, "/model ".to_string()));
         // Ambiguous: only as far as they agree, then the ghost narrows.
         assert_eq!(tab("/re", false), (true, "/re".to_string()));
-        // A whole command already typed swallows the Tab without a space.
+        // A whole command already typed consumes the Tab without a space.
         assert_eq!(tab("/quit", false), (true, "/quit".to_string()));
         // No `/`-word live: Tab keeps its old meaning.
         assert_eq!(tab("hello", false), (false, "hello".to_string()));

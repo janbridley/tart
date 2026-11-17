@@ -216,7 +216,7 @@ pub(crate) struct Transcript {
 }
 
 impl Transcript {
-    /// A fresh transcript under a highlighted title line, spaced with a newline.
+    /// A fresh transcript with a highlighted title line and a blank line after it.
     pub(crate) fn titled(title: &str) -> Self {
         let mut transcript = Self::default();
         transcript.push(Line::from(Span::styled(title.to_owned(), HIGHLIGHT_STYLE)));

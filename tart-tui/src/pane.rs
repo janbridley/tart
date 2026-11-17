@@ -1,4 +1,4 @@
-//! `Pane` object stores data and rendering logic for the terminal interface.
+//! The pane: data and rendering logic for the terminal interface.
 
 mod copy;
 mod digest;
@@ -55,7 +55,7 @@ const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::
 const BANG_PROMPT: &str = "! ";
 /// The bang glyph's color, matching the frame it announces.
 const BANG_STYLE: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
-/// The rules' color while the mode is on or a run is in flight; see [`reframe`].
+/// The rules' color while the mode is on or a command is running; see [`reframe`].
 const BANG_RULE: Color = Color::Magenta;
 
 /// The prompt glyph while plan mode is on: also 2 cells.
@@ -65,7 +65,7 @@ const PLAN_STYLE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::
 /// The rules' color while plan mode is on; see [`reframe`].
 const PLAN_RULE: Color = Color::Yellow;
 
-/// The copy cursor and the editor caret are the cell under them, inverted.
+/// The copy cursor and the editor caret invert the cell under them.
 const CURSOR_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 /// Key results the pane cannot handle itself.
@@ -86,7 +86,7 @@ pub enum PaneEvent {
     },
     /// An agent picked in the `/model` chooser, ready to switch to.
     Model(AgentChoice),
-    /// Esc with nothing open, with a turn or a manual command in flight.
+    /// Esc with nothing open, with a turn or a manual command running.
     Cancel,
     /// Shift+Tab: toggle plan mode, moving the agent's mode with it.
     Plan,
@@ -107,10 +107,10 @@ pub enum Wake {
 
 /// The composer's mode: exactly one at a time.
 ///
-/// `Bang` and `Plan` cannot both be on, and the glyph and frame each show the current
-/// mode. Changes to or from [`Mode::Plan`] always travel through the front end
-/// (via [`PaneEvent::Plan`] or [`PaneEvent::Approve`]) so the agent's chat mode moves
-/// with them; `Bang` is only triggered on the TUI side, as it doesn't impact the model.
+/// `Bang` and `Plan` cannot both be on, and the glyph and frame each show the
+/// current mode. Changes to or from [`Mode::Plan`] always go through the front
+/// end (via [`PaneEvent::Plan`] or [`PaneEvent::Approve`]) so the agent's chat
+/// mode moves with them. `Bang` is TUI-only, as it does not affect the model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Mode {
     /// Ordinary chat with the agent.
@@ -135,7 +135,7 @@ pub(crate) enum Popup {
 }
 
 impl Popup {
-    /// Arrows move the highlight; whether Tab/Enter accepts.
+    /// Handle one key: arrows move the highlight; returns whether Tab/Enter accepts.
     fn key(&mut self, code: KeyCode) -> bool {
         match self {
             Popup::Files(popup) => match code {
@@ -143,7 +143,7 @@ impl Popup {
                 KeyCode::Down => popup.select_next(),
                 _ => {}
             },
-            // The typed choosers all key alike.
+            // The typed choosers share one key handler.
             Popup::Sessions(picker) => Self::chooser_key(picker, code),
             Popup::Models(picker) => Self::chooser_key(picker, code),
             Popup::Turns(picker) => Self::chooser_key(picker, code),
@@ -160,7 +160,8 @@ impl Popup {
         }
     }
 
-    /// Draw the popup above `anchor`, titled for its chooser; `bang` swaps the typeahead.
+    /// Draw the popup above `anchor`, with the chooser's title; `bang`
+    /// swaps the typeahead.
     fn render(&mut self, frame: &mut Frame, anchor: Rect, bang: bool) {
         let hint = if bang {
             "↑↓ select · Tab insert · Esc close"
@@ -193,7 +194,7 @@ struct Usage {
     output: u64,
 }
 
-/// One manual command in flight.
+/// A manual command, while it runs.
 struct ManualCommand {
     /// The text of the command
     command: String,
@@ -362,7 +363,7 @@ impl Pane {
                     return Some(PaneEvent::Model(choice));
                 }
             }
-            // /rewind must wait for idle like /resume, otherwise we could break history
+            // /rewind must wait for idle like /resume, or the record could be corrupted
             Some(Popup::Turns(picker)) => {
                 if self.spin.is_none()
                     && self.manual.is_none()
@@ -391,7 +392,7 @@ impl Pane {
     /// Key routing without the popup bookkeeping.
     #[allow(clippy::too_many_lines, reason = "This control should be in one place")]
     fn route(&mut self, key: KeyEvent) -> Option<PaneEvent> {
-        // Copy mode takes every key first, so the draft is immutable while scrolling
+        // Copy mode takes every key first, so the draft cannot change while scrolling
         if let Some(cursor) = self.copy {
             match key.code {
                 // q or Esc leaves copy mode.
@@ -417,7 +418,7 @@ impl Pane {
             }
             return None;
         }
-        // The observed subagent takes plain keys so Esc or `q` quit to main convo.
+        // Observed subagents take plain keys, so Esc or `q` return to the main view.
         if self.observing.is_some() && !key.modifiers.contains(KeyModifiers::CONTROL) {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'Q')) {
                 self.observing = None;
@@ -427,12 +428,12 @@ impl Pane {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c' | 'd') => return Some(PaneEvent::Quit),
-                // Ctrl+Left walks back out of an observed subagent, mirroring
-                // the hint row; the composer claims no ctrl+arrow of its own.
+                // Ctrl+Left also leaves an observed subagent, as the hint row
+                // says; the composer claims no ctrl+arrow of its own.
                 KeyCode::Left if self.observing.is_some() => self.observing = None,
                 KeyCode::Char('u') => self.clear_prompt(),
-                // The rendered row's edges, crossing onto the neighboring row
-                // when already at one.
+                // Home/End stop at the rendered row's edges, crossing onto the
+                // neighboring row when already at one.
                 KeyCode::Char('a') => self.prompt.home(),
                 KeyCode::Char('e') => self.prompt.end(),
                 // ⌃Y steps the draft back one edit group
@@ -445,8 +446,8 @@ impl Pane {
             }
             return None;
         }
-        // A queued message claims Option+Up before the draft jump, moving
-        // the queue into the composer for editing; Enter re-queues the edited
+        // A queued message claims Option+Up before the draft jump: the queue
+        // moves into the composer for editing, and Enter re-queues the edited
         // draft as a new message.
         if key.code == KeyCode::Up
             && key.modifiers.contains(KeyModifiers::ALT)
@@ -524,7 +525,7 @@ impl Pane {
             }
             KeyCode::Char(c) => self.prompt.insert_char(c),
             // Tab completes a typed `/`-command word, else stays a literal tab.
-            // ALT is left alone, as for the popups, so Alt+Tab never completes.
+            // Alt is left alone, as with the popups, so Alt+Tab never completes.
             KeyCode::Tab
                 if !key.modifiers.contains(KeyModifiers::ALT)
                     && !slash::TabComplete::live(&self.prompt, self.chat)
@@ -571,7 +572,7 @@ impl Pane {
         self.popup.take().is_some() || self.copy.take().is_some()
     }
 
-    /// Paint one event into the tui
+    /// Paint one event into the TUI.
     pub fn apply(&mut self, progress: &Progress) {
         match progress {
             Progress::User(text) => {
@@ -581,8 +582,8 @@ impl Pane {
             Progress::Usage { input, cached, output } => {
                 self.set_usage(*input, *cached, *output);
             }
-            // A transient note sits in the status line until sent, and every other arm
-            // is the conversation's own, shared with the observed views below.
+            // A transient note sits in the status line until sent; every other arm
+            // belongs to the conversation, shared with the observed views below.
             _ => Self::paint(&mut self.transcript, progress),
         }
     }
@@ -607,7 +608,7 @@ impl Pane {
         }
     }
 
-    /// Append a dim system line to the UI that is excluded from the sessions record.
+    /// Append a dim system line to the UI, excluded from the session record.
     pub fn note<S: Into<String>>(&mut self, text: S) {
         self.transcript.note(text);
     }
@@ -617,7 +618,7 @@ impl Pane {
         self.transcript.append_span(span);
     }
 
-    /// Retire the previous response's thinking; see [`Transcript::begin_response`].
+    /// End the previous response's thinking; see [`Transcript::begin_response`].
     pub fn begin_response(&mut self) {
         self.transcript.begin_response();
     }
@@ -639,7 +640,7 @@ impl Pane {
         self.transcript.touch_agent(&id.tag(), name, arguments);
     }
 
-    /// Resolve the subagent's box with its report; see [`Transcript::finish_tool`].
+    /// Finish the subagent's box with its report; see [`Transcript::finish_tool`].
     pub fn finish_agent(&mut self, id: AgentId, output: String, exit: Option<i32>) {
         // The slot frees for the next arrival, wherever the agent sat.
         if let Some(slot) = self
@@ -663,7 +664,7 @@ impl Pane {
         self.observing = Some(id);
     }
 
-    /// Take one of a subagent's events into its view, painting as it arrives.
+    /// Add one of a subagent's events to its view, painting as it arrives.
     pub fn child_event(&mut self, id: AgentId, progress: &Progress) {
         if let Some((_, view)) = self.children.iter_mut().find(|(bid, _)| *bid == id) {
             Self::paint(view, progress);
@@ -763,9 +764,9 @@ impl Pane {
 
     /// The bottom rule's right-aligned block while subagents run.
     ///
-    /// One cell per slot up to the highest occupied one, so each set of agent
-    /// dispatches is grouped fairly naturally. Once later agents start to exit, the
-    /// space is cleared for the next round of launches.
+    /// One cell per slot, up to the highest occupied one, so each batch of
+    /// dispatched agents stays grouped. As agents finish, the freed space opens
+    /// for the next round of launches.
     fn agent_block(&self) -> Option<String> {
         let slots = &self.slots[..=self.slots.iter().rposition(Option::is_some)?];
         let cells: Vec<char> = slots
@@ -801,8 +802,8 @@ impl Pane {
         Some(ellipsize(text, width.saturating_sub(8) as usize))
     }
 
-    /// The top rule's queued-message snippet, if messages wait: the front
-    /// one, with a count when more queue behind it.
+    /// The top rule's queued-message snippet when messages wait: the front
+    /// one, plus a count when more queue behind it.
     fn queued_text(&self, width: u16) -> Option<String> {
         let front = self.queued.front()?;
         let message = match self.queued.len() {
@@ -851,9 +852,10 @@ impl Pane {
         transcript.push_user(message)
     }
 
-    /// Begin a response, retiring the previous turn's thinking box, and run the turn
+    /// Begin a response, closing the previous turn's thinking box, and run the turn.
     ///
-    /// `ultrathink` enables max reasoning effort in the main agnet but not in subagents
+    /// `ultrathink` enables maximum reasoning effort in the main agent but not in
+    /// subagents.
     pub fn start_turn(
         &mut self,
         agent: &Agent,
@@ -881,7 +883,7 @@ impl Pane {
         self.spin.is_some()
     }
 
-    /// Set the composer's mode. Leaving plan mode retires any approval on
+    /// Set the composer's mode. Leaving plan mode drops any approval on
     /// offer; entering `Bang` from plan mode is the front end's call to undo.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
@@ -896,13 +898,13 @@ impl Pane {
         matches!(self.mode, Mode::Plan)
     }
 
-    /// Offer (or retire) plan approval: Enter on an empty draft approves.
+    /// Offer (or withdraw) plan approval: Enter on an empty draft approves.
     pub fn set_plan_ready(&mut self, ready: bool) {
         self.plan_ready = ready && matches!(self.mode, Mode::Plan);
     }
 
     /// Switch plan mode on or off, updating the sandbox and the transcript's
-    /// reminder. A turn in the way defers: the switch comes back as `Some(on)`
+    /// reminder. A running turn defers the switch: it comes back as `Some(on)`
     /// for the caller to apply when the turn ends.
     pub fn set_plan(
         &mut self,
@@ -911,7 +913,7 @@ impl Pane {
         on: bool,
     ) -> anyhow::Result<Option<bool>> {
         if self.chat {
-            // Chat mode has no plan to make: nothing to research read-only.
+            // Chat mode has no plan mode to enter: nothing to research read-only.
             self.note("plan mode is unavailable in chat");
             return Ok(None);
         }
@@ -941,21 +943,20 @@ impl Pane {
 
     /// Queue `text` for the next turn, interrupting the running one.
     ///
-    /// Queue `text` for the next turn, interrupting the running one: the
-    /// interrupted turn ends cancelled, and the front end requeues the
+    /// The interrupted turn ends cancelled, and the front end requeues the
     /// messages when it does.
     fn queue_message(&mut self, text: String) {
         self.queued.push_back(text);
         self.control.cancel();
     }
 
-    /// Queue a finished subagent's report for delivery: the claim happens at
-    /// delivery, so a `wait` inside the running turn still takes it first.
+    /// Queue a finished subagent's report for delivery. The claim happens at
+    /// delivery, so a `wait` inside the running turn can still take it first.
     pub fn report(&mut self, id: AgentId) {
         self.reports.push(id);
     }
 
-    /// Meter a subagent's output tokens into the status line's agent total.
+    /// Add a subagent's output tokens to the status line's agent total.
     pub fn add_child_output(&mut self, tokens: u64) {
         self.child_tokens += tokens;
     }
@@ -969,8 +970,8 @@ impl Pane {
         wake: &Sender<Wake>,
     ) -> anyhow::Result<bool> {
         let reported = std::mem::take(&mut self.reports);
-        // Every reported child retires, delivering its report or getting claimed with a
-        // `wait`, so its view goes with it.
+        // Every reported child is removed: its report is delivered, or a
+        // `wait` claims it, and its view goes with it.
         if let Some(watched) = self.observing
             && reported.contains(&watched)
         {
@@ -1005,9 +1006,9 @@ impl Pane {
         self.queued.front().is_some_and(|text| text.contains(ULTRATHINK))
     }
 
-    /// Echo and record the front queued message, if one waits, reporting
-    /// whether it fired: the record half of the requeue, shared by a fresh
-    /// submit whose turn the message joins.
+    /// Echo and record the front queued message if one waits, reporting
+    /// whether it fired. This is the record half of the requeue, shared by a
+    /// fresh submit whose turn the message joins.
     pub fn drain_queued(&mut self, transcript: &Conversation, cwd: &Path) -> anyhow::Result<bool> {
         if let Some(text) = self.queued.pop_front() {
             self.echo(&text);
@@ -1017,8 +1018,8 @@ impl Pane {
         Ok(false)
     }
 
-    /// Requeue: the waiting message echoes, records, and starts the next
-    /// turn, reporting whether one waited. An interrupted turn ends here.
+    /// Requeue: the waiting message echoes, is recorded, and starts the next
+    /// turn. Returns whether one waited. An interrupted turn ends here.
     pub fn requeue(
         &mut self,
         agent: &Agent,
@@ -1046,9 +1047,10 @@ impl Pane {
         self.prompt.insert_str(&text);
     }
 
-    /// Sync the bang-mode completion for the argument under the caret: an open
-    /// list tracks the word as it changes and closes when the word ends, and
-    /// `open` (Tab) opens one unless the word is the command's own or ended.
+    /// Sync the bang-mode completion for the argument under the caret. An
+    /// open list tracks the word as it changes and closes when the word ends.
+    /// `open` (Tab) opens a list unless the word is the command's own or has
+    /// ended.
     fn sync_completion(&mut self, open: bool) {
         let query = file_mentions::derive_argument(&self.prompt);
         if open {
@@ -1058,7 +1060,7 @@ impl Pane {
         }
     }
 
-    /// Submit the manual-command draft, or explain why now is not the time.
+    /// Submit the manual-command draft, or explain why it cannot run yet.
     fn submit_bang(&mut self) -> Option<PaneEvent> {
         let refusal = if self.manual.is_some() {
             "a manual command is already running"
@@ -1077,7 +1079,7 @@ impl Pane {
     fn submit(&mut self) -> Option<PaneEvent> {
         let text = self.prompt.text();
         if text.trim().is_empty() {
-            // An empty draft in plan mode approves the plan that just landed.
+            // An empty draft in plan mode approves the plan that just arrived.
             if matches!(self.mode, Mode::Plan) && self.plan_ready {
                 return Some(PaneEvent::Approve);
             }
@@ -1091,7 +1093,7 @@ impl Pane {
         self.prompt.forget_undo();
         if bang {
             // A command's echo waits for its run: what the transcript shows
-            // and what it records both land with the framed output.
+            // and what it records both arrive with the framed output.
             return Some(PaneEvent::Command(text));
         }
         self.echo(&text);
@@ -1122,14 +1124,14 @@ impl Pane {
         self.transcript.blank();
     }
 
-    /// Mark a manual command in flight: the frame holds the bang styling and
+    /// Mark a manual command as running: the frame holds the bang styling, and
     /// the status rule carries `! <command>` until [`Pane::manual_done`].
     pub fn manual_running(&mut self, command: Option<String>) {
         self.manual = command.map(|command| ManualCommand { command, started: Instant::now() });
     }
 
-    /// Finish the in-flight manual command by echoing its line and the framed
-    /// output, and hand back the command that ran.
+    /// Finish the running manual command by echoing its line and the framed
+    /// output, and return the command that ran.
     pub fn manual_done(&mut self, framed: &str) -> Option<String> {
         let manual = self.manual.take()?;
         self.echo_styled(BANG_PROMPT, BANG_STYLE, &manual.command);
@@ -1150,7 +1152,7 @@ impl Pane {
         self.leave_bang();
     }
 
-    /// Submitted command, cleared draft, or an empty draft's backspace leaves bang mode
+    /// A submitted command, cleared draft, or empty-draft backspace leaves bang mode.
     fn leave_bang(&mut self) {
         if matches!(self.mode, Mode::Bang) {
             self.mode = Mode::Default;
@@ -1209,9 +1211,9 @@ impl Pane {
             return;
         }
         let buf = frame.buffer_mut();
-        // Live prompt: the "❯ " gutter (or "! " in the manual-command mode),
-        // then the wrapped draft. The inverted caret cell marks the cursor, so the
-        // terminal cursor stays hidden and the prompt viewport can never misplace it.
+        // Live prompt: the "❯ " gutter (or "! " in manual-command mode), then
+        // the wrapped draft. The inverted caret cell marks the cursor, so the
+        // terminal cursor stays hidden and the viewport cannot misplace it.
         let width = prompt_area.width - GUTTER;
         let (glyph, glyph_style) = match self.mode {
             Mode::Bang => (BANG_PROMPT, BANG_STYLE),
@@ -1237,11 +1239,11 @@ impl Pane {
             &layout.rows[top..top + shown],
             width,
         );
-        // A typed `/`-command ghosts its completion, dim, from the caret.
+        // A typed `/`-command shows its completion as a dim ghost after the caret.
         if !matches!(self.mode, Mode::Bang)
             && let Some(ghost) =
                 slash::TabComplete::live(&self.prompt, self.chat).and_then(|c| c.ghost())
-            // Only draw if it will fit
+            // Only draw if it will fit.
             && layout.caret_col < width as usize
         {
             let budget = width as usize - layout.caret_col;
@@ -1330,7 +1332,7 @@ impl Pane {
                 agents.as_deref(),
             );
         }
-        // A manual command in flight or the `!` mode colors the frame around
+        // A running manual command or the `!` mode colors the frame around
         // the composer magenta; plan mode colors it yellow.
         if self.manual.is_some() || matches!(self.mode, Mode::Bang) {
             reframe(buf, bar_top, BANG_RULE);
@@ -1341,7 +1343,7 @@ impl Pane {
         }
     }
 
-    /// The prompt row's stand-in when the composer is swapped out.
+    /// The prompt row's stand-in when the composer is hidden.
     fn render_hint(frame: &mut Frame, prompt_area: Rect, text: &str, style: Style) {
         if prompt_area.height > 0 {
             frame.buffer_mut().set_line(
@@ -1389,7 +1391,7 @@ impl SpansExt for Vec<Span<'static>> {
     }
 }
 
-/// Painting whole rows at once, the multi-row sibling of `set_line`.
+/// Paint whole rows at once: the multi-row sibling of `set_line`.
 trait BufRows {
     fn set_rows(&mut self, x: u16, y: u16, rows: &[Line<'static>], width: u16);
 }
@@ -1485,7 +1487,7 @@ fn status_rule(
     if let Some(spinner) = spinner {
         buf.set_stringn(area.x, area.y, spinner, 3, DIM_STYLE);
     }
-    // The agent block hugs the right edge with a two-cell margin, and the
+    // The agent block sits at the right edge with a two-cell margin, and the
     // status shrinks to the width left between it and the spinner. The
     // spinner frames are single-cell, so the character count is the width.
     let mut block = 0;
@@ -1649,8 +1651,9 @@ mod tests {
         let (mut pane, _agent, _record, _wake, _agents) = setup_tests();
         pane.note("main only");
         let id = AgentId::from(3);
-        // What arrived before the swap: the opener (which opens the view on the task it
-        // carries), an answer, and a call still running, plus a subagent's view
+        // What arrived before the swap: the opener (which opens the view on
+        // the task it carries), an answer, a still-running call, and a
+        // subagent's view.
         pane.child_event(
             id,
             &Progress::ToolStart {
@@ -1680,11 +1683,11 @@ mod tests {
         pane.child_event(AgentId::from(4), &Progress::Answer("elsewhere".into()));
         pane.observe(id, "map the module");
 
-        // The view opens on the header and what has painted so far, the
-        // in-flight box running among it, hiding the main conversation's rows
-        // and standing the composer down for its hint row: nothing looks
-        // writable, and the way back is named. The opener headed the view
-        // rather than opening a box in it.
+        // The view opens on the header and what has painted so far, with the
+        // in-flight box running among it. The main conversation's rows hide,
+        // and the composer is replaced by its hint row, so nothing looks
+        // writable and the way back is named there. The opener is the view's
+        // header, not a box in it.
         let screen = render(&mut pane, (40, 12));
         assert!(screen.contains("agent-3 · map the module"), "{screen}");
         assert!(screen.contains("on it"), "{screen}");
@@ -1695,7 +1698,7 @@ mod tests {
         assert!(screen.contains("◀ ctrl+← or esc/q return"), "{screen}");
         assert!(!screen.contains("❯"), "{screen}");
 
-        // Live events land, outputs included; another subagent's do not.
+        // Live events land, outputs included; another subagent's events do not.
         pane.child_event(
             id,
             &Progress::ToolOutput {
@@ -1709,9 +1712,9 @@ mod tests {
         assert!(screen.contains("1 passed"), "{screen}");
         assert!(!screen.contains("also elsewhere"), "{screen}");
 
-        // The control bindings still run while observing, quit among them,
-        // and they leave the view open; the thinking toggle works on the
-        // observed view, placeholder giving way to the reasoning itself.
+        // The control bindings still run while observing (quit among them)
+        // and leave the view open. The thinking toggle works on the observed
+        // view, its placeholder giving way to the reasoning itself.
         assert_eq!(
             pane.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(PaneEvent::Quit)
@@ -1725,8 +1728,8 @@ mod tests {
         assert!(screen.contains("reasoning"), "{screen}");
         assert!(!screen.contains("[Thinking…"), "{screen}");
 
-        // Esc returns to the main rows; Ctrl+Left returns too, as the hint
-        // row promises.
+        // Esc returns to the main rows; Ctrl+Left does too, as the hint row
+        // says.
         pane.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(pane.observing.is_none());
         let screen = render(&mut pane, (40, 12));
@@ -1764,8 +1767,8 @@ mod tests {
         pane.type_keys("/re");
         let screen = render(&mut pane, (40, 12));
         assert!(screen.contains("/resume,wind"), "{screen}");
-        // The ghost, and only the ghost, is dim on the prompt row: the gutter
-        // is bold cyan, the typed word unstyled, the rules elsewhere.
+        // Only the ghost is dim on the prompt row: the gutter is bold cyan,
+        // the typed word unstyled, the rules unaffected.
         let styles = draw_styles(|frame, area| pane.render(frame, area), (40, 12));
         let prompt_row = styles.split('\n').nth(10).unwrap();
         assert!(
@@ -1773,7 +1776,7 @@ mod tests {
             "the ghost is dim: {styles}"
         );
 
-        // Ambiguous: Tab types only the shared part, typing disambiguates.
+        // Ambiguous: Tab types only the shared part; typing disambiguates.
         pane.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(pane.prompt.text(), "/re");
         pane.type_keys("su");
@@ -1781,7 +1784,7 @@ mod tests {
         assert_eq!(pane.prompt.text(), "/resume ");
 
         // Chat mode knows no subagent commands, so the word stays unknown and
-        // Tab stays a literal tab rather than inventing a completion.
+        // Tab stays a literal tab rather than offering a completion.
         pane.clear_prompt();
         pane.set_chat(true);
         pane.type_keys("/ag");
@@ -1815,7 +1818,7 @@ mod tests {
             agents.spawn(&agent, "watched").expect("the second child spawns"),
         ];
         // The dead endpoint never answers on its own, so cancel both: the
-        // outcomes arrive as `Cancelled`, which delivers like any other.
+        // outcomes arrive as `Cancelled`, delivered like any other.
         for id in ids {
             agents.cancel(id);
         }
@@ -1838,8 +1841,8 @@ mod tests {
         assert!(pane.observing.is_some(), "an unrelated delivery keeps the view");
         assert_eq!(pane.children.len(), 1, "only the delivered child's view goes");
 
-        // A report claimed through a `wait` retires just the same: the sweep
-        // keys on the reported ids, delivered or not.
+        // A report claimed through a `wait` is removed just the same: the
+        // sweep goes by the reported ids, delivered or not.
         agents.take_outcome(ids[1]);
         pane.report(ids[1]);
         pane.deliver_reports(&agents, &agent, &transcript, &wake).unwrap();
@@ -1872,8 +1875,8 @@ mod tests {
         assert_eq!(token_count(999_999_999), "999.9 M");
     }
 
-    /// The bottom rule carries the token gauge; plain until usage arrives,
-    /// and `perf` still overrides it.
+    /// The bottom rule carries the token gauge; it stays plain until usage
+    /// arrives, and `perf` still overrides it.
     #[test]
     fn the_bottom_rule_carries_the_usage_badge() {
         let mut pane = Pane::default();
@@ -1922,7 +1925,7 @@ mod tests {
     }
 
     /// Enter mid-generation queues the draft for the next turn and cancels
-    /// this one; slash commands wait
+    /// this one; slash commands wait.
     #[test]
     fn enter_while_generating_queues_a_message() {
         let mut pane = Pane::default();
@@ -2003,7 +2006,7 @@ mod tests {
         assert_eq!(pane.prompt.text(), "");
 
         // A spill onto a non-empty draft lands on a fresh line, and the chord
-        // reaches through an open popup (bare arrows stay the popup's).
+        // works through an open popup (bare arrows stay the popup's).
         pane.on_paste("also this");
         pane.popup = Some(Popup::Files(FilePopup::from_files(vec![], String::new())));
         pane.on_key(key(KeyCode::Up, KeyModifiers::ALT));
@@ -2179,8 +2182,8 @@ mod tests {
         assert!(text.contains("Subagent 1 finished (map the module)"), "{text}");
     }
 
-    /// The requeue echoes the queued message like a submitted one, retiring
-    /// the interrupted response's thinking run, records it as the next user
+    /// The requeue echoes the queued message like a submitted one, closes the
+    /// interrupted response's thinking run, records it as the next user
     /// message, and starts the next turn.
     #[test]
     fn the_requeue_echoes_and_records_the_queued_message() {
@@ -2213,8 +2216,8 @@ mod tests {
         ));
     }
 
-    /// `!` on an empty draft enters the manual-command mode: the glyph swaps to
-    /// `!`, both rules turn magenta, and the marker never reaches the editor
+    /// `!` on an empty draft enters manual-command mode: the glyph swaps to
+    /// `!`, both rules turn magenta, and the marker never reaches the editor.
     #[test]
     fn bang_on_an_empty_draft_swaps_the_glyph_and_the_rules() {
         let mut pane = Pane::default();
@@ -2249,7 +2252,7 @@ mod tests {
         assert_eq!(left[7], "d".repeat(40));
     }
 
-    /// The marker only enters the mode at the start of an empty draft
+    /// The marker only enters the mode at the start of an empty draft.
     #[test]
     fn a_literal_bang_elsewhere_stays_text() {
         let mut pane = Pane::default();
@@ -2272,7 +2275,7 @@ mod tests {
     }
 
     /// Plan mode swaps the glyph, colors the frame yellow, and takes the
-    /// status badge; the approve hint appears only once a plan has landed.
+    /// status badge; the approve hint appears only once a plan arrives.
     #[test]
     fn plan_mode_swaps_the_glyph_the_rules_and_the_badge() {
         let mut pane = Pane::default();
@@ -2289,7 +2292,7 @@ mod tests {
         assert_eq!(rows[7], "c".repeat(40), "the bottom rule is yellow: {plan}");
         assert!(rows[6].starts_with('B'), "the glyph is bold: {plan}");
 
-        // A landed plan offers Enter; leaving the mode retires the offer.
+        // A plan that has arrived offers Enter; leaving the mode withdraws the offer.
         pane.set_plan_ready(true);
         assert!(render(&mut pane, (40, 8)).contains("⏎ approve"), "offers Enter");
         pane.set_mode(Mode::Default);
@@ -2345,9 +2348,9 @@ mod tests {
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
     }
 
-    /// Enter on an empty draft approves a landed plan; a draft submits as an
-    /// ordinary planning message, and Esc dismisses the offer without leaving
-    /// plan mode.
+    /// Enter on an empty draft approves the offered plan; a draft submits as
+    /// an ordinary planning message, and Esc dismisses the offer without
+    /// leaving plan mode.
     #[test]
     fn enter_approves_a_ready_plan() {
         let mut pane = Pane::default();
@@ -2382,7 +2385,7 @@ mod tests {
         assert!(pane.is_plan(), "Esc keeps plan mode on");
     }
 
-    /// A plan switch asked for mid-turn waits: `set_plan` hands it back for the
+    /// A plan switch requested mid-turn waits: `set_plan` returns it for the
     /// front end to apply when the turn ends.
     #[test]
     fn mid_turn_plan_switches_wait_for_the_turn() {
@@ -2417,7 +2420,7 @@ mod tests {
         );
     }
 
-    /// Enter ships the command as its own event
+    /// Enter ships the command as its own event.
     #[test]
     fn bang_enter_ships_the_command_and_waits_to_echo() {
         let mut pane = Pane::default();
@@ -2442,7 +2445,7 @@ mod tests {
         assert_eq!(running[7], "m".repeat(40));
 
         // Landing: the line echoes in the bang style, the output dim, and the
-        // pane hands back the command that ran.
+        // pane returns the command that ran.
         assert_eq!(pane.manual_done("[exit 1]\nboom"), Some("x".repeat(60)));
         assert_eq!(
             pane.transcript.message_texts(),
@@ -2509,7 +2512,7 @@ mod tests {
         assert!(matches!(pane.mode, Mode::Bang));
     }
 
-    /// A manual command never interrupts a running turn, and waits for it.
+    /// A manual command never interrupts a running turn; it waits for the turn.
     #[test]
     fn bang_enter_waits_for_a_running_turn() {
         let mut pane = Pane::default();
@@ -2555,11 +2558,11 @@ mod tests {
             Some(PaneEvent::Cancel)
         );
         assert_eq!(pane.queued.front(), Some(&"meanwhile".to_string()));
-        // The run is still in flight; its framed output lands when it does.
+        // The command is still running; its framed output arrives when it ends.
         assert!(render(&mut pane, (40, 8)).contains("[ ! cargo build ]"));
     }
 
-    /// A paste starting with the marker enters the mode, the marker stripped.
+    /// A paste starting with the marker enters the mode, with the marker stripped.
     #[test]
     fn a_pasted_bang_command_enters_the_mode() {
         let mut pane = Pane::default();
@@ -3002,7 +3005,7 @@ mod tests {
         assert!(echo_at < thinking_at, "{screen}");
     }
 
-    /// Validate copy mode isn't exited prematurely.
+    /// Check that copy mode is not exited prematurely.
     #[test]
     fn copy_mode_swallows_keys_and_survives_resizes() {
         let mut pane = Pane::default();
@@ -3027,8 +3030,8 @@ mod tests {
         assert!(render(&mut pane, (40, 10)).contains("❯ ")); // live again
     }
 
-    /// Space anchors, movement reshapes, Enter ships the selection out and
-    /// leaves copy mode.
+    /// Space sets the anchor, movement reshapes the selection, Enter copies
+    /// the selection and leaves copy mode.
     #[test]
     fn enter_copies_the_selection_and_exits() {
         let mut pane = Pane::default();
@@ -3049,7 +3052,7 @@ mod tests {
     }
 
     /// `q`, a bare Enter, and an anchored-but-empty selection all leave
-    /// without clobbering the clipboard.
+    /// without touching the clipboard.
     #[test]
     fn leaving_without_a_selection_copies_nothing() {
         let mut pane = Pane::default();
@@ -3094,7 +3097,7 @@ mod tests {
         assert!(lines.all(|line| !line.contains('#')));
     }
 
-    /// A rewrap between Space and Enter re-clamps the anchor with the cursor
+    /// A rewrap between Space and Enter re-clamps the anchor with the cursor.
     #[test]
     fn anchored_selection_survives_a_rewrap() {
         let mut pane = Pane::default();
@@ -3276,7 +3279,7 @@ mod tests {
         assert!(text.contains("• item one"), "{text}");
         assert!(!text.contains("**"), "{text}");
     }
-    /// A background child's view never draws
+    /// A background child's view never draws.
     #[test]
     fn unobserved_views_never_fold() {
         let (mut pane, _agent, _record, _wake, _agents) = setup_tests();
