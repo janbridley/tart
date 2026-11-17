@@ -51,7 +51,7 @@ binary installed: `TART_SEARCH_BIN` overrides the lookup (`uv tool install ddgs`
 
 ### Plan Mode
 
-The keyboard combination `Shift+Tab` or `/plan` enter a read-only plan mode, allowing
+The keyboard combination `Shift+Tab` enters a read-only plan mode, allowing
 the model to iterate on a design before applying any changes to the working directory.
 To ensure the model has a scratch workspace for test commands, build scripts, and
 similar, `/tmp` is still writable in plan mode. *These filesystem requirements are
