@@ -201,22 +201,22 @@ struct ManualCommand {
     started: Instant,
 }
 
-/// The TUI interface.
+/// The TUI: owns the prompt and transcript, and turns key presses into [`PaneEvent`]s.
 #[derive(Default)]
 pub struct Pane {
-    /// Input interface for the `Pane`.
+    /// The prompt's text editor.
     prompt: Editor,
     /// Conversation history.
     transcript: Transcript,
-    /// A `CopyCursor` in copymode, or `None` otherwise.
+    /// The copy-mode cursor; `None` outside copy mode.
     copy: Option<CopyCursor>,
-    /// The `@file` typeahead or a `/command` chooser, while one is present
+    /// The open popup: an `@file` typeahead or a `/command` chooser.
     popup: Option<Popup>,
     /// Where `/resume` lists sessions from: the sessions root and project.
     session_dir: Option<(PathBuf, PathBuf)>,
     /// Whether this pane runs in chat mode, where plan mode does not exist.
     chat: bool,
-    /// The conversation `/rewind` lists turns from; re-pointed on a `/resume`
+    /// The conversation `/rewind` lists turns from; a `/resume` switches it.
     conversation: Option<Conversation>,
     /// The agents `/model` lists, from the agents file.
     models: Vec<AgentChoice>,
@@ -226,36 +226,36 @@ pub struct Pane {
     usage: Option<Usage>,
     /// The model's context window, from the agents file.
     context_tokens: Option<u64>,
-    /// When the generating turn started; `None` when the model is idle.
-    /// Enter keeps the draft while set, and the status rule's spinner runs
-    /// off the elapsed time for a steady frame rate.
+    /// When the running turn started; `None` when the model is idle.
+    ///
+    /// While it is set, Enter queues the draft, and the status rule's
+    /// spinner uses the elapsed time for a steady frame rate.
     spin: Option<Instant>,
     /// The subagents with a box open, one per spinner slot.
     slots: [Option<(AgentId, Instant)>; spinners::AGENTS.len()],
-    /// The subagent whose view the transcript area shows in place of the main
-    /// one; see [`Pane::observe`].
+    /// The subagent being observed: its view replaces the main one. See
+    /// [`Pane::observe`].
     observing: Option<AgentId>,
-    /// Every subagent's view, painting from its spawn: the registry's record
-    /// holds only completed rounds, so the round in flight lives here or nowhere.
-    /// A view retires with its child's report.
+    /// Every subagent's live view, painted from when it was spawned. The
+    /// registry stores only completed rounds, so the running round exists only
+    /// here. The view is dropped when the child's report is delivered.
     children: Vec<(AgentId, Transcript)>,
     /// The composer's mode: ordinary chat, `!` commands, or plan mode.
     mode: Mode,
-    /// A plan has landed in plan mode, so Enter would approve it.
+    /// A plan is waiting in plan mode; Enter approves it.
     plan_ready: bool,
-    /// A manual command in flight, holding the purple frame until its output lands.
+    /// A running manual command; it holds the purple frame until its output arrives.
     manual: Option<ManualCommand>,
     /// The messages queued while a turn runs.
     queued: VecDeque<String>,
     /// The finished subagents whose reports await delivery.
     ///
-    /// All pending reports deliver together as one message, unless a `wait`
-    /// claimed one first.
+    /// All pending reports deliver together as one message, unless a `wait` claimed one
+    /// first.
     reports: Vec<AgentId>,
-    /// Output tokens the subagents have spent, metered apart from the main
-    /// turn's own usage.
+    /// Output tokens spent by subagents, counted separately from the main turn's usage.
     child_tokens: u64,
-    /// The agent's turn lever: queueing a message cancels the running turn.
+    /// The agent's turn handle: queueing a message cancels the running turn.
     control: TurnHandle,
 }
 
