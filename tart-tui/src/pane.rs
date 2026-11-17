@@ -236,9 +236,8 @@ pub struct Pane {
     /// one; see [`Pane::observe`].
     observing: Option<AgentId>,
     /// Every subagent's view, painting from its spawn: the registry's record
-    /// holds only completed rounds, so the round in flight — the very one
-    /// worth watching — lives here or nowhere. A view retires with its
-    /// child's report.
+    /// holds only completed rounds, so the round in flight lives here or nowhere.
+    /// A view retires with its child's report.
     children: Vec<(AgentId, Transcript)>,
     /// The composer's mode: ordinary chat, `!` commands, or plan mode.
     mode: Mode,
