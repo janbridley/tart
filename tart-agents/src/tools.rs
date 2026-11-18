@@ -1415,7 +1415,7 @@ mod tests {
             (r#"{"command":"sleep 1","timeout":1500.7}"#, 1_501),
             (r#"{"command":"sleep 1","timeout":120000.0}"#, 120_000),
             (r#"{"command":"ls","timeout":"300"}"#, 120_000),
-            (r#"{"command":"sleep 5","timeout":9000000}"#, 600_000),
+            (r#"{"command":"sleep 5","timeout":90000000}"#, 1_800_000),
         ] {
             let parsed = parse_bash(arguments).unwrap();
             assert_eq!(parsed.timeout, Duration::from_millis(millis), "{arguments}");
@@ -1606,7 +1606,7 @@ mod tests {
         );
         assert_eq!(
             timeout_text("", MAX_BASH_TIMEOUT),
-            "Exit code 137\nCommand timed out after 10m 0s"
+            "Exit code 137\nCommand timed out after 30m 0s"
         );
         // Sub-minute durations carry no minute marker.
         assert_eq!(
