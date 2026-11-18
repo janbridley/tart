@@ -36,7 +36,7 @@ const READ_PROGRAM: &str = include_str!("data/read.pl");
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The longest timeout a bash call may ask for.
-const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_BASH_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// read.pl's exit code for a missing file.
 const READ_EXIT_NOT_FOUND: i32 = 3;

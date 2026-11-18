@@ -12,7 +12,7 @@ step at a time.
 Call `bash` with:
 
 - `command` (string): the command to execute.
-- `timeout` (number, optional): timeout in milliseconds, minimum 1000, max 600000;
+- `timeout` (number, optional): timeout in milliseconds, minimum 1000, max 1800000;
   default 120000. Values are milliseconds: `120` means a tenth of a second, not two
   minutes.
 
