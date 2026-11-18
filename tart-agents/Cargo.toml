@@ -22,16 +22,13 @@ futures = "0.3.34"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", default-features = false, features = ["std"] }
-# Just `killpg` and the `Pid` it takes, so the harness itself stays free of
-# `unsafe`: signalling a group cannot violate memory safety, which nix encodes.
 nix = { version = "0.31.4", default-features = false, features = ["fs", "signal"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 rs-trafilatura = "0.2.2"
 dom_query = "0.24"
-# Sessions record as gzipped JSONL: one gzip member per recorded turn.
-flate2 = "1"
+flate2 = "1.1.11"
 libc = "0.2.191"
-tempfile = "3"
+tempfile = "3.27.0"
 
 [dev-dependencies]
 macro_rules_attribute = "0.2.3"
