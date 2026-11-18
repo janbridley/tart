@@ -1,5 +1,10 @@
 ; GPU access for Metal compute, granted only by Policy::allow_gpu
 (allow iokit-open (iokit-user-client-class "AGXDeviceUserClient"))
+; The IOSurface/IOAccelerator family shared events require. Without these,
+; MTLSharedEvent comes back nil. WebKit's GPU-process profile grants the same family,
+; scoping its IOSurfaceRootUserClient allow with an iokit message filter.
+(allow iokit-open (iokit-user-client-class "IOSurfaceRootUserClient"))
+(allow iokit-open (iokit-connection "IOAccelerator"))
 ; The shader-compiler service
 (allow mach-lookup (global-name "com.apple.MTLCompilerService"))
 (allow mach-lookup (local-name "com.apple.MTLCompilerService"))
