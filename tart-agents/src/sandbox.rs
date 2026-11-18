@@ -1120,6 +1120,24 @@ sys.exit(0 if event else 1)";
                 .output()
                 .unwrap()
         };
+        // CI's macOS runners are GPU-less VMs: no default Metal device, so this test
+        // fails. Try unsandboxed first, skipping if that fails.
+        let hardware = std::process::Command::new("/usr/bin/python3")
+            .arg("-I")
+            .arg("-c")
+            .arg(PROBE)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        if !hardware.status.success() {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "note: skipping live test shared_metal_events_need_the_iosurface_grants: \
+                 no Metal device on this machine"
+            );
+            return;
+        }
         let out = probe(&Policy::new(dir.path()).unwrap().allow_gpu());
         assert!(
             out.status.success(),
