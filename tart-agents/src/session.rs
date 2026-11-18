@@ -14,8 +14,10 @@ use flate2::{Compression, GzBuilder};
 use time::OffsetDateTime;
 
 use crate::history::{LineMetadata, RecordLine, Transcript, stamp_utc_at};
+use crate::progress::Progress;
 #[cfg(not(test))]
 use crate::usage;
+use crate::usage::Ledger;
 
 pub static SESSIONS_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
     let home = std::env::var_os("HOME")
@@ -114,6 +116,20 @@ impl Session {
     #[inline]
     pub fn reopen(&self, path: &Path) -> anyhow::Result<(Transcript, Self)> {
         Self::open(&self.root, &self.project, path)
+    }
+
+    /// Write the resumed conversation into `pane` or other container.
+    #[inline]
+    pub fn write_into<P: Extend<Progress>>(&self, pane: &mut P, transcript: &Transcript) {
+        let name = self.stem();
+        if name.is_empty() {
+            return;
+        }
+        pane.extend([Progress::Note(format!("resumed {name}"))]);
+        pane.extend(transcript.replay());
+        if let Some((input, cached, output)) = Ledger::gauge_for(&name) {
+            pane.extend([Progress::Usage { input, cached, output }]);
+        }
     }
 
     /// Append the transcript's items past `written`, creating the file if needed.
@@ -1166,5 +1182,40 @@ mod tests {
         let next = unused(dir.path(), "20260101-000000");
 
         assert_eq!(next, dir.path().join("20260101-000000-2.jsonl.gz"));
+    }
+
+    /// A resumed session writes itself into a pane: a note naming it, then
+    /// the recorded turns. A session yet to open its file writes nothing.
+    #[test]
+    fn write_into_replays_the_turns_with_a_note() {
+        let _held = crate::usage::tests::held_for_test();
+        let _ledger = crate::usage::tests::ledger_root();
+        let root = tempfile::tempdir().unwrap();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+        transcript.push_assistant("hi".to_string()).unwrap();
+        let mut session = Session::start(root.path(), Path::new("/tmp/proj"));
+        session.record(&transcript).unwrap();
+
+        let mut painted = Vec::new();
+        session.write_into(&mut painted, &transcript);
+
+        assert_eq!(painted.len(), 3, "{painted:?}");
+        assert!(
+            matches!(&painted[0], Progress::Note(note) if note.ends_with(&session.stem())),
+            "{painted:?}"
+        );
+        assert!(
+            matches!(&painted[1], Progress::User(text) if text == "hello"),
+            "{painted:?}"
+        );
+        assert!(
+            matches!(&painted[2], Progress::Answer(text) if text == "hi"),
+            "{painted:?}"
+        );
+
+        let mut fresh = Vec::new();
+        Session::start(root.path(), Path::new("/tmp/proj")).write_into(&mut fresh, &transcript);
+        assert!(fresh.is_empty(), "{fresh:?}");
     }
 }

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use tart_agents::{
     Agent, CHAT_PROJECT, ChatMode, SESSIONS_ROOT, Session, Transcript, prompts, sandbox::Policy,
+    session,
 };
 
 use crate::cli;
@@ -134,11 +135,20 @@ impl TryFrom<&cli::Cli> for Tui {
         let project = kind.project(&cwd);
         let mut agent = agent_config.into_agent(kind.policy(&cwd, cli.gpu)?);
         agent.set_mode(kind.mode());
+        // `--resume` reopens the project's newest session in place of a fresh one
+        let (transcript, session) = if cli.resume {
+            let (newest, _opening) = session::list(&SESSIONS_ROOT, &project)
+                .with_context(|| "nothing to resume; run without --resume to start a session")?
+                .remove(0);
+            Session::open(&SESSIONS_ROOT, &project, &newest)?
+        } else {
+            (kind.transcript()?, Session::start(&SESSIONS_ROOT, &project))
+        };
         Ok(Self {
-            session: Session::start(&SESSIONS_ROOT, &project),
-            transcript: kind.transcript()?,
             config,
             agent,
+            session,
+            transcript,
             project,
             label,
             context_tokens,
@@ -162,6 +172,7 @@ impl Tui {
         });
         pane.set_context_tokens(self.context_tokens);
         pane.set_models(self.config.agents());
+        self.session.write_into(&mut pane, &self.transcript);
         pane
     }
 }
@@ -194,6 +205,7 @@ mod tests {
             agents: providers(dir.path()),
             chat: true,
             gpu: false,
+            resume: false,
         };
 
         let tui = Tui::try_from(&cli).unwrap();
@@ -252,6 +264,7 @@ mod tests {
             agents: providers(dir.path()),
             chat: false,
             gpu: false,
+            resume: false,
         };
 
         let tui = Tui::try_from(&cli).unwrap();
