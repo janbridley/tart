@@ -1120,21 +1120,16 @@ sys.exit(0 if event else 1)";
                 .output()
                 .unwrap()
         };
-        // CI's macOS runners are GPU-less VMs: no default Metal device, so this test
-        // fails. Try unsandboxed first, skipping if that fails.
-        let hardware = std::process::Command::new("/usr/bin/python3")
-            .arg("-I")
-            .arg("-c")
-            .arg(PROBE)
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        if !hardware.status.success() {
+        // Disable the test on CI, as their gpus are sandboxed under another policy
+        let agx = std::process::Command::new("/usr/sbin/ioreg")
+            .args(["-r", "-c", "AGXAccelerator"])
+            .output();
+        if !agx.is_ok_and(|out| !out.stdout.is_empty()) {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr().lock(),
                 "note: skipping live test shared_metal_events_need_the_iosurface_grants: \
-                 no Metal device on this machine"
+                 no AGX GPU for the grants to cover"
             );
             return;
         }

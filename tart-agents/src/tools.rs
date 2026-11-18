@@ -1897,7 +1897,7 @@ mod tests {
         command.arg("-c").arg(format!(
             "/usr/bin/perl -MPOSIX=setsid -e ' \
                 defined(my $first = fork) or die; \
-                exit 0 if $first; \
+                if ($first) {{ waitpid($first, 0); exit 0; }} \
                 setsid() >= 0 or die; \
                 defined(my $daemon = fork) or die; \
                 if ($daemon) {{ open(my $out, q(>), q({})) or die; \
