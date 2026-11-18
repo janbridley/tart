@@ -19,6 +19,8 @@ use crate::progress::Progress;
 use crate::usage;
 use crate::usage::Ledger;
 
+/// The directory every project's sessions record under:
+/// `~/.config/tart/sessions`.
 pub static SESSIONS_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)

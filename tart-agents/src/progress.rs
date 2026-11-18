@@ -26,6 +26,7 @@ pub enum Progress {
     },
     /// A finished tool invocation, paired with its start by `id`.
     ToolOutput {
+        /// The call's id, pairing the output with its start.
         id: String,
         /// The combined output, shown to the user.
         output: String,

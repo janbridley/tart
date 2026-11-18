@@ -744,7 +744,9 @@ impl Pane {
 
     /// The status rule's current spinner frame, or None while idle.
     fn spinner(&self) -> Option<&'static str> {
-        let started = self.spin.or(self.manual.as_ref().map(|manual| manual.started))?;
+        let started = self
+            .spin
+            .or_else(|| self.manual.as_ref().map(|manual| manual.started))?;
         Some(spinners::main_dots(started.elapsed().as_millis()))
     }
 
@@ -855,7 +857,7 @@ impl Pane {
     ) {
         let effort = ultrathink
             .then_some(ReasoningEffort::Max)
-            .or(agent.configured_effort());
+            .or_else(|| agent.configured_effort());
         if ultrathink {
             self.note("ultrathink · max reasoning for this turn");
         }
@@ -1861,7 +1863,7 @@ mod tests {
         assert_eq!(pane.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), None);
         assert_eq!(pane.prompt.text(), "");
         assert_eq!(pane.queued.front(), Some(&"hi".to_string()));
-        assert!(pane.transcript.message_texts().is_empty());
+        assert_eq!(pane.transcript.message_texts(), [] as [String; 0]);
 
         // A second message queues behind the first, order kept.
         pane.on_paste("another");

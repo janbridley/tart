@@ -8,7 +8,7 @@ cargo = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 # Dependencies have conflicts we can't resolve
-multiple-crate-versions = "allow"
+multiple_crate_versions = "allow"
 
 # We don't need 100% doc coverage
 missing_docs_in_private_items = "allow"
@@ -31,6 +31,7 @@ allow_attributes_without_reason = "warn"
 exhaustive_enums = "warn"
 impl_trait_in_params = "warn"
 missing_inline_in_public_items = "warn"
+mod_module_files = "warn"
 panic = "warn"
 partial_pub_fields = "warn"
 print_stderr = "warn"
@@ -45,6 +46,7 @@ unwrap_used = "warn"
 fallible_impl_from = "warn"
 needless_collect = "warn"
 needless_pass_by_ref_mut = "warn"
+or_fun_call = "warn"
 
 # Speed up compiles. Can override with CARGO_PROFILE_DEV_DEBUG=full.
 [profile.dev]

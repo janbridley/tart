@@ -2416,7 +2416,6 @@ dependencies = [
  "dom_query",
  "flate2",
  "futures",
- "itertools 0.15.0",
  "libc",
  "macro_rules_attribute",
  "nix",

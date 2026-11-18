@@ -714,7 +714,7 @@ mod tests {
         // Default: the granted roots are writable, and `edit` is offered alongside the
         // subagent pair only a spawning agent gets.
         assert_eq!(agent.mode(), ChatMode::Default);
-        assert!(!agent.policy().writable_roots().is_empty());
+        assert_ne!(agent.policy().writable_roots(), [] as [std::path::PathBuf; 0]);
         assert!(names(&agent.tools_for()).contains(&"edit"));
         assert!(names(&agent.tools_for()).contains(&"spawn_agent"));
         assert!(names(&agent.tools_for()).contains(&"check_agent"));
@@ -1311,7 +1311,7 @@ mod tests {
             assert!(outcome.is_some(), "a failed child still reports: {outcome:?}");
             assert_eq!(agents.take_outcome(id), None, "one delivery only");
         }
-        assert!(agents.running().is_empty());
+        assert_eq!(agents.running(), []);
         agents
             .spawn(&agent, "task")
             .expect("the slots freed with the reports");
