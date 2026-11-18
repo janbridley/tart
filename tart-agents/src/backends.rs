@@ -26,21 +26,18 @@ pub(crate) use self::openai_responses::{
     clippy::exhaustive_enums,
     reason = "tart owns this closed set: a new variant should break every match on it"
 )]
+#[allow(
+    missing_docs,
+    reason = "levels are self-explanatory and their meaning varies with provider"
+)]
 pub enum ReasoningEffort {
-    /// Reasoning off: the model answers straight away.
     None,
-    /// The least reasoning the provider still runs.
     Minimal,
-    /// Light reasoning, for quick problems.
     Low,
-    /// The balanced default.
     #[default]
     Medium,
-    /// Deep reasoning, for hard problems.
     High,
-    /// Deeper still, for long-horizon work.
     Xhigh,
-    /// Everything the model will spend.
     Max,
 }
 
