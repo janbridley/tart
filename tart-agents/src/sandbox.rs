@@ -1000,8 +1000,11 @@ mod tests {
         let plain = Policy::new(dir.path()).unwrap().render();
         assert!(!plain.contains("AGXDeviceUserClient"), "default: {plain}");
         assert!(!plain.contains("com.apple.metalfe"), "default: {plain}");
+        assert!(!plain.contains("IOAccelerator"), "default: {plain}");
         let gpu = Policy::new(dir.path()).unwrap().allow_gpu().render();
         assert!(gpu.contains(r#"(iokit-user-client-class "AGXDeviceUserClient")"#));
+        assert!(gpu.contains(r#"(iokit-user-client-class "IOSurfaceRootUserClient")"#));
+        assert!(gpu.contains(r#"(iokit-connection "IOAccelerator")"#));
         assert!(gpu.contains(r#"(global-name "com.apple.MTLCompilerService")"#));
         // The cache-leaf grant is fixed text in gpu.sbpl, matched against the
         // OS's layout rather than resolved per host, and still lands ahead
@@ -1055,6 +1058,81 @@ mod tests {
             let out = plain.command("/bin/sh").arg("-c").arg(&op).output().unwrap();
             assert!(!out.status.success(), "the default policy must deny `{op}`");
         }
+    }
+
+    #[test]
+    fn rendered_profiles_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        for gpu in [false, true] {
+            let mut policy = Policy::new(dir.path()).unwrap().exclude_git();
+            if gpu {
+                policy = policy.allow_gpu();
+            }
+            let compiled = policy.compile();
+            let mut cmd = Command::new(SANDBOX_EXEC);
+            cmd.arg("-p").arg(&compiled.text);
+            for (name, value) in &compiled.params {
+                let mut arg = OsString::from(format!("-D{name}="));
+                arg.push(value);
+                cmd.arg(arg);
+            }
+            let out = cmd.arg("--").arg("/usr/bin/true").output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() || stderr.contains("sandbox_apply"),
+                "profile must parse (gpu={gpu}): {stderr}"
+            );
+        }
+    }
+
+    #[apply(skip_unless_live!)]
+    #[test]
+    fn shared_metal_events_need_the_iosurface_grants() {
+        // MTLSharedEvent requires IOSurface/IOAccelerator grants: without
+        // them the Metal device still opens but the event is nil, and MLX
+        // fails at its first op. The probe drives the system frameworks
+        // through the stock python3's ctypes, so it needs no venv or wheels.
+        const PROBE: &str = "\
+import ctypes, sys
+metal = ctypes.CDLL('/System/Library/Frameworks/Metal.framework/Metal')
+objc = ctypes.CDLL('/usr/lib/libobjc.A.dylib')
+metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
+objc.sel_registerName.restype = ctypes.c_void_p
+objc.sel_registerName.argtypes = [ctypes.c_char_p]
+# objc_msgSend needs its argtypes spelled out: the arm64 libffi call
+# segfaults without them.
+msg = objc.objc_msgSend
+msg.restype = ctypes.c_void_p
+msg.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+device = metal.MTLCreateSystemDefaultDevice()
+if not device:
+    sys.exit('no Metal device')
+event = msg(device, objc.sel_registerName(b'newSharedEvent'))
+sys.exit(0 if event else 1)";
+        let dir = tempfile::tempdir().unwrap();
+        let probe = |policy: &Policy| {
+            policy
+                .command("/usr/bin/python3")
+                .arg("-I")
+                .arg("-c")
+                .arg(PROBE)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        let out = probe(&Policy::new(dir.path()).unwrap().allow_gpu());
+        assert!(
+            out.status.success(),
+            "gpu must allow a Metal shared event: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Without allow_gpu even the device is denied
+        let out = probe(&Policy::new(dir.path()).unwrap());
+        assert!(
+            !out.status.success(),
+            "the default policy must deny the GPU: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     #[test]
