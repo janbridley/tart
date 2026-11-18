@@ -2,6 +2,8 @@
 resolver = "3"
 members = ["tart-agents", "tart-tui"]
 
+[workspace.package]
+rust-version = "1.100"
 
 [workspace.lints.clippy]
 cargo = { level = "warn", priority = -1 }
