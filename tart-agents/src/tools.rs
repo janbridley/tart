@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::Read as _;
-use std::io::{self, Seek, SeekFrom};
+use std::io::{self, Seek};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -763,7 +763,7 @@ fn run_watched(
     deadline: Option<Duration>,
     cancel: &CancelToken,
 ) -> io::Result<WatchedRun> {
-    let (mut child, group, mut out, mut err) = spawn_grouped(command)?;
+    let (mut child, group, out, err) = spawn_grouped(command)?;
 
     // The watchdog's kill reason, when it killed: sent before the kill lands
     // and read after the watchdog joins, so a killed group is never mistaken
@@ -804,17 +804,25 @@ fn run_watched(
     let _ = watchdog.join();
     let status = status?;
 
-    let mut stdout = Vec::new();
-    out.seek(SeekFrom::Start(0))?;
-    out.read_to_end(&mut stdout)?;
-    let mut stderr = Vec::new();
-    err.seek(SeekFrom::Start(0))?;
-    err.read_to_end(&mut stderr)?;
     Ok(WatchedRun {
-        output: Output { status, stdout, stderr },
+        output: Output {
+            status,
+            stdout: read_log_from_start(out)?,
+            stderr: read_log_from_start(err)?,
+        },
         killed,
         note,
     })
+}
+
+/// A command's stream, read back from its anonymous log file: rewound to the
+/// start, into a buffer sized from the file so it grows no more than once.
+fn read_log_from_start(mut log: std::fs::File) -> io::Result<Vec<u8>> {
+    let capacity = log.metadata()?.len() as usize;
+    log.rewind()?;
+    let mut bytes = Vec::with_capacity(capacity);
+    log.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The watchdog's kill, on a cancel or a timeout.
@@ -887,6 +895,46 @@ fn straggler_note(pids: &[Pid]) -> String {
 /// listing nothing.
 #[cfg(target_os = "macos")]
 fn kill_list(group: Pid) -> Option<Vec<Pid>> {
+    let table = process_table()?;
+    let leader = group.as_raw();
+    let mut targets: HashSet<i32> = table
+        .iter()
+        .filter(|proc| proc.live && proc.pgid == leader && proc.pid != leader)
+        .map(|proc| proc.pid)
+        .collect();
+    // Walk down from the leader through its children. A parent chain cannot
+    // loop, and the first filter already covers the group's members.
+    let mut frontier = vec![leader];
+    while let Some(parent) = frontier.pop() {
+        for proc in table.iter().filter(|proc| proc.live && proc.ppid == parent) {
+            if targets.insert(proc.pid) {
+                frontier.push(proc.pid);
+            }
+        }
+    }
+    targets.remove(&leader);
+    Some(targets.into_iter().map(Pid::from_raw).collect())
+}
+
+/// One row of `ps` output, as this closeout needs it.
+#[cfg(target_os = "macos")]
+struct Process {
+    /// The process id.
+    pid: i32,
+    /// The parent's process id.
+    ppid: i32,
+    /// The process group id.
+    pgid: i32,
+    /// False for a zombie: it holds nothing and only the table keeps it.
+    live: bool,
+}
+
+/// The process table, or `None` when `ps` cannot read it.
+///
+/// Every row must parse: a table that only half-parses is not trustworthy,
+/// so it reads as unreadable instead of silently dropping lines.
+#[cfg(target_os = "macos")]
+fn process_table() -> Option<Vec<Process>> {
     let table = Command::new("/bin/ps")
         .args(["-A", "-o", "pid=,ppid=,pgid=,state="])
         .output()
@@ -894,35 +942,18 @@ fn kill_list(group: Pid) -> Option<Vec<Pid>> {
     if !table.status.success() {
         return None;
     }
-    let rows: Vec<(i32, i32, i32)> = String::from_utf8_lossy(&table.stdout)
+    String::from_utf8_lossy(&table.stdout)
         .lines()
-        .filter_map(|row| {
+        .map(|row| {
             let mut columns = row.split_whitespace();
-            let pid = columns.next()?.parse().ok()?;
-            let ppid = columns.next()?.parse().ok()?;
-            let pgid = columns.next()?.parse().ok()?;
-            let state = columns.next()?;
-            (!state.starts_with('Z')).then_some((pid, ppid, pgid))
+            Some(Process {
+                pid: columns.next()?.parse().ok()?,
+                ppid: columns.next()?.parse().ok()?,
+                pgid: columns.next()?.parse().ok()?,
+                live: !columns.next()?.starts_with('Z'),
+            })
         })
-        .collect();
-    let leader = group.as_raw();
-    let mut targets: HashSet<i32> = rows
-        .iter()
-        .filter(|&&(pid, _, pgid)| pgid == leader && pid != leader)
-        .map(|&(pid, _, _)| pid)
-        .collect();
-    // Walk down from the leader through its children. A parent chain cannot
-    // loop, and the first filter already covers the group's members.
-    let mut frontier = vec![leader];
-    while let Some(parent) = frontier.pop() {
-        for &(pid, ..) in rows.iter().filter(|&&(_, ppid, _)| ppid == parent) {
-            if targets.insert(pid) {
-                frontier.push(pid);
-            }
-        }
-    }
-    targets.remove(&leader);
-    Some(targets.into_iter().map(Pid::from_raw).collect())
+        .collect()
 }
 
 /// Off macOS the process table is not read: the group kill is the whole
