@@ -30,10 +30,10 @@ rs-trafilatura = "0.2.2"
 dom_query = "0.24"
 # Sessions record as gzipped JSONL: one gzip member per recorded turn.
 flate2 = "1"
+libc = "0.2.191"
+tempfile = "3"
 
 [dev-dependencies]
-# Test scratch files and directories; tempfile removes them on drop.
-tempfile = "3"
 macro_rules_attribute = "0.2.3"
 
 [lints]

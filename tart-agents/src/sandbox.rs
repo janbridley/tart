@@ -46,7 +46,18 @@
 //!   (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`), providing what is
 //!   effectively a read-only git tool.
 //! - Standard input is [`Stdio::null`](std::process::Stdio::null) by default, and the
-//!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices.
+//!   policy denies reads and writes on `/dev/tty` and the `/dev/ttys*` devices,
+//!   and on `/dev/ptmx`, so a detached multiplexer cannot daemonize.
+//! - Process lifetime is bounded by the runner rather than the sandbox. At a call's end
+//!   it kills the command's whole process group, which still reaches the group's
+//!   members after the shell is reaped. Backgrounded work (`nohup ... & disown`,
+//!   nested subshells) die with the call, and a timeout or cancel also takes the
+//!   own-pgroup jobs that still hang from the shell's parent chain. The pty master and
+//!   the multiplexers' sockets are denied outright, so a detached multiplexer
+//!   (`screen -dm`) can never run its command. Work that left the group and the chain
+//!   (`set -m` at a natural end, `setsid` daemons) escapes. Since `signal` and
+//!   `process-info*` are scoped to `same-sandbox` while every call compiles its own
+//!   profile, no later call can see or signal it.
 //! - Homebrew under `/opt/homebrew` is readable and executable, minus `etc`,
 //!   `var`, `Caskroom`, `share`, and the brew runtime itself (`Library`, `Taps`),
 //!   so `brew` commands fail outright (see `sbpl/extras.sbpl`). Binaries outside
@@ -442,6 +453,22 @@ impl Policy {
                 .to_owned(),
         );
         deny_rules.push(r#"(deny file-read-data file-write-data (literal "/dev/tty"))"#.to_owned());
+        // Deny the pty master outright: a non-interactive call has no terminal to lose
+        // This overrides the base policy's `openpty()` allowance, so `screen -dm` and
+        // `tmux new -d` can never open a window.
+        deny_rules
+            .push(r#"(deny file-read* file-write* file-ioctl (literal "/dev/ptmx"))"#.to_owned());
+        // Deny the multiplexers' sockets too: this makes `screen -dm` fail loudly
+        // instead of leaving a daemon that can never run anything.
+        if let Some(temp) = &self.temp {
+            deny_rules.push(format!(
+                r#"(deny file-write* (subpath "{}"))"#,
+                temp.join(".screen").display()
+            ));
+        }
+        deny_rules.push(r#"(deny file-write* (subpath "/tmp/.screen"))"#.to_owned());
+        deny_rules
+            .push(r#"(deny file-write* (regex #"^/(private/)?tmp/tmux-[0-9]+(/|$)"))"#.to_owned());
 
         let mut text = String::from(BASE_POLICY);
         for section in [&read_rules, &write_rules] {
@@ -674,6 +701,19 @@ mod tests {
             r#"(deny file-read-data file-write-data file-ioctl (regex #"^/dev/ttys[0-9]+$"))"#
         ));
         assert!(rendered.contains(r#"(deny file-read-data file-write-data (literal "/dev/tty"))"#));
+        assert!(
+            rendered.contains(r#"(deny file-read* file-write* file-ioctl (literal "/dev/ptmx"))"#)
+        );
+        // The socket denies carry both the policy's temp dir (the environment's TMPDIR,
+        // canonicalized like every root) and the fixed /tmp one.
+        let socket = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(".screen");
+        assert!(
+            rendered.contains(&format!(r#"(deny file-write* (subpath "{}"))"#, socket.display())),
+            "socket deny missing for {}",
+            socket.display()
+        );
     }
 
     /// A read-only root gets a read allow and no write rule of its own.

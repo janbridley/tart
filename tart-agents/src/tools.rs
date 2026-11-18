@@ -1,4 +1,6 @@
-use std::io;
+use std::collections::HashSet;
+use std::io::Read as _;
+use std::io::{self, Seek};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -9,7 +11,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::backends::{FunctionToolCall, Tool, tool};
-use nix::sys::signal::{Signal, killpg};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 
 use crate::backends::Backend;
@@ -34,7 +36,7 @@ const READ_PROGRAM: &str = include_str!("data/read.pl");
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The longest timeout a bash call may ask for.
-const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_BASH_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// read.pl's exit code for a missing file.
 const READ_EXIT_NOT_FOUND: i32 = 3;
@@ -650,10 +652,13 @@ pub(crate) struct Tooling<'a, B: Backend = Responses> {
 
 /// One finished command run under a watchdog: a deadline or a cancel.
 struct WatchedRun {
-    /// The command's streams and exit status, as `output()` returns them.
+    /// The command's streams and exit status, read back from its log files.
     output: Output,
     /// Why the watchdog killed the process group, when it did.
     killed: Option<KillReason>,
+    /// The warning to add to the call's text when the sweep finds a process it can't
+    /// kill, or `None` when nothing is left.
+    note: Option<String>,
 }
 
 /// Which lever a watchdog pulled to kill a run.
@@ -670,7 +675,7 @@ enum KillReason {
 /// where the caller renders what the child actually produced.
 fn watched_failure(run: &WatchedRun, timeout: Duration) -> Option<String> {
     let text = combined_output(&run.output);
-    if run.killed.is_some() {
+    if landed_kill(run.killed, run.output.status).is_some() {
         Some(timeout_text(&text, timeout))
     } else if !run.output.status.success() {
         Some(command_text_inline(&text, run.output.status, false))
@@ -725,40 +730,46 @@ pub fn bounded(text: &str, cap: usize) -> String {
     )
 }
 
-/// Spawn `command` in its own process group with piped output and no input,
-/// returning the child and its group id.
-fn spawn_grouped(command: &mut Command) -> io::Result<(std::process::Child, Pid)> {
+/// Spawn `command` as the leader of its own process group. Its streams land
+/// in anonymous files, so a process left running cannot hold the call open
+/// the way an open pipe could. Returns the child and its group id.
+fn spawn_grouped(
+    command: &mut Command,
+) -> io::Result<(std::process::Child, Pid, std::fs::File, std::fs::File)> {
+    let stdout = tempfile::tempfile()?;
+    let stderr = tempfile::tempfile()?;
     command
         .process_group(0)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
     let child = command.spawn()?;
-    // A pid always fits an i32, and the child leads its own group.
+    // A pid always fits an i32; the child leads its own group.
     let group = Pid::from_raw(child.id().cast_signed());
-    Ok((child, group))
+    Ok((child, group, stdout, stderr))
 }
 
 /// Run `command` to completion, killing its process group the moment `cancel`
 /// fires or, with a `deadline`, once it outlives it.
 ///
 /// The watchdog polls both levers, so a kill lands within one [`CANCEL_POLL`]
-/// of its cause. Four rules hold arm-for-arm: the reason is reported before
-/// the kill lands, the reaped child's sender drop wakes the watchdog, the
-/// group dies even when the wait errors, and the watchdog joins before
-/// returning.
+/// of its cause, and it reports its reason before any kill. The command's
+/// streams land in anonymous files, so a process left running cannot hold the
+/// call open the way an open pipe could. After the command is reaped, its
+/// kill reason is settled, [`sweep`] kills what remains and returns a warning
+/// if anything could not be killed, and the logs are read back.
 fn run_watched(
     command: &mut Command,
     deadline: Option<Duration>,
     cancel: &CancelToken,
 ) -> io::Result<WatchedRun> {
-    let (child, group) = spawn_grouped(command)?;
+    let (mut child, group, out, err) = spawn_grouped(command)?;
 
     // The watchdog's kill reason, when it killed: sent before the kill lands
     // and read after the watchdog joins, so a killed group is never mistaken
     // for a natural exit.
     let (killer, killed_by) = mpsc::channel::<KillReason>();
-    // The sender drops once the command is reaped, waking the watchdog at once.
+    // The sender drops once the sweep ends, waking the watchdog at once.
     let (finished, slept) = mpsc::channel::<()>();
     let token = cancel.clone();
     let end = deadline.map(|timeout| Instant::now() + timeout);
@@ -766,7 +777,7 @@ fn run_watched(
         loop {
             if token.cancelled() {
                 let _ = killer.send(KillReason::Cancelled);
-                let _ = killpg(group, Signal::SIGKILL);
+                closeout_kill(group);
                 return;
             }
             // Sleep only until the nearer of the poll and the deadline, so a
@@ -778,24 +789,184 @@ fn run_watched(
             }
             if end.is_some_and(|end| Instant::now() >= end) {
                 let _ = killer.send(KillReason::Timeout);
-                let _ = killpg(group, Signal::SIGKILL);
+                closeout_kill(group);
                 return;
             }
         }
     });
 
-    let output = child.wait_with_output();
+    let status = child.wait();
+    // The command has ended: settle the kill reason before the force close sweep, so a
+    // deadline that lands after the exit cannot be reported for it.
+    let killed = killed_by.try_recv().ok();
     drop(finished);
-    // Double check we've killed everything even if the wait errors.
-    if output.is_err() {
-        let _ = killpg(group, Signal::SIGKILL);
-    }
+    let note = sweep(group);
     let _ = watchdog.join();
+    let status = status?;
 
     Ok(WatchedRun {
-        output: output?,
-        killed: killed_by.try_recv().ok(),
+        output: Output {
+            status,
+            stdout: read_log_from_start(out)?,
+            stderr: read_log_from_start(err)?,
+        },
+        killed,
+        note,
     })
+}
+
+/// A command's stream, read back from its anonymous log file: rewound to the
+/// start, into a buffer sized from the file so it grows no more than once.
+fn read_log_from_start(mut log: std::fs::File) -> io::Result<Vec<u8>> {
+    let capacity = log.metadata()?.len() as usize;
+    log.rewind()?;
+    let mut bytes = Vec::with_capacity(capacity);
+    log.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The watchdog's kill, on a cancel or a timeout.
+///
+/// Collect the descendants first: while the leader lives, its parent chain still
+/// reaches the jobs a `set -m` shell left in their own group. Then kill the group, then
+/// the collected pids.
+fn closeout_kill(group: Pid) {
+    let targets = kill_list(group).unwrap_or_default();
+    let _ = killpg(group, Signal::SIGKILL);
+    for pid in targets {
+        let _ = kill(pid, Signal::SIGKILL);
+    }
+}
+
+/// How many [`sweep`] rounds a closeout spends on leftovers.
+const SWEEP_ATTEMPTS: usize = 3;
+/// The pause between [`sweep`] rounds, enough to outlast a member forking.
+const SWEEP_RETRY: Duration = Duration::from_millis(50);
+
+/// Kill what the command left behind, and return a warning if anything survived, if any
+///
+/// The group kill runs first in every round. It still reaches the group's
+/// members after the shell is reaped, so `nohup ... & disown`, nested
+/// subshells and plain background jobs die even when the process table
+/// cannot be read. [`kill_list`] then finds what the group kill cannot
+/// reach, and the rounds repeat until nothing is left or they run out. If
+/// the table stays readable and still shows processes, they are reported.
+/// If it cannot be read, nothing is reported: the group kill did its work.
+fn sweep(group: Pid) -> Option<String> {
+    for _ in 0..SWEEP_ATTEMPTS {
+        let _ = killpg(group, Signal::SIGKILL);
+        let targets = kill_list(group)?;
+        if targets.is_empty() {
+            return None;
+        }
+        for pid in &targets {
+            let _ = kill(*pid, Signal::SIGKILL);
+        }
+        std::thread::sleep(SWEEP_RETRY);
+    }
+    match kill_list(group) {
+        None => None,
+        Some(left) if left.is_empty() => None,
+        Some(left) => Some(straggler_note(&left)),
+    }
+}
+
+/// Name what a closeout could not kill: no later call can see or signal those processes
+fn straggler_note(pids: &[Pid]) -> String {
+    let pids = pids.iter().map(Pid::to_string).collect::<Vec<_>>();
+    format!(
+        "\n\nwarning: {} process(es) the command left running could not be \
+         killed; no later call can see or signal them: pids {}",
+        pids.len(),
+        pids.join(", ")
+    )
+}
+
+/// The live processes a closeout can name, not counting the leader: the
+/// group's members, plus its descendants while the leader still lives, which
+/// covers the jobs a `set -m` shell left in their own group. Once the leader
+/// is reaped, its children have re-parented to launchd and that chain is
+/// gone, so a natural end reaches group membership only. Sessions would
+/// cover the rest, but macOS `ps` prints `sess` as a kernel pointer, not an
+/// id, so sessions cannot be listed. Zombies are skipped: they hold nothing.
+///
+/// One `ps` table serves both filters. `None` means the table cannot be read:
+/// under a sandbox that denies process enumeration, `ps` fails instead of
+/// listing nothing.
+#[cfg(target_os = "macos")]
+fn kill_list(group: Pid) -> Option<Vec<Pid>> {
+    let table = process_table()?;
+    let leader = group.as_raw();
+    let mut targets: HashSet<i32> = table
+        .iter()
+        .filter(|proc| proc.live && proc.pgid == leader && proc.pid != leader)
+        .map(|proc| proc.pid)
+        .collect();
+    // Walk down from the leader through its children. A parent chain cannot
+    // loop, and the first filter already covers the group's members.
+    let mut frontier = vec![leader];
+    while let Some(parent) = frontier.pop() {
+        for proc in table.iter().filter(|proc| proc.live && proc.ppid == parent) {
+            if targets.insert(proc.pid) {
+                frontier.push(proc.pid);
+            }
+        }
+    }
+    targets.remove(&leader);
+    Some(targets.into_iter().map(Pid::from_raw).collect())
+}
+
+/// One row of `ps` output, as this closeout needs it.
+#[cfg(target_os = "macos")]
+struct Process {
+    /// The process id.
+    pid: i32,
+    /// The parent's process id.
+    ppid: i32,
+    /// The process group id.
+    pgid: i32,
+    /// False for a zombie: it holds nothing and only the table keeps it.
+    live: bool,
+}
+
+/// The process table, or `None` when `ps` cannot read it.
+///
+/// Every row must parse: a table that only half-parses is not trustworthy,
+/// so it reads as unreadable instead of silently dropping lines.
+#[cfg(target_os = "macos")]
+fn process_table() -> Option<Vec<Process>> {
+    let table = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,state="])
+        .output()
+        .ok()?;
+    if !table.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&table.stdout)
+        .lines()
+        .map(|row| {
+            let mut columns = row.split_whitespace();
+            Some(Process {
+                pid: columns.next()?.parse().ok()?,
+                ppid: columns.next()?.parse().ok()?,
+                pgid: columns.next()?.parse().ok()?,
+                live: !columns.next()?.starts_with('Z'),
+            })
+        })
+        .collect()
+}
+
+/// Off macOS the process table is not read: the group kill is the whole
+/// closeout, and nothing can be listed or reported.
+#[cfg(not(target_os = "macos"))]
+fn kill_list(group: Pid) -> Option<Vec<Pid>> {
+    let _ = killpg(group, Signal::SIGKILL);
+    Some(Vec::new())
+}
+
+/// A command reaped before the kill reached it can still exit successfully, and a success means nothing killed it.
+fn landed_kill(killed: Option<KillReason>, status: ExitStatus) -> Option<KillReason> {
+    killed.filter(|_| !status.success())
 }
 
 /// Announce a tool call, run it, and report its conclusion.
@@ -840,7 +1011,8 @@ fn misuse<F: Fn(Progress)>(
 
 /// Run one bash tool call under `tools`, reporting its steps to `on_progress`.
 ///
-/// A command that outlives its timeout is killed with everything it started.
+/// A command is killed with everything it started when it ends, times out,
+/// or is cancelled.
 fn run_bash<B: Backend, F: Fn(Progress)>(
     call: &FunctionToolCall,
     tools: &Tooling<'_, B>,
@@ -858,11 +1030,11 @@ fn run_bash<B: Backend, F: Fn(Progress)>(
         // Decode the stream into output for the front and backends.
         match run_watched(&mut sandboxed, Some(bash.timeout), tools.cancel) {
             Ok(run) => {
-                let WatchedRun { output, killed } = run;
+                let WatchedRun { output, killed, note } = run;
                 let text = combined_output(&output);
                 let exit = output.status.code();
                 let one_is_success = exit == Some(1) && exit_one_is_success(&bash.command);
-                match killed {
+                let (mut front, mut record, exit) = match landed_kill(killed, output.status) {
                     // A kill has no exit status of its own, so we mark up the body.
                     Some(KillReason::Timeout) => {
                         let marked = timeout_text(&text, bash.timeout);
@@ -878,7 +1050,12 @@ fn run_bash<B: Backend, F: Fn(Progress)>(
                         let reported = if one_is_success { Some(0) } else { exit };
                         (command_text(&text, output.status, one_is_success), text, reported)
                     }
+                };
+                if let Some(note) = note {
+                    front.push_str(&note);
+                    record.push_str(&note);
                 }
+                (front, record, exit)
             }
             Err(error) => {
                 let text = format!("error: {error}");
@@ -894,16 +1071,27 @@ pub fn manual_command(command: &str, cancel: &CancelToken) -> String {
     let mut shell = Command::new("/bin/bash");
     shell.arg("-c").arg(command);
     match run_watched(&mut shell, None, cancel) {
-        Ok(WatchedRun { output, killed }) => {
+        Ok(WatchedRun { output, killed, note }) => {
             let text = bounded(&combined_output(&output), CONTENT_CAP);
-            match killed {
+            let mut text = match landed_kill(killed, output.status) {
                 Some(KillReason::Cancelled) => cancel_text(&text),
                 // No deadline exists to outlive, so nothing else kills it.
                 _ => command_text_inline(&text, output.status, false),
+            };
+            if let Some(note) = note {
+                text.push_str(&note);
             }
+            text
         }
         Err(error) => format!("error: {error}"),
     }
+}
+
+/// The path exists but is not a regular file (a FIFO, device, or directory)
+///
+/// In this case, a read would block forever or fail so the file tools refuse it
+fn not_regular_file(path: impl AsRef<Path>) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| !meta.is_file())
 }
 
 /// Run one read tool call under `tools`, reporting its steps to `on_progress`.
@@ -924,6 +1112,10 @@ fn run_read<B: Backend, F: Fn(Progress)>(
         .arg("--")
         .arg(&read.file_path);
     traced(call, on_progress, || {
+        if not_regular_file(&read.file_path) {
+            let text = format!("read: not a regular file: {}", read.file_path);
+            return (text.clone(), text, None);
+        }
         // A failure to launch comes back as an error string for the model to deal with.
         match &command.output() {
             Ok(spawned) => {
@@ -976,6 +1168,9 @@ fn apply_edit(edit: &Edit, policy: &Policy) -> (String, Option<i32>) {
     if edit.old_string == edit.new_string {
         // <https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts#L107>
         return edit_failure("No changes to make: old_string and new_string are exactly the same.");
+    }
+    if not_regular_file(path) {
+        return edit_failure(&format!("edit: not a regular file: {}", path.display()));
     }
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -1081,11 +1276,36 @@ fn edit_receipt(edit: &Edit) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test assertions")]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::print_stderr,
+        reason = "test assertions and skip notes"
+    )]
 
     use super::*;
+    use nix::sys::signal::kill;
     use std::fmt::Write as _;
     use std::os::unix::process::ExitStatusExt as _;
+
+    /// Whether the process table can be read from here.
+    fn can_enumerate() -> bool {
+        Command::new("/bin/ps")
+            .arg("-o")
+            .arg("pid=")
+            .arg("-p")
+            .arg(std::process::id().to_string())
+            .output()
+            .is_ok_and(|found| found.status.success())
+    }
+
+    /// One manual run with any closeout warning stripped.
+    fn manual(command: &str, cancel: &CancelToken) -> String {
+        manual_command(command, cancel)
+            .split("\n\nwarning: ")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
 
     use crate::sandbox::live::skip_unless_live;
     use macro_rules_attribute::apply;
@@ -1195,7 +1415,7 @@ mod tests {
             (r#"{"command":"sleep 1","timeout":1500.7}"#, 1_501),
             (r#"{"command":"sleep 1","timeout":120000.0}"#, 120_000),
             (r#"{"command":"ls","timeout":"300"}"#, 120_000),
-            (r#"{"command":"sleep 5","timeout":9000000}"#, 600_000),
+            (r#"{"command":"sleep 5","timeout":90000000}"#, 1_800_000),
         ] {
             let parsed = parse_bash(arguments).unwrap();
             assert_eq!(parsed.timeout, Duration::from_millis(millis), "{arguments}");
@@ -1386,7 +1606,7 @@ mod tests {
         );
         assert_eq!(
             timeout_text("", MAX_BASH_TIMEOUT),
-            "Exit code 137\nCommand timed out after 10m 0s"
+            "Exit code 137\nCommand timed out after 30m 0s"
         );
         // Sub-minute durations carry no minute marker.
         assert_eq!(
@@ -1423,14 +1643,14 @@ mod tests {
     /// Manual runs reuse the bash tool's framing; these run unsandboxed
     #[test]
     fn manual_command_frames_success_and_failure() {
-        assert_eq!(manual_command("echo hi", &CancelToken::new()), "hi\n");
+        assert_eq!(manual("echo hi", &CancelToken::new()), "hi\n");
         assert_eq!(
-            manual_command("true", &CancelToken::new()),
+            manual("true", &CancelToken::new()),
             "(Bash completed with no output)"
         );
-        assert_eq!(manual_command("false", &CancelToken::new()), "Exit code 1");
+        assert_eq!(manual("false", &CancelToken::new()), "Exit code 1");
         assert_eq!(
-            manual_command("echo boom >&2; exit 3", &CancelToken::new()),
+            manual("echo boom >&2; exit 3", &CancelToken::new()),
             "boom\nExit code 3"
         );
     }
@@ -1442,10 +1662,7 @@ mod tests {
         let ahead = CancelToken::new();
         ahead.cancel();
         let started = Instant::now();
-        assert_eq!(
-            manual_command("sleep 9871 & sleep 9871 & wait", &ahead),
-            "[cancelled]"
-        );
+        assert_eq!(manual("sleep 9871 & sleep 9871 & wait", &ahead), "[cancelled]");
         assert!(started.elapsed() < Duration::from_secs(5));
 
         let live = CancelToken::new();
@@ -1455,9 +1672,9 @@ mod tests {
             token.cancel();
         });
         let started = Instant::now();
-        // The sleeps hold the output pipe, so returning promptly proves the
-        // whole group died and not just bash.
-        let framed = manual_command("echo started; sleep 9871 & sleep 9871 & wait", &live);
+        // Bash blocks on `wait`, so a prompt return proves the cancel killed
+        // it. The sleeps themselves die with the group kill.
+        let framed = manual("echo started; sleep 9871 & sleep 9871 & wait", &live);
         assert_eq!(framed, "[cancelled]\nstarted\n");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -1481,14 +1698,11 @@ mod tests {
     fn manual_command_inherits_the_parents_directory_and_environment() {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(
-            manual_command("pwd -P", &CancelToken::new()),
+            manual("pwd -P", &CancelToken::new()),
             format!("{}\n", cwd.display())
         );
         if let Ok(home) = std::env::var("HOME") {
-            assert_eq!(
-                manual_command("printenv HOME", &CancelToken::new()),
-                format!("{home}\n")
-            );
+            assert_eq!(manual("printenv HOME", &CancelToken::new()), format!("{home}\n"));
         }
     }
 
@@ -1549,6 +1763,213 @@ mod tests {
 
         assert_eq!(run.killed, Some(KillReason::Timeout));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Wait for `pid` to disappear. SIGCONT is a no-op for these sleepers, so
+    /// only ESRCH proves one is gone.
+    fn wait_gone(pid: Pid, what: &str) {
+        let gone = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            matches!(kill(pid, Signal::SIGCONT), Err(nix::errno::Errno::ESRCH))
+        });
+        let _ = kill(pid, Signal::SIGKILL);
+        assert!(gone, "{what} outlived the call");
+    }
+
+    /// Run `script` as one call and assert the sweep killed its sleeper. The
+    /// script must background a sleeper, write its pid into `{pids}`, and let
+    /// the call end, which must also happen promptly.
+    fn assert_swept(script: &str, what: &str) {
+        if !can_enumerate() {
+            eprintln!("skipped: process enumeration is denied under this sandbox");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pid");
+        let mut command = Command::new("/bin/bash");
+        command.arg("-c").arg(format!(
+            "{}; echo spawned",
+            script.replace("{pids}", &pids.display().to_string())
+        ));
+        let started = Instant::now();
+        let cancel = CancelToken::new();
+        let run = run_watched(&mut command, Some(DEFAULT_BASH_TIMEOUT), &cancel).unwrap();
+        assert_eq!(combined_output(&run.output), "spawned\n", "{what}");
+        assert!(run.output.status.success(), "{what}");
+        assert!(run.note.is_none(), "{what}: {:?}", run.note);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{what} held the call"
+        );
+        let written = std::fs::read_to_string(&pids).unwrap();
+        let pid = Pid::from_raw(written.trim().parse().unwrap());
+        wait_gone(pid, what);
+    }
+
+    /// A disowned nohup job, the most common way a model leaves work behind.
+    #[test]
+    fn run_watched_kills_a_disowned_straggler() {
+        assert_swept(
+            "nohup sleep 9871 >/dev/null 2>&1 </dev/null & echo $! > {pids}",
+            "the disowned sleep",
+        );
+    }
+
+    /// A nested background subshell, the shape earlier closeouts missed. It
+    /// stays in the group, so the group kill still reaches it.
+    #[test]
+    fn run_watched_kills_a_nested_subshell_straggler() {
+        assert_swept(
+            "( ( sleep 9872 >/dev/null 2>&1 </dev/null ) & echo $! > {pids} )",
+            "the nested sleep",
+        );
+    }
+
+    /// An own-pgroup job (`set -m`) leaves the group. At a natural end its
+    /// shell is gone and its parent chain is severed, so nothing can name it:
+    /// it survives, and the test kills it. A timeout still reaches one,
+    /// because the shell is alive to walk from.
+    #[test]
+    fn an_own_pgroup_job_outlives_a_natural_end() {
+        if !can_enumerate() {
+            eprintln!("skipped: process enumeration is denied under this sandbox");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pid");
+        let mut command = Command::new("/bin/bash");
+        command.arg("-c").arg(format!(
+            "set -m; sleep 9875 >/dev/null 2>&1 </dev/null & echo $! > {}; set +m",
+            pids.display()
+        ));
+
+        let cancel = CancelToken::new();
+        let run = run_watched(&mut command, Some(DEFAULT_BASH_TIMEOUT), &cancel).unwrap();
+
+        assert!(run.output.status.success(), "{:?}", run.killed);
+        assert!(run.note.is_none(), "note: {:?}", run.note);
+        let written = std::fs::read_to_string(&pids).unwrap();
+        let pid = Pid::from_raw(written.trim().parse().unwrap());
+        let alive = kill(pid, Signal::SIGCONT).is_ok();
+        let _ = kill(pid, Signal::SIGKILL);
+        assert!(alive, "the own-pgroup job died with the call");
+    }
+
+    /// A timeout takes down more than the group. The watchdog collects the
+    /// leader's descendants before killing, so it also reaches an own-pgroup
+    /// job.
+    #[test]
+    fn a_timeout_kills_own_pgroup_jobs() {
+        if !can_enumerate() {
+            eprintln!("skipped: process enumeration is denied under this sandbox");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pid");
+        let mut command = Command::new("/bin/bash");
+        command.arg("-c").arg(format!(
+            "set -m; sleep 9874 >/dev/null 2>&1 </dev/null & echo $! > {}; sleep 30",
+            pids.display()
+        ));
+
+        let cancel = CancelToken::new();
+        let run = run_watched(&mut command, Some(Duration::from_millis(300)), &cancel).unwrap();
+
+        assert_eq!(run.killed, Some(KillReason::Timeout));
+        assert!(run.note.is_none(), "note: {:?}", run.note);
+        let written = std::fs::read_to_string(&pids).unwrap();
+        let pid = Pid::from_raw(written.trim().parse().unwrap());
+        wait_gone(pid, "the own-pgroup sleep");
+    }
+
+    /// A process that starts a session of its own (`setsid`) leaves before
+    /// the sweep can name it. Only deliberate daemonization crosses that
+    /// line; the test kills the daemon.
+    #[test]
+    fn a_setsid_daemon_outlives_the_call() {
+        if !can_enumerate() {
+            eprintln!("skipped: process enumeration is denied under this sandbox");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pid");
+        let mut command = Command::new("/bin/bash");
+        command.arg("-c").arg(format!(
+            "/usr/bin/perl -MPOSIX=setsid -e ' \
+                defined(my $first = fork) or die; \
+                exit 0 if $first; \
+                setsid() >= 0 or die; \
+                defined(my $daemon = fork) or die; \
+                if ($daemon) {{ open(my $out, q(>), q({})) or die; \
+                    print $out $daemon; close $out; exit 0; }} \
+                exec q(/bin/sleep), q(9876) or die; \
+             '; echo spawned",
+            pids.display()
+        ));
+
+        let cancel = CancelToken::new();
+        let run = run_watched(&mut command, Some(DEFAULT_BASH_TIMEOUT), &cancel).unwrap();
+
+        assert_eq!(combined_output(&run.output), "spawned\n");
+        // Unseen, so unreported: the daemon left the group and the chain.
+        assert!(run.note.is_none(), "note: {:?}", run.note);
+        let written = std::fs::read_to_string(&pids).unwrap();
+        let pid = Pid::from_raw(written.trim().parse().unwrap());
+        let alive = kill(pid, Signal::SIGCONT).is_ok();
+        let _ = kill(pid, Signal::SIGKILL);
+        assert!(alive, "the setsid daemon died with the call");
+    }
+
+    /// A detached multiplexer is the idiomatic way to background work, so the
+    /// policy denies the pty master. `screen -dm` can still exit 0, but its
+    /// command never runs. The marker is the invariant; screen's exit code is
+    /// not, because it detaches before it windows anything.
+    #[test]
+    fn a_detached_screen_cannot_run_work_under_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let mut screen = policy.command("/usr/bin/screen");
+        screen
+            .arg("-dmS")
+            .arg("tart-probe")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(format!("echo ran > {}", marker.display()));
+        // The sandbox wrapper itself must run for the denial to be exercised.
+        let probe = policy.command("/usr/bin/true").output();
+        if !probe.is_ok_and(|ran| ran.status.success()) {
+            eprintln!("skipped: sandbox-exec is denied under this sandbox");
+            return;
+        }
+        let cancel = CancelToken::new();
+        let run = run_watched(&mut screen, Some(DEFAULT_BASH_TIMEOUT), &cancel).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // Leave no server behind, then assert the command never ran.
+        let _ = Command::new("/usr/bin/screen")
+            .args(["-S", "tart-probe", "-X", "quit"])
+            .output();
+        assert!(
+            !marker.exists(),
+            "the detached command ran: {}",
+            combined_output(&run.output)
+        );
+    }
+
+    /// A FIFO would block a file tool forever: both refuse it instead.
+    #[test]
+    fn a_fifo_is_not_editable_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap();
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        assert_eq!(
+            apply_edit(&an_edit(&fifo, "a", "b", false), &policy).0,
+            format!(
+                "<tool_use_error>edit: not a regular file: {}</tool_use_error>",
+                fifo.display()
+            )
+        );
     }
 
     /// A fast command finishes un-killed and successful, and the sender's drop
