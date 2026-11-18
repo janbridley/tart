@@ -136,6 +136,12 @@ progress when you check, defer to the user or end your turn.
   resumed. Timed-out commands will end with `Exit code 137` and
   `Command timed out after Nm Ns` after whatever output was captured before the kill.
   Plan long work (full builds, long test suites) as steps that finish inside the limit.
+- Commands are fully torn down at the end of the tool call or timeout. Work backgrounded
+  with `nohup ... &`, `& disown`, or nested subshells die with the call, and a timeout
+  or a cancel also kills own-group jobs (`set -m`) that a natural end cannot reach.
+  Detached multiplexers (`screen -dm`, `tmux new -d`) are denied by the sandbox. There
+  is no supported way to keep work running between calls, so split long work into steps
+  that finish inside the limit, checkpointing to disk to resume across calls.
 - A success that prints more than 30,000 bytes spills to a file holding the full output
   and previews its start and end. A failure over 10,000 bytes is cut to its first and
   last 5,000 bytes, with a marker where the middle was dropped.
@@ -154,6 +160,9 @@ limits are intentional:
   network.
 - **Writes are confined to the working directory and `/tmp`** (and `/var/tmp`). Nothing
   else is writable.
+- **Process lifetime is confined to the call.** The closeout kills everything a command
+  leaves running. Later calls run under their own sandbox and can neither see nor signal
+  a survivor.
 - **`.git` is read-only.** Commands like `status`, `diff`, `log`, `show`, `blame`,
   `merge-base`, and `stash show` function as normal, but nothing that writes refs, the
   index, or objects can run: `commit`, `merge`, `stash push|pop`, `checkout`, and
