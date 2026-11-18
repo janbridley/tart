@@ -15,6 +15,8 @@ pub(crate) struct Cli {
     pub(crate) chat: bool,
     /// Whether `--gpu` was passed: Metal compute inside the sandbox.
     pub(crate) gpu: bool,
+    /// Whether `--resume` was passed: reopen this project's newest session.
+    pub(crate) resume: bool,
 }
 
 impl Cli {
@@ -30,6 +32,7 @@ impl Cli {
             agents: resolve(matches, home)?,
             chat: matches.get_flag("chat"),
             gpu: matches.get_flag("gpu"),
+            resume: matches.get_flag("resume"),
         })
     }
 }
@@ -69,6 +72,12 @@ fn command() -> Command {
         .arg(Arg::new("gpu").long("gpu").action(clap::ArgAction::SetTrue).help(
             "Grant the coding sandbox GPU access for Metal compute (toggle at runtime with /gpu)",
         ))
+        .arg(
+            Arg::new("resume")
+                .long("resume")
+                .action(clap::ArgAction::SetTrue)
+                .help("Resume this project's most recent session instead of starting a new one"),
+        )
 }
 
 #[cfg(test)]
@@ -152,6 +161,29 @@ mod tests {
         )
         .expect("the named file is used as-is");
         assert!(!without.gpu);
+    }
+
+    /// `--resume` parses true, and its absence false, alongside the agents file.
+    #[test]
+    fn the_resume_flag_parses() {
+        let with = Cli::from(
+            &command()
+                .try_get_matches_from(["tart", "--agents", "f.toml", "--resume"])
+                .expect("the flags parse"),
+            None,
+        )
+        .expect("the named file is used as-is");
+        assert!(with.resume);
+        assert_eq!(with.agents, PathBuf::from("f.toml"));
+
+        let without = Cli::from(
+            &command()
+                .try_get_matches_from(["tart", "--agents", "f.toml"])
+                .expect("the flags parse"),
+            None,
+        )
+        .expect("the named file is used as-is");
+        assert!(!without.resume);
     }
 
     /// `--chat` parses true, and its absence false, alongside the agents file.
