@@ -2,12 +2,13 @@
 name = "tart-agents"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
-anyhow = "1.0.104"
+anyhow.workspace = true
 # rustls-no-provider keeps aws-lc-rs provider out of our dependency chain and speed up
 # compiles. We directly depend on rustls to get the required components.
-async-openai = { version = "0.42.0", default-features = false, features = ["responses", "rustls-no-provider"] }
+async-openai = { version = "0.42.3", default-features = false, features = ["responses", "rustls-no-provider"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "rustls-no-provider",
@@ -18,20 +19,16 @@ reqwest = { version = "0.13", default-features = false, features = [
 url = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures = "0.3.34"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 time = { version = "0.3", default-features = false, features = ["std"] }
-# Just `killpg` and the `Pid` it takes, so the harness itself stays free of
-# `unsafe`: signalling a group cannot violate memory safety, which nix encodes.
-nix = { version = "0.31.3", default-features = false, features = ["fs", "signal"] }
-itertools = "0.15.0"
+nix = { version = "0.31.4", default-features = false, features = ["fs", "signal"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 rs-trafilatura = "0.2.2"
 dom_query = "0.24"
-# Sessions record as gzipped JSONL: one gzip member per recorded turn.
-flate2 = "1"
+flate2.workspace = true
 libc = "0.2.191"
-tempfile = "3"
+tempfile.workspace = true
 
 [dev-dependencies]
 macro_rules_attribute = "0.2.3"

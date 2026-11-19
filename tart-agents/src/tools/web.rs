@@ -566,8 +566,10 @@ fn extract_markdown(body: &[u8], url: &str) -> String {
                 rs_trafilatura::extract_with_options(&preprocessed, &options)
             }))
             .unwrap_or(Err(rs_trafilatura::Error::NoContent))
-            .map(|result| extraction_text(result.content_markdown, result.content_text))
-            .unwrap_or_default()
+            .map_or_else(
+                |_| String::new(),
+                |result| extraction_text(result.content_markdown, result.content_text),
+            )
         }
         // Non-utf8 data cannot be handled by extract_with_options so we don't try
         // to preprocess it
@@ -575,8 +577,10 @@ fn extract_markdown(body: &[u8], url: &str) -> String {
             rs_trafilatura::extract_bytes_with_options(body, &options)
         }))
         .unwrap_or(Err(rs_trafilatura::Error::NoContent))
-        .map(|result| extraction_text(result.content_markdown, result.content_text))
-        .unwrap_or_default(),
+        .map_or_else(
+            |_| String::new(),
+            |result| extraction_text(result.content_markdown, result.content_text),
+        ),
     }
 }
 

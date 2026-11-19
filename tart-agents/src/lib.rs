@@ -1,5 +1,7 @@
 //! The *tart* agent harness.
 
+#![warn(missing_docs)]
+
 mod agent;
 mod agents;
 mod debug;

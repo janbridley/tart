@@ -8,6 +8,8 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
+#![warn(missing_docs)]
+
 mod attachments;
 mod cli;
 mod clipboard;
@@ -49,6 +51,7 @@ use tart_agents::{
 
 use tmux_override::{override_shift_up, restore_tmux};
 
+/// How often the event loop redraws while animating, in milliseconds.
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
@@ -545,7 +548,7 @@ fn on_child_event(
                 .with_outcome(id, |outcome| {
                     (outcome.report(), matches!(outcome, Outcome::Done(_)).then_some(0))
                 })
-                .unwrap_or(("report delivered through wait".to_string(), Some(0)));
+                .unwrap_or_else(|| ("report delivered through wait".to_string(), Some(0)));
             // The id queues either way: the report's delivery ends any observation of
             // ion of it, and a `wait`-claimed one still retires its view in the sweep.
             pane.report(id);

@@ -644,8 +644,8 @@ mod tests {
 
         // Reading to the end, and past it, yields nothing without panicking:
         // a cleared record can end before a session's flushed prefix.
-        assert!(transcript.items_after(transcript.len()).is_empty());
-        assert!(transcript.items_after(transcript.len() + 3).is_empty());
+        assert_eq!(transcript.items_after(transcript.len()), []);
+        assert_eq!(transcript.items_after(transcript.len() + 3), []);
     }
 
     #[test]

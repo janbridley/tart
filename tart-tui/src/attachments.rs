@@ -152,7 +152,7 @@ mod tests {
         // Inside the grant: the model reads it with its own tools.
         let (message, notes) = attach_mentions("fix @src/pane.rs please", &cwd);
         assert_eq!(message, "fix @src/pane.rs please");
-        assert!(notes.is_empty());
+        assert_eq!(notes, [] as [String; 0]);
 
         // Outside: the contents ride along in a fence that outlasts any run of
         // backticks in the file, with a note for the pane.
