@@ -68,7 +68,21 @@ fn main() -> anyhow::Result<()> {
         &tui.config,
     );
     leave_terminal(&mut terminal)?;
+    // Print an exit summary once we've closed the TUI
+    print_exit_summary(&tui.session);
     result
+}
+
+/// Print the session's token spend as codex does on close:
+/// `Token usage so far: total=... input=... (+ ... cached) output=... (reasoning ...)`.
+#[allow(
+    clippy::print_stdout,
+    reason = "the exit line is stdout's one job, after the TUI has closed"
+)]
+fn print_exit_summary(session: &Session) {
+    if let Some(line) = Ledger::exit_summary(&session.stem()) {
+        println!("{line}");
+    }
 }
 
 /// Enter the alternate screen with bracketed paste and disambiguated escape codes on.
