@@ -22,7 +22,7 @@ static SESSION: Mutex<Option<String>> = Mutex::new(None);
 pub(crate) const MAIN_AGENT: &str = "main";
 
 /// One response's five token counts, as the provider measured them.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TokenUsage {
     /// All input tokens, cache included.
     pub(crate) input: u64,
@@ -44,6 +44,26 @@ impl TokenUsage {
         (self.input, self.cached, self.output)
     }
 
+    /// Display the session's usage on exit.
+    ///
+    /// ```text
+    /// Token usage so far: total=411717 input=341493 (+ 5247872 cached) output=70224 (reasoning 37081)
+    /// ```
+    pub(crate) fn summary(self) -> anyhow::Result<String> {
+        use std::fmt::Write as _;
+
+        let fresh = self.input.saturating_sub(self.cached);
+        let mut line = format!("Token usage so far: total={} input={fresh}", fresh + self.output);
+        if self.cached > 0 {
+            write!(line, " (+ {} cached)", self.cached)?;
+        }
+        write!(line, " output={}", self.output)?;
+        if self.reasoning > 0 {
+            write!(line, " (reasoning {})", self.reasoning)?;
+        }
+        Ok(line)
+    }
+
     /// Append this usage to the ledger as one billed response
     ///
     /// NOTE: this is *not* guaranteed to be the exact bill quantity
@@ -60,6 +80,20 @@ impl TokenUsage {
         if let Err(error) = Ledger::append(&entry) {
             debug::log("usage ledger", || error.to_string());
         }
+    }
+}
+
+/// A session's spend is its rows added field-wise.
+impl std::iter::Sum for TokenUsage {
+    #[inline]
+    fn sum<I: Iterator<Item = TokenUsage>>(iter: I) -> Self {
+        iter.fold(Self::default(), |sum, usage| Self {
+            input: sum.input + usage.input,
+            cached: sum.cached + usage.cached,
+            output: sum.output + usage.output,
+            reasoning: sum.reasoning + usage.reasoning,
+            total: sum.total + usage.total,
+        })
     }
 }
 
@@ -109,6 +143,30 @@ impl Ledger {
             .filter(|entry| entry.agent == MAIN_AGENT && entry.session.as_deref() == Some(stem))
             .map(|entry| entry.usage.gauge())
             .last()
+    }
+
+    /// The session's whole spend in tokens, or None if not knowwn.
+    ///
+    /// This counts all rows in the session, including subagents.
+    #[must_use]
+    #[inline]
+    pub fn exit_summary(stem: &str) -> Option<String> {
+        let total = Self::session_total(stem);
+        if total.total == 0 {
+            return None;
+        }
+        total
+            .summary()
+            .inspect_err(|error| debug::log("usage ledger", || error.to_string()))
+            .ok()
+    }
+
+    /// The sum of every row `stem` billed, main conversation and children alike.
+    fn session_total(stem: &str) -> TokenUsage {
+        Self::entries()
+            .filter(|entry| entry.session.as_deref() == Some(stem))
+            .map(|entry| entry.usage)
+            .sum()
     }
 
     /// The ledger's path.
@@ -412,5 +470,84 @@ pub(crate) mod tests {
             Some((1, 2, 3)),
             "the row past the bad bytes is the newest"
         );
+    }
+
+    #[test]
+    fn the_summary_line_keeps_codexs_shape_with_bare_digits() {
+        let usage = TokenUsage {
+            input: 5_589_365,
+            cached: 5_247_872,
+            output: 70_224,
+            reasoning: 37_081,
+            total: 5_659_589,
+        };
+
+        assert_eq!(
+            usage.summary().expect("writing into a String cannot fail"),
+            "Token usage so far: total=411717 input=341493 \
+             (+ 5247872 cached) output=70224 (reasoning 37081)"
+        );
+    }
+
+    #[test]
+    fn zero_cached_and_reasoning_segments_drop_away() {
+        let usage = TokenUsage {
+            input: 10,
+            cached: 0,
+            output: 2,
+            reasoning: 0,
+            total: 12,
+        };
+
+        // The same shape codex's own snapshot test holds.
+        let line = usage.summary().expect("the line formats");
+        assert_eq!(line, "Token usage so far: total=12 input=10 output=2");
+    }
+
+    #[test]
+    fn exit_summary_sums_the_whole_session_children_included() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+
+        set_session("sum".to_string());
+        sample_usage().bill(MAIN_AGENT, "m");
+        sample_usage().bill(MAIN_AGENT, "m");
+        TokenUsage {
+            input: 1000,
+            cached: 1000,
+            output: 50,
+            reasoning: 10,
+            total: 1050,
+        }
+        .bill("child-1", "m");
+        // Another session's rows stay out of this one's line.
+        set_session("elsewhere".to_string());
+        sample_usage().bill(MAIN_AGENT, "m");
+
+        assert_eq!(
+            Ledger::exit_summary("sum").as_deref(),
+            Some(
+                "Token usage so far: total=2648 input=1574 \
+                 (+ 17428 cached) output=1074 (reasoning 202)"
+            ),
+            "both main rows and the child's row count"
+        );
+        // A child-only session still spent; the line reports spend, not the gauge.
+        set_session("child-only".to_string());
+        TokenUsage {
+            input: 100,
+            cached: 90,
+            output: 10,
+            reasoning: 2,
+            total: 110,
+        }
+        .bill("child-1", "m");
+        assert_eq!(
+            Ledger::exit_summary("child-only").as_deref(),
+            Some("Token usage so far: total=20 input=10 (+ 90 cached) output=10 (reasoning 2)")
+        );
+        // A session that never billed prints nothing at all.
+        assert_eq!(Ledger::exit_summary("never"), None);
+        assert_eq!(Ledger::exit_summary(""), None);
     }
 }
