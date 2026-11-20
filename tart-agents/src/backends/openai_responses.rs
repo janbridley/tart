@@ -84,11 +84,34 @@ fn request_of(
             context: None,
             mode: None,
         })
-        .input(InputParam::Items(items));
+        .input(InputParam::Items(plain_items(items)));
     if !tools.is_empty() {
         args.tools(tools);
     }
     Ok(args.build()?)
+}
+
+/// The record as plain, self-contained items.
+///
+/// We must drop server-side data (`id`s for stored items, as well as their
+/// `encrypted_content`), or proxies like `Azure OpenAI` kill the stream when the
+/// backing resource changes. We keep track of dropped data on our end for posterity.
+fn plain_items(items: Vec<InputItem>) -> Vec<InputItem> {
+    items
+        .into_iter()
+        .map(|item| match item {
+            InputItem::Item(Item::Reasoning(mut reasoning)) => {
+                reasoning.id = None;
+                reasoning.encrypted_content = None;
+                InputItem::Item(Item::Reasoning(reasoning))
+            }
+            InputItem::Item(Item::FunctionCall(mut call)) => {
+                call.id = None;
+                InputItem::Item(Item::FunctionCall(call))
+            }
+            plain => plain,
+        })
+        .collect()
 }
 
 /// Translate one provider event; `None` when tart has no use for it.
@@ -227,5 +250,40 @@ mod tests {
             Some(1),
             "the offered tool rides along: {armed}"
         );
+    }
+
+    #[test]
+    fn the_request_replays_items_without_provider_minted_ids() {
+        let reasoning = InputItem::Item(Item::Reasoning(ReasoningItem {
+            id: Some("rs_0".to_string()),
+            encrypted_content: Some("ciphertext".to_string()),
+            content: Some(vec![ReasoningItemContent::ReasoningText(ReasoningTextContent {
+                text: "pondering".to_string(),
+            })]),
+            ..ReasoningItem::default()
+        }));
+        let call = InputItem::Item(Item::FunctionCall(FunctionToolCall {
+            id: Some("fc_0".to_string()),
+            call_id: "call_0".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+            ..FunctionToolCall::default()
+        }));
+        let request = request_of("model", None, vec![reasoning, call], Vec::new()).unwrap();
+
+        let body = serde_json::to_value(&request).unwrap();
+        let input = &body["input"];
+        // An id is either stripped or serialized as null, whichever the type
+        // does with a `None`; both leave nothing for a resource to look up.
+        assert!(input[0]["id"].is_null(), "reasoning id gone: {input}");
+        assert!(
+            input[0]["encrypted_content"].is_null(),
+            "ciphertext gone: {input}"
+        );
+        assert!(input[1]["id"].is_null(), "call id gone: {input}");
+        // What carries meaning for the next round stays.
+        assert_eq!(input[0]["content"][0]["text"], "pondering");
+        assert_eq!(input[1]["call_id"], "call_0");
+        assert_eq!(input[1]["name"], "bash");
     }
 }
