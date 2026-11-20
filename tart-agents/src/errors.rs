@@ -137,6 +137,13 @@ mod tests {
             ("content_policy_violation", Permanent),
             ("credit_balance_exhausted", Permanent),
             ("organization_spend_limit_exceeded", Permanent),
+            // A relay across Azure resources rejects items from a different resource
+            (
+                "azure-openai error: The requested item was created under a different \
+                 Azure OpenAI resource. Use the same resource that created the item to \
+                 access it.",
+                Permanent,
+            ),
             ("This model's maximum context length is 262144 tokens", Overflow),
             ("the prompt is too long: 390000 > 262144 tokens", Overflow),
             // z.ai's phrasing carries no "is".

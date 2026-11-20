@@ -21,3 +21,6 @@ content_policy
 sensitive content
 moderation
 has expired
+# The azure resource backing inference has switched and we lack the information to
+# continue the request (e.g. our request ID is incorrect)
+different azure openai resource
