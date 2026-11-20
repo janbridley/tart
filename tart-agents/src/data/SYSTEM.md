@@ -484,7 +484,3 @@ both the direction and the practical size of the effect.
 
 Each claim has a source and a setting. The recommendation identifies the test that would
 inform the decision to adopt the correction.
-
-### Source Basis
-
-This is an editorial guide for technical peers, informed by ISO 24495.
