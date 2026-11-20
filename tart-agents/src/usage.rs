@@ -1,9 +1,12 @@
 //! Append-only ledger of token usage per model and session.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+use fixed::types::I32F32;
 
 use crate::locked;
 
@@ -97,6 +100,57 @@ impl std::iter::Sum for TokenUsage {
     }
 }
 
+/// A price in US$ per 1M tokens, held exactly.
+pub type Price = I32F32;
+
+/// A cost in US dollars.
+///
+/// Values enter only through checked conversions, so unrepresentable amounts are None.
+pub type Money = I32F32;
+
+/// A model's pay-as-you-go prices: USD per 1M tokens.
+///
+/// Agents that are not pay-as-you-go do not require a [`Cost`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cost {
+    /// Fresh input tokens.
+    pub input: Price,
+    /// Cached input tokens: the discounted rate cache reads bill at.
+    pub cached: Price,
+    /// Output tokens, reasoning included.
+    pub output: Price,
+}
+
+impl Cost {
+    /// `tokens` at `price` US$/1M, as [`Money`].
+    fn part(tokens: u64, price: Price) -> Option<Money> {
+        // Scale before multiply so that we don't drop any microdollars.
+        let millions = I32F32::checked_from_num(tokens)? / I32F32::from_num(1_000_000);
+        millions.checked_mul(price)
+    }
+}
+
+/// [`Money`] as a dollar string: four decimals, shedding the hundredths of a
+/// cent that read as noise, so a session's groups sum to its total on
+/// screen. The figure is non-negative: prices are, and token counts are.
+fn dollars(money: Money) -> String {
+    // Count $0.0001s. Saturating, so a figure somehow past the type's range
+    // still prints rather than panics.
+    let ticks = money
+        .saturating_mul(Money::from_num(10_000))
+        .round()
+        .to_num::<i64>();
+    let mut text = format!("{}.{:04}", ticks / 10_000, ticks % 10_000);
+    if text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('0') {
+        text.pop();
+    }
+    format!("${text}")
+}
+
 /// The append-only token ledger: `usage.jsonl` beside the sessions, with one
 /// [`LedgerEntry`] per billed response.
 pub struct Ledger;
@@ -145,28 +199,48 @@ impl Ledger {
             .last()
     }
 
-    /// The session's whole spend in tokens, or None if not knowwn.
+    /// The session's whole spend in tokens, plus its estimated cost when configured.
     ///
-    /// This counts all rows in the session, including subagents.
+    /// ```text
+    /// Token usage so far: total=411717 input=341493 (+ 5247872 cached) output=70224 (reasoning 37081)
+    /// Estimated cost: $2.10 @ glm-5.3 (input $1.00 + cached $0.10 + output $1.00)
+    /// ```
+    ///
+    /// This counts all rows in the session, including subagents. Models without a price
+    /// are named but do not give cost entries.
     #[must_use]
     #[inline]
-    pub fn exit_summary(stem: &str) -> Option<String> {
-        let total = Self::session_total(stem);
+    pub fn exit_summary(stem: &str, prices: &BTreeMap<String, Cost>) -> Option<String> {
+        let by_model = Self::session_by_model(stem);
+        let total: TokenUsage = by_model.values().copied().sum();
         if total.total == 0 {
             return None;
         }
-        total
+        let mut line = total
             .summary()
             .inspect_err(|error| debug::log("usage ledger", || error.to_string()))
-            .ok()
+            .ok()?;
+        if let Some(cost) = cost_line(&by_model, prices) {
+            line.push('\n');
+            line.push_str(&cost);
+        }
+        Some(line)
     }
 
-    /// The sum of every row `stem` billed, main conversation and children alike.
-    fn session_total(stem: &str) -> TokenUsage {
-        Self::entries()
-            .filter(|entry| entry.session.as_deref() == Some(stem))
-            .map(|entry| entry.usage)
-            .sum()
+    /// The session's rows summed per model, model names alphabetical.
+    fn session_by_model(stem: &str) -> BTreeMap<String, TokenUsage> {
+        let mut by_model = BTreeMap::new();
+        for entry in Self::entries().filter(|entry| entry.session.as_deref() == Some(stem)) {
+            let sum = by_model.entry(entry.model).or_insert_with(TokenUsage::default);
+            *sum = TokenUsage {
+                input: sum.input + entry.usage.input,
+                cached: sum.cached + entry.usage.cached,
+                output: sum.output + entry.usage.output,
+                reasoning: sum.reasoning + entry.usage.reasoning,
+                total: sum.total + entry.usage.total,
+            };
+        }
+        by_model
     }
 
     /// The ledger's path.
@@ -221,6 +295,67 @@ impl LedgerEntry {
 /// The project the billed round ran in: its sessions-directory slug.
 fn project() -> String {
     std::env::current_dir().map_or_else(|_| String::new(), |dir| slug(&dir))
+}
+
+/// The exit summary's estimated-cost line: one group per priced model, the
+/// session's total in front, unpriced models named if present.
+fn cost_line(
+    by_model: &BTreeMap<String, TokenUsage>,
+    prices: &BTreeMap<String, Cost>,
+) -> Option<String> {
+    let mut total = Money::ZERO;
+    let mut groups = Vec::new();
+    let mut unpriced = Vec::new();
+    for (model, usage) in by_model {
+        let Some(price) = prices.get(model) else {
+            unpriced.push(model.clone());
+            continue;
+        };
+        let fresh = usage.input.saturating_sub(usage.cached);
+        let parts = [
+            (fresh, price.input),
+            (usage.cached, price.cached),
+            (usage.output, price.output),
+        ];
+        let mut cost = Money::ZERO;
+        let mut labels = [String::new(), String::new(), String::new()];
+        for (slot, &(tokens, rate)) in labels.iter_mut().zip(&parts) {
+            let part = Cost::part(tokens, rate)?;
+            cost = cost.checked_add(part)?;
+            *slot = dollars(part);
+        }
+        total = total.checked_add(cost)?;
+        let [input, cached, output] = labels;
+        groups.push((
+            model,
+            cost,
+            format!("input {input} + cached {cached} + output {output}"),
+        ));
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    let named = groups
+        .iter()
+        .map(|(model, cost, parts)| {
+            if groups.len() > 1 {
+                format!("{model} {} ({parts})", dollars(*cost))
+            } else {
+                format!("{model} ({parts})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut line = format!("Estimated cost: {} @ {named}", dollars(total));
+    if !unpriced.is_empty() {
+        let named: Vec<String> = unpriced
+            .iter()
+            .map(|model| format!("{model} (no price set)"))
+            .collect();
+        line.push_str("; ");
+        line.push_str(&named.join("; "));
+    }
+    Some(line)
 }
 
 #[cfg(test)]
@@ -525,7 +660,7 @@ pub(crate) mod tests {
         sample_usage().bill(MAIN_AGENT, "m");
 
         assert_eq!(
-            Ledger::exit_summary("sum").as_deref(),
+            Ledger::exit_summary("sum", &no_prices()).as_deref(),
             Some(
                 "Token usage so far: total=2648 input=1574 \
                  (+ 17428 cached) output=1074 (reasoning 202)"
@@ -543,11 +678,145 @@ pub(crate) mod tests {
         }
         .bill("child-1", "m");
         assert_eq!(
-            Ledger::exit_summary("child-only").as_deref(),
+            Ledger::exit_summary("child-only", &no_prices()).as_deref(),
             Some("Token usage so far: total=20 input=10 (+ 90 cached) output=10 (reasoning 2)")
         );
         // A session that never billed prints nothing at all.
-        assert_eq!(Ledger::exit_summary("never"), None);
-        assert_eq!(Ledger::exit_summary(""), None);
+        assert_eq!(Ledger::exit_summary("never", &no_prices()), None);
+        assert_eq!(Ledger::exit_summary("", &no_prices()), None);
+    }
+
+    /// No model priced: only the token line, never a zero-dollar estimate.
+    fn no_prices() -> BTreeMap<String, Cost> {
+        BTreeMap::new()
+    }
+
+    /// A price as the config spells it: a decimal string, never a float.
+    fn price(text: &str) -> Price {
+        text.parse().expect("a valid price")
+    }
+
+    /// The three rates, spelled as the config spells them.
+    fn priced(input: &str, cached: &str, output: &str) -> Cost {
+        Cost {
+            input: price(input),
+            cached: price(cached),
+            output: price(output),
+        }
+    }
+
+    /// `per_million` prices chosen so every part lands on an exact micro-dollar.
+    fn glm_prices() -> BTreeMap<String, Cost> {
+        BTreeMap::from([("glm-5.3".to_string(), priced("1", "0.1", "2"))])
+    }
+
+    #[test]
+    fn a_priced_session_estimates_its_cost() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+
+        set_session("priced".to_string());
+        // Fresh 1M input + 1M cached + 0.5M output = $1.00 + $0.10 + $1.00.
+        TokenUsage {
+            input: 2_000_000,
+            cached: 1_000_000,
+            output: 500_000,
+            reasoning: 0,
+            total: 2_500_000,
+        }
+        .bill(MAIN_AGENT, "glm-5.3");
+
+        assert_eq!(
+            Ledger::exit_summary("priced", &glm_prices()).as_deref(),
+            Some(
+                "Token usage so far: total=1500000 input=1000000 \
+                 (+ 1000000 cached) output=500000\n\
+                 Estimated cost: $2.10 @ glm-5.3 (input $1.00 + cached $0.10 + output $1.00)"
+            )
+        );
+    }
+
+    #[test]
+    fn unpriced_models_are_named_and_cost_nothing() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+
+        set_session("mixed".to_string());
+        sample_usage().bill(MAIN_AGENT, "glm-5.3");
+        sample_usage().bill("child-1", "glm-4.7");
+
+        // Only glm-5.3's spend prices out; glm-4.7 is named for its absence.
+        assert_eq!(
+            Ledger::exit_summary("mixed", &glm_prices())
+                .expect("the summary formats")
+                .lines()
+                .nth(1)
+                .expect("the cost line follows the token line"),
+            "Estimated cost: $0.0026 @ glm-5.3 (input $0.0008 + cached $0.0008 + output $0.001); \
+             glm-4.7 (no price set)"
+        );
+    }
+
+    #[test]
+    fn two_priced_models_split_the_estimate_between_them() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+
+        set_session("split".to_string());
+        sample_usage().bill(MAIN_AGENT, "glm-5.3");
+        TokenUsage {
+            input: 1_000_000,
+            cached: 0,
+            output: 1_000_000,
+            reasoning: 0,
+            total: 2_000_000,
+        }
+        .bill("child-1", "glm-5.3-flash");
+        let prices = BTreeMap::from([
+            ("glm-5.3".to_string(), priced("1", "0.1", "2")),
+            ("glm-5.3-flash".to_string(), priced("0.5", "0.05", "1")),
+        ]);
+
+        // glm-5.3: $0.002632; glm-5.3-flash: 1M fresh + 1M output = $1.50.
+        // Alphabetical order, each model's own sum after its name.
+        assert_eq!(
+            Ledger::exit_summary("split", &prices)
+                .expect("the summary formats")
+                .lines()
+                .nth(1)
+                .expect("the cost line follows the token line"),
+            "Estimated cost: $1.5026 @ glm-5.3 $0.0026 (input $0.0008 + cached $0.0008 + output $0.001); \
+             glm-5.3-flash $1.50 (input $0.50 + cached $0.00 + output $1.00)"
+        );
+    }
+
+    #[test]
+    fn sub_cent_estimates_keep_four_decimals() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+
+        set_session("cheap".to_string());
+        sample_usage().bill(MAIN_AGENT, "glm-5.3");
+
+        // 787 + 821.4 + 1024 micro-dollars = $0.002632, not "$0.00".
+        let line = Ledger::exit_summary("cheap", &glm_prices()).expect("the summary formats");
+        assert!(
+            line.lines()
+                .nth(1)
+                .expect("the cost line")
+                .starts_with("Estimated cost: $0.0026"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_part_outside_the_envelope_is_declined() {
+        // A token count beyond the type's range cannot be priced at all.
+        assert_eq!(Cost::part(u64::MAX, price("1")), None);
+        // Nor can a count × price whose product leaves the range: 2e9 tokens
+        // fit, $2M/1M times their millions does not.
+        assert_eq!(Cost::part(2_000_000_000, price("2000000")), None);
+        // The same count in-envelope prices: 2e9 tokens at $1/1M is $2,000.
+        assert_eq!(Cost::part(2_000_000_000, price("1")), Some(price("2000")));
     }
 }

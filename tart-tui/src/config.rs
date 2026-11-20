@@ -6,10 +6,11 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use itertools::Itertools;
 use serde::Deserialize;
 use tart_agents::sandbox::Policy;
+use tart_agents::usage::Cost;
 use tart_agents::{Agent, ReasoningEffort};
 
 /// A parsed agents file. `default_agent` picks the agent the TUI runs;
@@ -110,6 +111,8 @@ struct AgentSpec {
     model: String,
     reasoning_effort: Option<ReasoningEffort>,
     context_tokens: Option<u64>,
+    /// The model's pay-as-you-go prices, if known.
+    cost: Option<Cost>,
 }
 
 impl Config {
@@ -146,10 +149,51 @@ impl Config {
             if let Some(dup) = provider.agents.iter().map(|a| &a.name).duplicates().next() {
                 bail!("provider [{key}] defines two agents named '{dup}'");
             }
+            for agent in &provider.agents {
+                if let Some(cost) = agent.cost {
+                    ensure!(
+                        !cost.input.is_negative()
+                            && !cost.cached.is_negative()
+                            && !cost.output.is_negative(),
+                        "provider [{key}] agent '{}' prices a token rate below zero",
+                        agent.name
+                    );
+                }
+            }
 
             providers.insert(key, provider);
         }
+        // One model, one price: the exit summary joins ledger rows to rates by
+        // model name, so two agents disagreeing on a model's price is a load
+        // error, not an average to guess.
+        let mut priced = BTreeMap::new();
+        for (key, provider) in &providers {
+            for agent in &provider.agents {
+                let Some(cost) = agent.cost else { continue };
+                match priced.get(&agent.model) {
+                    Some(&prior) if prior != cost => bail!(
+                        "model '{}' is priced two ways (provider [{key}], agent '{}')",
+                        agent.model,
+                        agent.name
+                    ),
+                    _ => {
+                        priced.insert(agent.model.clone(), cost);
+                    }
+                }
+            }
+        }
         Ok(Self { default_agent, chat_agent, providers })
+    }
+
+    /// Every priced model's rates, for the exit summary's cost estimate.
+    pub(crate) fn prices(&self) -> BTreeMap<String, Cost> {
+        let mut prices = BTreeMap::new();
+        for agent in self.providers.values().flat_map(|provider| &provider.agents) {
+            if let Some(cost) = agent.cost {
+                prices.insert(agent.model.clone(), cost);
+            }
+        }
+        prices
     }
 
     /// Resolve the default agent: look it up, obtain its API key.
@@ -509,6 +553,103 @@ model = "glm-4-flash"
         let agent = Config::parse(&text).unwrap().default_agent().unwrap();
 
         assert_eq!(agent.context_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn cost_round_trips_as_decimal_strings() {
+        let text = MINIMAL.replacen(
+            "reasoning_effort = \"high\"",
+            "cost = { input = \"1.25\", cached = \"0.125\", output = \"10\" }",
+            1,
+        );
+
+        let prices = Config::parse(&text).unwrap().prices();
+        let cost = prices.get("glm-5.3").expect("the model is priced");
+        // The rates parse exactly as written, cached input discounted.
+        assert_eq!(cost.input.to_string(), "1.25");
+        assert_eq!(cost.cached.to_string(), "0.125");
+        assert_eq!(cost.output.to_string(), "10");
+    }
+
+    #[test]
+    fn a_partial_cost_is_an_error_naming_the_missing_rate() {
+        let text = MINIMAL.replacen(
+            "reasoning_effort = \"high\"",
+            "cost = { input = \"1.25\", output = \"10\" }",
+            1,
+        );
+        let error = format!("{:#}", Config::parse(&text).unwrap_err());
+
+        assert!(error.contains("cached"), "names the missing rate: {error}");
+        assert!(error.contains("invalid provider [zai]"), "{error}");
+    }
+
+    #[test]
+    fn a_float_price_is_rejected_as_a_string_field() {
+        // Prices ride as decimal strings; a bare float names its field.
+        let text = MINIMAL.replacen(
+            "reasoning_effort = \"high\"",
+            "cost = { input = 1.25, cached = \"0.125\", output = \"10\" }",
+            1,
+        );
+        let error = format!("{:#}", Config::parse(&text).unwrap_err());
+
+        assert!(
+            error.contains("input") || error.contains("string"),
+            "the error points at the float: {error}"
+        );
+    }
+
+    #[test]
+    fn a_negative_rate_is_an_error() {
+        let text = MINIMAL.replacen(
+            "reasoning_effort = \"high\"",
+            "cost = { input = \"-1.25\", cached = \"0.125\", output = \"10\" }",
+            1,
+        );
+        let error = format!("{:#}", Config::parse(&text).unwrap_err());
+
+        assert!(error.contains("below zero"), "{error}");
+    }
+
+    #[test]
+    fn one_model_priced_two_ways_is_an_error() {
+        let priced = MINIMAL.replacen(
+            "reasoning_effort = \"high\"",
+            "cost = { input = \"1.25\", cached = \"0.125\", output = \"10\" }",
+            1,
+        );
+        // The twin agent reuses the model with different rates.
+        let text = format!(
+            "{priced}\n[[zai.agents]]\nname = \"twin\"\nmodel = \"glm-5.3\"\n\
+             cost = {{ input = \"2\", cached = \"0.2\", output = \"20\" }}\n"
+        );
+        let error = Config::parse(&text).unwrap_err().to_string();
+
+        assert!(error.contains("priced two ways"), "{error}");
+    }
+
+    #[test]
+    fn one_model_priced_identically_twice_is_no_error() {
+        let priced = MINIMAL.replacen(
+            "reasoning_effort = \"high\"",
+            "cost = { input = \"1.25\", cached = \"0.125\", output = \"10\" }",
+            1,
+        );
+        // Two agents, one model, one price: the map holds the shared rate.
+        let text = format!(
+            "{priced}\n[[zai.agents]]\nname = \"twin\"\nmodel = \"glm-5.3\"\n\
+             cost = {{ input = \"1.25\", cached = \"0.125\", output = \"10\" }}\n"
+        );
+        let prices = Config::parse(&text).unwrap().prices();
+
+        assert_eq!(prices.len(), 1, "one model, one price: {prices:?}");
+    }
+
+    #[test]
+    fn agents_without_cost_price_nothing() {
+        // No `cost` anywhere: the map is empty, never a zero-dollar guess.
+        assert!(Config::parse(MINIMAL).unwrap().prices().is_empty());
     }
 
     #[test]

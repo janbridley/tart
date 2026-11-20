@@ -27,6 +27,7 @@ mod turn_picker;
 #[cfg(test)]
 mod testutil;
 
+use std::collections::BTreeMap;
 use std::io::stdout;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -46,7 +47,8 @@ use perf::Perf;
 use recorded::MANUAL_AT;
 use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
-    ReasoningEffort, Session, Transcript, manual_command, prompts, usage::Ledger,
+    ReasoningEffort, Session, Transcript, manual_command, prompts,
+    usage::{Cost, Ledger},
 };
 
 use tmux_override::{override_shift_up, restore_tmux};
@@ -69,18 +71,19 @@ fn main() -> anyhow::Result<()> {
     );
     leave_terminal(&mut terminal)?;
     // Print an exit summary once we've closed the TUI
-    print_exit_summary(&tui.session);
+    print_exit_summary(&tui.session, &tui.config.prices());
     result
 }
 
-/// Print the session's token spend as codex does on close:
-/// `Token usage so far: total=... input=... (+ ... cached) output=... (reasoning ...)`.
+/// Print the session's token spend and its estimated cost if known.
+/// `Token usage so far: total=... input=... (+ ... cached) output=... (reasoning ...)`
+/// `Estimated cost: $X @ model (input $a + cached $b + output $c)`.
 #[allow(
     clippy::print_stdout,
     reason = "the exit line is stdout's one job, after the TUI has closed"
 )]
-fn print_exit_summary(session: &Session) {
-    if let Some(line) = Ledger::exit_summary(&session.stem()) {
+fn print_exit_summary(session: &Session, prices: &BTreeMap<String, Cost>) {
+    if let Some(line) = Ledger::exit_summary(&session.stem(), prices) {
         println!("{line}");
     }
 }
@@ -240,6 +243,9 @@ fn run(
                         pane.note("plan approved · implementing");
                         pane.echo(prompts::PLAN_APPROVAL);
                         transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
+                        // The turn's rounds bill under the session file's stem,
+                        // so the file must exist before the first one lands.
+                        session.record(&transcript)?;
                         pane.start_turn(agent, false, &transcript, &wake);
                     }
                 }
@@ -356,6 +362,12 @@ fn run(
                         let ultrathink = line.contains(ULTRATHINK) || pane.queue_has_ultrathink();
                         pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
+                        // Create (or append) the session file before the turn
+                        // starts: rounds bill under the file's stem, and a
+                        // round completing before the file exists bills
+                        // untagged, leaving the session's first turn out of
+                        // its exit summary.
+                        session.record(&transcript)?;
                         pane.start_turn(agent, ultrathink, &transcript, &wake);
                     }
                 },

@@ -25,6 +25,9 @@ model = "glm-5.3"
 reasoning_effort = "high" # Optional
 # The model's context window, shown in the status line's token gauge.
 context_tokens = 1000000 # Optional
+# Optional: US$ per 1M tokens, for the exit summary's cost estimate.
+# Omit `cost` entirely for agents that are not pay-as-you-go.
+cost = { input = "1.25", cached = "0.125", output = "10.00" }
 
 # Agent 2
 [["z.ai".agents]]

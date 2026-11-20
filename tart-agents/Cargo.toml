@@ -29,6 +29,7 @@ dom_query = "0.24"
 flate2.workspace = true
 libc = "0.2.191"
 tempfile.workspace = true
+fixed = { version = "1.31.0", features = ["serde", "serde-str"] }
 
 [dev-dependencies]
 macro_rules_attribute = "0.2.3"
