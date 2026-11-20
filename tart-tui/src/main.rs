@@ -21,6 +21,7 @@ mod pane;
 mod perf;
 mod recorded;
 mod session_picker;
+mod settings;
 mod tmux_override;
 mod turn_picker;
 
