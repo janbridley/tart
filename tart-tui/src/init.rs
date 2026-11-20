@@ -11,6 +11,7 @@ use tart_agents::{
 use crate::cli;
 use crate::config;
 use crate::pane::Pane;
+use crate::settings;
 
 const REFUSAL: &str = "cd into a project directory, or pass --chat for a session \
                    with no filesystem access";
@@ -120,6 +121,10 @@ pub(crate) struct Tui {
 impl TryFrom<&cli::Cli> for Tui {
     type Error = anyhow::Error;
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "the AGENTS.md notice prints before the TUI opens, where only stderr is visible"
+    )]
     fn try_from(cli: &cli::Cli) -> Result<Self, Self::Error> {
         let kind = Kind::of(cli.chat);
         // The coding grant root, fetched once and screened before anything else
@@ -136,7 +141,7 @@ impl TryFrom<&cli::Cli> for Tui {
         let mut agent = agent_config.into_agent(kind.policy(&cwd, cli.gpu)?);
         agent.set_mode(kind.mode());
         // `--resume` reopens the project's newest session in place of a fresh one
-        let (transcript, session) = if cli.resume {
+        let (mut transcript, session) = if cli.resume {
             let (newest, _opening) = session::list(&SESSIONS_ROOT, &project)
                 .with_context(|| "nothing to resume; run without --resume to start a session")?
                 .remove(0);
@@ -144,6 +149,18 @@ impl TryFrom<&cli::Cli> for Tui {
         } else {
             (kind.transcript()?, Session::start(&SESSIONS_ROOT, &project))
         };
+        // The working directory's AGENTS.md, when this repository is allowed
+        // one, rides ahead of the conversation on every request. It is sent,
+        // never recorded, so resumed sessions pick up the current file.
+        if kind == Kind::Coding
+            && let Some(doc) = settings::Settings::load().agents_md(&cwd)
+        {
+            eprintln!(
+                "tart: loaded AGENTS.md from the working directory ({} bytes)",
+                doc.len()
+            );
+            transcript.set_preamble(Some(&prompts::project_doc(&doc)))?;
+        }
         Ok(Self {
             config,
             agent,

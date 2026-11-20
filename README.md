@@ -61,6 +61,23 @@ and how they should proceed. This message is stripped from context when plan mod
 exited to ensure future messages or compaction do not accidentally misinterpret the
 planning state.
 
+### AGENTS.md
+
+Working directories with an `AGENTS.md` send it to the model as a labeled user message
+ahead of the conversation. Because the file can arrive with an untrusted clone, loading
+is gated on the repository's remote: a repository *without* an `origin` remote loads its
+file unconditionally, while a cloned one only loads it if the remote's owner is listed
+in `~/.config/tart/settings.toml`:
+
+```toml
+["agents.md"]
+owners = ["janbridley"]
+```
+
+The file is read at session start and again on resume, sent with every request, but not
+recorded, so a resumed session always uses the current file. Subagents do not get the
+AGENTS.md text.
+
 ### User Conveniences
 
 Files outside the sandbox can be natively added to the model's context with

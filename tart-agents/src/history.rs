@@ -80,6 +80,10 @@ impl RecordLine {
 pub struct Transcript {
     /// The lines, oldest first, opening with the system prompt.
     lines: Arc<Mutex<Vec<RecordLine>>>,
+    /// The repository's AGENTS.md block, sent ahead of the conversation.
+    ///
+    /// see [`Transcript::set_preamble`]
+    preamble: Option<InputItem>,
     /// A mode reminder appended to the end of the input at request time.
     ///
     /// This is designed to mirror Codex's instruction handling, as we can't
@@ -109,6 +113,7 @@ impl Transcript {
                 item: message(Role::System, system.to_string())?,
                 meta: LineMetadata::default(),
             }])),
+            preamble: None,
             reminder: None,
         })
     }
@@ -118,6 +123,7 @@ impl Transcript {
     pub(crate) fn from_lines(lines: Vec<RecordLine>) -> Self {
         Self {
             lines: Arc::new(Mutex::new(lines)),
+            preamble: None,
             reminder: None,
         }
     }
@@ -209,6 +215,16 @@ impl Transcript {
         }
     }
 
+    /// Send `text` as a user message behind the system prompt on every request or clear
+    #[inline]
+    pub fn set_preamble(&mut self, text: Option<&str>) -> anyhow::Result<()> {
+        self.preamble = match text {
+            Some(text) => Some(message(Role::User, text.to_string())?),
+            None => None,
+        };
+        Ok(())
+    }
+
     /// Append `text` to the end of the input on every subsequent request, or clear with `None`.
     ///
     /// # Errors
@@ -241,16 +257,23 @@ impl Transcript {
         self.lines().get(start..).map_or_else(Vec::new, ToOwned::to_owned)
     }
 
-    /// The input items for the next request: the stored record with the
-    /// reminder, when one is set, appended after it.
+    /// The input items for the next request: the stored record, the AGENTS.md preamble
+    /// spliced in behind the leading system messages, and the reminder, if set.
     #[inline]
     #[must_use]
     pub fn request_items(&self) -> Vec<InputItem> {
-        self.lines()
-            .iter()
-            .map(|line| line.item.clone())
-            .chain(self.reminder.clone())
-            .collect()
+        let mut items: Vec<_> = self.lines().iter().map(|line| line.item.clone()).collect();
+        if let Some(preamble) = &self.preamble {
+            let systems = items
+                .iter()
+                .take_while(
+                    |item| matches!(item, InputItem::EasyMessage(m) if m.role == Role::System),
+                )
+                .count();
+            items.insert(systems, preamble.clone());
+        }
+        items.extend(self.reminder.clone());
+        items
     }
 
     /// The progress stream that renders this record, in live order, for replay.
@@ -368,6 +391,36 @@ mod tests {
             encrypted_content: None,
             status: None,
         }
+    }
+
+    #[test]
+    fn preamble_rides_behind_the_system_prompt_unrecorded() {
+        let mut transcript = Transcript::new_with("system").unwrap();
+        transcript.set_preamble(Some("# AGENTS.md\n\ndoc")).unwrap();
+        transcript.push_user("hello".to_string()).unwrap();
+
+        // Sent on every request, right behind the system prompt.
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"], "# AGENTS.md\n\ndoc");
+        assert_eq!(items[2]["content"], "hello");
+
+        // But never recorded: replay shows only the user's own words.
+        let users: Vec<String> = transcript
+            .replay()
+            .into_iter()
+            .filter_map(|event| match event {
+                Progress::User(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["hello"]);
+
+        // Clearing it stops the send.
+        transcript.set_preamble(None).unwrap();
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items.as_array().unwrap().len(), 2);
     }
 
     #[test]

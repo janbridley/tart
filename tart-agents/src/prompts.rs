@@ -18,6 +18,15 @@ pub const PLAN_APPROVAL: &str = "The plan above is approved: implement it now. E
 /// The system prompt for `--chat` sessions.
 pub const CHAT: &str = include_str!("data/CHAT.md");
 
+/// Label `AGENTS.md`, to be sent as user-side preamble.
+#[inline]
+pub fn project_doc(doc: &str) -> String {
+    format!(
+        "# AGENTS.md\n\nInstructions from the repository's AGENTS.md follow; \
+         the user's direct messages override this guidance.\n\n{doc}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,5 +39,13 @@ mod tests {
             !CHAT.contains("spawn_agent"),
             "the minimal prompt does not advertise withheld tools"
         );
+    }
+
+    /// The project doc block is labeled, and carries the doc verbatim.
+    #[test]
+    fn project_doc_labels_the_doc() {
+        let block = project_doc("the doc");
+        assert!(block.starts_with("# AGENTS.md\n\n"), "{block}");
+        assert!(block.ends_with("the doc"), "{block}");
     }
 }
