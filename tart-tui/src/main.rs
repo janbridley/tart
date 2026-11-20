@@ -75,9 +75,7 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-/// Print the session's token spend and its estimated cost if known.
-/// `Token usage so far: total=... input=... (+ ... cached) output=... (reasoning ...)`
-/// `Estimated cost: $X @ model (input $a + cached $b + output $c)`.
+/// Print the session's spend and estimated cost as codex does on close.
 #[allow(
     clippy::print_stdout,
     reason = "the exit line is stdout's one job, after the TUI has closed"
@@ -88,7 +86,7 @@ fn print_exit_summary(session: &Session, prices: &BTreeMap<String, Cost>) {
     }
 }
 
-/// Refresh the status line's `[ $7.34 ]` block from the ledger.
+/// Refresh the status line's cost block from the ledger.
 fn refresh_cost(pane: &mut Pane, session: &Session, prices: &BTreeMap<String, Cost>) {
     pane.set_session_cost(Ledger::session_cost(&session.stem(), prices));
 }
@@ -155,9 +153,8 @@ fn run(
 ) -> anyhow::Result<()> {
     // The sandbox's grant root, for deciding which mentions need attaching.
     let cwd = std::env::current_dir()?;
-    // A resumed session's cost block shows before its first new round.
     let prices = config.prices();
-    refresh_cost(pane, session, &prices);
+    refresh_cost(pane, session, &prices); // a resumed session's cost, if any
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
     std::thread::spawn({
@@ -251,8 +248,7 @@ fn run(
                         pane.note("plan approved · implementing");
                         pane.echo(prompts::PLAN_APPROVAL);
                         transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
-                        // The turn's rounds bill under the session file's stem,
-                        // so the file must exist before the first one lands.
+                        // Rounds bill under the session's stem: name it first.
                         session.record(&transcript)?;
                         pane.start_turn(agent, false, &transcript, &wake);
                     }
@@ -370,11 +366,6 @@ fn run(
                         let ultrathink = line.contains(ULTRATHINK) || pane.queue_has_ultrathink();
                         pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
-                        // Create (or append) the session file before the turn
-                        // starts: rounds bill under the file's stem, and a
-                        // round completing before the file exists bills
-                        // untagged, leaving the session's first turn out of
-                        // its exit summary.
                         session.record(&transcript)?;
                         pane.start_turn(agent, ultrathink, &transcript, &wake);
                     }
@@ -563,7 +554,7 @@ fn on_main_event(
         }
         session.record(transcript)?;
     } else {
-        // Each billed round refreshes the status line's cost block.
+        // Each billed round refreshes the cost block.
         if matches!(progress, Progress::Usage { .. }) {
             refresh_cost(pane, session, prices);
         }
@@ -600,7 +591,7 @@ fn on_child_event(
         }
         _ if progress.is_terminal() => {
             // Peek, don't claim: the outcome is read for the box, and claiming waits
-            // for delivery, — so a `wait` inside this turn could still take the report
+            // for delivery, so a `wait` inside this turn could still take the report
             // for itself.
             let (report, exit) = agents
                 .with_outcome(id, |outcome| {
@@ -614,8 +605,7 @@ fn on_child_event(
             // Idle: the reports start their turn now.
             // Busy: the running turn's end delivers them.
             if !pane.is_generating() {
-                // The reports' turn must bill under the session: record (and
-                // so name) it before the turn starts.
+                // The reports' turn bills under the session: name it first.
                 session.record(transcript)?;
                 pane.deliver_reports(agents, agent, transcript, wake)?;
             }

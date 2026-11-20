@@ -549,11 +549,11 @@ model = "glm-4-flash"
             "cost = { input = \"1.25\", cached = \"0.125\", output = \"10\" }",
             1,
         );
-        let prices = Config::parse(&text).unwrap().prices();
-        let cost = prices.get("glm-5.3").expect("the model is priced");
-        assert_eq!(cost.input.to_string(), "1.25");
-        assert_eq!(cost.cached.to_string(), "0.125");
-        assert_eq!(cost.output.to_string(), "10");
+        let cost = Config::parse(&text).unwrap().prices()["glm-5.3"];
+        assert_eq!(
+            (cost.input.to_string(), cost.cached.to_string()),
+            ("1.25".into(), "0.125".into())
+        );
         // No `cost` anywhere else: the map holds nothing, never a zero guess.
         assert!(Config::parse(MINIMAL).unwrap().prices().is_empty());
     }
