@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, bail};
 use itertools::Itertools;
 use serde::Deserialize;
 use tart_agents::sandbox::Policy;
@@ -149,35 +149,24 @@ impl Config {
             if let Some(dup) = provider.agents.iter().map(|a| &a.name).duplicates().next() {
                 bail!("provider [{key}] defines two agents named '{dup}'");
             }
-            for agent in &provider.agents {
-                if let Some(cost) = agent.cost {
-                    ensure!(
-                        !cost.input.is_negative()
-                            && !cost.cached.is_negative()
-                            && !cost.output.is_negative(),
-                        "provider [{key}] agent '{}' prices a token rate below zero",
-                        agent.name
-                    );
-                }
-            }
-
             providers.insert(key, provider);
         }
         // One model, one price: the exit summary joins ledger rows to rates by
         // model name, so two agents disagreeing on a model's price is a load
         // error, not an average to guess.
-        let mut priced = BTreeMap::new();
+        let mut priced: BTreeMap<String, (Cost, String)> = BTreeMap::new();
         for (key, provider) in &providers {
             for agent in &provider.agents {
                 let Some(cost) = agent.cost else { continue };
                 match priced.get(&agent.model) {
-                    Some(&prior) if prior != cost => bail!(
-                        "model '{}' is priced two ways (provider [{key}], agent '{}')",
+                    Some(&(prior, ref first)) if prior != cost => bail!(
+                        "model '{}' is priced two ways: {first}, and provider [{key}] agent '{}'",
                         agent.model,
                         agent.name
                     ),
                     _ => {
-                        priced.insert(agent.model.clone(), cost);
+                        let definer = format!("provider [{key}] agent '{}'", agent.name);
+                        priced.insert(agent.model.clone(), (cost, definer));
                     }
                 }
             }
@@ -599,7 +588,7 @@ model = "glm-4-flash"
     }
 
     #[test]
-    fn a_negative_rate_is_an_error() {
+    fn a_negative_rate_is_rejected_by_the_type() {
         let text = MINIMAL.replacen(
             "reasoning_effort = \"high\"",
             "cost = { input = \"-1.25\", cached = \"0.125\", output = \"10\" }",
@@ -607,7 +596,9 @@ model = "glm-4-flash"
         );
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
-        assert!(error.contains("below zero"), "{error}");
+        // The unsigned price type rejects the sign at parse.
+        assert!(error.contains("invalid provider [zai]"), "{error}");
+        assert!(error.contains("agents.cost.input"), "{error}");
     }
 
     #[test]

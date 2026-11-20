@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use fixed::types::I32F32;
+use fixed::types::U32F32;
 
 use crate::locked;
 
@@ -100,8 +100,8 @@ impl std::iter::Sum for TokenUsage {
     }
 }
 
-/// US dollars, held exactly as a config decimal (`"1.25"`).
-pub type Money = I32F32;
+/// US dollars as a fixed-point decimal, parsed from config strings (`"1.25"`).
+pub type Money = U32F32;
 
 /// A model's pay-as-you-go prices: USD per 1M tokens.
 ///
@@ -117,32 +117,24 @@ pub struct Cost {
     pub output: Money,
 }
 
-impl Cost {
-    /// `tokens` at `price` US$/1M, as [`Money`].
-    fn part(tokens: u64, price: Money) -> Option<Money> {
-        // Scale before multiply so that we don't drop any microdollars.
-        let millions = Money::checked_from_num(tokens)? / Money::from_num(1_000_000);
-        millions.checked_mul(price)
-    }
-}
+/// [`Money`] printed in whole cents, rounded up; millidollar precision internally.
+pub struct Dollars(pub Money);
 
-/// [`Money`] printed as a dollar figure: four decimals, respecting sigfigs.
-struct Dollars(Money);
+/// One tenth of a cent.
+const DECICENT: Money = Money::const_from_fixed(Money::strict_from_str("0.001"));
 
 impl std::fmt::Display for Dollars {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // $0.0001 ticks, saturating so an out-of-range figure still prints.
-        let ticks = self
-            .0
-            .saturating_mul(Money::from_num(10_000))
-            .round()
-            .to_num::<i64>();
-        let (frac, decimals) = match ticks % 10_000 {
-            frac if frac % 100 == 0 => (frac / 100, 2),
-            frac if frac % 10 == 0 => (frac / 10, 3),
-            frac => (frac, 4),
-        };
-        write!(f, "${}.{:0decimals$}", ticks / 10_000, frac)
+        // Whole dollars plus cents rounded up.
+        let dollars: i64 = self.0.int().to_num();
+        let cents = self.0.frac().saturating_mul(Money::from_num(100));
+        let floor: i64 = cents.int().to_num();
+        // Round exactly
+        let cents = dollars.saturating_mul(100)
+            + floor
+            + i64::from(cents - Money::from_num(floor) > DECICENT);
+        write!(f, "${}.{:02}", cents / 100, cents % 100)
     }
 }
 
@@ -222,6 +214,23 @@ impl Ledger {
         Some(line)
     }
 
+    /// The session's estimated cost so far, children included; `None` while cost==0
+    #[must_use]
+    #[inline]
+    pub fn session_cost(stem: &str, prices: &BTreeMap<String, Cost>) -> Option<Money> {
+        let total =
+            Self::session_by_model(stem)
+                .iter()
+                .try_fold(Money::ZERO, |sum, (model, usage)| {
+                    // Unpriced and out-of-range models are skipped, not zero-cost.
+                    match prices.get(model).and_then(|price| price.group(usage)) {
+                        Some((cost, _)) => sum.checked_add(cost),
+                        None => Some(sum),
+                    }
+                });
+        total.filter(|&cost| cost > Money::ZERO)
+    }
+
     /// The session's rows summed per model, model names alphabetical.
     fn session_by_model(stem: &str) -> BTreeMap<String, TokenUsage> {
         Self::entries()
@@ -289,24 +298,26 @@ fn project() -> String {
     std::env::current_dir().map_or_else(|_| String::new(), |dir| slug(&dir))
 }
 
-/// The exit summary's estimated-cost line: one group per priced model, the
-/// session's total in front, unpriced models named if present.
-fn cost_line(
-    by_model: &BTreeMap<String, TokenUsage>,
-    prices: &BTreeMap<String, Cost>,
-) -> Option<String> {
-    /// One model's priced group: `(its summed cost, its part breakdown)`.
-    fn group(usage: &TokenUsage, price: &Cost) -> Option<(Money, String)> {
+impl Cost {
+    /// `tokens` at `price` US$/1M, as [`Money`].
+    fn part(tokens: u64, price: Money) -> Option<Money> {
+        // Scale to prevent underflow when performing the multiplication.
+        let millions = Money::checked_from_num(tokens)? / Money::from_num(1_000_000);
+        millions.checked_mul(price)
+    }
+
+    /// One billed usage's group: `(its cost, its part breakdown)`.
+    fn group(self, usage: &TokenUsage) -> Option<(Money, String)> {
         const NAMES: [&str; 3] = ["input", "cached", "output"];
         let fresh = usage.input.saturating_sub(usage.cached);
         let parts = [
-            (fresh, price.input),
-            (usage.cached, price.cached),
-            (usage.output, price.output),
+            (fresh, self.input),
+            (usage.cached, self.cached),
+            (usage.output, self.output),
         ];
         let priced: Vec<Money> = parts
             .iter()
-            .map(|&(tokens, rate)| Cost::part(tokens, rate))
+            .map(|&(tokens, rate)| Self::part(tokens, rate))
             .collect::<Option<_>>()?;
         let cost = priced.iter().copied().try_fold(Money::ZERO, Money::checked_add)?;
         let breakdown = NAMES
@@ -317,16 +328,22 @@ fn cost_line(
             .join(" + ");
         Some((cost, breakdown))
     }
+}
 
-    // Unpriced models are named with zero dollar cost, as are zero-dolalr sessions..
+/// The exit summary's estimated-cost line.
+fn cost_line(
+    by_model: &BTreeMap<String, TokenUsage>,
+    prices: &BTreeMap<String, Cost>,
+) -> Option<String> {
+    // Unpriced and out-of-range models are named, never priced at zero.
     let (groups, unpriced) = by_model.iter().try_fold(
         (Vec::new(), Vec::new()),
         |(mut groups, mut unpriced), (model, usage)| {
             match prices.get(model) {
-                Some(price) => {
-                    let (cost, parts) = group(usage, price)?;
-                    groups.push((model.clone(), cost, parts));
-                }
+                Some(price) => match price.group(usage) {
+                    Some((cost, parts)) => groups.push((model.clone(), cost, parts)),
+                    None => unpriced.push(format!("{model} (out of range)")),
+                },
                 None => unpriced.push(format!("{model} (no price set)")),
             }
             Some((groups, unpriced))
@@ -730,7 +747,7 @@ pub(crate) mod tests {
                 .lines()
                 .nth(1)
                 .expect("the cost line follows the token line"),
-            "Estimated cost: $0.0026 @ glm-5.3 (input $0.0008 + cached $0.0008 + output $0.001); \
+            "Estimated cost: $0.01 @ glm-5.3 (input $0.01 + cached $0.01 + output $0.01); \
              glm-4.7 (no price set)"
         );
     }
@@ -763,18 +780,90 @@ pub(crate) mod tests {
                 .lines()
                 .nth(1)
                 .expect("the cost line follows the token line"),
-            "Estimated cost: $1.5026 @ glm-5.3 $0.0026 (input $0.0008 + cached $0.0008 + output $0.001); \
+            "Estimated cost: $1.51 @ glm-5.3 $0.01 (input $0.01 + cached $0.01 + output $0.01); \
              glm-5.3-flash $1.50 (input $0.50 + cached $0.00 + output $1.00)"
         );
+    }
+
+    #[test]
+    fn session_cost_tracks_priced_rows_children_included() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+        let prices = BTreeMap::from([("glm-5.3".to_string(), priced("1", "0.1", "2"))]);
+
+        set_session("cost".to_string());
+        TokenUsage {
+            input: 2_000_000,
+            cached: 1_000_000,
+            output: 500_000,
+            reasoning: 0,
+            total: 2_500_000,
+        }
+        .bill(MAIN_AGENT, "glm-5.3");
+        let spent = Ledger::session_cost("cost", &prices).map(|money| Dollars(money).to_string());
+        assert_eq!(spent.as_deref(), Some("$2.10"));
+
+        // Nothing priced, nothing to show — not a zero-dollar block.
+        set_session("bare".to_string());
+        sample_usage().bill(MAIN_AGENT, "glm-4.7");
+        assert_eq!(Ledger::session_cost("bare", &prices), None);
+        // A $0-priced model tracks nothing either.
+        set_session("free".to_string());
+        sample_usage().bill(MAIN_AGENT, "glm-5.3");
+        let free = BTreeMap::from([("glm-5.3".to_string(), priced("0", "0", "0"))]);
+        assert_eq!(Ledger::session_cost("free", &free), None);
+    }
+
+    #[test]
+    fn dollars_print_any_figure_without_wrapping() {
+        // The type's own maximum once overflowed the ticks multiply.
+        assert_eq!(Dollars(Money::MAX).to_string(), "$4294967296.00");
+        // A negative rate cannot even parse into the unsigned type.
+        assert!("-1.25".parse::<Money>().is_err());
+        // Sub-cent figures round up, never reading low.
+        assert_eq!(Dollars("0.0007".parse().expect("price")).to_string(), "$0.01");
+    }
+
+    #[test]
+    fn an_out_of_range_model_is_named_not_free() {
+        let _held = held_for_test();
+        let _ledger = ledger_root();
+        let prices = BTreeMap::from([
+            ("glm-5.3".to_string(), priced("1", "0.1", "2")),
+            ("glm-4.7".to_string(), priced("1", "0.1", "2")),
+        ]);
+
+        // 5e9 input tokens cannot price in-range; the sane model still does.
+        set_session("range".to_string());
+        TokenUsage {
+            input: 5_000_000_000,
+            cached: 0,
+            output: 0,
+            reasoning: 0,
+            total: 5_000_000_000,
+        }
+        .bill(MAIN_AGENT, "glm-4.7");
+        sample_usage().bill(MAIN_AGENT, "glm-5.3");
+        let summary = Ledger::exit_summary("range", &prices).expect("the summary formats");
+        let line = summary
+            .lines()
+            .nth(1)
+            .expect("the cost line follows the token line");
+        assert!(line.contains("glm-4.7 (out of range)"), "{line}");
+        assert!(line.contains("@ glm-5.3 (input $0.01"), "{line}");
+
+        // And the status block keeps the priced model's spend.
+        let spent = Ledger::session_cost("range", &prices).map(|money| Dollars(money).to_string());
+        assert_eq!(spent.as_deref(), Some("$0.01"));
     }
 
     #[test]
     fn a_part_outside_the_envelope_is_declined() {
         // A token count beyond the type's range cannot be priced at all.
         assert_eq!(Cost::part(u64::MAX, priced("1", "0.1", "2").input), None);
-        // Nor can a count × price whose product leaves the range: 2e9 tokens
+        // Nor can a count × price whose product leaves the range: 3e9 tokens
         // fit, $2M/1M times their millions does not.
-        assert_eq!(Cost::part(2_000_000_000, priced("2000000", "1", "1").input), None);
+        assert_eq!(Cost::part(3_000_000_000, priced("2000000", "1", "1").input), None);
         // The same count in-envelope prices: 2e9 tokens at $1/1M is $2,000.
         assert_eq!(
             Cost::part(2_000_000_000, priced("1", "0.1", "2").input),

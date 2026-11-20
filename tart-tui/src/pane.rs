@@ -22,6 +22,7 @@ use std::time::Instant;
 use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, ChatMode, MAIN, Progress, ReasoningEffort,
     Transcript as Conversation, TurnHandle, prompts,
+    usage::{Dollars, Money},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -255,6 +256,8 @@ pub struct Pane {
     /// Output tokens the subagents have spent, metered apart from the main
     /// turn's own usage.
     child_tokens: u64,
+    /// The session's tracked cost, when a priced model has a specific amount.
+    session_cost: Option<Money>,
     /// The agent's turn lever: queueing a message cancels the running turn.
     control: TurnHandle,
 }
@@ -704,6 +707,11 @@ impl Pane {
         self.context_tokens = tokens;
     }
 
+    /// Record the session's tracked cost, from the ledger; `None` drops the price block
+    pub fn set_session_cost(&mut self, cost: Option<Money>) {
+        self.session_cost = cost;
+    }
+
     /// Name the agents `/model` picks from, from the agents file.
     pub fn set_models(&mut self, models: Vec<AgentChoice>) {
         self.models = models;
@@ -734,10 +742,15 @@ impl Pane {
             None => token_count(context),
         }];
         if usage.cached > 0 && usage.input > 0 {
-            parts.push(format!("{}% cached", usage.cached * 100 / usage.input));
+            // draughts king character for the cache: white below 95%, black below.
+            let share = usage.cached * 100 / usage.input;
+            parts.push(format!("{share}% {}", if share < 95 { "⛁" } else { "⛃" }));
         }
         if self.child_tokens > 0 {
             parts.push(format!("{} in agents", token_count(self.child_tokens)));
+        }
+        if let Some(cost) = self.session_cost {
+            parts.push(Dollars(cost).to_string());
         }
         Some(parts.join(" · "))
     }
@@ -1814,7 +1827,7 @@ mod tests {
         pane.set_context_tokens(Some(200_000));
         pane.set_usage(45_000, 40_000, 3_000);
         let gauge = render(&mut pane, (60, 8));
-        assert!(gauge.contains("───[ 48k / 200k · 88% cached ]"), "{gauge}");
+        assert!(gauge.contains("───[ 48k / 200k · 88% ⛁ ]"), "{gauge}");
 
         // The perf line replaces the badge when both are set.
         pane.set_perf(Some(" fps 60 ".into()));
@@ -1823,7 +1836,15 @@ mod tests {
         assert!(!perf.contains("48k"), "{perf}");
         pane.set_perf(None);
 
-        // No cache reported drops the suffix.
+        // A hot cache takes the black king, and tracked cost its own block.
+        pane.set_usage(100_000, 99_000, 3_000);
+        pane.set_session_cost(Some("7.34".parse().expect("a valid price")));
+        let gauge = render(&mut pane, (60, 8));
+        assert!(gauge.contains("99% ⛃"), "{gauge}");
+        assert!(gauge.contains("$7.34"), "{gauge}");
+
+        // No cache reported drops the suffix, and no tracked cost the block.
+        pane.set_session_cost(None);
         pane.set_usage(1_000, 0, 0);
         assert!(render(&mut pane, (60, 8)).contains("[ 1k / 200k ]"));
 
