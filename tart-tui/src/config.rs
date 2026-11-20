@@ -187,13 +187,11 @@ impl Config {
 
     /// Every priced model's rates, for the exit summary's cost estimate.
     pub(crate) fn prices(&self) -> BTreeMap<String, Cost> {
-        let mut prices = BTreeMap::new();
-        for agent in self.providers.values().flat_map(|provider| &provider.agents) {
-            if let Some(cost) = agent.cost {
-                prices.insert(agent.model.clone(), cost);
-            }
-        }
-        prices
+        self.providers
+            .values()
+            .flat_map(|provider| &provider.agents)
+            .filter_map(|agent| agent.cost.map(|cost| (agent.model.clone(), cost)))
+            .collect()
     }
 
     /// Resolve the default agent: look it up, obtain its API key.
