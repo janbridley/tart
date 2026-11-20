@@ -152,25 +152,25 @@ impl Config {
             providers.insert(key, provider);
         }
         // One model, one price: the exit summary joins ledger rows to rates by
-        // model name, so two agents disagreeing on a model's price is a load
-        // error, not an average to guess.
-        let mut priced: BTreeMap<String, (Cost, String)> = BTreeMap::new();
-        for (key, provider) in &providers {
-            for agent in &provider.agents {
-                let Some(cost) = agent.cost else { continue };
-                match priced.get(&agent.model) {
-                    Some(&(prior, ref first)) if prior != cost => bail!(
-                        "model '{}' is priced two ways: {first}, and provider [{key}] agent '{}'",
-                        agent.model,
-                        agent.name
+        // model name, so two agents disagreeing on a model's price is a load error.
+        providers
+            .iter()
+            .flat_map(|(key, provider)| {
+                provider.agents.iter().map(move |agent| (key.as_str(), agent))
+            })
+            .try_fold(BTreeMap::new(), |mut priced, (key, agent)| {
+                let Some(cost) = agent.cost else {
+                    return Ok(priced);
+                };
+                let definer = format!("provider [{key}] agent '{}'", agent.name);
+                match priced.insert(agent.model.clone(), (cost, definer.clone())) {
+                    Some((prior, first)) if prior != cost => bail!(
+                        "model '{}' is priced two ways: {first}, and {definer}",
+                        agent.model
                     ),
-                    _ => {
-                        let definer = format!("provider [{key}] agent '{}'", agent.name);
-                        priced.insert(agent.model.clone(), (cost, definer));
-                    }
+                    _ => Ok(priced),
                 }
-            }
-        }
+            })?;
         Ok(Self { default_agent, chat_agent, providers })
     }
 
