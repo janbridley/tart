@@ -27,6 +27,7 @@ mod turn_picker;
 #[cfg(test)]
 mod testutil;
 
+use std::collections::BTreeMap;
 use std::io::stdout;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -46,7 +47,8 @@ use perf::Perf;
 use recorded::MANUAL_AT;
 use tart_agents::{
     AGENT_TOOL, Agent, AgentId, Agents, CancelToken, ChatMode, MAIN, Outcome, Progress,
-    ReasoningEffort, Session, Transcript, manual_command, prompts, usage::Ledger,
+    ReasoningEffort, Session, Transcript, manual_command, prompts,
+    usage::{Cost, Ledger},
 };
 
 use tmux_override::{override_shift_up, restore_tmux};
@@ -69,20 +71,24 @@ fn main() -> anyhow::Result<()> {
     );
     leave_terminal(&mut terminal)?;
     // Print an exit summary once we've closed the TUI
-    print_exit_summary(&tui.session);
+    print_exit_summary(&tui.session, &tui.config.prices());
     result
 }
 
-/// Print the session's token spend as codex does on close:
-/// `Token usage so far: total=... input=... (+ ... cached) output=... (reasoning ...)`.
+/// Print the session's spend and estimated cost as codex does on close.
 #[allow(
     clippy::print_stdout,
     reason = "the exit line is stdout's one job, after the TUI has closed"
 )]
-fn print_exit_summary(session: &Session) {
-    if let Some(line) = Ledger::exit_summary(&session.stem()) {
+fn print_exit_summary(session: &Session, prices: &BTreeMap<String, Cost>) {
+    if let Some(line) = Ledger::exit_summary(&session.stem(), prices) {
         println!("{line}");
     }
+}
+
+/// Refresh the status line's cost block from the ledger.
+fn refresh_cost(pane: &mut Pane, session: &Session, prices: &BTreeMap<String, Cost>) {
+    pane.set_session_cost(Ledger::session_cost(&session.stem(), prices));
 }
 
 /// Enter the alternate screen with bracketed paste and disambiguated escape codes on.
@@ -147,6 +153,8 @@ fn run(
 ) -> anyhow::Result<()> {
     // The sandbox's grant root, for deciding which mentions need attaching.
     let cwd = std::env::current_dir()?;
+    let prices = config.prices();
+    refresh_cost(pane, session, &prices); // a resumed session's cost, if any
     // Forward terminal input onto the wake channel so the event loop has a single wait point.
     let (wake, wake_receiver) = mpsc::channel();
     std::thread::spawn({
@@ -240,6 +248,8 @@ fn run(
                         pane.note("plan approved · implementing");
                         pane.echo(prompts::PLAN_APPROVAL);
                         transcript.push_user(prompts::PLAN_APPROVAL.to_string())?;
+                        // Rounds bill under the session's stem: name it first.
+                        session.record(&transcript)?;
                         pane.start_turn(agent, false, &transcript, &wake);
                     }
                 }
@@ -356,6 +366,7 @@ fn run(
                         let ultrathink = line.contains(ULTRATHINK) || pane.queue_has_ultrathink();
                         pane.drain_queued(&transcript, &cwd)?;
                         pane.submit_text(&transcript, &line, &cwd)?;
+                        session.record(&transcript)?;
                         pane.start_turn(agent, ultrathink, &transcript, &wake);
                     }
                 },
@@ -387,6 +398,7 @@ fn run(
                         if let Some((input, cached, output)) = Ledger::gauge_for(&name) {
                             pane.extend([Progress::Usage { input, cached, output }]);
                         }
+                        refresh_cost(pane, session, &prices);
                     }
                     // A file too damaged to open just puts the error into our pane.
                     Err(error) => pane.note(error.to_string()),
@@ -457,10 +469,21 @@ fn run(
                         &cwd,
                         &wake,
                         &mut pending_plan,
+                        &prices,
                         &progress,
                     )?;
                 } else {
-                    on_child_event(pane, agent, &agents, &transcript, &wake, id, &progress)?;
+                    on_child_event(
+                        pane,
+                        agent,
+                        &agents,
+                        session,
+                        &transcript,
+                        &wake,
+                        &prices,
+                        id,
+                        &progress,
+                    )?;
                 }
                 work += ping.elapsed();
             }
@@ -494,6 +517,7 @@ fn on_main_event(
     cwd: &Path,
     wake: &Sender<Wake>,
     pending_plan: &mut Option<bool>,
+    prices: &BTreeMap<String, Cost>,
     progress: &Progress,
 ) -> anyhow::Result<()> {
     // When the turn ends the worker has already recorded the entire turn
@@ -530,18 +554,29 @@ fn on_main_event(
         }
         session.record(transcript)?;
     } else {
+        // Each billed round refreshes the cost block.
+        if matches!(progress, Progress::Usage { .. }) {
+            refresh_cost(pane, session, prices);
+        }
         pane.apply(progress);
     }
     Ok(())
 }
 
 /// Apply one child event: its box, its spend, and, once it has ended, its report.
+/// Apply one child event: its box, its spend, and, once it has ended, its report.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the event touches every arm of the loop's state"
+)]
 fn on_child_event(
     pane: &mut Pane,
     agent: &Agent,
     agents: &Agents,
+    session: &mut Session,
     transcript: &Transcript,
     wake: &Sender<Wake>,
+    prices: &BTreeMap<String, Cost>,
     id: AgentId,
     progress: &Progress,
 ) -> anyhow::Result<()> {
@@ -556,7 +591,7 @@ fn on_child_event(
         }
         _ if progress.is_terminal() => {
             // Peek, don't claim: the outcome is read for the box, and claiming waits
-            // for delivery, — so a `wait` inside this turn could still take the report
+            // for delivery, so a `wait` inside this turn could still take the report
             // for itself.
             let (report, exit) = agents
                 .with_outcome(id, |outcome| {
@@ -570,11 +605,16 @@ fn on_child_event(
             // Idle: the reports start their turn now.
             // Busy: the running turn's end delivers them.
             if !pane.is_generating() {
+                // The reports' turn bills under the session: name it first.
+                session.record(transcript)?;
                 pane.deliver_reports(agents, agent, transcript, wake)?;
             }
         }
-        // A child's spend meters into the status line's agent total.
-        Progress::Usage { output, .. } => pane.add_child_output(*output),
+        // A child's spend meters into the status line's agent total and cost.
+        Progress::Usage { output, .. } => {
+            pane.add_child_output(*output);
+            refresh_cost(pane, session, prices);
+        }
         _ => {}
     }
     Ok(())
