@@ -549,56 +549,39 @@ model = "glm-4-flash"
             "cost = { input = \"1.25\", cached = \"0.125\", output = \"10\" }",
             1,
         );
-
         let prices = Config::parse(&text).unwrap().prices();
         let cost = prices.get("glm-5.3").expect("the model is priced");
-        // The rates parse exactly as written, cached input discounted.
         assert_eq!(cost.input.to_string(), "1.25");
         assert_eq!(cost.cached.to_string(), "0.125");
         assert_eq!(cost.output.to_string(), "10");
+        // No `cost` anywhere else: the map holds nothing, never a zero guess.
+        assert!(Config::parse(MINIMAL).unwrap().prices().is_empty());
     }
 
     #[test]
-    fn a_partial_cost_is_an_error_naming_the_missing_rate() {
-        let text = MINIMAL.replacen(
-            "reasoning_effort = \"high\"",
-            "cost = { input = \"1.25\", output = \"10\" }",
-            1,
-        );
-        let error = format!("{:#}", Config::parse(&text).unwrap_err());
-
-        assert!(error.contains("cached"), "names the missing rate: {error}");
-        assert!(error.contains("invalid provider [zai]"), "{error}");
-    }
-
-    #[test]
-    fn a_float_price_is_rejected_as_a_string_field() {
-        // Prices ride as decimal strings; a bare float names its field.
-        let text = MINIMAL.replacen(
-            "reasoning_effort = \"high\"",
-            "cost = { input = 1.25, cached = \"0.125\", output = \"10\" }",
-            1,
-        );
-        let error = format!("{:#}", Config::parse(&text).unwrap_err());
-
-        assert!(
-            error.contains("input") || error.contains("string"),
-            "the error points at the float: {error}"
-        );
-    }
-
-    #[test]
-    fn a_negative_rate_is_rejected_by_the_type() {
-        let text = MINIMAL.replacen(
-            "reasoning_effort = \"high\"",
-            "cost = { input = \"-1.25\", cached = \"0.125\", output = \"10\" }",
-            1,
-        );
-        let error = format!("{:#}", Config::parse(&text).unwrap_err());
-
-        // The unsigned price type rejects the sign at parse.
-        assert!(error.contains("invalid provider [zai]"), "{error}");
-        assert!(error.contains("agents.cost.input"), "{error}");
+    fn bad_cost_configs_are_load_errors() {
+        let with = |line: &str| MINIMAL.replacen("reasoning_effort = \"high\"", line, 1);
+        for (line, names) in [
+            (
+                "cost = { input = \"1.25\", output = \"10\" }",
+                "missing field `cached`",
+            ),
+            (
+                "cost = { input = 1.25, cached = \"0.1\", output = \"10\" }",
+                "floating point",
+            ),
+            (
+                "cost = { input = \"-1.25\", cached = \"0.1\", output = \"10\" }",
+                "agents.cost.input",
+            ),
+            (
+                "cost = { input = \"1\", cached = \"1\", output = \"1\", batch = \"1\" }",
+                "batch",
+            ),
+        ] {
+            let error = format!("{:#}", Config::parse(&with(line)).unwrap_err());
+            assert!(error.contains(names), "{line}: {error}");
+        }
     }
 
     #[test]
@@ -608,37 +591,17 @@ model = "glm-4-flash"
             "cost = { input = \"1.25\", cached = \"0.125\", output = \"10\" }",
             1,
         );
-        // The twin agent reuses the model with different rates.
-        let text = format!(
-            "{priced}\n[[zai.agents]]\nname = \"twin\"\nmodel = \"glm-5.3\"\n\
-             cost = {{ input = \"2\", cached = \"0.2\", output = \"20\" }}\n"
-        );
-        let error = Config::parse(&text).unwrap_err().to_string();
-
+        let twin = |rates: &str| {
+            format!(
+                "{priced}\n[[zai.agents]]\nname = \"twin\"\nmodel = \"glm-5.3\"\ncost = {rates}\n"
+            )
+        };
+        let differs = twin("{ input = \"2\", cached = \"0.2\", output = \"20\" }");
+        let error = Config::parse(&differs).unwrap_err().to_string();
         assert!(error.contains("priced two ways"), "{error}");
-    }
-
-    #[test]
-    fn one_model_priced_identically_twice_is_no_error() {
-        let priced = MINIMAL.replacen(
-            "reasoning_effort = \"high\"",
-            "cost = { input = \"1.25\", cached = \"0.125\", output = \"10\" }",
-            1,
-        );
-        // Two agents, one model, one price: the map holds the shared rate.
-        let text = format!(
-            "{priced}\n[[zai.agents]]\nname = \"twin\"\nmodel = \"glm-5.3\"\n\
-             cost = {{ input = \"1.25\", cached = \"0.125\", output = \"10\" }}\n"
-        );
-        let prices = Config::parse(&text).unwrap().prices();
-
-        assert_eq!(prices.len(), 1, "one model, one price: {prices:?}");
-    }
-
-    #[test]
-    fn agents_without_cost_price_nothing() {
-        // No `cost` anywhere: the map is empty, never a zero-dollar guess.
-        assert!(Config::parse(MINIMAL).unwrap().prices().is_empty());
+        // The same price twice is no error: one model, one entry.
+        let same = twin("{ input = \"1.25\", cached = \"0.125\", output = \"10\" }");
+        assert_eq!(Config::parse(&same).unwrap().prices().len(), 1);
     }
 
     #[test]
