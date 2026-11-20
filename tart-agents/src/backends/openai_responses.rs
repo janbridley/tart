@@ -84,34 +84,30 @@ fn request_of(
             context: None,
             mode: None,
         })
-        .input(InputParam::Items(plain_items(items)));
+        .input(InputParam::Items(
+            items.into_iter().map(strip_server_side_state).collect(),
+        ));
     if !tools.is_empty() {
         args.tools(tools);
     }
     Ok(args.build()?)
 }
 
-/// The record as plain, self-contained items.
+/// One record item as a plain, self-contained item.
 ///
 /// We must drop server-side data (`id`s for stored items, as well as their
 /// `encrypted_content`), or proxies like `Azure OpenAI` kill the stream when the
 /// backing resource changes. We keep track of dropped data on our end for posterity.
-fn plain_items(items: Vec<InputItem>) -> Vec<InputItem> {
-    items
-        .into_iter()
-        .map(|item| match item {
-            InputItem::Item(Item::Reasoning(mut reasoning)) => {
-                reasoning.id = None;
-                reasoning.encrypted_content = None;
-                InputItem::Item(Item::Reasoning(reasoning))
-            }
-            InputItem::Item(Item::FunctionCall(mut call)) => {
-                call.id = None;
-                InputItem::Item(Item::FunctionCall(call))
-            }
-            plain => plain,
-        })
-        .collect()
+fn strip_server_side_state(mut item: InputItem) -> InputItem {
+    match &mut item {
+        InputItem::Item(Item::Reasoning(reasoning)) => {
+            reasoning.id = None;
+            reasoning.encrypted_content = None;
+        }
+        InputItem::Item(Item::FunctionCall(call)) => call.id = None,
+        _ => {} // Nothing else the record holds names stored state.
+    }
+    item
 }
 
 /// Translate one provider event; `None` when tart has no use for it.
