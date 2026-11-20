@@ -379,6 +379,16 @@ fn run(
                         let history = restored.replay();
                         *session = resumed;
                         transcript = restored;
+                        // The restored record carries no preamble: a coding convo
+                        // sends the current AGENTS.md again, as does `--resume`
+                        let agents_md = if agent.mode() == ChatMode::Chat {
+                            None
+                        } else {
+                            settings::Settings::load().agents_md(&cwd)
+                        };
+                        if let Some(doc) = &agents_md {
+                            transcript.set_preamble(Some(&prompts::project_doc(doc)))?;
+                        }
                         // The pane's rewind chooser follows the new record.
                         pane.set_conversation(&transcript);
                         // The restored record carries no reminder; plan mode
@@ -394,6 +404,12 @@ fn run(
                             |stem| stem.to_string_lossy().into_owned(),
                         );
                         pane.note(format!("resumed {name}"));
+                        if let Some(doc) = &agents_md {
+                            pane.note(format!(
+                                "loaded AGENTS.md from the working directory ({} bytes)",
+                                doc.len()
+                            ));
+                        }
                         pane.extend(history);
                         // Usage gauge restores with the conversation.
                         if let Some((input, cached, output)) = Ledger::gauge_for(&name) {
