@@ -15,8 +15,8 @@ usage and estimated cost per model, grouped by provider.
 `⛁` is the share of input tokens served from the prompt cache. Models without a `cost`
 in `providers.toml` show their token counts. Counts below 100,000 are shown in full.
 
-The pie icon opens a menu with spend for the current UTC day, week, and month. Weeks
-start on Sunday. The `Updated` time uses the local time zone.
+The pie icon opens a menu with spend for the current day, week, and month in the Mac's
+time zone. Weeks start on Sunday. The `Updated` time uses the same time zone.
 
 ```text
 ($3.37 today · $8.36 this week · $21.00 this month) · Updated 13:45
@@ -40,8 +40,7 @@ $HOME/.local/bin/tartusage # Open the menu-bar app
 ## Resource use
 
 The background reader decodes complete lines with Foundation's `JSONDecoder` and keeps
-totals per UTC day and model. Each refresh resumes at the last complete line, so partial
-writes can finish before they count. The scan restarts if the file is replaced or
-shortened, or if the last 64 bytes already read have changed. On a synthetic 200,000-row
-(40 MB) ledger, a release build took about 1 second for the first refresh and 3 ms with
-no new rows. The app refreshes once per minute.
+totals per local day and model. Each refresh resumes at the last complete line, so
+partial writes can finish before they add to the count. The scan restarts if the file is
+replaced or shortened, if the last 64 bytes already read have changed, or if the Mac's
+time zone changes. The app refreshes once per minute.

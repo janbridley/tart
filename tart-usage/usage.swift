@@ -40,25 +40,34 @@ private struct LedgerRow: Decodable {
   }
 }
 
-private typealias DailyUsage = [String: [String: Tokens]]
+private typealias DailyUsage = [Date?: [String: Tokens]]
 
 actor Ledger {
   private let url: URL
   private var identity: (dev_t, ino_t) = (0, 0)
   private var offset: off_t = 0
   private var anchor = Data()
+  private var calendar = Calendar(identifier: .gregorian)
   private var days: DailyUsage = [:]
 
   init(url: URL) {
     self.url = url
+    calendar.timeZone = .current
+    calendar.firstWeekday = 1  // Sunday
   }
 
   func refresh(providers: URL) -> UsageReport {
-    readAppendedRows()
-    return makeReport(days, models: models(in: providers), now: .now)
+    readAppendedRows(in: .current)
+    return makeReport(days, models: models(in: providers), now: .now, calendar: calendar)
   }
 
-  private func readAppendedRows() {
+  private func readAppendedRows(in timeZone: TimeZone) {
+    if calendar.timeZone != timeZone {
+      // Rebucket earlier rows when the Mac moves to another time zone.
+      reset()
+      calendar.timeZone = timeZone
+    }
+
     guard let file = fopen(url.path, "r") else {
       if errno == ENOENT { reset() }
       return
@@ -76,7 +85,9 @@ actor Ledger {
     guard offset < info.st_size, fseeko(file, offset, SEEK_SET) == 0 else { return }
 
     let decoder = JSONDecoder()
-    let datePrefix = #/[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])/#
+    let stamp = Date.ISO8601FormatStyle(timeZone: .gmt)
+      .year().month().day().time(includingFractionalSeconds: false)
+      .dateSeparator(.dash).dateTimeSeparator(.space).timeSeparator(.colon)
     var line: UnsafeMutablePointer<CChar>?
     var capacity = 0
     defer { free(line) }
@@ -86,8 +97,10 @@ actor Ledger {
       let length = getline(&line, &capacity, file)
       guard let line, length > 0, line[length - 1] == 0x0A else { break }
       if let row = try? decoder.decode(LedgerRow.self, from: Data(bytes: line, count: length)) {
-        // Missing or malformed dates still contribute to the all-time total.
-        let day = row.stamp.prefixMatch(of: datePrefix).map { String($0.output) } ?? ""
+        // Invalid stamps still contribute to the all-time model totals.
+        let day = (try? stamp.parse(row.stamp)).flatMap {
+          stamp.format($0) == row.stamp ? calendar.startOfDay(for: $0) : nil
+        }
         days[day, default: [:]][row.model, default: Tokens()].add(row.tokens)
       }
       offset += off_t(length)
@@ -171,16 +184,14 @@ private func compact(_ count: Decimal) -> String {
   return count.description
 }
 
-private func makeReport(_ days: DailyUsage, models: [String: Model], now: Date) -> UsageReport {
+private func makeReport(
+  _ days: DailyUsage, models: [String: Model], now: Date, calendar: Calendar
+) -> UsageReport {
   guard !days.isEmpty else { return UsageReport(detail: "No usage yet", groups: []) }
 
-  var calendar = Calendar(identifier: .gregorian)
-  calendar.timeZone = .gmt
-  calendar.firstWeekday = 1
-  let date = Date.ISO8601FormatStyle().year().month().day().dateSeparator(.dash)
-  let today = date.format(now)
-  let week = date.format(calendar.dateInterval(of: .weekOfYear, for: now)?.start ?? now)
-  let month = date.format(calendar.dateInterval(of: .month, for: now)?.start ?? now)
+  let today = calendar.startOfDay(for: now)
+  let week = calendar.dateInterval(of: .weekOfYear, for: now)?.start ?? today
+  let month = calendar.dateInterval(of: .month, for: now)?.start ?? today
   let earliest = min(week, month)
 
   var byModel: [String: Tokens] = [:]
@@ -190,7 +201,9 @@ private func makeReport(_ days: DailyUsage, models: [String: Model], now: Date) 
   for (day, bucket) in days {
     for (model, tokens) in bucket {
       byModel[model, default: Tokens()].add(tokens)
-      guard day >= earliest, day <= today, let rates = models[model]?.rates else { continue }
+      guard let day, day >= earliest, day <= today, let rates = models[model]?.rates else {
+        continue
+      }
       let cost = tokens.cost(at: rates)
       if day == today { dayCost += cost }
       if day >= week { weekCost += cost }
@@ -208,7 +221,7 @@ private func makeReport(_ days: DailyUsage, models: [String: Model], now: Date) 
     groups[home?.provider ?? "unknown", default: []].append("- \(model): \(price)(\(counts))")
   }
 
-  let clock = Date.FormatStyle(locale: Locale(identifier: "en_GB"))
+  let clock = Date.FormatStyle(locale: Locale(identifier: "en_GB"), timeZone: calendar.timeZone)
     .hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
   let detail =
     "(\(dayCost.formatted(dollars)) today · \(weekCost.formatted(dollars)) this week · "
