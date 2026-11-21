@@ -22,7 +22,6 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let checkmark = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
   private var report: UsageReport?
   private var refreshing = false
-  private var displayedText = ""
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     item.button?.title = ""
@@ -71,12 +70,13 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
       menu.addItem(labelItem("[\(group.provider)]", font: heading))
       for line in group.lines { menu.addItem(labelItem(line, font: body)) }
     }
-    displayedText = report?.text(for: period) ?? ""
     menu.addItem(.separator())
-    menu.addItem(
-      withTitle: "Copy Report", action: displayedText.isEmpty ? nil : #selector(copyReport),
+    let copy = menu.addItem(
+      withTitle: "Copy Report", action: groups.isEmpty ? nil : #selector(copyReport),
       keyEquivalent: "c"
-    ).target = self
+    )
+    copy.target = self
+    copy.representedObject = report?.text(for: period)
     menu.addItem(periodItem(for: period))
     menu.addItem(.separator())
     let login = menu.addItem(
@@ -128,9 +128,10 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
     return item
   }
 
-  @objc private func copyReport() {
+  @objc private func copyReport(_ sender: NSMenuItem) {
+    guard let text = sender.representedObject as? String else { return }
     NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(displayedText, forType: .string)
+    NSPasteboard.general.setString(text, forType: .string)
   }
 
   // The standard terminate selector can add an automatic menu image.
