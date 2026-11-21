@@ -24,9 +24,11 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var displayedText = ""
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    item.button?.title = ""
     item.button?.image = NSImage(
       systemSymbolName: "chart.pie", accessibilityDescription: "tart usage")
-    item.button?.imagePosition = .imageOnly
+    // AppKit centers the symbol in the menu bar on the leading-image layout path.
+    item.button?.imagePosition = .imageLeading
     item.button?.toolTip = "tart usage — all sessions\n\(ledgerURL.path)"
 
     let menu = NSMenu()
