@@ -18,6 +18,7 @@ private let loginAgent = home.appending(path: "Library/LaunchAgents/\(loginLabel
 final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
   private let ledger = Ledger(url: ledgerURL)
+  private let checkmark = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
   private var report: UsageReport?
   private var refreshing = false
   private var displayedText = ""
@@ -49,12 +50,15 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func menuNeedsUpdate(_ menu: NSMenu) {
     refresh()
     menu.removeAllItems()
-    menu.addItem(withTitle: "tart usage", action: nil, keyEquivalent: "")
-    menu.addItem(withTitle: report?.detail ?? "Loading usage…", action: nil, keyEquivalent: "")
+    menu.addItem(labelItem("tart usage"))
+    menu.addItem(labelItem(report?.detail ?? "Loading usage…"))
+    let size = NSFont.menuFont(ofSize: 0).pointSize
+    let heading = NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
+    let body = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
     for group in report?.groups ?? [] {
       menu.addItem(.separator())
-      menu.addItem(monoItem("[\(group.provider)]", weight: .semibold))
-      for line in group.lines { menu.addItem(monoItem(line, weight: .regular)) }
+      menu.addItem(labelItem("[\(group.provider)]", font: heading))
+      for line in group.lines { menu.addItem(labelItem(line, font: body)) }
     }
     displayedText = report?.text ?? ""
     menu.addItem(.separator())
@@ -64,25 +68,40 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let login = menu.addItem(
       withTitle: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
     login.target = self
-    if FileManager.default.fileExists(atPath: loginAgent.path) {
-      login.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Enabled")
+    if let checkmark {
+      login.onStateImage = checkmark
+      // Reserve the same gutter when launch at login is off.
+      login.offStateImage = NSImage(size: checkmark.size, flipped: false) { _ in true }
     }
-    menu.addItem(
-      withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    login.state = FileManager.default.fileExists(atPath: loginAgent.path) ? .on : .off
+    menu.addItem(withTitle: "Quit", action: #selector(quitApp), keyEquivalent: "q").target = self
   }
 
-  private func monoItem(_ text: String, weight: NSFont.Weight) -> NSMenuItem {
-    let font = NSFont.monospacedSystemFont(
-      ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: weight)
+  private func labelItem(_ text: String, font: NSFont = .menuFont(ofSize: 0)) -> NSMenuItem {
+    let label = NSTextField(labelWithString: text)
+    label.font = font
+    label.textColor = .labelColor
+    let row = NSStackView(views: [label])
+    // Match the command rows, including their reserved state column.
+    let inset: CGFloat = 16
+    let stateWidth = checkmark.map { $0.size.width + 1 } ?? 0
+    row.edgeInsets = NSEdgeInsets(top: 4, left: inset + stateWidth, bottom: 4, right: inset)
+    row.frame.size = row.fittingSize
+
     let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-    item.attributedTitle = NSAttributedString(
-      string: text, attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+    item.isEnabled = false
+    item.view = row
     return item
   }
 
   @objc private func copyReport() {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(displayedText, forType: .string)
+  }
+
+  // The standard terminate selector can add an automatic menu image.
+  @objc private func quitApp() {
+    NSApplication.shared.terminate(nil)
   }
 
   @objc private func toggleLogin() {
