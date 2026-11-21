@@ -153,10 +153,8 @@ private func models(in url: URL) -> [String: Model] {
     guard let agents = value.table?["agents"]?.array else { continue }
     for agent in agents {
       guard let name = agent["model"]?.string else { continue }
-      let first = models[name]
-      models[name] = (
-        first?.provider ?? provider, first?.rates ?? agent["cost"]?.table.flatMap(rates)
-      )
+      let modelRates = models[name]?.rates ?? agent["cost"]?.table.flatMap(rates)
+      models[name, default: (provider, nil)].rates = modelRates
     }
   }
   return models
