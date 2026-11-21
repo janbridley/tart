@@ -117,9 +117,9 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ]
     try? files.createDirectory(
       at: loginAgent.deletingLastPathComponent(), withIntermediateDirectories: true)
-    let data = try? PropertyListSerialization.data(
-      fromPropertyList: plist, format: .xml, options: 0)
-    try? data?.write(to: loginAgent, options: .atomic)
+    try? PropertyListSerialization.data(
+      fromPropertyList: plist, format: .xml, options: 0
+    ).write(to: loginAgent, options: .atomic)
   }
 
   static func main() {
