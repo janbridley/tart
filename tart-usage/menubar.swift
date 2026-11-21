@@ -59,9 +59,8 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
     menu.removeAllItems()
     menu.addItem(labelItem("tart usage"))
     menu.addItem(labelItem(report?.detail ?? "Loading usage…"))
-    menu.addItem(.separator())
-    menu.addItem(periodItem(for: period))
     if groups.isEmpty, report?.groups.isEmpty == false {
+      menu.addItem(.separator())
       menu.addItem(labelItem("No usage in this period"))
     }
     let size = NSFont.menuFont(ofSize: 0).pointSize
@@ -78,6 +77,7 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
       withTitle: "Copy Report", action: displayedText.isEmpty ? nil : #selector(copyReport),
       keyEquivalent: "c"
     ).target = self
+    menu.addItem(periodItem(for: period))
     menu.addItem(.separator())
     let login = menu.addItem(
       withTitle: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
