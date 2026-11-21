@@ -160,12 +160,21 @@ private func models(in url: URL) -> [String: Model] {
   return models
 }
 
-struct UsageReport: Sendable {
-  let detail: String
-  let groups: [(provider: String, lines: [String])]
+enum ReportPeriod: String, CaseIterable, Sendable {
+  case day = "Today"
+  case week = "This Week"
+  case month = "This Month"
+  case allTime = "All Time"
+}
 
-  var text: String {
-    groups.map { (["[\($0.provider)]"] + $0.lines).joined(separator: "\n") }
+struct UsageReport: Sendable {
+  typealias Group = (provider: String, lines: [String])
+
+  let detail: String
+  let groups: [ReportPeriod: [Group]]
+
+  func text(for period: ReportPeriod) -> String {
+    (groups[period] ?? []).map { (["[\($0.provider)]"] + $0.lines).joined(separator: "\n") }
       .joined(separator: "\n\n")
   }
 }
@@ -185,32 +194,45 @@ private func compact(_ count: Decimal) -> String {
 private func makeReport(
   _ days: DailyUsage, models: [String: Model], now: Date, calendar: Calendar
 ) -> UsageReport {
-  guard !days.isEmpty else { return UsageReport(detail: "No usage yet", groups: []) }
+  guard !days.isEmpty else { return UsageReport(detail: "No usage yet", groups: [:]) }
 
   let today = calendar.startOfDay(for: now)
   let week = calendar.dateInterval(of: .weekOfYear, for: now)?.start ?? today
   let month = calendar.dateInterval(of: .month, for: now)?.start ?? today
-  let earliest = min(week, month)
+  let starts: [(ReportPeriod, Date)] = [(.day, today), (.week, week), (.month, month)]
 
-  var byModel: [String: Tokens] = [:]
-  var dayCost: Decimal = 0
-  var weekCost: Decimal = 0
-  var monthCost: Decimal = 0
+  var totals: [ReportPeriod: [String: Tokens]] = [:]
+  var costs: [ReportPeriod: Decimal] = [:]
   for (day, bucket) in days {
+    let periods =
+      day.map { day in
+        starts.compactMap { period, start in day >= start && day <= today ? period : nil }
+      } ?? []
     for (model, tokens) in bucket {
-      byModel[model, default: Tokens()].add(tokens)
-      guard let day, day >= earliest, day <= today, let rates = models[model]?.rates else {
-        continue
+      totals[.allTime, default: [:]][model, default: Tokens()].add(tokens)
+      guard !periods.isEmpty else { continue }
+      let cost = models[model]?.rates.map { tokens.cost(at: $0) } ?? 0
+      for period in periods {
+        totals[period, default: [:]][model, default: Tokens()].add(tokens)
+        costs[period, default: 0] += cost
       }
-      let cost = tokens.cost(at: rates)
-      if day == today { dayCost += cost }
-      if day >= week { weekCost += cost }
-      if day >= month { monthCost += cost }
     }
   }
 
+  let clock = Date.FormatStyle(locale: Locale(identifier: "en_GB"), timeZone: calendar.timeZone)
+    .hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+  let summary = starts.map { period, _ in
+    "\(costs[period, default: 0].formatted(dollars)) \(period.rawValue.lowercased())"
+  }.joined(separator: " · ")
+  return UsageReport(
+    detail: "(\(summary)) · Updated \(now.formatted(clock))",
+    groups: totals.mapValues { groups(for: $0, models: models) }
+  )
+}
+
+private func groups(for totals: [String: Tokens], models: [String: Model]) -> [UsageReport.Group] {
   var groups: [String: [String]] = [:]
-  for (model, tokens) in byModel.sorted(by: { $0.key < $1.key }) {
+  for (model, tokens) in totals.sorted(by: { $0.key < $1.key }) {
     let home = models[model]
     let price = home?.rates.map { "\(tokens.cost(at: $0).formatted(dollars)) " } ?? ""
     let share = tokens.input > 0 ? tokens.cached / tokens.input * 100 : 0
@@ -219,13 +241,5 @@ private func makeReport(
     groups[home?.provider ?? "unknown", default: []].append("- \(model): \(price)(\(counts))")
   }
 
-  let clock = Date.FormatStyle(locale: Locale(identifier: "en_GB"), timeZone: calendar.timeZone)
-    .hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
-  let detail =
-    "(\(dayCost.formatted(dollars)) today · \(weekCost.formatted(dollars)) this week · "
-    + "\(monthCost.formatted(dollars)) this month) · Updated \(now.formatted(clock))"
-  return UsageReport(
-    detail: detail,
-    groups: groups.sorted(by: { $0.key < $1.key }).map { ($0.key, $0.value) }
-  )
+  return groups.sorted(by: { $0.key < $1.key }).map { ($0.key, $0.value) }
 }

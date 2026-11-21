@@ -22,6 +22,9 @@ time zone. Weeks start on Sunday. The `Updated` time uses the same time zone.
 ($3.37 today · $8.36 this week · $21.00 this month) · Updated 13:45
 ```
 
+**Report Period** sets the range for the per-model breakdown and **Copy Report**. Choose
+Today, This Week, This Month, or All Time (the default). The app remembers your choice.
+
 The estimate uses `cost.input` for fresh input, `cost.cached` for cache hits, and
 `cost.output` for generated tokens. Rates are in USD per million tokens. The app totals
 in Decimal and rounds up to the nearest cent for display.

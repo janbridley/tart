@@ -12,6 +12,7 @@ private let executable =
   Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
 private let loginLabel = "local.tartusage"
 private let loginAgent = home.appending(path: "Library/LaunchAgents/\(loginLabel).plist")
+private let reportPeriodKey = "reportPeriod"
 
 @main
 @MainActor
@@ -29,7 +30,7 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
       systemSymbolName: "chart.pie", accessibilityDescription: "tart usage")
     // AppKit centers the symbol in the menu bar on the leading-image layout path.
     item.button?.imagePosition = .imageLeading
-    item.button?.toolTip = "tart usage — all sessions\n\(ledgerURL.path)"
+    item.button?.toolTip = "tart usage\n\(ledgerURL.path)"
 
     let menu = NSMenu()
     menu.delegate = self
@@ -51,21 +52,32 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   func menuNeedsUpdate(_ menu: NSMenu) {
     refresh()
+    let period =
+      UserDefaults.standard.string(forKey: reportPeriodKey)
+      .flatMap(ReportPeriod.init(rawValue:)) ?? .allTime
+    let groups = report?.groups[period] ?? []
     menu.removeAllItems()
     menu.addItem(labelItem("tart usage"))
     menu.addItem(labelItem(report?.detail ?? "Loading usage…"))
+    menu.addItem(.separator())
+    menu.addItem(periodItem(for: period))
+    if groups.isEmpty, report?.groups.isEmpty == false {
+      menu.addItem(labelItem("No usage in this period"))
+    }
     let size = NSFont.menuFont(ofSize: 0).pointSize
     let heading = NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
     let body = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
-    for group in report?.groups ?? [] {
+    for group in groups {
       menu.addItem(.separator())
       menu.addItem(labelItem("[\(group.provider)]", font: heading))
       for line in group.lines { menu.addItem(labelItem(line, font: body)) }
     }
-    displayedText = report?.text ?? ""
+    displayedText = report?.text(for: period) ?? ""
     menu.addItem(.separator())
-    menu.addItem(withTitle: "Copy Report", action: #selector(copyReport), keyEquivalent: "c")
-      .target = self
+    menu.addItem(
+      withTitle: "Copy Report", action: displayedText.isEmpty ? nil : #selector(copyReport),
+      keyEquivalent: "c"
+    ).target = self
     menu.addItem(.separator())
     let login = menu.addItem(
       withTitle: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
@@ -77,6 +89,26 @@ final class TartUsage: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     login.state = FileManager.default.fileExists(atPath: loginAgent.path) ? .on : .off
     menu.addItem(withTitle: "Quit", action: #selector(quitApp), keyEquivalent: "q").target = self
+  }
+
+  private func periodItem(for period: ReportPeriod) -> NSMenuItem {
+    let item = NSMenuItem(
+      title: "Report Period: \(period.rawValue)", action: nil, keyEquivalent: "")
+    let submenu = NSMenu()
+    for choice in ReportPeriod.allCases {
+      let option = submenu.addItem(
+        withTitle: choice.rawValue, action: #selector(selectPeriod), keyEquivalent: "")
+      option.target = self
+      option.representedObject = choice
+      option.state = choice == period ? .on : .off
+    }
+    item.submenu = submenu
+    return item
+  }
+
+  @objc private func selectPeriod(_ sender: NSMenuItem) {
+    guard let period = sender.representedObject as? ReportPeriod else { return }
+    UserDefaults.standard.set(period.rawValue, forKey: reportPeriodKey)
   }
 
   private func labelItem(_ text: String, font: NSFont = .menuFont(ofSize: 0)) -> NSMenuItem {
