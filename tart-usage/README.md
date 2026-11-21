@@ -29,7 +29,7 @@ in Decimal and rounds up to the nearest cent for display.
 ## Installing
 
 The app targets macOS 13 and later and builds with Swift 6. The first build downloads
-the parser for `providers.toml`. [TOMLKit](https://github.com/LebJe/TOMLKit)
+[TOMLKit](https://github.com/LebJe/TOMLKit), the parser for `providers.toml`
 
 ```
 cd tart-usage
