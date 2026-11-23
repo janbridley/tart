@@ -70,7 +70,7 @@ impl Progress {
     /// Whether this event ends its conversation's turn.
     #[inline]
     #[must_use]
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(self, Self::Done { .. } | Self::Failed(_) | Self::Cancelled)
     }
 }

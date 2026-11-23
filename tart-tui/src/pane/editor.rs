@@ -292,7 +292,7 @@ pub(crate) fn graphemes(s: &str) -> usize {
 
 /// Whether a character may enter the draft: controls are dropped except tab.
 #[inline]
-fn insertable(c: char) -> bool {
+const fn insertable(c: char) -> bool {
     !c.is_control() || c == '\t'
 }
 

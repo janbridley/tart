@@ -18,7 +18,7 @@ pub(crate) struct CopyCursor {
 
 impl CopyCursor {
     /// Enter copy mode with the cursor on the last row.
-    pub(crate) fn enter(rows_len: usize) -> Self {
+    pub(crate) const fn enter(rows_len: usize) -> Self {
         Self {
             row: rows_len.saturating_sub(1),
             col: 0,

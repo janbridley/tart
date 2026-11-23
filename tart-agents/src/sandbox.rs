@@ -299,7 +299,7 @@ impl Policy {
     /// A policy granting nothing.
     #[must_use]
     #[inline]
-    pub fn no_access() -> Self {
+    pub const fn no_access() -> Self {
         Self {
             writable: Vec::new(),
             read_only: Vec::new(),
@@ -323,14 +323,14 @@ impl Policy {
     /// Grant GPU access for Metal compute.
     #[must_use]
     #[inline]
-    pub fn allow_gpu(mut self) -> Self {
+    pub const fn allow_gpu(mut self) -> Self {
         self.gpu = true;
         self
     }
 
     /// Flip [`Policy::allow_gpu`]'s grants, returning the new state.
     #[inline]
-    pub fn toggle_gpu(&mut self) -> bool {
+    pub const fn toggle_gpu(&mut self) -> bool {
         self.gpu = !self.gpu;
         self.gpu
     }

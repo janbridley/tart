@@ -149,7 +149,7 @@ impl Inline {
     }
 
     /// Whether any text is pending.
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.spans.is_empty()
     }
 }
@@ -537,7 +537,7 @@ impl Blocks {
     }
 
     /// Mark a block boundary.
-    fn gap(&mut self) {
+    const fn gap(&mut self) {
         if !self.out.is_empty() && self.lists.is_empty() {
             self.pending_gap = true;
         }
