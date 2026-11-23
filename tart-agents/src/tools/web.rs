@@ -8,14 +8,15 @@
 
 use std::io::{Read as _, Write as _};
 use std::iter::successors;
-use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy as Redirects;
@@ -27,6 +28,10 @@ use super::{
     run_watched, string_field, tool, traced,
 };
 use crate::Progress;
+
+/// The destination policy for requests.
+mod egress;
+use egress::{PublicDns, check_destination};
 
 mod preprocessing;
 
@@ -192,115 +197,6 @@ fn temp_path(tool: &str, extension: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tart-{tool}-{}-{call}.{extension}", std::process::id()))
 }
 
-/// Reject URLs that are not plain public web addresses.
-///
-/// Anything but `http`/`https` is refused outright for security.
-fn check_url(url: &str) -> Result<String, String> {
-    let url = url.trim();
-    if url.is_empty() || url.len() >= 2_048 {
-        return Err("fetch: url is empty or longer than 2048 characters".to_string());
-    }
-    if url.bytes().any(|byte| byte.is_ascii_control() || byte == b' ') {
-        return Err("fetch: url contains whitespace or control characters".to_string());
-    }
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return Err(format!("fetch: url has no scheme: {url}"));
-    };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return Err(format!("fetch: only http and https are supported, not {scheme}"));
-    }
-    let host = authority_host(rest);
-    if host.is_empty() {
-        return Err(format!("fetch: url has no host: {url}"));
-    }
-    if is_private_host(host) {
-        return Err(format!("fetch: refusing non-public host {host}"));
-    }
-    Ok(url.to_string())
-}
-
-/// The host in a URL's authority: userinfo dropped, port dropped, IPv6 unbracketed.
-fn authority_host(rest: &str) -> &str {
-    let host_port = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
-        .unwrap_or_default();
-    if let Some(inner) = host_port.strip_prefix('[') {
-        // A bracketed IPv6 literal, with the port (if any) after the `]`.
-        return inner.split(']').next().unwrap_or_default();
-    }
-    // A name or IPv4 with an optional port; a tail that is not all digits is
-    // part of the host, not a port.
-    match host_port.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => host_port,
-    }
-}
-
-/// Whether a host names this machine or a private network rather than the web.
-///
-/// Names are resolved and every address checked, so a public-looking name that
-/// answers for a private record is refused too.
-#[allow(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "the host is lowercased on the first line, so `.local` is already case-insensitive"
-)]
-fn is_private_host(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        // A zone ID names a link-local interface address (`[fe80::1%en0]`); it
-        // never parses as one, and curl would still understand it, so refuse
-        // it lexically before the resolver ever runs.
-        || host.contains('%')
-        || host.parse::<IpAddr>().is_ok_and(|ip| !is_global(ip))
-        || resolves_to_private(&host)
-}
-
-/// Whether any address `host` resolves to is not globally routable.
-///
-/// Every record is checked: a rebinder answers with a public and a private
-/// address together, and either may come back first. A name that fails to
-/// resolve stays public: the client shares this resolver, so an unresolvable
-/// name fails there with the better error. Resolution blocks this thread for
-/// as long as the resolver takes, like the fetch it guards.
-fn resolves_to_private(host: &str) -> bool {
-    (host, 0)
-        .to_socket_addrs()
-        .is_ok_and(|mut addrs| addrs.any(|addr| !is_global(addr.ip())))
-}
-
-/// Whether an IP address is globally routable.
-///
-/// TODO: replace w/ `IpAddr::is_global` when stabilized.
-const fn is_global(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
-            !ip.is_loopback()
-                && !ip.is_private()
-                && !ip.is_link_local()
-                && !ip.is_multicast()
-                && !ip.is_broadcast()
-                && !ip.is_unspecified()
-                && !(a == 100 && b & 0b1100_0000 == 0b0100_0000) // 100.64/10, shared
-        }
-        IpAddr::V6(ip) => {
-            let [first, ..] = ip.segments();
-            !ip.is_loopback()
-                && !ip.is_multicast()
-                && !ip.is_unspecified()
-                && first & 0xfe00 != 0xfc00 // fc00::/7, unique local
-                && first & 0xffc0 != 0xfe80 // fe80::/10, link local
-        }
-    }
-}
-
 /// An error with its causes on one line.
 fn error_chain(error: &dyn std::error::Error) -> String {
     successors(Some(error), |error| error.source())
@@ -316,12 +212,16 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 /// here can be const: building spawns a thread and installs the TLS provider.
 /// The blocking client hosts its own runtime and panics inside an async one,
 /// so fetch only ever runs on plain threads, never the agent's.
+///
+/// Every name the client dials is resolved through [`PublicDns`], so the addresses
+/// a connection uses are the same ones admitted by the destination policy.
 static FETCH_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     // Register a cryptography backend, otherwise reqwest rustls-no-provider panics.
     let _ = rustls::crypto::ring::default_provider().install_default();
     Client::builder()
         .user_agent(USER_AGENT)
         .redirect(redirect_policy())
+        .dns_resolver(Arc::new(PublicDns))
         .connect_timeout(Duration::from_secs(10))
         .timeout(FETCH_TIMEOUT)
         .no_proxy()
@@ -329,12 +229,18 @@ static FETCH_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
         .map_err(|error| format!("error: {}", error_chain(&error)))
 });
 
-/// The redirect rule: at most [`MAX_REDIRECTS`] hops, and none into a host
-/// this machine or a private network owns, checked on every hop.
+/// The redirect rule: at most [`MAX_REDIRECTS`] hops, and each hop passes the
+/// same destination check as the first request before it is followed.
 fn redirect_policy() -> Redirects {
     Redirects::custom(|attempt| {
-        if let Some(refusal) = private_hop(attempt.url()) {
-            attempt.error(refusal)
+        if let Err(refusal) = check_destination(attempt.url()) {
+            // The sentence names the hop; the reason follows without its prefix.
+            let reason = refusal.to_string();
+            let reason = reason.strip_prefix("fetch: ").unwrap_or(&reason);
+            let url = attempt.url().to_string();
+            attempt.error(format!(
+                "fetch: refusing redirect to non-public host {url}: {reason}"
+            ))
         } else if attempt.previous().len() >= MAX_REDIRECTS {
             attempt.error("too many redirects")
         } else {
@@ -343,27 +249,13 @@ fn redirect_policy() -> Redirects {
     })
 }
 
-/// The refusal for one hop's url, when its host is not on the public web.
-///
-/// Names go through the same resolver check as the original url in
-/// [`check_url`], so a rebinder answering for a private address is refused
-/// mid-chain.
-fn private_hop(url: &Url) -> Option<String> {
-    let private = match url.host()? {
-        url::Host::Domain(host) => is_private_host(host),
-        url::Host::Ipv4(address) => !is_global(IpAddr::V4(address)),
-        url::Host::Ipv6(address) => !is_global(IpAddr::V6(address)),
-    };
-    private.then(|| format!("fetch: refusing redirect to non-public host {url}"))
-}
-
 /// Whether a url's path looks like a PDF: a `.pdf`-named leaf or path segment.
 #[allow(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "the leaf is lowercased first, so the extension test is already case-insensitive"
 )]
-fn url_hints_pdf(url: &str) -> bool {
-    let path = url.split(['?', '#']).next().unwrap_or_default();
+fn url_hints_pdf(url: &Url) -> bool {
+    let path = url.path();
     let leaf = path.rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
     leaf.ends_with(".pdf") || path.split('/').any(|seg| seg.eq_ignore_ascii_case("pdf"))
 }
@@ -382,27 +274,30 @@ fn is_pdf(body: &[u8]) -> bool {
 /// - `github.com/{o}/{r}/issues/{n}` -> `api.github.com/repos/{o}/{r}/issues/{n}`
 ///
 /// `None` for every other URL, including views themselves, so rewrites apply only once.
-fn github_text_view(url: &str) -> Option<String> {
-    let url = Url::parse(url).ok()?;
-    if url.host_str()? != "github.com" {
+///
+/// The view is a parsed URL the caller admits through the destination check
+/// before any request is made with it.
+fn github_text_view(url: &Url) -> Option<Url> {
+    if url.scheme() != "https" || url.host_str()? != "github.com" {
         return None;
     }
     let segments = url.path_segments()?.collect::<Vec<_>>();
-    match segments.as_slice() {
+    let view = match segments.as_slice() {
         // A blob names a file: the raw host serves its bytes verbatim, query
         // and fragment dropped, path segments kept percent-encoded as parsed.
-        [owner, repo, "blob", reference, path @ ..] if !path.is_empty() => Some(format!(
+        [owner, repo, "blob", reference, path @ ..] if !path.is_empty() => format!(
             "https://raw.githubusercontent.com/{owner}/{repo}/{reference}/{}",
             path.join("/")
-        )),
+        ),
         [owner, repo, kind @ ("pull" | "issues"), number] if number.parse::<u64>().is_ok() => {
-            Some(format!(
+            format!(
                 "https://api.github.com/repos/{owner}/{repo}/{}/{number}",
                 if *kind == "pull" { "pulls" } else { "issues" }
-            ))
+            )
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Url::parse(&view).ok()
 }
 
 /// One successfully downloaded body, with the URL it landed on.
@@ -420,11 +315,12 @@ struct DownloadedBody {
 impl DownloadedBody {
     /// Downloads one URL and captures the post-redirect landing URL.
     ///
+    /// `url` must already be admitted to reach this step.
     /// Fails on http errors, or if the body exceeds [`DOWNLOAD_CAP`], returning a
     /// string that gets passed through to the model.
-    fn try_download(client: &Client, url: &str) -> Result<Self, String> {
+    fn try_download(client: &Client, url: &Url) -> Result<Self, String> {
         let response = client
-            .get(url)
+            .get(url.clone())
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(|error| format!("error: {}", error_chain(&error)))?;
@@ -791,12 +687,12 @@ impl<'a> Pages<'a> {
 }
 
 /// Get the content for a single fetch, handling special case filetypes.
-fn fetch_body(fetch: &Fetch, url: &str, client: &Client) -> Result<String, String> {
-    if !fetch.raw && !url_hints_pdf(url) {
+fn fetch_body(raw: bool, url: &Url, client: &Client) -> Result<String, String> {
+    if !raw && !url_hints_pdf(url) {
         return DownloadedBody::try_download(client, url).map(|body| body.read());
     }
     let body = DownloadedBody::try_download(client, url)?;
-    if fetch.raw && !body.is_pdf() {
+    if raw && !body.is_pdf() {
         // Raw non-PDF bodies are content, unprocessed.
         Ok(body.raw_text())
     } else {
@@ -816,21 +712,28 @@ pub(super) fn run_fetch<F: Fn(Progress)>(call: &FunctionToolCall, on_progress: &
     };
     traced(call, on_progress, || {
         let fetched = || -> Result<String, String> {
-            // The guard is content visible to the model, not an error.
-            let url = check_url(&fetch.url)?;
+            // Parsed once, by the client's own parser, then admitted. Either
+            // refusal is content visible to the model, not an error.
+            let url = Url::parse(fetch.url.trim())
+                .with_context(|| format!("fetch: cannot parse url {:?}", fetch.url))
+                .and_then(|url| {
+                    check_destination(&url)?;
+                    Ok(url)
+                })
+                .map_err(|refusal| refusal.to_string())?;
             let client = FETCH_CLIENT.clone()?;
             // A github.com page whose text view exists is fetched through it,
             // raw (the view is plain text or JSON, never HTML to extract);
-            // a view that refuses falls back to the page itself. `raw=true`
-            // skips the detour: the model asked for its URL, byte for byte.
+            // a view that is refused, or that fails, falls back to the page itse;f
+            // `raw=true` skips the detour.
             if !fetch.raw
                 && let Some(view) = github_text_view(&url)
-                && let raw = (Fetch { url: view.clone(), raw: true })
-                && let Ok(text) = fetch_body(&raw, &view, &client)
+                && check_destination(&view).is_ok()
+                && let Ok(text) = fetch_body(true, &view, &client)
             {
                 return Ok(text);
             }
-            fetch_body(&fetch, &url, &client)
+            fetch_body(fetch.raw, &url, &client)
         };
         match fetched() {
             Ok(text) => (text.clone(), text, Some(0)),
@@ -895,60 +798,6 @@ mod tests {
     }
 
     #[test]
-    fn check_url_accepts_public_web_addresses() {
-        for url in [
-            "https://example.com/a?b=c#d",
-            "HTTP://Example.COM/",
-            "https://user:pass@example.com/",
-            "http://192.0.2.10:8080/page",
-            "https://[2001:db8::1]/",
-        ] {
-            assert_eq!(check_url(url).ok().as_deref(), Some(url), "{url}");
-        }
-    }
-
-    #[test]
-    fn check_url_refuses_other_schemes_private_hosts_and_malformed_urls() {
-        for url in [
-            "file:///etc/passwd",
-            "ftp://example.com/x",
-            "gopher://localhost",
-            "data:text/html,hi",
-            "javascript:alert(1)",
-            "/etc/passwd",
-            "example.com/no-scheme",
-            "",
-            "https://",
-            "https://user@/",
-            "https://localhost/x",
-            "http://127.0.0.1:8080/",
-            "http://10.0.0.5/",
-            "http://192.168.1.1/",
-            "http://172.16.0.1/",
-            "http://169.254.169.254/latest/meta-data",
-            "http://[::1]/",
-            "http://[fe80::1]/",
-            "https://printer.local/",
-            "https://service.internal/",
-            "https://foo.bar.localhost/",
-            "https://example.com/ has space",
-            "https://example.com/\u{7}",
-            &format!("https://example.com/{}", "a".repeat(2_100)),
-        ] {
-            assert!(check_url(url).is_err(), "expected refusal: {url}");
-        }
-    }
-
-    #[test]
-    fn authority_host_drops_userinfo_ports_and_brackets() {
-        assert_eq!(authority_host("example.com/path"), "example.com");
-        assert_eq!(authority_host("user:pass@example.com:8080/x"), "example.com");
-        assert_eq!(authority_host("[2001:db8::1]:443/x"), "2001:db8::1");
-        assert_eq!(authority_host("example.com?q"), "example.com");
-        assert_eq!(authority_host(""), "");
-    }
-
-    #[test]
     fn http_client_builds() {
         assert!(FETCH_CLIENT.is_ok());
     }
@@ -995,12 +844,19 @@ mod tests {
         let client = FETCH_CLIENT.clone().unwrap();
 
         let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_string());
-        let body = DownloadedBody::try_download(&client, &format!("http://{address}/x")).unwrap();
+        let body = DownloadedBody::try_download(
+            &client,
+            &Url::parse(&format!("http://{address}/x")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(body.bytes, b"hello");
 
         let address = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string());
-        let error =
-            DownloadedBody::try_download(&client, &format!("http://{address}/gone")).unwrap_err();
+        let error = DownloadedBody::try_download(
+            &client,
+            &Url::parse(&format!("http://{address}/gone")).unwrap(),
+        )
+        .unwrap_err();
         assert!(error.contains("404"), "{error}");
 
         // The policy refusal happens on the hop, before any connection is
@@ -1010,28 +866,13 @@ mod tests {
             "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.5/x\r\nContent-Length: 0\r\n\r\n"
                 .to_string(),
         );
-        let error =
-            DownloadedBody::try_download(&client, &format!("http://{address}/hop")).unwrap_err();
+        let error = DownloadedBody::try_download(
+            &client,
+            &Url::parse(&format!("http://{address}/hop")).unwrap(),
+        )
+        .unwrap_err();
         assert!(error.contains("refusing redirect"), "{error}");
         assert!(error.contains("10.0.0.5"), "{error}");
-    }
-
-    #[test]
-    fn private_hop_flags_private_redirects_only() {
-        for url in [
-            "http://127.0.0.1:8080/x",
-            "http://10.0.0.5/",
-            "http://[::1]/",
-            "http://[fe80::1]/",
-            "https://printer.local/",
-            "https://localhost/x",
-        ] {
-            let url = Url::parse(url).unwrap();
-            assert!(private_hop(&url).is_some(), "expected refusal: {url}");
-        }
-
-        let url = Url::parse("https://example.com/final").unwrap();
-        assert!(private_hop(&url).is_none());
     }
 
     #[test]
@@ -1044,7 +885,7 @@ mod tests {
             "https://example.com/paper.PDF",
             "https://example.com/download.pdf?version=2",
         ] {
-            assert!(url_hints_pdf(url), "expected a hint: {url}");
+            assert!(url_hints_pdf(&Url::parse(url).unwrap()), "expected a hint: {url}");
         }
 
         for url in [
@@ -1053,31 +894,36 @@ mod tests {
             "https://example.com/lib/pdfjs/reader",
             "https://arxiv.org/abs/2401.14196",
         ] {
-            assert!(!url_hints_pdf(url), "expected no hint: {url}");
+            assert!(
+                !url_hints_pdf(&Url::parse(url).unwrap()),
+                "expected no hint: {url}"
+            );
         }
+    }
+
+    /// The view as the request would send it, for a github.com `url`.
+    fn view(url: &str) -> Option<String> {
+        github_text_view(&Url::parse(url).unwrap()).map(|view| view.to_string())
     }
 
     #[test]
     fn github_text_view_maps_blobs_pulls_and_issues() {
         assert_eq!(
-            github_text_view(
-                "https://github.com/glotzerlab/hoomd-workflow/blob/trunk/workflow.toml"
-            )
-            .as_deref(),
+            view("https://github.com/glotzerlab/hoomd-workflow/blob/trunk/workflow.toml")
+                .as_deref(),
             Some("https://raw.githubusercontent.com/glotzerlab/hoomd-workflow/trunk/workflow.toml")
         );
         // Deep and percent-encoded paths survive the rebuild, query drops.
         assert_eq!(
-            github_text_view("https://github.com/o/r/blob/main/a%20b/c.toml?plain=1").as_deref(),
+            view("https://github.com/o/r/blob/main/a%20b/c.toml?plain=1").as_deref(),
             Some("https://raw.githubusercontent.com/o/r/main/a%20b/c.toml")
         );
         assert_eq!(
-            github_text_view("https://github.com/janbridley/tart/pull/67").as_deref(),
+            view("https://github.com/janbridley/tart/pull/67").as_deref(),
             Some("https://api.github.com/repos/janbridley/tart/pulls/67")
         );
         assert_eq!(
-            github_text_view("https://github.com/janbridley/tart/issues/68#issuecomment-1")
-                .as_deref(),
+            view("https://github.com/janbridley/tart/issues/68#issuecomment-1").as_deref(),
             Some("https://api.github.com/repos/janbridley/tart/issues/68")
         );
     }
@@ -1096,8 +942,28 @@ mod tests {
             "https://api.github.com/repos/o/r",
             "https://gitlab.com/o/r/blob/main/f",
             "https://github.com/janbridley/tart/wiki",
+            // The rewrite is for the real github.com only, over https; a
+            // look-alike host or a downgraded scheme is nobody's text view.
+            "http://github.com/o/r/blob/main/f",
+            "https://github.com.evil.example/o/r/blob/main/f",
+            "https://github.com./o/r/blob/main/f",
         ] {
-            assert!(github_text_view(url).is_none(), "expected no view: {url}");
+            assert!(view(url).is_none(), "expected no view: {url}");
+        }
+    }
+
+    /// Every view the rewrite produces is itself an admitted destination, so
+    /// the detour never needs a second policy.
+    #[test]
+    fn github_text_views_pass_the_destination_check() {
+        for url in [
+            "https://github.com/o/r/blob/main/f",
+            "https://github.com/o/r/pull/1",
+            "https://github.com/o/r/issues/1",
+        ] {
+            let view = github_text_view(&Url::parse(url).unwrap()).unwrap();
+            let refusal = check_destination(&view).err();
+            assert!(refusal.is_none(), "{view}: {refusal:?}");
         }
     }
 
@@ -1292,32 +1158,6 @@ mod tests {
             !out.contains("page nesting"),
             "shallow body must not refuse: {out}"
         );
-    }
-
-    #[test]
-    fn check_url_refuses_zone_ids_and_resolver_shorthand_addresses() {
-        // A zone ID names a link-local interface address; it does not parse as
-        // one, and curl would still fetch it, so it is refused lexically.
-        for url in ["https://[fe80::1%25en0]/", "http://[fe80::1%en0]:8080/x"] {
-            assert!(check_url(url).is_err(), "expected refusal: {url}");
-        }
-
-        // Integer and hex shorthands for 127.0.0.1 parse as no IP at all; the
-        // resolver accepts them, so the record check refuses them.
-        for url in ["http://2130706433/", "http://0x7f000001/"] {
-            assert!(check_url(url).is_err(), "expected refusal: {url}");
-        }
-    }
-
-    #[test]
-    fn resolves_to_private_checks_every_record_and_fails_open() {
-        // `localhost` is private through /etc/hosts alone: the resolver finds
-        // it without any network, and every record it lists is loopback.
-        assert!(resolves_to_private("localhost"));
-
-        // A name the resolver rejects outright stays public: curl shares the
-        // resolver, so it reports the failure better than a refusal here could.
-        assert!(!resolves_to_private("not a hostname"));
     }
 
     /// Live: reaches the network and the system keychain, so it only passes
