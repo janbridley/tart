@@ -109,6 +109,15 @@ jq -s 'group_by(.model)
          total: (map(.total)|add)})' ~/.config/tart/usage.jsonl
 ```
 
+### Menu Bar Usage Monitor
+
+`tartusage` is a native macOS menu bar app that watches the same `usage.jsonl` ledger
+and shows spend for the day, week, and month, plus a per-model breakdown of tokens,
+cache hit rate, and estimated cost grouped by provider. Install it with
+`make lint install` from that directory.
+
+![The `tartusage` menu bar app with its menu open](./tart-usage/menu-bar-render.svg)
+
 ## Package Structure
 
 Internally, we use an agent harness package structure similar to the one
