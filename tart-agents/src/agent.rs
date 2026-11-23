@@ -178,7 +178,7 @@ impl Agent {
 impl<B: Backend> Agent<B> {
     /// The session's collaboration mode.
     #[inline]
-    pub fn mode(&self) -> ChatMode {
+    pub const fn mode(&self) -> ChatMode {
         self.mode
     }
 
@@ -188,13 +188,13 @@ impl<B: Backend> Agent<B> {
     /// [`Agent::spawn`] copied the agent before it began, so this cannot change the
     /// sandbox under a running command.
     #[inline]
-    pub fn set_mode(&mut self, mode: ChatMode) {
+    pub const fn set_mode(&mut self, mode: ChatMode) {
         self.mode = mode;
     }
 
     /// Toggle the writable policy's GPU grants mid-session, returning the new state.
     #[inline]
-    pub fn toggle_gpu(&mut self) -> bool {
+    pub const fn toggle_gpu(&mut self) -> bool {
         self.writable.toggle_gpu()
     }
 
@@ -228,7 +228,7 @@ impl<B: Backend> Agent<B> {
 
     /// Name this agent's conversation, as a spawned subagent's registry id.
     #[inline]
-    pub(crate) fn identify(mut self, id: AgentId) -> Self {
+    pub(crate) const fn identify(mut self, id: AgentId) -> Self {
         self.id = id;
         self
     }
@@ -269,21 +269,21 @@ impl<B: Backend> Agent<B> {
     /// Set how hard the model reasons before answering.
     #[must_use]
     #[inline]
-    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+    pub const fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.effort = Some(effort);
         self
     }
 
     /// Change the reasoning effort for subsequent turns.
     #[inline]
-    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
+    pub const fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
         self.effort = Some(effort);
     }
 
     /// The configured effort, so a caller can layer a one-turn boost on it.
     #[inline]
     #[must_use]
-    pub fn configured_effort(&self) -> Option<ReasoningEffort> {
+    pub const fn configured_effort(&self) -> Option<ReasoningEffort> {
         self.effort
     }
 

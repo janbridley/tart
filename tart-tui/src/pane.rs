@@ -697,18 +697,18 @@ impl Pane {
     }
 
     /// Record one response's token usage for the status line.
-    pub fn set_usage(&mut self, input: u64, cached: u64, output: u64) {
+    pub const fn set_usage(&mut self, input: u64, cached: u64, output: u64) {
         self.usage = Some(Usage { input, cached, output });
     }
 
     /// Record the model's context window, from the agents file; `None` leaves
     /// the status line's gauge without a window.
-    pub fn set_context_tokens(&mut self, tokens: Option<u64>) {
+    pub const fn set_context_tokens(&mut self, tokens: Option<u64>) {
         self.context_tokens = tokens;
     }
 
     /// Record the session's tracked cost, from the ledger; `None` drops the price block
-    pub fn set_session_cost(&mut self, cost: Option<Money>) {
+    pub const fn set_session_cost(&mut self, cost: Option<Money>) {
         self.session_cost = cost;
     }
 
@@ -723,7 +723,7 @@ impl Pane {
     }
 
     /// Mark the pane as running in chat mode, where plan mode does not exist.
-    pub fn set_chat(&mut self, chat: bool) {
+    pub const fn set_chat(&mut self, chat: bool) {
         self.chat = chat;
     }
 
@@ -884,7 +884,7 @@ impl Pane {
 
     /// Whether a turn is generating, so a mode switch must wait.
     #[inline]
-    pub fn is_generating(&self) -> bool {
+    pub const fn is_generating(&self) -> bool {
         self.spin.is_some()
     }
 
@@ -899,12 +899,12 @@ impl Pane {
 
     /// Whether plan mode is on.
     #[inline]
-    pub fn is_plan(&self) -> bool {
+    pub const fn is_plan(&self) -> bool {
         matches!(self.mode, Mode::Plan)
     }
 
     /// Offer (or retire) plan approval: Enter on an empty draft approves.
-    pub fn set_plan_ready(&mut self, ready: bool) {
+    pub const fn set_plan_ready(&mut self, ready: bool) {
         self.plan_ready = ready && matches!(self.mode, Mode::Plan);
     }
 
@@ -963,7 +963,7 @@ impl Pane {
     }
 
     /// Meter a subagent's output tokens into the status line's agent total.
-    pub fn add_child_output(&mut self, tokens: u64) {
+    pub const fn add_child_output(&mut self, tokens: u64) {
         self.child_tokens += tokens;
     }
 
@@ -1158,7 +1158,7 @@ impl Pane {
     }
 
     /// Submitted command, cleared draft, or an empty draft's backspace leaves bang mode
-    fn leave_bang(&mut self) {
+    const fn leave_bang(&mut self) {
         if matches!(self.mode, Mode::Bang) {
             self.mode = Mode::Default;
         }
@@ -1394,7 +1394,7 @@ impl BufRows for Buffer {
 }
 
 /// Whether a rule row at `area` still lands on the buffer.
-fn on_screen(buf: &Buffer, area: Rect) -> bool {
+const fn on_screen(buf: &Buffer, area: Rect) -> bool {
     area.y < buf.area.height
 }
 

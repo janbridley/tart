@@ -278,7 +278,7 @@ fn resolves_to_private(host: &str) -> bool {
 /// Whether an IP address is globally routable.
 ///
 /// TODO: replace w/ `IpAddr::is_global` when stabilized.
-fn is_global(ip: IpAddr) -> bool {
+const fn is_global(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, _, _] = ip.octets();
@@ -692,7 +692,7 @@ struct Pages<'a> {
 
 impl<'a> Pages<'a> {
     /// Wrap pages straight out of pdftotext, totals still unrefined.
-    fn new(text: &'a mut [String]) -> Self {
+    const fn new(text: &'a mut [String]) -> Self {
         Self {
             total: text.len(),
             text,
@@ -725,7 +725,7 @@ impl<'a> Pages<'a> {
     }
 
     /// The pages the text layer left thin, whatever happened to them after.
-    fn scanned(&self) -> usize {
+    const fn scanned(&self) -> usize {
         self.ocr + self.failed + self.skipped
     }
 

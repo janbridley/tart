@@ -157,7 +157,7 @@ fn translate(event: ResponseStreamEvent) -> Option<Event> {
 }
 
 /// The wire spelling of a reasoning effort; the seam an upstream rename breaks.
-fn effort_of(effort: ReasoningEffort) -> ResponsesEffort {
+const fn effort_of(effort: ReasoningEffort) -> ResponsesEffort {
     match effort {
         ReasoningEffort::None => ResponsesEffort::None,
         ReasoningEffort::Minimal => ResponsesEffort::Minimal,

@@ -45,7 +45,7 @@ enum Kind {
 
 impl Kind {
     /// The kind `chat` selects.
-    fn of(chat: bool) -> Self {
+    const fn of(chat: bool) -> Self {
         if chat { Self::Chat } else { Self::Coding }
     }
 
@@ -59,7 +59,7 @@ impl Kind {
     }
 
     /// The mode the agent runs in.
-    fn mode(self) -> ChatMode {
+    const fn mode(self) -> ChatMode {
         match self {
             Self::Coding => ChatMode::Default,
             Self::Chat => ChatMode::Chat,

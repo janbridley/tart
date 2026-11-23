@@ -81,7 +81,7 @@ impl Editor {
     }
 
     /// Cmd+↑: to the very start of the draft.
-    pub(crate) fn draft_home(&mut self) {
+    pub(crate) const fn draft_home(&mut self) {
         self.line = 0;
         self.g = 0;
     }

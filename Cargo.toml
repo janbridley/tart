@@ -7,7 +7,7 @@ rust-version = "1.100"
 
 # Dependencies shared between member crates, so their versions stay in lockstep.
 [workspace.dependencies]
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 flate2 = "1.1.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -57,6 +57,7 @@ fallible_impl_from = "warn"
 needless_collect = "warn"
 needless_pass_by_ref_mut = "warn"
 or_fun_call = "warn"
+missing_const_for_fn = "warn"
 
 # Speed up compiles. Can override with CARGO_PROFILE_DEV_DEBUG=full.
 [profile.dev]

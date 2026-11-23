@@ -43,7 +43,7 @@ impl TokenUsage {
     /// The gauge's three display counts: `(input, cached, output)`.
     #[inline]
     #[must_use]
-    pub(crate) fn gauge(self) -> (u64, u64, u64) {
+    pub(crate) const fn gauge(self) -> (u64, u64, u64) {
         (self.input, self.cached, self.output)
     }
 

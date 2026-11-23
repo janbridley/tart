@@ -105,7 +105,7 @@ pub const AGENTS: [Spinner; 8] = [
 
 /// MAIN's dot frame showing at `millis` past its cycle's start.
 #[inline]
-pub fn main_dots(millis: u128) -> &'static str {
+pub const fn main_dots(millis: u128) -> &'static str {
     const DOTS: [&str; 6] = ["·  ", "·· ", "···", " ··", "  ·", "   "];
     DOTS[(millis / (2 * CADENCE)) as usize % DOTS.len()]
 }

@@ -259,7 +259,7 @@ struct Read {
 impl Read {
     /// The inclusive line bounds the perl reader takes: an offset becomes the
     /// first line, a limit counts from it (or from the top).
-    fn bounds(&self) -> (Option<u64>, Option<u64>) {
+    const fn bounds(&self) -> (Option<u64>, Option<u64>) {
         match (self.offset, self.limit) {
             (Some(offset), Some(limit)) => {
                 (Some(offset), Some(offset.saturating_add(limit).saturating_sub(1)))
