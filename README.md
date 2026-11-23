@@ -116,7 +116,7 @@ and shows spend for the day, week, and month, plus a per-model breakdown of toke
 cache hit rate, and estimated cost grouped by provider. Install it with
 `make lint install` from that directory.
 
-<img src="./tart-usage/menu-bar-render.svg" alt="The tartusage menu bar app with its menu open" height="300">
+<img src="./tart-usage/menu-bar-render.svg" alt="The tartusage menu bar app with its menu open" width="50%">
 
 ## Package Structure
 
