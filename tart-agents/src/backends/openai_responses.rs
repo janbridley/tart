@@ -15,7 +15,7 @@ use futures::{Stream, StreamExt};
 use crate::debug;
 use crate::usage::TokenUsage;
 
-use super::{Event, ReasoningEffort};
+use super::Event;
 
 /// The record vocabulary the loop exchanges with the backend, plus
 /// the raw wire events for tests that serve a stream by hand.
@@ -29,6 +29,10 @@ pub(crate) use async_openai::types::responses::{
 pub(crate) use async_openai::types::responses::{
     ResponseOutputItemDoneEvent, ResponseTextDeltaEvent,
 };
+
+/// How hard the model reasons: the provider's own vocabulary, spelled as the
+/// config file and the wire spell it.
+pub use async_openai::types::responses::ReasoningEffort;
 
 /// Credentials and endpoint for the Responses API.
 #[derive(Clone)]

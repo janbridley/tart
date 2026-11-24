@@ -12,7 +12,7 @@ pub(crate) use self::openai_responses::{
 
 /// How hard the model reasons: the provider's own vocabulary, spelled as the
 /// config file and the wire spell it.
-pub use async_openai::types::responses::ReasoningEffort;
+pub use self::openai_responses::ReasoningEffort;
 
 /// The events of one round's stream, in arrival order.
 pub(crate) enum Event {

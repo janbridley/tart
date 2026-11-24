@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -26,14 +27,13 @@ pub(crate) fn stamp_utc_at(moment: OffsetDateTime) -> String {
 /// JSON object: `{"timestamp":"…","type":"reasoning","id":"rs_…",…}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RecordLine {
-    /// When the line was first written, `YYYY-MM-DD HH:MM:SS` UTC; minted at
-    /// write time when absent. A stamp of any other shape reads as absent.
+    /// When the line was recorded, `YYYY-MM-DD HH:MM:SS` UTC
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "stamp"
     )]
-    pub(crate) timestamp: Option<String>,
+    pub(crate) timestamp: Option<String>, // Stamped when it enters record
     /// The item itself, as the record and a request send it.
     #[serde(flatten)]
     pub(crate) item: InputItem,
@@ -212,15 +212,20 @@ impl Transcript {
     /// call order.
     ///
     /// Provider items are never rewritten, which keeps the model's reasoning
-    /// intact between rounds and the growing record a stable prefix.
+    /// intact between rounds and the growing record a stable prefix. The one
+    /// thing left out is a call that did not run (e.g. when a cancel skips the
+    /// rest of its round): paired with no output, the provider refuses the record.
     pub(crate) fn push_round(
         &self,
         round: Vec<InputItem>,
         answer: Option<&str>,
         outputs: Vec<(FunctionToolCall, String)>,
     ) {
+        let ran: HashSet<&str> = outputs.iter().map(|(call, _)| call.call_id.as_str()).collect();
         let mut lines = self.locked();
-        lines.extend(round.into_iter().map(RecordLine::fresh));
+        lines.extend(round.into_iter().filter(|item| {
+            !matches!(item, InputItem::Item(Item::FunctionCall(call)) if !ran.contains(call.call_id.as_str()))
+        }).map(RecordLine::fresh));
         if let Some(answer) = answer.filter(|answer| !answer.is_empty()) {
             lines.push(RecordLine::fresh(message(Role::Assistant, answer.to_string())));
         }
@@ -259,7 +264,10 @@ impl Transcript {
     pub fn request_items(&self) -> Vec<InputItem> {
         let mut items: Vec<_> = self.locked().iter().map(|line| line.item.clone()).collect();
         if let Some(preamble) = &self.preamble {
-            let systems = items.iter().filter(|item| is_message(item, Role::System)).count();
+            let systems = items
+                .iter()
+                .take_while(|item| is_message(item, Role::System))
+                .count();
             items.insert(systems, preamble.clone());
         }
         items.extend(self.reminder.clone());
@@ -422,6 +430,24 @@ mod tests {
         outputs: Vec<(FunctionToolCall, String)>,
     ) {
         transcript.push_round(items, None, outputs);
+    }
+
+    #[test]
+    fn a_round_cut_short_records_only_the_calls_that_ran() {
+        let transcript = Transcript::new().unwrap();
+        let mut skipped = bash_call();
+        skipped.call_id = "call_1".into();
+        skipped.id = Some("item_1".into());
+        transcript.push_round(
+            vec![call(bash_call()), call(skipped)],
+            Some("checking"),
+            vec![(bash_call(), "one\n".to_string())],
+        );
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        assert_eq!(items[1]["call_id"], "call_0");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items.as_array().unwrap().len(), 4, "{items}");
     }
 
     #[test]

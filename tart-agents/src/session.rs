@@ -12,8 +12,8 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use time::OffsetDateTime;
 
-use crate::backends::{InputItem, Item};
-use crate::history::{RecordLine, Transcript, stamp_utc_at};
+use crate::backends::{InputItem, Item, Role};
+use crate::history::{RecordLine, Transcript, is_message, stamp_utc_at};
 use crate::progress::Progress;
 #[cfg(not(test))]
 use crate::usage;
@@ -34,7 +34,7 @@ pub const CHAT_PROJECT: &str = "CHAT";
 
 /// One session's file: gzipped JSON lines, one recorded item each, rewritten
 /// whole after each turn through a sibling renamed into place, so a crash
-/// leaves the last complete turn, never a torn one.
+/// leaves the previous write intact, never a torn file.
 ///
 /// A recorded conversation resumes as the same request it recorded:
 ///
@@ -134,8 +134,9 @@ impl Session {
     /// and a crash leaves the previous write in place.
     #[inline]
     pub fn record(&mut self, transcript: &Transcript) -> anyhow::Result<()> {
+        let lines = transcript.lines();
         // A session that has yet to hear from the user needs no file.
-        if self.path.is_none() && transcript.user_turns().is_empty() {
+        if self.path.is_none() && !lines.iter().any(|line| is_message(&line.item, Role::User)) {
             return Ok(());
         }
         let path = if let Some(path) = &self.path {
@@ -149,7 +150,7 @@ impl Session {
             usage::set_session(self.stem());
             path
         };
-        write(&path, &transcript.lines())
+        write(&path, &lines)
     }
 
     /// The live file's stem, the ledger's tag for this session's rounds.
@@ -204,7 +205,10 @@ pub fn list(root: &Path, project: &Path) -> anyhow::Result<Vec<(PathBuf, String)
     }
     // Newest first: the file a picker's first hit should be.
     files.sort_by_key(|path| {
-        std::cmp::Reverse(fs::metadata(path).and_then(|meta| meta.modified()).ok())
+        std::cmp::Reverse((
+            fs::metadata(path).and_then(|meta| meta.modified()).ok(),
+            path.file_name().map(std::ffi::OsStr::to_owned),
+        ))
     });
     Ok(files
         .into_iter()
@@ -248,8 +252,9 @@ fn read(path: &Path) -> anyhow::Result<(Vec<RecordLine>, bool)> {
     Ok((lines, false))
 }
 
-/// Write `lines` to `path` as one gzip member, through a sibling renamed into
-/// place: a reader sees the last complete write, never a torn one.
+/// Write `lines` to `path` as one gzip member, through a sibling of the
+/// writer's own renamed into place: a reader sees the last complete write a
+/// process left behind, never a torn one.
 fn write(path: &Path, lines: &[RecordLine]) -> anyhow::Result<()> {
     let mut bytes = Vec::new();
     let mut member = GzEncoder::new(&mut bytes, Compression::new(6));
@@ -258,7 +263,7 @@ fn write(path: &Path, lines: &[RecordLine]) -> anyhow::Result<()> {
         member.write_all(b"\n")?;
     }
     member.finish()?;
-    let sibling = path.with_extension("tmp");
+    let sibling = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&sibling, &bytes).with_context(|| format!("writing {}", sibling.display()))?;
     fs::rename(&sibling, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())

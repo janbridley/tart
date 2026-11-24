@@ -567,9 +567,10 @@ impl Agent {
                 };
                 exchanges.push((call, kept));
             }
-            // A round cut short before its first executed call records none of
-            // its output items: without their calls they would dangle in the
-            // replay, and the retried round delivers them again.
+            // A round cut short before its first executed call records only the
+            // partial answer: its calls would have no outputs to pair with, and
+            // the retried round delivers its items again. Calls skipped after
+            // the first one ran are left out of the record by `push_round`.
             if exchanges.is_empty() {
                 transcript.push_answer(&answer);
             } else {
