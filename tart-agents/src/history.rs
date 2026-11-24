@@ -291,6 +291,7 @@ impl Transcript {
 /// The events one recorded item replays as, in live order.
 fn replay_events(item: &InputItem) -> Vec<Progress> {
     match item {
+        // tart's own words: the user's turn and the assistant's answer.
         InputItem::EasyMessage(message) => match (&message.role, &message.content) {
             (Role::User, EasyInputContent::Text(text)) => vec![Progress::User(text.clone())],
             (Role::Assistant, EasyInputContent::Text(text)) => {
@@ -298,51 +299,46 @@ fn replay_events(item: &InputItem) -> Vec<Progress> {
             }
             _ => Vec::new(),
         },
-        // The provider's own words: an assistant message's text, or the
-        // reasoning it shows, empty when it kept its thinking to itself.
-        InputItem::Item(Item::Message(MessageItem::Output(message))) => {
-            let text: String = message
-                .content
-                .iter()
-                .filter_map(|part| match part {
-                    OutputMessageContent::OutputText(text) => Some(text.text.as_str()),
-                    OutputMessageContent::Refusal(_) => None,
-                })
-                .collect();
-            (!text.is_empty())
-                .then_some(Progress::Answer(text))
-                .into_iter()
-                .collect()
-        }
-        InputItem::Item(Item::Reasoning(reasoning)) => {
-            let text: String = reasoning
+        // The provider's own words: assistant messages or reasoning.
+        InputItem::Item(Item::Message(MessageItem::Output(message))) => shown(
+            Progress::Answer,
+            message.content.iter().filter_map(|part| match part {
+                OutputMessageContent::OutputText(text) => Some(text.text.as_str()),
+                OutputMessageContent::Refusal(_) => None,
+            }),
+        ),
+        InputItem::Item(Item::Reasoning(reasoning)) => shown(
+            Progress::Thinking,
+            reasoning
                 .content
                 .iter()
                 .flatten()
-                .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
-                .collect();
-            (!text.is_empty())
-                .then_some(Progress::Thinking(text))
-                .into_iter()
-                .collect()
-        }
-        InputItem::Item(Item::FunctionCall(call)) => {
-            // Just show the header, exits/output are not super necessary
-            vec![
-                Progress::ToolStart {
-                    id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                },
-                Progress::ToolOutput {
-                    id: call.call_id.clone(),
-                    output: String::new(),
-                    exit: Some(0),
-                },
-            ]
-        }
+                .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str()),
+        ),
+        // A tool call replays as its header, but we don't need the body
+        InputItem::Item(Item::FunctionCall(call)) => vec![
+            Progress::ToolStart {
+                id: call.call_id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+            Progress::ToolOutput {
+                id: call.call_id.clone(),
+                output: String::new(),
+                exit: Some(0),
+            },
+        ],
         _ => Vec::new(),
     }
+}
+
+/// `event` over the text `parts` join into, or nothing when there is none.
+fn shown<'a>(
+    event: impl FnOnce(String) -> Progress,
+    parts: impl Iterator<Item = &'a str>,
+) -> Vec<Progress> {
+    let text: String = parts.collect();
+    if text.is_empty() { Vec::new() } else { vec![event(text)] }
 }
 
 #[cfg(test)]
