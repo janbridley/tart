@@ -61,11 +61,7 @@ fn load_keychain<T: serde::de::DeserializeOwned>(account: &str) -> anyhow::Resul
 }
 
 fn save_keychain(account: &str, value: &impl Serialize) -> anyhow::Result<()> {
-    Ok(set_generic_password(
-        SERVICE,
-        account,
-        &serde_json::to_vec(value)?,
-    )?)
+    set_generic_password(SERVICE, account, &serde_json::to_vec(value)?).map_err(Into::into)
 }
 
 fn lock(name: &str) -> anyhow::Result<File> {
