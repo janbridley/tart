@@ -23,8 +23,12 @@ impl Cli {
     /// Parse the process's argv.
     pub(crate) fn parse() -> anyhow::Result<Option<Self>> {
         let matches = command().get_matches();
-        if matches.subcommand_name() == Some("login") {
-            tart_agents::chatgpt::login()?;
+        if let Some(login) = matches.subcommand_matches("login") {
+            if login.get_flag("reset") {
+                tart_agents::chatgpt::reset_login()?;
+            } else {
+                tart_agents::chatgpt::login()?;
+            }
             return Ok(None);
         }
         Self::from(&matches, std::env::var_os("HOME")).map(Some)
@@ -68,7 +72,13 @@ fn command() -> Command {
         .subcommand(
             Command::new("login")
                 .about("Sign in with ChatGPT")
-                .arg(Arg::new("provider").required(true).value_parser(["chatgpt"])),
+                .arg(Arg::new("provider").required(true).value_parser(["chatgpt"]))
+                .arg(
+                    Arg::new("reset")
+                        .long("reset")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Clear the local connection and register again"),
+                ),
         )
         .arg(Arg::new("agents").long("agents").value_name("FILE").help(
             "TOML file describing the available agents [default: ~/.config/tart/providers.toml]",
@@ -93,6 +103,18 @@ fn command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resetting_chatgpt_requires_the_explicit_flag() {
+        let args = ["tart", "login", "chatgpt"];
+        for reset in [false, true] {
+            let matches = command()
+                .try_get_matches_from(args.into_iter().chain(reset.then_some("--reset")))
+                .expect("login command parses");
+            let login = matches.subcommand_matches("login").expect("login subcommand");
+            assert_eq!(login.get_flag("reset"), reset);
+        }
+    }
 
     /// `--agents` names the file to read, without checking it exists:
     /// `Config::load` reports a missing named file with the path as typed.

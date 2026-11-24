@@ -5,10 +5,11 @@ use std::future::Future;
 use async_openai::{
     Client,
     config::OpenAIConfig,
+    error::OpenAIError,
     types::responses::{
         CreateResponse, CreateResponseArgs, EasyInputMessageArgs, FunctionCallOutput,
         FunctionCallOutputItemParam, FunctionTool, InputParam, Reasoning,
-        ReasoningEffort as ResponsesEffort, ResponseErrorCode, ResponseUsage,
+        ReasoningEffort as ResponsesEffort, ResponseErrorCode, ResponseStream, ResponseUsage,
     },
 };
 use futures::StreamExt;
@@ -39,7 +40,13 @@ pub struct Responses {
 
 pub(crate) fn chatgpt_backend() -> Responses {
     let mut backend = backend(crate::chatgpt::RESOURCE, "");
-    backend.chatgpt_http = Some(reqwest::Client::new());
+    backend.chatgpt_http = Some(
+        reqwest::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("ChatGPT HTTP client did not initialize"),
+    );
     backend
 }
 
@@ -57,6 +64,10 @@ pub(crate) fn backend<U: Into<String>, K: Into<String>>(base_url: U, api_key: K)
 }
 
 impl Backend for Responses {
+    fn requires_completion(&self) -> bool {
+        self.chatgpt_http.is_some()
+    }
+
     fn round(
         &self,
         model: &str,
@@ -67,19 +78,15 @@ impl Backend for Responses {
         let model = model.to_string();
         async move {
             let mut request = request_of(&model, effort, items, tools)?;
-            let mut client = self.client.clone();
-            if let Some(http) = &self.chatgpt_http {
+            if self.requires_completion() {
                 configure_chatgpt_request(&mut request);
-                let token = tokio::task::spawn_blocking(crate::chatgpt::access_token).await??;
-                client = Client::build(
-                    http.clone(),
-                    OpenAIConfig::new()
-                        .with_api_base(crate::chatgpt::RESOURCE)
-                        .with_api_key(token),
-                );
             }
             debug::log_json("round request", || serde_json::to_string(&request));
-            let stream = client.responses().create_stream(request).await?;
+            let stream = if let Some(http) = &self.chatgpt_http {
+                chatgpt_stream(http, request).await?
+            } else {
+                self.client.responses().create_stream(request).await?
+            };
             Ok(Box::pin(stream.filter_map(|item| async {
                 match item {
                     Ok(event) => translate(event).map(Ok),
@@ -87,6 +94,41 @@ impl Backend for Responses {
                 }
             })) as RoundStream)
         }
+    }
+}
+
+async fn chatgpt_stream(
+    http: &reqwest::Client,
+    request: CreateResponse,
+) -> anyhow::Result<ResponseStream> {
+    use crate::chatgpt::{RECONNECT, RESOURCE, access_token, invalidate_access_token};
+
+    let token = tokio::task::spawn_blocking(access_token).await??;
+    let client = Client::build(
+        http.clone(),
+        OpenAIConfig::new()
+            .with_api_base(RESOURCE)
+            .with_api_key(token.clone())
+            .with_org_id("")
+            .with_project_id(""),
+    );
+    let error = match client.responses().create_stream(request).await {
+        Err(OpenAIError::ApiError(error))
+            if error.status_code == reqwest::StatusCode::UNAUTHORIZED =>
+        {
+            error
+        }
+        other => return Ok(other?),
+    };
+    match error.api_error.code.as_deref() {
+        Some("token_revoked" | "refresh_token_invalidated") => {
+            tokio::task::spawn_blocking(move || invalidate_access_token(&token)).await??;
+            anyhow::bail!("ChatGPT session was revoked. {RECONNECT}.");
+        }
+        Some("subscription_sharing_invalid_user" | "invalid_token") => {
+            anyhow::bail!("{error}. {RECONNECT}.");
+        }
+        _ => Err(OpenAIError::ApiError(error).into()),
     }
 }
 

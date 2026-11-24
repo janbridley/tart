@@ -149,22 +149,8 @@ impl Agent {
         )
     }
 
-    fn with_backend(backend: Responses, model: String, policy: Policy) -> Self {
-        Self {
-            backend: Arc::new(backend),
-            model,
-            effort: None,
-            max_rounds: max_tool_rounds(),
-            mode: ChatMode::Default,
-            writable: policy,
-            runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
-            subagents: None,
-            control: TurnHandle::default(),
-            id: MAIN,
-        }
-    }
-
     /// Create an agent using the saved `ChatGPT` account.
+    #[inline]
     pub fn new_chatgpt(model: String, policy: Policy) -> Self {
         Self::with_backend(
             crate::backends::openai_responses::chatgpt_backend(),
@@ -174,6 +160,7 @@ impl Agent {
     }
 
     /// Switch to a model using the saved `ChatGPT` account.
+    #[inline]
     pub fn set_chatgpt_model(&mut self, model: String) {
         self.backend = Arc::new(crate::backends::openai_responses::chatgpt_backend());
         self.model = model;
@@ -200,6 +187,21 @@ impl Agent {
     reason = "`B` is crate plumbing; the public name is the defaulted `Agent`"
 )]
 impl<B: Backend> Agent<B> {
+    fn with_backend(backend: B, model: String, policy: Policy) -> Self {
+        Self {
+            backend: Arc::new(backend),
+            model,
+            effort: None,
+            max_rounds: max_tool_rounds(),
+            mode: ChatMode::Default,
+            writable: policy,
+            runtime: Arc::new(Runtime::new().expect("tokio runtime did not start")),
+            subagents: None,
+            control: TurnHandle::default(),
+            id: MAIN,
+        }
+    }
+
     /// The session's collaboration mode.
     #[inline]
     pub const fn mode(&self) -> ChatMode {
@@ -431,6 +433,8 @@ impl<B: Backend> Agent<B> {
             let mut call_in_flight = false;
             // Some output arrived, so the stream was delivering.
             let mut saw_output = false;
+            let mut completed = false;
+            let requires_completion = self.backend.requires_completion();
             // The last transport error, skipped so a trailing one cannot discard an
             // otherwise complete answer.
             let mut last_error: Option<String> = None;
@@ -480,6 +484,7 @@ impl<B: Backend> Agent<B> {
                         saw_output = true;
                     }
                     Ok(Event::Completed(usage)) => {
+                        completed = true;
                         // A completed response is output even when it holds no items.
                         saw_output = true;
                         if let Some(spend) = usage {
@@ -488,6 +493,9 @@ impl<B: Backend> Agent<B> {
                             spend.bill(&self.agent_tag(), &self.model);
                             let (input, cached, output) = spend.gauge();
                             on_progress(Progress::Usage { input, cached, output });
+                        }
+                        if requires_completion {
+                            break;
                         }
                     }
                     Ok(Event::Failed(reason)) => {
@@ -517,6 +525,10 @@ impl<B: Backend> Agent<B> {
             }
 
             // A stream that broke before completing its round dropped it -> retry.
+            if requires_completion && !completed && saw_output {
+                let reason = with_last_error("stream ended before response.completed", last_error);
+                return terminate_and_log(on_progress, Progress::Failed(reason));
+            }
             if call_in_flight || !saw_output {
                 let reason = with_last_error(
                     if call_in_flight {
@@ -790,7 +802,7 @@ mod tests {
             .collect()
     }
 
-    fn drive(agent: &Agent, transcript: &Transcript) -> Vec<String> {
+    fn drive(agent: &Agent<impl Backend>, transcript: &Transcript) -> Vec<String> {
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let (sender, receiver) = mpsc::channel(1);
         let handle = agent.handle();
@@ -955,6 +967,46 @@ mod tests {
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         assert_eq!(items.as_array().map(Vec::len), Some(3));
         assert_eq!(items[2]["content"], "Once upon a time");
+    }
+
+    #[test]
+    fn explicit_completion_is_required_before_dispatching_a_tool() {
+        #[derive(Clone)]
+        struct Truncated;
+
+        impl Backend for Truncated {
+            fn requires_completion(&self) -> bool {
+                true
+            }
+
+            fn round(
+                &self,
+                _: &str,
+                _: Option<ReasoningEffort>,
+                _: Vec<crate::backends::InputItem>,
+                _: Vec<Tool>,
+            ) -> impl Future<Output = anyhow::Result<crate::backends::RoundStream>> + Send
+            {
+                let ResponseStreamEvent::ResponseOutputItemDone(done) = call_done(0) else {
+                    panic!("expected a finished tool call");
+                };
+                let OutputItem::FunctionCall(call) = done.item else {
+                    panic!("expected a function call");
+                };
+                let stream: crate::backends::RoundStream =
+                    Box::pin(futures::stream::iter([Ok(Event::Call(call))]));
+                std::future::ready(Ok(stream))
+            }
+        }
+
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let agent = Agent::with_backend(Truncated, "model".into(), policy);
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("Read a file".into()).unwrap();
+        let before = transcript.request_items().len();
+        let log = drive(&agent, &transcript);
+        assert_eq!(log, [r#"Failed("stream ended before response.completed")"#]);
+        assert_eq!(transcript.request_items().len(), before);
     }
 
     /// One round whose `read` output passes the content cap: history records

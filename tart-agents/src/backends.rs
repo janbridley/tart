@@ -66,6 +66,11 @@ pub(crate) type RoundStream = Pin<Box<dyn Stream<Item = anyhow::Result<Event>> +
 
 /// A provider that runs rounds of the tool loop.
 pub(crate) trait Backend: Clone + Send + Sync + 'static {
+    /// Whether EOF requires an explicit completion event.
+    fn requires_completion(&self) -> bool {
+        false
+    }
+
     /// Connect one round: the model, the effort, the record, and the tools.
     fn round(
         &self,
