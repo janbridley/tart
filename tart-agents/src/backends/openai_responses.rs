@@ -10,10 +10,20 @@ use async_openai::{
         Reasoning, ResponseErrorCode, ResponseStream, ResponseUsage,
     },
 };
+use std::pin::Pin;
+
 use futures::{Stream, StreamExt};
 
 use crate::debug;
 use crate::usage::TokenUsage;
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::task::Poll;
 
 use super::Event;
 
@@ -74,8 +84,21 @@ impl Provider {
 pub(crate) enum Responses {
     ApiKey(Client<OpenAIConfig>),
     ChatGpt(reqwest::Client),
+    /// A scripted stand-in: each round streams the next queued events, then
+    /// holds the stream open when asked, as a server would.
     #[cfg(test)]
-    ChatGptFixture(Client<OpenAIConfig>),
+    Scripted(Arc<Script>),
+}
+
+/// What a [`Responses::Scripted`] backend serves: the rounds in turn, and
+/// whether its streams wait to be dropped.
+#[cfg(test)]
+pub(crate) struct Script {
+    rounds: Mutex<VecDeque<Vec<ResponseStreamEvent>>>,
+    /// Keep every stream open after its events, until the loop drops it.
+    hold: bool,
+    /// Stream like the `ChatGPT` backend: only `response.completed` ends a round.
+    explicit_completion: AtomicBool,
 }
 
 impl Responses {
@@ -96,15 +119,52 @@ impl Responses {
         }
     }
 
-    pub(crate) const fn requires_completion(&self) -> bool {
-        !matches!(self, Self::ApiKey(_))
+    pub(crate) fn requires_completion(&self) -> bool {
+        match self {
+            Self::ApiKey(_) => false,
+            Self::ChatGpt(_) => true,
+            #[cfg(test)]
+            Self::Scripted(script) => script.explicit_completion.load(Ordering::Relaxed),
+        }
+    }
+
+    /// A backend serving `rounds` in turn, each stream held open after its
+    /// events when `hold` is set.
+    #[cfg(test)]
+    pub(crate) fn scripted(rounds: Vec<Vec<ResponseStreamEvent>>, hold: bool) -> Self {
+        Self::Scripted(Arc::new(Script {
+            rounds: Mutex::new(rounds.into()),
+            hold,
+            explicit_completion: AtomicBool::new(false),
+        }))
     }
 
     #[cfg(test)]
     pub(crate) fn use_chatgpt_wire_format_for_test(&mut self) {
-        if let Self::ApiKey(client) = self {
-            *self = Self::ChatGptFixture(client.clone());
+        if let Self::Scripted(script) = self {
+            script.explicit_completion.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// The next round's stream: its events as the loop takes them, then an
+    /// open end that never comes while the script holds.
+    #[cfg(test)]
+    fn next_round(
+        &self,
+        script: &Script,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>> {
+        let events = crate::locked(&script.rounds).pop_front().unwrap_or_default();
+        let items = events
+            .into_iter()
+            .filter_map(translate)
+            .map(Ok)
+            .collect::<Vec<_>>();
+        let hold = script.hold;
+        Box::pin(
+            futures::stream::iter(items).chain(futures::stream::poll_fn(move |_| {
+                if hold { Poll::Pending } else { Poll::Ready(None) }
+            })),
+        )
     }
 
     pub(crate) async fn round(
@@ -113,21 +173,34 @@ impl Responses {
         effort: Option<ReasoningEffort>,
         items: Vec<InputItem>,
         tools: Vec<Tool>,
-    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Event>> + Unpin + use<>> {
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>>> {
         let request = request_of(model, effort, items, tools, self.requires_completion());
         debug::log_json("round request", || serde_json::to_string(&request));
-        let stream = match self {
-            Self::ApiKey(client) => client.responses().create_stream(request).await?,
-            Self::ChatGpt(http) => chatgpt_stream(http, request).await?,
+        let stream: Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>> = match self {
+            Self::ApiKey(client) => Box::pin(
+                client
+                    .responses()
+                    .create_stream(request)
+                    .await?
+                    .filter_map(|item| std::future::ready(translated(item))),
+            ),
+            Self::ChatGpt(http) => Box::pin(
+                chatgpt_stream(http, request)
+                    .await?
+                    .filter_map(|item| std::future::ready(translated(item))),
+            ),
             #[cfg(test)]
-            Self::ChatGptFixture(client) => client.responses().create_stream(request).await?,
+            Self::Scripted(script) => self.next_round(script),
         };
-        Ok(stream.filter_map(|item| {
-            std::future::ready(match item {
-                Ok(event) => translate(event).map(Ok),
-                Err(error) => Some(Err(error.into())),
-            })
-        }))
+        Ok(stream)
+    }
+}
+
+/// One provider event as the loop takes it, dropping what it has no use for.
+fn translated(item: Result<ResponseStreamEvent, OpenAIError>) -> Option<anyhow::Result<Event>> {
+    match item {
+        Ok(event) => translate(event).map(Ok),
+        Err(error) => Some(Err(error.into())),
     }
 }
 
@@ -239,7 +312,7 @@ fn translate(event: ResponseStreamEvent) -> Option<Event> {
             matches!(added.item, OutputItem::FunctionCall(_)).then_some(Event::CallStarted)
         }
         // Finished items are the record: an output item is a valid input item
-        // as the provider minted it, and the crate's conversion is total.
+        // as the provider minted it, and async-openai's conversion is total.
         ResponseStreamEvent::ResponseOutputItemDone(done) => {
             Some(Event::ItemDone(done.item.into()))
         }
@@ -332,46 +405,60 @@ mod tests {
 
     use super::*;
 
-    /// The request's shape on both backends: streaming; stateless on `ChatGPT`,
-    /// with namespaced tools, `developer` system messages, and encrypted
-    /// reasoning asked for; no `tools` field when nothing is offered.
+    /// The request's shape on both backends: streaming, encrypted reasoning
+    /// asked for, and the configured effort spelled as the wire spells it;
+    /// stateless on `ChatGPT`, with namespaced tools and `developer` system
+    /// messages; the API key's endpoint left stateful, with `system` intact
+    /// and plain function tools, and no `tools` field when nothing is offered.
     #[test]
     fn the_request_renders_for_its_endpoint() {
         let system = message(Role::System, "Instructions".into());
         let read = tool("read", "Read a file", serde_json::json!({"type": "object"}));
-        let chatgpt =
-            serde_json::to_value(request_of("model", None, vec![system], vec![read], true))
-                .unwrap();
+        let effort = Some(ReasoningEffort::High);
+        let chatgpt = serde_json::to_value(request_of(
+            "model",
+            effort.clone(),
+            vec![system.clone()],
+            vec![read],
+            true,
+        ))
+        .unwrap();
         assert_eq!(chatgpt["store"], false);
         assert_eq!(chatgpt["stream"], true);
         assert_eq!(chatgpt["input"][0]["role"], "developer");
         assert_eq!(chatgpt["tools"][0]["type"], "namespace");
         assert_eq!(chatgpt["tools"][0]["tools"][0]["name"], "read");
-        assert_eq!(
-            chatgpt["include"],
-            serde_json::json!(["reasoning.encrypted_content"])
-        );
+        let include = serde_json::json!(["reasoning.encrypted_content"]);
+        assert_eq!(chatgpt["include"], include);
 
         let bare =
             serde_json::to_value(request_of("model", None, Vec::new(), Vec::new(), false)).unwrap();
         assert!(bare.get("tools").is_none(), "no tools, no field: {bare}");
+        assert!(bare.get("store").is_none(), "stateful by default: {bare}");
         let armed = serde_json::to_value(request_of(
             "model",
-            None,
-            Vec::new(),
+            effort,
+            vec![system],
             vec![crate::tools::bash()],
             false,
         ))
         .unwrap();
         assert_eq!(armed["tools"][0]["type"], "function");
         assert_eq!(armed["tools"][0]["name"], "bash");
+        // Only the ChatGPT endpoint takes a `developer` message; the effort
+        // and the include ride on every request.
+        assert_eq!(armed["input"][0]["role"], "system");
+        assert_eq!(armed["reasoning"]["effort"], "high");
+        assert_eq!(armed["include"], include);
     }
 
-    /// The replay contract: a recorded item goes back as it arrived, minted ids
-    /// and encrypted reasoning included, on both backends.
+    /// The replay contract, end to end: an item the wire delivers — read from
+    /// a session line, or finished in a stream and translated — goes back as
+    /// it arrived, minted ids, phase, and encrypted reasoning included, on
+    /// both backends.
     #[test]
-    fn the_request_replays_recorded_items_verbatim() {
-        let items = [
+    fn recorded_items_replay_verbatim_however_they_arrived() {
+        let wire = [
             serde_json::json!({
                 "type": "reasoning",
                 "id": "rs_0",
@@ -398,13 +485,39 @@ mod tests {
                 ],
             }),
         ];
-        for value in items {
-            let item: InputItem = serde_json::from_value(value.clone()).unwrap();
-            for chatgpt in [false, true] {
-                let request = request_of("model", None, vec![item.clone()], Vec::new(), chatgpt);
-                let back = &serde_json::to_value(&request).unwrap()["input"][0];
-                for (key, _) in value.as_object().unwrap() {
-                    assert_eq!(back[key], value[key], "{} keeps {key}: {back}", value["type"]);
+        for value in wire {
+            let read: InputItem = serde_json::from_value(value.clone()).unwrap();
+            let done = serde_json::from_value(serde_json::json!({
+                "type": "response.output_item.done",
+                "sequence_number": 0,
+                "output_index": 0,
+                "item": value,
+            }))
+            .unwrap();
+            let finished = translate(done)
+                .and_then(|event| match event {
+                    Event::ItemDone(item) => Some(item),
+                    _ => None,
+                })
+                .expect("a finished output item is recorded");
+            for item in [read, finished] {
+                // A recorded call needs its output: one without it is a call
+                // that never ran, which the record leaves out.
+                let outputs = match &item {
+                    InputItem::Item(Item::FunctionCall(call)) => {
+                        vec![(call.clone(), "ok\n".to_string())]
+                    }
+                    _ => Vec::new(),
+                };
+                let transcript = crate::Transcript::new().unwrap();
+                transcript.push_round(vec![item], "", outputs);
+                for chatgpt in [false, true] {
+                    let request =
+                        request_of("model", None, transcript.request_items(), Vec::new(), chatgpt);
+                    let back = &serde_json::to_value(&request).unwrap()["input"][1];
+                    for (key, _) in value.as_object().unwrap() {
+                        assert_eq!(back[key], value[key], "chatgpt={chatgpt}: keeps {key}: {back}");
+                    }
                 }
             }
         }

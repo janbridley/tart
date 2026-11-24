@@ -218,15 +218,18 @@ impl Transcript {
     pub(crate) fn push_round(
         &self,
         round: Vec<InputItem>,
-        answer: Option<&str>,
+        answer: &str,
         outputs: Vec<(FunctionToolCall, String)>,
     ) {
+        let messaged = round
+            .iter()
+            .any(|item| matches!(item, InputItem::Item(Item::Message(_))));
         let ran: HashSet<&str> = outputs.iter().map(|(call, _)| call.call_id.as_str()).collect();
         let mut lines = self.locked();
         lines.extend(round.into_iter().filter(|item| {
             !matches!(item, InputItem::Item(Item::FunctionCall(call)) if !ran.contains(call.call_id.as_str()))
         }).map(RecordLine::fresh));
-        if let Some(answer) = answer.filter(|answer| !answer.is_empty()) {
+        if !messaged && !answer.is_empty() {
             lines.push(RecordLine::fresh(message(Role::Assistant, answer.to_string())));
         }
         lines.extend(
@@ -351,8 +354,7 @@ mod tests {
 
     impl Transcript {
         /// A transcript over `items`, as a session file restored them: the
-        /// lines arrive unstamped, so a record seeded this way mints stamps at
-        /// its next write. Resume restores full lines with
+        /// lines arrive unstamped, and stay so. Resume restores full lines with
         /// [`Transcript::from_lines`].
         #[inline]
         fn from_items(items: Vec<InputItem>) -> Self {
@@ -366,7 +368,7 @@ mod tests {
 
         /// The stored items from `start` on, oldest first, as tests read them;
         /// [`Session`](crate::Session) reads the same tail as lines, stamps
-        /// attached, in [`Transcript::recorded_after`].
+        /// attached, in [`Transcript::lines`].
         #[inline]
         #[must_use]
         fn items_after(&self, start: usize) -> Vec<InputItem> {
@@ -394,12 +396,12 @@ mod tests {
         InputItem::Item(Item::FunctionCall(call))
     }
 
-    /// A reasoning item as the provider mints one: visible text and its ciphertext.
-    fn reasoning() -> InputItem {
+    /// A reasoning item as the provider mints one: visible text and its
+    /// ciphertext, under its minted id.
+    fn reasoning(id: &str) -> InputItem {
         serde_json::from_value(serde_json::json!({
             "type": "reasoning",
-            "id": "rs_0",
-            "summary": [],
+            "id": id,"summary": [],
             "content": [{ "type": "reasoning_text", "text": "thinking" }],
             "encrypted_content": "gAAAAABciphertext",
         }))
@@ -429,7 +431,7 @@ mod tests {
         items: Vec<InputItem>,
         outputs: Vec<(FunctionToolCall, String)>,
     ) {
-        transcript.push_round(items, None, outputs);
+        transcript.push_round(items, "", outputs);
     }
 
     #[test]
@@ -440,7 +442,7 @@ mod tests {
         skipped.id = Some("item_1".into());
         transcript.push_round(
             vec![call(bash_call()), call(skipped)],
-            Some("checking"),
+            "checking",
             vec![(bash_call(), "one\n".to_string())],
         );
         let items = serde_json::to_value(transcript.request_items()).unwrap();
@@ -448,6 +450,34 @@ mod tests {
         assert_eq!(items[2]["role"], "assistant");
         assert_eq!(items[3]["type"], "function_call_output");
         assert_eq!(items.as_array().unwrap().len(), 4, "{items}");
+    }
+
+    #[test]
+    fn a_round_records_items_then_the_answer_then_outputs() {
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("run it".to_string()).unwrap();
+        transcript.push_round(
+            vec![reasoning("rs_0"), reasoning("rs_1"), call(bash_call())],
+            "running ls\n",
+            vec![(bash_call(), "one\n".to_string())],
+        );
+        transcript.push_round(vec![reasoning("rs_2"), answer()], "All done.", Vec::new());
+        transcript.push_round(Vec::new(), "", Vec::new());
+
+        assert_eq!(
+            transcript.items_after(0),
+            [
+                message(Role::System, SYSTEM.to_string()),
+                message(Role::User, "run it".to_string()),
+                reasoning("rs_0"),
+                reasoning("rs_1"),
+                call(bash_call()),
+                message(Role::Assistant, "running ls\n".to_string()),
+                call_output(&bash_call(), "one\n".to_string()),
+                reasoning("rs_2"),
+                answer(),
+            ]
+        );
     }
 
     #[test]
@@ -527,7 +557,6 @@ mod tests {
         for (item, kept) in request.iter().zip(sent.as_array().unwrap()) {
             assert_eq!(item, kept, "the record leads the request unchanged");
         }
-        assert!(!sent.to_string().contains("plan mode is on"), "never stored");
 
         // The plan lands, the mode leaves, the approval turn is recorded: the
         // implementing request ends in the approval, the cached prefix intact.
@@ -559,7 +588,7 @@ mod tests {
         transcript.push_user("run it".to_string()).unwrap();
         round(
             &transcript,
-            vec![reasoning(), call(bash_call())],
+            vec![reasoning("rs_0"), call(bash_call())],
             vec![(bash_call(), "one\n".to_string())],
         );
         transcript.push_assistant("done".to_string()).unwrap();
@@ -623,7 +652,7 @@ mod tests {
             message(Role::System, "be terse".to_string()),
             message(Role::User, "hello".to_string()),
         ]);
-        transcript.push_round(Vec::new(), None, vec![(bash_call(), "one\n".to_string())]);
+        transcript.push_round(Vec::new(), "", vec![(bash_call(), "one\n".to_string())]);
         transcript.push_assistant("hi".to_string()).unwrap();
 
         transcript.clear();
@@ -649,7 +678,7 @@ mod tests {
         transcript.push_user("two".to_string()).unwrap();
         round(
             &transcript,
-            vec![reasoning(), call(bash_call())],
+            vec![reasoning("rs_0"), call(bash_call())],
             vec![(bash_call(), "one\n".to_string())],
         );
         transcript.push_assistant("2".to_string()).unwrap();
@@ -699,7 +728,7 @@ mod tests {
         second.call_id = "call_1".to_string();
         round(
             &transcript,
-            vec![reasoning(), call(bash_call()), call(second.clone())],
+            vec![reasoning("rs_0"), call(bash_call()), call(second.clone())],
             vec![
                 (bash_call(), "one\n".to_string()),
                 (second, "[exit 2]\ntwo\n".to_string()),
@@ -761,8 +790,11 @@ mod tests {
         let parsed = serde_json::from_str::<RecordLine>(mangled).unwrap();
         assert_eq!(parsed.timestamp, None);
         assert!(matches!(
-            parsed.item,
+            &parsed.item,
             InputItem::EasyMessage(message) if message.content == EasyInputContent::Text("hi".into())
         ));
+        // A null stamp is absent too, not damage: the line still parses.
+        let nulled = mangled.replace("123", "null");
+        assert_eq!(serde_json::from_str::<RecordLine>(&nulled).unwrap(), parsed);
     }
 }

@@ -392,9 +392,6 @@ impl Agent {
             let mut items: Vec<InputItem> = Vec::new();
             // The typed view of its calls, for execution and their outputs.
             let mut calls: Vec<FunctionToolCall> = Vec::new();
-            // Whether an assistant message item arrived: its text then stands
-            // as the record, and the streamed text is only the fallback.
-            let mut saw_message = false;
             // A function-call item started but never reported done.
             let mut call_in_flight = false;
             // Some output arrived, so the stream was delivering.
@@ -436,13 +433,9 @@ impl Agent {
                     }
                     Ok(Event::ItemDone(item)) => {
                         saw_output = true;
-                        match &item {
-                            InputItem::Item(Item::FunctionCall(call)) => {
-                                calls.push(call.clone());
-                                call_in_flight = false;
-                            }
-                            InputItem::Item(Item::Message(_)) => saw_message = true,
-                            _ => {}
+                        if let InputItem::Item(Item::FunctionCall(call)) = &item {
+                            calls.push(call.clone());
+                            call_in_flight = false;
                         }
                         items.push(item);
                     }
@@ -508,11 +501,8 @@ impl Agent {
             }
 
             // No calls pending: this round's answer is the turn's message.
-            // The streamed text stands in for it only when the stream
-            // delivered no message item to carry it.
-            let fallback = (!saw_message).then_some(answer.as_str());
             if calls.is_empty() {
-                transcript.push_round(items, fallback, Vec::new());
+                transcript.push_round(items, &answer, Vec::new());
                 return terminate_and_log(
                     on_progress,
                     Progress::Done {
@@ -574,7 +564,7 @@ impl Agent {
             if exchanges.is_empty() {
                 transcript.push_answer(&answer);
             } else {
-                transcript.push_round(items, fallback, exchanges);
+                transcript.push_round(items, &answer, exchanges);
             }
             if self.control.cancelled(&mut cancel_rx) {
                 // The turn stops here, keeping the rounds recorded so far.
@@ -615,10 +605,10 @@ mod tests {
     use super::*;
     use crate::backends::openai_responses::{
         OutputItem, ResponseOutputItemDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
+        Responses,
     };
     use crate::usage::TokenUsage;
     use crate::usage::tests::sample_usage;
-    use std::io::{Read, Write};
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -711,16 +701,13 @@ mod tests {
         definitions.iter().map(|tool| tool.name.as_str()).collect()
     }
 
-    /// A loopback listener with an agent pointed at it, or `None` where the
-    /// sandbox denies the bind (the calling test skips).
-    fn live() -> Option<(std::net::TcpListener, Agent)> {
+    /// An agent whose backend serves `rounds` in turn, each stream held open
+    /// after its events when `hold` is set.
+    fn scripted(rounds: Vec<Vec<ResponseStreamEvent>>, hold: bool) -> Agent {
         let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let listener = loopback()?;
-        let address = listener.local_addr().expect("a bound address");
-        Some((
-            listener,
-            Agent::new(format!("http://{address}"), "key", "model", policy),
-        ))
+        let mut agent = Agent::new("http://unused", "key", "model", policy);
+        agent.backend = Responses::scripted(rounds, hold);
+        agent
     }
 
     /// A transcript holding the user's `prompt`.
@@ -784,14 +771,11 @@ mod tests {
     /// interrupted turn leaves behind for the front end to requeue onto.
     #[test]
     fn cancel_mid_stream_keeps_the_partial_answer() {
-        let Some((listener, agent)) = live() else {
-            return;
-        };
         let transcript = primed("tell me a story");
 
         // One round streams a partial answer, then parks: the stream never
         // ends on its own, so only a cancel can end the turn.
-        let server = serve_rounds(listener, vec![vec![delta("Once upon"), delta(" a time")]], true);
+        let agent = scripted(vec![vec![delta("Once upon"), delta(" a time")]], true);
 
         // Esc lands once both fragments have streamed, so the cancel wakes
         // the parked select with the partial already in hand.
@@ -829,26 +813,45 @@ mod tests {
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         assert_eq!(items.as_array().map(Vec::len), Some(3));
         assert_eq!(items[2]["content"], "Once upon a time");
-
-        server.join().expect("the server exits");
     }
 
     /// A stream that delivers nothing and closes drops its round; the retry
     /// re-sends the request verbatim and the turn completes on the second one.
+    /// A round that streams its text and then the finished message item
+    /// records the provider's item alone: the streamed text is the fallback,
+    /// not a second copy beside it, while `Done` still carries it.
+    #[test]
+    fn a_message_item_replaces_the_streamed_answer_in_the_record() {
+        let transcript = primed("tell me a story");
+        let agent = scripted(
+            vec![vec![delta("All "), delta("done."), message_done("All done.")]],
+            false,
+        );
+
+        let log = drive(&agent, &transcript);
+
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some(r#"Done { message: Some("All done.") }"#)
+        );
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 3, "system, user, the provider's message: {items:?}");
+        assert_eq!(items[2]["id"], "msg_0", "the provider's item, not a stand-in");
+        assert_eq!(items[2]["phase"], "final_answer");
+        assert_eq!(items[2]["content"][0]["text"], "All done.");
+    }
+
     #[test]
     fn a_dropped_stream_retries_its_round() {
-        let Some((listener, agent)) = live() else {
-            return;
-        };
         let transcript = primed("tell me a story");
 
         // The first request answers with an empty stream that closes at once;
         // the retried request gets the complete one, so only the retry ends
         // the turn.
-        let server = serve_rounds(listener, vec![vec![], vec![delta("Once upon a time")]], false);
+        let agent = scripted(vec![vec![], vec![delta("Once upon a time")]], false);
 
         let log = drive(&agent, &transcript);
-        server.join().expect("the server exits");
 
         // The stall is visible as a note, and the retry completes the turn.
         assert!(
@@ -866,17 +869,13 @@ mod tests {
 
     #[test]
     fn explicit_completion_is_required_before_dispatching_a_tool() {
-        let Some((listener, mut agent)) = live() else {
-            return;
-        };
-        let server = serve_rounds(listener, vec![vec![call_done(0)]], false);
+        let mut agent = scripted(vec![vec![call_done(0)]], false);
         agent.backend.use_chatgpt_wire_format_for_test();
         let transcript = primed("Read a file");
         let before = transcript.request_items().len();
         let log = drive(&agent, &transcript);
         assert_eq!(log, [r#"Failed("stream ended before response.completed")"#]);
         assert_eq!(transcript.request_items().len(), before);
-        server.join().unwrap();
     }
 
     /// One round whose `read` output passes the content cap: history records
@@ -887,9 +886,17 @@ mod tests {
     fn an_oversized_tool_output_spills_into_history() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let Some((listener, agent)) = live() else {
+        // The round runs a real `read`, under the harness's own sandbox.
+        if let Err(why) = crate::sandbox::live::probe() {
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "note: skipping live test an_oversized_tool_output_spills_into_history (reaches sandbox-exec): {why}"
+            );
             return;
-        };
+        }
+
         let transcript = primed("read it all");
 
         // A file whose numbered rendering passes the content cap.
@@ -898,8 +905,7 @@ mod tests {
         let arguments = serde_json::json!({ "file_path": &big }).to_string();
 
         // The first round calls read on the big file; the second answers.
-        let server = serve_rounds(
-            listener,
+        let agent = scripted(
             vec![
                 vec![call_done_with(
                     0,
@@ -954,7 +960,6 @@ mod tests {
 
         let _ = std::fs::remove_file(saved);
         let _ = std::fs::remove_file(&big);
-        server.join().expect("the server exits");
     }
 
     /// A call the harness cannot run records its misuse as the output and ends
@@ -963,14 +968,10 @@ mod tests {
     /// sibling call.
     #[test]
     fn the_rounds_remaining_calls_run_after_a_malformed_one() {
-        let Some((listener, agent)) = live() else {
-            return;
-        };
         let transcript = primed("read something");
 
         // One round carries two malformed read calls; the next round answers.
-        let server = serve_rounds(
-            listener,
+        let agent = scripted(
             vec![vec![call_done(0), call_done(1)], vec![delta("both answered")]],
             false,
         );
@@ -1004,30 +1005,23 @@ mod tests {
             );
         }
         assert_eq!(items[6]["content"], "both answered");
-        server.join().expect("the server exits");
     }
 
     /// A claim on a running child answers "still running" at once, as often
     /// as asked: nothing blocks, so nothing has to recover from blocking.
     #[test]
     fn a_claim_on_a_running_child_is_instant_and_repeatable() {
-        let Some((_listener, agent)) = live() else {
-            return;
-        };
+        // A stream that never ends holds the child mid-request, so it stays
+        // running through every claim.
+        let agent = scripted(Vec::new(), true);
         let agents = Agents::new(|_, _| {});
         let id = agents.spawn(&agent, "outlive the claims").unwrap();
-
-        // A listener that never accepts holds the child mid-request, so it
-        // stays running through every claim.
         assert!(agents.claim(id).unwrap().is_none());
         assert!(agents.claim(id).unwrap().is_none());
     }
 
     #[test]
     fn spawned_subagents_run_and_report() {
-        let Some((listener, agent)) = live() else {
-            return;
-        };
         let events = Arc::new(Mutex::new(Vec::<(crate::AgentId, Progress)>::new()));
         let log = Arc::clone(&events);
         let agents = crate::Agents::new(move |id, progress| {
@@ -1036,7 +1030,7 @@ mod tests {
 
         // The child's one round streams an answer, then the stream closes:
         // the turn ends on its own, no cancel needed.
-        let server = serve_rounds(listener, vec![vec![delta("found it")]], false);
+        let agent = scripted(vec![vec![delta("found it")]], false);
 
         let id = agents
             .spawn(&agent, "find the flaky test")
@@ -1044,7 +1038,6 @@ mod tests {
         settled(&agents, id);
         let outcome = agents.claim(id).expect("the child is registered");
         assert_eq!(outcome, Some(crate::Outcome::Done(Some("found it".to_string()))));
-        server.join().expect("the server exits");
 
         // The box opener precedes every child event.
         let events = events.lock().unwrap();
@@ -1069,26 +1062,18 @@ mod tests {
     /// requirement, pinned end to end through the real spawn path.
     #[test]
     fn a_subagents_round_bills_as_a_child() {
-        let Some((listener, agent)) = live() else {
-            return;
-        };
         let _held = crate::usage::tests::held_for_test();
         let _ledger = crate::usage::tests::ledger_root();
         crate::usage::set_session("child-ledger".to_string());
         let agents = crate::Agents::new(|_, _| ());
 
         // The child's one round answers, bills, and the stream ends.
-        let server = serve_rounds(
-            listener,
-            vec![vec![delta("found it"), completed(&sample_usage())]],
-            false,
-        );
+        let agent = scripted(vec![vec![delta("found it"), completed(&sample_usage())]], false);
 
         let id = agents
             .spawn(&agent, "find the flaky test")
             .expect("room for a child");
         settled(&agents, id);
-        server.join().expect("the server exits");
 
         let row = crate::usage::Ledger::last_entry().expect("the child's round billed");
         assert_eq!(row.agent, format!("child-{}", id.id()), "the row names the child");
@@ -1149,23 +1134,6 @@ mod tests {
         }
     }
 
-    /// The loopback listener the worker test streams from, or `None` where denied
-    fn loopback() -> Option<std::net::TcpListener> {
-        match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-            Ok(listener) => Some(listener),
-            Err(error) => {
-                let current = std::thread::current();
-                let name = current.name().unwrap_or("<unnamed>");
-                let mut stderr = std::io::stderr().lock();
-                let _ = writeln!(
-                    stderr,
-                    "note: skipping live test {name} (needs loopback the sandbox denies): {error}"
-                );
-                None
-            }
-        }
-    }
-
     /// An output-text delta event carrying `text`.
     fn delta(text: &str) -> ResponseStreamEvent {
         ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
@@ -1208,6 +1176,25 @@ mod tests {
         })
     }
 
+    /// An output-item-done event carrying the finished assistant message, as
+    /// a provider streams it after the text deltas: the item the record keeps.
+    fn message_done(text: &str) -> ResponseStreamEvent {
+        let event = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 7,
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_0",
+                "role": "assistant",
+                "status": "completed",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        });
+        serde_json::from_value(event).expect("a message item done event parses")
+    }
+
     /// A `response.completed` event whose response burned `spend` tokens.
     fn completed(spend: &TokenUsage) -> ResponseStreamEvent {
         let event = serde_json::json!({
@@ -1235,20 +1222,13 @@ mod tests {
 
     #[test]
     fn a_completed_round_bills_the_ledger() {
-        let Some((listener, agent)) = live() else {
-            return;
-        };
         let transcript = primed("hello");
         let _held = crate::usage::tests::held_for_test();
         let _ledger = crate::usage::tests::ledger_root();
         crate::usage::set_session("ledgered".to_string());
 
         // One round answers, bills, and the stream ends: the turn completes.
-        let server = serve_rounds(
-            listener,
-            vec![vec![delta("hi there"), completed(&sample_usage())]],
-            false,
-        );
+        let agent = scripted(vec![vec![delta("hi there"), completed(&sample_usage())]], false);
 
         let log = drive(&agent, &transcript);
 
@@ -1269,68 +1249,5 @@ mod tests {
         assert_eq!(row.model, "model");
         assert_eq!(row.session.as_deref(), Some("ledgered"));
         assert_eq!(row.usage, crate::usage::tests::sample_usage());
-        server.join().expect("the server exits");
-    }
-
-    /// Answer each successive `/responses` request with one round's `events`
-    /// as `text/event-stream`, in order; `hold` keeps every connection open
-    /// until the client goes away instead of closing after its events.
-    fn serve_rounds(
-        listener: std::net::TcpListener,
-        rounds: Vec<Vec<ResponseStreamEvent>>,
-        hold: bool,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            for events in rounds {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    return;
-                };
-                read_request(&mut stream);
-                let _ = stream.write_all(head.as_bytes());
-                for event in &events {
-                    let event = serde_json::to_string(event).expect("a stream event serializes");
-                    let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-                }
-                let _ = stream.flush();
-                if hold {
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                    let mut drain = [0; 1024];
-                    while !matches!(stream.read(&mut drain), Ok(0) | Err(_)) {}
-                }
-            }
-        })
-    }
-
-    /// Read one request off `stream`: the head, then the body its
-    /// `content-length` names. Nothing beyond that length is parsed.
-    fn read_request(stream: &mut std::net::TcpStream) {
-        let mut seen = Vec::new();
-        let mut chunk = [0; 1024];
-        let head = loop {
-            let read = stream.read(&mut chunk).unwrap_or(0);
-            if read == 0 {
-                return; // the client gave up
-            }
-            seen.extend_from_slice(&chunk[..read]);
-            if let Some(at) = seen.windows(4).position(|window| window == b"\r\n\r\n") {
-                break at + 4;
-            }
-        };
-        let length = String::from_utf8_lossy(&seen[..head])
-            .to_uppercase()
-            .lines()
-            .find_map(|line| line.strip_prefix("CONTENT-LENGTH:"))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        while seen.len() < head + length {
-            let read = stream.read(&mut chunk).unwrap_or(0);
-            if read == 0 {
-                return;
-            }
-            seen.extend_from_slice(&chunk[..read]);
-        }
     }
 }
