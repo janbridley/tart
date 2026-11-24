@@ -1,13 +1,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::backends::{
-    EasyInputContent, FunctionToolCall, InputItem, Item, ReasoningItem, ReasoningItemContent, Role,
-    call_output, message,
-};
-
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::Progress;
+use crate::backends::{
+    EasyInputContent, FunctionToolCall, InputItem, Item, MessageItem, OutputMessageContent,
+    ReasoningItemContent, Role, call_output, message,
+};
 
 /// The system prompt for *tart*, included in every conversation.
 const SYSTEM: &str = include_str!("data/SYSTEM.md");
@@ -21,21 +21,32 @@ pub(crate) fn stamp_utc_at(moment: OffsetDateTime) -> String {
     format!("{y:04}-{m:02}-{d:02} {hr:02}:{min:02}:{sec:02}")
 }
 
-/// One session line's durable metadata, preserved by every rewrite.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct LineMetadata {
+/// One line of the record: an item and the stamp its session file wrote beside
+/// it. The item's own fields flatten in beside the stamp, so the line is one
+/// JSON object: `{"timestamp":"…","type":"reasoning","id":"rs_…",…}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RecordLine {
     /// When the line was first written, `YYYY-MM-DD HH:MM:SS` UTC; minted at
-    /// write time when absent.
+    /// write time when absent. A stamp of any other shape reads as absent.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stamp"
+    )]
     pub(crate) timestamp: Option<String>,
+    /// The item itself, as the record and a request send it.
+    #[serde(flatten)]
+    pub(crate) item: InputItem,
 }
 
-/// One recorded item and the metadata its session line carries.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct RecordLine {
-    /// The item itself, as the record and a request send it.
-    pub(crate) item: InputItem,
-    /// The metadata its session line writes beside it.
-    pub(crate) meta: LineMetadata,
+/// The stamp as written, or absent when the sibling holds anything but text.
+fn stamp<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(
+        Option::<serde_json::Value>::deserialize(deserializer)?.and_then(|value| match value {
+            serde_json::Value::String(stamp) => Some(stamp),
+            _ => None,
+        }),
+    )
 }
 
 impl RecordLine {
@@ -45,9 +56,7 @@ impl RecordLine {
     fn fresh(item: InputItem) -> Self {
         Self {
             item,
-            meta: LineMetadata {
-                timestamp: Some(stamp_utc_at(OffsetDateTime::now_utc())),
-            },
+            timestamp: Some(stamp_utc_at(OffsetDateTime::now_utc())),
         }
     }
 }
@@ -93,9 +102,14 @@ pub struct Transcript {
     reminder: Option<InputItem>,
 }
 
+/// Whether `item` is a plain message carrying `role`.
+pub(crate) fn is_message(item: &InputItem, role: Role) -> bool {
+    matches!(item, InputItem::EasyMessage(message) if message.role == role)
+}
+
 impl Transcript {
     /// The lines under their lock, poison recovered as [`crate::locked`] does.
-    fn lines(&self) -> MutexGuard<'_, Vec<RecordLine>> {
+    fn locked(&self) -> MutexGuard<'_, Vec<RecordLine>> {
         crate::locked(&self.lines)
     }
 
@@ -109,10 +123,10 @@ impl Transcript {
     #[inline]
     pub fn new_with(system: &str) -> anyhow::Result<Self> {
         Ok(Self {
-            lines: Arc::new(Mutex::new(vec![RecordLine {
-                item: message(Role::System, system.to_string())?,
-                meta: LineMetadata::default(),
-            }])),
+            lines: Arc::new(Mutex::new(vec![RecordLine::fresh(message(
+                Role::System,
+                system.to_string(),
+            ))])),
             preamble: None,
             reminder: None,
         })
@@ -137,12 +151,10 @@ impl Transcript {
     /// Cut the record back to `start`, not including the system prompt.
     #[inline]
     pub fn rewind(&self, start: usize) {
-        let mut lines = self.lines();
+        let mut lines = self.locked();
         let systems = lines
             .iter()
-            .take_while(
-                |line| matches!(&line.item, InputItem::EasyMessage(m) if m.role == Role::System),
-            )
+            .take_while(|line| is_message(&line.item, Role::System))
             .count();
         lines.truncate(start.max(systems));
     }
@@ -151,11 +163,10 @@ impl Transcript {
     #[inline]
     #[must_use]
     pub fn user_turns(&self) -> Vec<(usize, String)> {
-        self.lines()
+        self.locked()
             .iter()
-            .map(|line| &line.item)
             .enumerate()
-            .filter_map(|(index, item)| match item {
+            .filter_map(|(index, line)| match &line.item {
                 InputItem::EasyMessage(message) => match (&message.role, &message.content) {
                     (Role::User, EasyInputContent::Text(text)) => Some((index, text.clone())),
                     // Prompts, answers, and content lists the harness never
@@ -170,91 +181,75 @@ impl Transcript {
     /// Record the user's turn.
     #[inline]
     pub fn push_user(&self, text: String) -> anyhow::Result<()> {
-        self.push(message(Role::User, text)?);
+        self.push(message(Role::User, text));
         Ok(())
     }
 
     /// Record the assistant's final answer for the current turn.
     #[inline]
     pub fn push_assistant(&self, text: String) -> anyhow::Result<()> {
-        self.push(message(Role::Assistant, text)?);
+        self.push(message(Role::Assistant, text));
         Ok(())
     }
 
     /// Record the answer a round streamed, when it streamed one at all.
-    pub(crate) fn push_answer(&self, answer: &str) -> anyhow::Result<()> {
-        if answer.is_empty() {
-            return Ok(());
+    pub(crate) fn push_answer(&self, answer: &str) {
+        if !answer.is_empty() {
+            self.push(message(Role::Assistant, answer.to_string()));
         }
-        self.push_assistant(answer.to_string())
     }
 
     /// Append one item, stamped with the moment of its recording.
     fn push(&self, item: InputItem) {
-        self.lines().push(RecordLine::fresh(item));
+        self.locked().push(RecordLine::fresh(item));
     }
 
-    /// Record the reasoning that preceded a round's tool calls.
+    /// Record one finished round under one lock: the provider's output items
+    /// exactly as it minted them, in stream order — reasoning with its
+    /// ciphertext, calls with their ids, assistant messages with their
+    /// structure; then the streamed `answer`, which stands in for the message
+    /// item only when the stream delivered none; then each call's output in
+    /// call order.
     ///
-    /// This is critical for `DeepSeek`'s thinking mode, which breaks on concurrent tool
-    /// calls without it.
-    pub(crate) fn push_reasoning(&self, item: ReasoningItem) {
-        self.push(InputItem::Item(item.into()));
-    }
-
-    /// Record one round of tool exchanges.
-    pub(crate) fn push_tool_round(&self, round: Vec<(FunctionToolCall, String)>) {
-        let mut lines = self.lines();
-        let mut outputs = Vec::with_capacity(round.len());
-        for (call, output) in round {
-            outputs.push(call_output(&call, output));
-            lines.push(RecordLine::fresh(InputItem::Item(Item::FunctionCall(call))));
+    /// Provider items are never rewritten, which keeps the model's reasoning
+    /// intact between rounds and the growing record a stable prefix.
+    pub(crate) fn push_round(
+        &self,
+        round: Vec<InputItem>,
+        answer: Option<&str>,
+        outputs: Vec<(FunctionToolCall, String)>,
+    ) {
+        let mut lines = self.locked();
+        lines.extend(round.into_iter().map(RecordLine::fresh));
+        if let Some(answer) = answer.filter(|answer| !answer.is_empty()) {
+            lines.push(RecordLine::fresh(message(Role::Assistant, answer.to_string())));
         }
-        for output in outputs {
-            lines.push(RecordLine::fresh(output));
-        }
+        lines.extend(
+            outputs
+                .into_iter()
+                .map(|(call, output)| RecordLine::fresh(call_output(&call, output))),
+        );
     }
 
     /// Send `text` as a user message behind the system prompt on every request or clear
     #[inline]
     pub fn set_preamble(&mut self, text: Option<&str>) -> anyhow::Result<()> {
-        self.preamble = match text {
-            Some(text) => Some(message(Role::User, text.to_string())?),
-            None => None,
-        };
+        self.preamble = text.map(|text| message(Role::User, text.to_string()));
         Ok(())
     }
 
     /// Append `text` to the end of the input on every subsequent request, or clear with `None`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the API's argument validation, which a non-empty `text` can't fail
     #[inline]
     pub fn set_reminder(&mut self, text: Option<&str>) -> anyhow::Result<()> {
-        self.reminder = match text {
-            Some(text) => Some(message(Role::System, text.to_string())?),
-            None => None,
-        };
+        self.reminder = text.map(|text| message(Role::System, text.to_string()));
         Ok(())
     }
 
-    /// How many items the stored record holds.
+    /// The stored lines, oldest first: the session file's contents.
     #[inline]
     #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.lines().len()
-    }
-
-    /// The stored items and their metadata from `start` on, oldest first.
-    ///
-    /// A cursor read: only the tail past what a session has already flushed
-    /// is cloned, each item paired with the metadata its session line carries.
-    /// A `start` past the end yields nothing.
-    #[inline]
-    #[must_use]
-    pub(crate) fn recorded_after(&self, start: usize) -> Vec<RecordLine> {
-        self.lines().get(start..).map_or_else(Vec::new, ToOwned::to_owned)
+    pub(crate) fn lines(&self) -> Vec<RecordLine> {
+        self.locked().clone()
     }
 
     /// The input items for the next request: the stored record, the AGENTS.md preamble
@@ -262,14 +257,9 @@ impl Transcript {
     #[inline]
     #[must_use]
     pub fn request_items(&self) -> Vec<InputItem> {
-        let mut items: Vec<_> = self.lines().iter().map(|line| line.item.clone()).collect();
+        let mut items: Vec<_> = self.locked().iter().map(|line| line.item.clone()).collect();
         if let Some(preamble) = &self.preamble {
-            let systems = items
-                .iter()
-                .take_while(
-                    |item| matches!(item, InputItem::EasyMessage(m) if m.role == Role::System),
-                )
-                .count();
+            let systems = items.iter().filter(|item| is_message(item, Role::System)).count();
             items.insert(systems, preamble.clone());
         }
         items.extend(self.reminder.clone());
@@ -281,53 +271,67 @@ impl Transcript {
     /// Tool exchanges replay headers only, with coloring skipped for simplicity.
     #[inline]
     pub fn replay(&self) -> Vec<Progress> {
-        self.lines()
+        self.locked()
             .iter()
-            .map(|line| &line.item)
-            .chain(self.reminder.as_ref())
-            .flat_map(Self::replay_events)
+            .flat_map(|line| replay_events(&line.item))
             .collect()
     }
+}
 
-    /// The events one recorded item replays as, in live order.
-    fn replay_events(item: &InputItem) -> Vec<Progress> {
-        match item {
-            InputItem::EasyMessage(message) => match (&message.role, &message.content) {
-                (Role::User, EasyInputContent::Text(text)) => vec![Progress::User(text.clone())],
-                (Role::Assistant, EasyInputContent::Text(text)) => {
-                    vec![Progress::Answer(text.clone())]
-                }
-                _ => Vec::new(),
-            },
-            InputItem::Item(Item::Reasoning(reasoning)) => {
-                let text: String = reasoning
-                    .content
-                    .iter()
-                    .flatten()
-                    .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
-                    .collect();
-                (!text.is_empty())
-                    .then_some(Progress::Thinking(text))
-                    .into_iter()
-                    .collect()
-            }
-            InputItem::Item(Item::FunctionCall(call)) => {
-                // Just show the header, exits/output are not super necessary
-                vec![
-                    Progress::ToolStart {
-                        id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    },
-                    Progress::ToolOutput {
-                        id: call.call_id.clone(),
-                        output: String::new(),
-                        exit: Some(0),
-                    },
-                ]
+/// The events one recorded item replays as, in live order.
+fn replay_events(item: &InputItem) -> Vec<Progress> {
+    match item {
+        InputItem::EasyMessage(message) => match (&message.role, &message.content) {
+            (Role::User, EasyInputContent::Text(text)) => vec![Progress::User(text.clone())],
+            (Role::Assistant, EasyInputContent::Text(text)) => {
+                vec![Progress::Answer(text.clone())]
             }
             _ => Vec::new(),
+        },
+        // The provider's own words: an assistant message's text, or the
+        // reasoning it shows, empty when it kept its thinking to itself.
+        InputItem::Item(Item::Message(MessageItem::Output(message))) => {
+            let text: String = message
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    OutputMessageContent::OutputText(text) => Some(text.text.as_str()),
+                    OutputMessageContent::Refusal(_) => None,
+                })
+                .collect();
+            (!text.is_empty())
+                .then_some(Progress::Answer(text))
+                .into_iter()
+                .collect()
         }
+        InputItem::Item(Item::Reasoning(reasoning)) => {
+            let text: String = reasoning
+                .content
+                .iter()
+                .flatten()
+                .map(|ReasoningItemContent::ReasoningText(part)| part.text.as_str())
+                .collect();
+            (!text.is_empty())
+                .then_some(Progress::Thinking(text))
+                .into_iter()
+                .collect()
+        }
+        InputItem::Item(Item::FunctionCall(call)) => {
+            // Just show the header, exits/output are not super necessary
+            vec![
+                Progress::ToolStart {
+                    id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+                Progress::ToolOutput {
+                    id: call.call_id.clone(),
+                    output: String::new(),
+                    exit: Some(0),
+                },
+            ]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -336,37 +340,35 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
-    use crate::backends::openai_responses::ReasoningTextContent;
 
     impl Transcript {
         /// A transcript over `items`, as a session file restored them: the
-        /// lines arrive metadata-free, so a record seeded this way mints
-        /// stamps at its next write. Resume restores full lines with
+        /// lines arrive unstamped, so a record seeded this way mints stamps at
+        /// its next write. Resume restores full lines with
         /// [`Transcript::from_lines`].
         #[inline]
         fn from_items(items: Vec<InputItem>) -> Self {
             Self::from_lines(
                 items
                     .into_iter()
-                    .map(|item| RecordLine { item, meta: LineMetadata::default() })
+                    .map(|item| RecordLine { item, timestamp: None })
                     .collect(),
             )
         }
 
-        /// The stored items from `start` on, oldest first, as tests replay
-        /// them; [`Session`](crate::Session) reads the same tail as lines,
-        /// metadata attached, in [`Transcript::recorded_after`].
+        /// The stored items from `start` on, oldest first, as tests read them;
+        /// [`Session`](crate::Session) reads the same tail as lines, stamps
+        /// attached, in [`Transcript::recorded_after`].
         #[inline]
         #[must_use]
         fn items_after(&self, start: usize) -> Vec<InputItem> {
-            self.recorded_after(start)
-                .into_iter()
-                .map(|line| line.item)
-                .collect()
+            self.lines().get(start..).map_or_else(Vec::new, |lines| {
+                lines.iter().map(|line| line.item.clone()).collect()
+            })
         }
     }
 
-    /// A finished `bash` call, as the agent loop would reconstruct it.
+    /// A finished `bash` call, as the provider mints one.
     fn bash_call() -> FunctionToolCall {
         FunctionToolCall {
             namespace: None,
@@ -380,17 +382,46 @@ mod tests {
         }
     }
 
-    /// A reasoning item, as the agent loop captures one.
-    fn reasoning_item() -> ReasoningItem {
-        ReasoningItem {
-            id: Some("rs_0".to_string()),
-            summary: Vec::new(),
-            content: Some(vec![ReasoningItemContent::ReasoningText(ReasoningTextContent {
-                text: "thinking".to_string(),
-            })]),
-            encrypted_content: None,
-            status: None,
-        }
+    fn call(call: FunctionToolCall) -> InputItem {
+        InputItem::Item(Item::FunctionCall(call))
+    }
+
+    /// A reasoning item as the provider mints one: visible text and its ciphertext.
+    fn reasoning() -> InputItem {
+        serde_json::from_value(serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_0",
+            "summary": [],
+            "content": [{ "type": "reasoning_text", "text": "thinking" }],
+            "encrypted_content": "gAAAAABciphertext",
+        }))
+        .unwrap()
+    }
+
+    /// An assistant message as the provider mints one.
+    fn answer() -> InputItem {
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": "msg_0",
+            "role": "assistant",
+            "status": "completed",
+            "phase": "final_answer",
+            "content": [
+                {"type": "output_text", "text": "All ", "annotations": []},
+                {"type": "output_text", "text": "done.", "annotations": []},
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// Record one round as the loop does: the provider's items in stream
+    /// order, then the outputs of its calls.
+    fn round(
+        transcript: &Transcript,
+        items: Vec<InputItem>,
+        outputs: Vec<(FunctionToolCall, String)>,
+    ) {
+        transcript.push_round(items, None, outputs);
     }
 
     #[test]
@@ -419,8 +450,7 @@ mod tests {
 
         // Clearing it stops the send.
         transcript.set_preamble(None).unwrap();
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-        assert_eq!(items.as_array().unwrap().len(), 2);
+        assert_eq!(transcript.request_items().len(), 2);
     }
 
     #[test]
@@ -444,14 +474,16 @@ mod tests {
         );
     }
 
-    /// A reminder trails the record on every request, once, and doesn't hit record.
+    /// A reminder trails the record on every request, once, and never reaches
+    /// the record; clearing it, as the approval handover does, leaves the
+    /// cached prefix exactly as the planning request sent it.
     #[test]
-    fn a_reminder_trails_the_record_once() {
+    fn a_reminder_trails_the_record_once_and_leaves_no_residue() {
         let mut transcript = Transcript::new().unwrap();
         transcript.push_user("look at the auth flow".to_string()).unwrap();
 
         // Without a reminder the request is exactly the stored record.
-        assert_eq!(transcript.request_items().len(), transcript.items_after(0).len());
+        assert_eq!(transcript.request_items(), transcript.items_after(0));
 
         transcript.set_reminder(Some("plan mode is on")).unwrap();
         let request = serde_json::to_value(transcript.request_items()).unwrap();
@@ -465,42 +497,14 @@ mod tests {
 
         // The stored record is an exact prefix of the request, so neither
         // arming nor clearing the reminder invalidates it.
-        let stored = serde_json::to_value(transcript.items_after(0)).unwrap();
-        for (sent, kept) in request.iter().zip(stored.as_array().unwrap()) {
-            assert_eq!(sent, kept, "the record leads the request unchanged");
-        }
-
-        // It stays one copy as turns accrue, and never reaches the record.
-        let record = serde_json::to_string(&transcript.items_after(0)).unwrap();
-        assert!(!record.contains("plan mode is on"), "never stored: {record}");
-        transcript.push_user("and the tests?".to_string()).unwrap();
-        let with_two_turns = serde_json::to_string(&transcript.request_items()).unwrap();
-        assert_eq!(
-            with_two_turns.matches("plan mode is on").count(),
-            1,
-            "one copy however long the session: {with_two_turns}"
-        );
-
-        // Clearing it restores the record exactly, and still moves nothing.
-        transcript.set_reminder(None).unwrap();
-        assert_eq!(
-            serde_json::to_value(transcript.request_items()).unwrap(),
-            serde_json::to_value(transcript.items_after(0)).unwrap()
-        );
-    }
-
-    /// The approval handover should leave no reminders.
-    #[test]
-    fn approval_leaves_no_reminder_behind() {
-        let mut transcript = Transcript::new().unwrap();
-        transcript
-            .push_user("plan the auth refactor".to_string())
-            .unwrap();
-        // What the last planning request sent as its prefix: the record alone.
         let sent = serde_json::to_value(transcript.items_after(0)).unwrap();
-        transcript.set_reminder(Some("plan mode is on")).unwrap();
+        for (item, kept) in request.iter().zip(sent.as_array().unwrap()) {
+            assert_eq!(item, kept, "the record leads the request unchanged");
+        }
+        assert!(!sent.to_string().contains("plan mode is on"), "never stored");
 
-        // The plan lands, the mode leaves, the approval turn is recorded.
+        // The plan lands, the mode leaves, the approval turn is recorded: the
+        // implementing request ends in the approval, the cached prefix intact.
         transcript
             .push_assistant("1. add a session table".to_string())
             .unwrap();
@@ -508,14 +512,11 @@ mod tests {
         transcript
             .push_user("The plan above is approved: implement it now.".to_string())
             .unwrap();
-
         let request = serde_json::to_value(transcript.request_items()).unwrap();
         assert!(
             !request.to_string().contains("plan mode is on"),
             "no residue: {request}"
         );
-        // The implementing request ends in the approval turn, and everything
-        // the planning request sent sits in front of it unchanged.
         let request = request.as_array().unwrap();
         assert_eq!(request.last().unwrap()["role"], "user");
         for (item, cached) in request.iter().zip(sent.as_array().unwrap()) {
@@ -523,107 +524,68 @@ mod tests {
         }
     }
 
+    /// A recorded round replays in spec order — message, reasoning, call,
+    /// output, message — and every shape the harness records is one JSON line
+    /// that reparses to itself.
     #[test]
-    fn consecutive_user_messages_replay_in_order() {
+    fn a_recorded_turn_keeps_spec_order_and_round_trips_through_jsonl() {
         let transcript = Transcript::new().unwrap();
         transcript.push_user("run it".to_string()).unwrap();
-        transcript.push_assistant("partial".to_string()).unwrap();
-        transcript.push_user("actually, go faster".to_string()).unwrap();
-
-        // An interrupted round's user/partial/user shape replays as recorded.
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-        assert_eq!(items[1]["role"], "user");
-        assert_eq!(items[2]["role"], "assistant");
-        assert_eq!(items[2]["content"], "partial");
-        assert_eq!(items[3]["role"], "user");
-        assert_eq!(items[3]["content"], "actually, go faster");
-    }
-
-    #[test]
-    fn tool_rounds_replay_calls_grouped_before_outputs() {
-        let transcript = Transcript::new().unwrap();
-        let mut second = bash_call();
-        second.call_id = "call_1".to_string();
-        transcript.push_tool_round(vec![
-            (bash_call(), "one\n".to_string()),
-            (second, "two\n".to_string()),
-        ]);
-
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-
-        // All calls first, then all outputs: interleaving would split the
-        // round into several assistant messages on the provider side.
-        assert_eq!(items[1]["type"], "function_call");
-        assert_eq!(items[1]["call_id"], "call_0");
-        assert_eq!(items[2]["type"], "function_call");
-        assert_eq!(items[2]["call_id"], "call_1");
-        assert_eq!(items[3]["type"], "function_call_output");
-        assert_eq!(items[3]["output"], "one\n");
-        assert_eq!(items[4]["type"], "function_call_output");
-        assert_eq!(items[4]["output"], "two\n");
-    }
-
-    #[test]
-    fn push_answer_records_only_real_answers() {
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("hello".to_string()).unwrap();
-
-        transcript.push_answer("").unwrap();
-        assert_eq!(
-            transcript.request_items().len(),
-            2,
-            "an empty answer records nothing"
+        round(
+            &transcript,
+            vec![reasoning(), call(bash_call())],
+            vec![(bash_call(), "one\n".to_string())],
         );
-
-        transcript.push_answer("hi").unwrap();
-        assert_eq!(transcript.request_items().len(), 3);
-    }
-
-    #[test]
-    fn clones_share_one_record() {
-        let transcript = Transcript::new().unwrap();
-        let worker = transcript.clone();
-        worker.push_user("hello".to_string()).unwrap();
-        worker.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
-
-        // What the agent loop records lands in the caller's transcript.
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-        assert_eq!(items.as_array().unwrap().len(), 4);
-        assert_eq!(items[1]["role"], "user");
-        assert_eq!(items[2]["type"], "function_call");
-        assert_eq!(items[3]["type"], "function_call_output");
-    }
-
-    #[test]
-    fn a_recorded_turn_replays_in_spec_order() {
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("run it".to_string()).unwrap();
-        transcript.push_reasoning(reasoning_item());
-        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
         transcript.push_assistant("done".to_string()).unwrap();
 
         let items = serde_json::to_value(transcript.request_items()).unwrap();
-
-        // message, reasoning, call, output, message, each call paired with its output
         assert_eq!(items[1]["role"], "user");
         assert_eq!(items[2]["type"], "reasoning");
+        assert_eq!(items[2]["id"], "rs_0");
+        assert_eq!(items[2]["content"][0]["text"], "thinking");
+        assert_eq!(items[2]["encrypted_content"], "gAAAAABciphertext");
         assert_eq!(items[3]["type"], "function_call");
         assert_eq!(items[4]["type"], "function_call_output");
+        assert_eq!(items[3]["id"], "item_0", "the call keeps its minted id");
         assert_eq!(items[3]["call_id"], items[4]["call_id"]);
         assert_eq!(items[5]["role"], "assistant");
         assert_eq!(items[5]["content"], "done");
+
+        for item in transcript.request_items() {
+            let line = serde_json::to_string(&item).unwrap();
+            assert!(!line.contains('\n'), "{line}");
+            assert_eq!(serde_json::from_str::<InputItem>(&line).unwrap(), item);
+        }
     }
 
+    /// A round's calls precede their outputs, each output paired to its call:
+    /// interleaving would split the round into several assistant messages on
+    /// the provider side. What the loop records lands in the caller's
+    /// transcript, clones sharing one record.
     #[test]
-    fn reasoning_replays_as_a_reasoning_item() {
+    fn tool_rounds_replay_calls_grouped_before_outputs() {
         let transcript = Transcript::new().unwrap();
-        transcript.push_reasoning(reasoning_item());
+        let worker = transcript.clone();
+        worker.push_user("hello".to_string()).unwrap();
+        let mut second = bash_call();
+        second.call_id = "call_1".to_string();
+        round(
+            &worker,
+            vec![call(bash_call()), call(second.clone())],
+            vec![(bash_call(), "one\n".to_string()), (second, "two\n".to_string())],
+        );
 
         let items = serde_json::to_value(transcript.request_items()).unwrap();
-
-        assert_eq!(items[1]["type"], "reasoning");
-        assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
-        assert_eq!(items[1]["content"][0]["text"], "thinking");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[2]["call_id"], "call_0");
+        assert_eq!(items[3]["type"], "function_call");
+        assert_eq!(items[3]["call_id"], "call_1");
+        assert_eq!(items[4]["type"], "function_call_output");
+        assert_eq!(items[4]["output"], "one\n");
+        assert_eq!(items[5]["type"], "function_call_output");
+        assert_eq!(items[5]["output"], "two\n");
+        assert_eq!(items.as_array().unwrap().len(), 6);
     }
 
     #[test]
@@ -631,11 +593,11 @@ mod tests {
         // A record restored from an older tart's session file may open with a
         // second system item; the whole leading block survives a clear.
         let transcript = Transcript::from_items(vec![
-            message(Role::System, SYSTEM.to_string()).unwrap(),
-            message(Role::System, "be terse".to_string()).unwrap(),
-            message(Role::User, "hello".to_string()).unwrap(),
+            message(Role::System, SYSTEM.to_string()),
+            message(Role::System, "be terse".to_string()),
+            message(Role::User, "hello".to_string()),
         ]);
-        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
+        transcript.push_round(Vec::new(), None, vec![(bash_call(), "one\n".to_string())]);
         transcript.push_assistant("hi".to_string()).unwrap();
 
         transcript.clear();
@@ -649,9 +611,7 @@ mod tests {
         let plain = Transcript::new().unwrap();
         plain.push_user("hello".to_string()).unwrap();
         plain.clear();
-        let items = serde_json::to_value(plain.request_items()).unwrap();
-        assert_eq!(items.as_array().unwrap().len(), 1);
-        assert_eq!(items[0]["content"], SYSTEM);
+        assert_eq!(plain.request_items().len(), 1);
     }
 
     /// A rewind cuts the record back to the turn it names, response and all.
@@ -661,8 +621,11 @@ mod tests {
         transcript.push_user("one".to_string()).unwrap();
         transcript.push_assistant("1".to_string()).unwrap();
         transcript.push_user("two".to_string()).unwrap();
-        transcript.push_reasoning(reasoning_item());
-        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
+        round(
+            &transcript,
+            vec![reasoning(), call(bash_call())],
+            vec![(bash_call(), "one\n".to_string())],
+        );
         transcript.push_assistant("2".to_string()).unwrap();
 
         transcript.rewind(transcript.user_turns()[1].0);
@@ -670,7 +633,6 @@ mod tests {
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         let items = items.as_array().unwrap();
         assert_eq!(items.len(), 3, "system, then the first turn only");
-        assert_eq!(items[0]["role"], "system");
         assert_eq!(items[1]["role"], "user");
         assert_eq!(items[1]["content"], "one");
         assert_eq!(items[2]["role"], "assistant");
@@ -685,36 +647,17 @@ mod tests {
         transcript.push_assistant("hi".to_string()).unwrap();
 
         // From zero the whole record reads back, matching a full request.
-        let whole = serde_json::to_value(transcript.items_after(0)).unwrap();
-        assert_eq!(whole, serde_json::to_value(transcript.request_items()).unwrap());
+        assert_eq!(transcript.items_after(0), transcript.request_items());
 
         // Past the system prompt: only the turn items follow.
-        let tail = serde_json::to_value(transcript.items_after(1)).unwrap();
-        let tail = tail.as_array().unwrap();
+        let tail = transcript.items_after(1);
         assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0]["role"], "user");
-        assert_eq!(tail[1]["role"], "assistant");
+        assert_eq!(serde_json::to_value(&tail[0]).unwrap()["role"], "user");
 
         // Reading to the end, and past it, yields nothing without panicking:
         // a cleared record can end before a session's flushed prefix.
-        assert_eq!(transcript.items_after(transcript.len()), []);
-        assert_eq!(transcript.items_after(transcript.len() + 3), []);
-    }
-
-    #[test]
-    fn items_round_trip_through_jsonl_lines() {
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("run it".to_string()).unwrap();
-        transcript.push_reasoning(reasoning_item());
-        transcript.push_tool_round(vec![(bash_call(), "one\n".to_string())]);
-        transcript.push_assistant("done".to_string()).unwrap();
-
-        // Every shape the harness records is one JSON line that reparses to itself.
-        for item in transcript.request_items() {
-            let line = serde_json::to_string(&item).unwrap();
-            assert!(!line.contains('\n'), "{line}");
-            assert_eq!(serde_json::from_str::<InputItem>(&line).unwrap(), item);
-        }
+        assert_eq!(transcript.items_after(transcript.lines().len()), []);
+        assert_eq!(transcript.items_after(transcript.lines().len() + 3), []);
     }
 
     #[test]
@@ -726,42 +669,32 @@ mod tests {
         assert!(transcript.replay().is_empty());
 
         transcript.push_user("run it".to_string()).unwrap();
-        transcript.push_reasoning(reasoning_item());
         let mut second = bash_call();
         second.call_id = "call_1".to_string();
-        transcript.push_tool_round(vec![
-            (bash_call(), "one\n".to_string()),
-            (second, "[exit 2]\ntwo\n".to_string()),
-        ]);
-        transcript.push_assistant("done".to_string()).unwrap();
+        round(
+            &transcript,
+            vec![reasoning(), call(bash_call()), call(second.clone())],
+            vec![
+                (bash_call(), "one\n".to_string()),
+                (second, "[exit 2]\ntwo\n".to_string()),
+            ],
+        );
+        round(&transcript, vec![answer()], vec![]);
 
         let events = transcript.replay();
 
         // Each call replays as its header, finished empty: no recorded output,
-        // no exit derived from its framing.
+        // no exit derived from its framing. The provider's message replays as
+        // the answer, its parts joined.
         assert!(matches!(
             events.as_slice(),
             [
                 User(text),
                 Thinking(thinking),
-                ToolStart {
-                    id,
-                    name,
-                    arguments,
-                },
-                ToolOutput {
-                    output,
-                    exit: Some(0),
-                    ..
-                },
-                ToolStart {
-                    id: second_id, ..
-                },
-                ToolOutput {
-                    output: second_output,
-                    exit: Some(0),
-                    ..
-                },
+                ToolStart { id, name, arguments },
+                ToolOutput { output, exit: Some(0), .. },
+                ToolStart { id: second_id, .. },
+                ToolOutput { output: second_output, exit: Some(0), .. },
                 Answer(answer),
             ] if text == "run it"
                 && thinking == "thinking"
@@ -771,7 +704,39 @@ mod tests {
                 && output.is_empty()
                 && second_id == "call_1"
                 && second_output.is_empty()
-                && answer == "done"
+                && answer == "All done."
+        ));
+    }
+
+    /// A line is the item's own fields with the stamp flattened in beside
+    /// them: it parses back to itself, an unstamped line writes no stamp, and
+    /// a stamp of another shape, or an unknown sibling, reads as no stamp.
+    #[test]
+    fn lines_flatten_the_stamp_beside_the_item() {
+        // A line as a hand-written file might hold it: no stamp at all.
+        let line = RecordLine {
+            timestamp: None,
+            item: message(Role::System, "system".to_string()),
+        };
+        let stamped = RecordLine {
+            timestamp: Some("2026-11-24 15:19:34".to_string()),
+            ..line.clone()
+        };
+        let text = serde_json::to_string(&stamped).unwrap();
+        assert_eq!(
+            text,
+            r#"{"timestamp":"2026-11-24 15:19:34","type":"message","role":"system","content":"system"}"#
+        );
+        assert_eq!(serde_json::from_str::<RecordLine>(&text).unwrap(), stamped);
+        let unstamped = serde_json::to_string(&line).unwrap();
+        assert!(!unstamped.contains("timestamp"), "{unstamped}");
+
+        let mangled = r#"{"content":"hi","role":"assistant","timestamp":123,"usage":"lots","type":"message"}"#;
+        let parsed = serde_json::from_str::<RecordLine>(mangled).unwrap();
+        assert_eq!(parsed.timestamp, None);
+        assert!(matches!(
+            parsed.item,
+            InputItem::EasyMessage(message) if message.content == EasyInputContent::Text("hi".into())
         ));
     }
 }

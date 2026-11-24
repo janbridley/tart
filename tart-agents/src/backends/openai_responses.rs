@@ -5,9 +5,9 @@ use async_openai::{
     config::OpenAIConfig,
     error::OpenAIError,
     types::responses::{
-        CreateResponse, EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam,
-        FunctionToolParam, InputParam, NamespaceToolParam, NamespaceToolParamTool, Reasoning,
-        ReasoningEffort as ResponsesEffort, ResponseErrorCode, ResponseStream, ResponseUsage,
+        CreateResponse, EasyInputMessage, FunctionCallOutput, FunctionCallOutputItemParam,
+        FunctionToolParam, IncludeEnum, InputParam, NamespaceToolParam, NamespaceToolParamTool,
+        Reasoning, ResponseErrorCode, ResponseStream, ResponseUsage,
     },
 };
 use futures::{Stream, StreamExt};
@@ -20,13 +20,14 @@ use super::{Event, ReasoningEffort};
 /// The record vocabulary the loop exchanges with the backend, plus
 /// the raw wire events for tests that serve a stream by hand.
 pub(crate) use async_openai::types::responses::{
-    EasyInputContent, FunctionTool as Tool, FunctionToolCall, InputItem, Item, OutputItem,
-    ReasoningItem, ReasoningItemContent, ResponseStreamEvent, Role, Tool as WireTool,
+    EasyInputContent, FunctionTool as Tool, FunctionToolCall, InputItem, Item, MessageItem,
+    OutputItem, OutputMessageContent, ReasoningItemContent, ResponseStreamEvent, Role,
+    Tool as WireTool,
 };
-/// Wire and content types used by stream fixtures.
+/// Wire types stream fixtures are built from.
 #[cfg(test)]
 pub(crate) use async_openai::types::responses::{
-    ReasoningTextContent, ResponseOutputItemDoneEvent, ResponseTextDeltaEvent,
+    ResponseOutputItemDoneEvent, ResponseTextDeltaEvent,
 };
 
 /// Credentials and endpoint for the Responses API.
@@ -173,11 +174,11 @@ fn request_of(
         model: Some(model.into()),
         stream: Some(true),
         store: chatgpt.then_some(false),
-        reasoning: Some(Reasoning {
-            effort: effort.map(effort_of),
-            ..Reasoning::default()
-        }),
-        input: InputParam::Items(items.into_iter().map(|item| wire_item(item, chatgpt)).collect()),
+        // Encrypted reasoning carries the model's thinking between rounds;
+        // asking on every request keeps replay possible on stateful endpoints too.
+        include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
+        reasoning: Some(Reasoning { effort, ..Reasoning::default() }),
+        input: InputParam::Items(items.into_iter().map(|item| render(item, chatgpt)).collect()),
         tools: (!tools.is_empty()).then(|| {
             if chatgpt {
                 vec![WireTool::Namespace(NamespaceToolParam {
@@ -207,22 +208,18 @@ fn request_of(
     }
 }
 
-/// One record item as a plain, self-contained item.
+/// One recorded item as the endpoint takes it.
 ///
-/// We must drop server-side data (`id`s for stored items, as well as their
-/// `encrypted_content`), or proxies like `Azure OpenAI` kill the stream when the
-/// backing resource changes. We keep track of dropped data on our end for posterity.
-fn wire_item(mut item: InputItem, chatgpt: bool) -> InputItem {
-    match &mut item {
-        InputItem::Item(Item::Reasoning(reasoning)) => {
-            reasoning.id = None;
-            reasoning.encrypted_content = None;
-        }
-        InputItem::Item(Item::FunctionCall(call)) => call.id = None,
-        InputItem::EasyMessage(message) if chatgpt && message.role == Role::System => {
-            message.role = Role::Developer;
-        }
-        _ => {}
+/// Provider items replay as they arrived, ids and encrypted reasoning included:
+/// the item carries its own state, so no lookup has to resolve it. The one
+/// rendering is the `ChatGPT` backend's, which takes a `developer` message
+/// where others take `system`.
+fn render(mut item: InputItem, chatgpt: bool) -> InputItem {
+    if chatgpt
+        && let InputItem::EasyMessage(message) = &mut item
+        && message.role == Role::System
+    {
+        message.role = Role::Developer;
     }
     item
 }
@@ -237,11 +234,11 @@ fn translate(event: ResponseStreamEvent) -> Option<Event> {
         ResponseStreamEvent::ResponseOutputItemAdded(added) => {
             matches!(added.item, OutputItem::FunctionCall(_)).then_some(Event::CallStarted)
         }
-        ResponseStreamEvent::ResponseOutputItemDone(done) => match done.item {
-            OutputItem::Reasoning(item) => Some(Event::Reasoning(item)),
-            OutputItem::FunctionCall(call) => Some(Event::Call(call)),
-            _ => None,
-        },
+        // Finished items are the record: an output item is a valid input item
+        // as the provider minted it, and the crate's conversion is total.
+        ResponseStreamEvent::ResponseOutputItemDone(done) => {
+            Some(Event::ItemDone(done.item.into()))
+        }
         ResponseStreamEvent::ResponseCompleted(completed) => {
             Some(Event::Completed(completed.response.usage.as_ref().map(usage_of)))
         }
@@ -273,19 +270,6 @@ fn translate(event: ResponseStreamEvent) -> Option<Event> {
     }
 }
 
-/// The wire spelling of a reasoning effort; the seam an upstream rename breaks.
-const fn effort_of(effort: ReasoningEffort) -> ResponsesEffort {
-    match effort {
-        ReasoningEffort::None => ResponsesEffort::None,
-        ReasoningEffort::Minimal => ResponsesEffort::Minimal,
-        ReasoningEffort::Low => ResponsesEffort::Low,
-        ReasoningEffort::Medium => ResponsesEffort::Medium,
-        ReasoningEffort::High => ResponsesEffort::High,
-        ReasoningEffort::Xhigh => ResponsesEffort::Xhigh,
-        ReasoningEffort::Max => ResponsesEffort::Max,
-    }
-}
-
 /// The usage a completed response reported: `cached` from `input_tokens_details`,
 /// `reasoning` from `output_tokens_details`.
 fn usage_of(usage: &ResponseUsage) -> TokenUsage {
@@ -307,12 +291,13 @@ fn code_text(code: &ResponseErrorCode) -> String {
 }
 
 /// One message in the conversation, as the backend sends it.
-pub(crate) fn message(role: Role, text: String) -> anyhow::Result<InputItem> {
-    Ok(EasyInputMessageArgs::default()
-        .role(role)
-        .content(text)
-        .build()?
-        .into())
+pub(crate) fn message(role: Role, text: String) -> InputItem {
+    EasyInputMessage {
+        role,
+        content: text.into(),
+        ..EasyInputMessage::default()
+    }
+    .into()
 }
 
 pub(crate) fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
@@ -343,30 +328,29 @@ mod tests {
 
     use super::*;
 
+    /// The request's shape on both backends: streaming; stateless on `ChatGPT`,
+    /// with namespaced tools, `developer` system messages, and encrypted
+    /// reasoning asked for; no `tools` field when nothing is offered.
     #[test]
-    fn chatgpt_uses_stateless_requests_and_namespaced_tools() {
-        let request = request_of(
-            "model",
-            None,
-            vec![message(Role::System, "Instructions".into()).unwrap()],
-            vec![tool("read", "Read a file", serde_json::json!({"type": "object"}))],
-            true,
+    fn the_request_renders_for_its_endpoint() {
+        let system = message(Role::System, "Instructions".into());
+        let read = tool("read", "Read a file", serde_json::json!({"type": "object"}));
+        let chatgpt =
+            serde_json::to_value(request_of("model", None, vec![system], vec![read], true))
+                .unwrap();
+        assert_eq!(chatgpt["store"], false);
+        assert_eq!(chatgpt["stream"], true);
+        assert_eq!(chatgpt["input"][0]["role"], "developer");
+        assert_eq!(chatgpt["tools"][0]["type"], "namespace");
+        assert_eq!(chatgpt["tools"][0]["tools"][0]["name"], "read");
+        assert_eq!(
+            chatgpt["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
         );
-        let wire = serde_json::to_value(request).unwrap();
-        assert_eq!(wire["store"], false);
-        assert_eq!(wire["stream"], true);
-        assert_eq!(wire["input"][0]["role"], "developer");
-        assert_eq!(wire["tools"][0]["type"], "namespace");
-        assert_eq!(wire["tools"][0]["name"], "tart");
-        assert_eq!(wire["tools"][0]["tools"][0]["name"], "read");
-    }
 
-    #[test]
-    fn the_request_omits_an_empty_tools_list() {
         let bare =
             serde_json::to_value(request_of("model", None, Vec::new(), Vec::new(), false)).unwrap();
         assert!(bare.get("tools").is_none(), "no tools, no field: {bare}");
-
         let armed = serde_json::to_value(request_of(
             "model",
             None,
@@ -375,45 +359,50 @@ mod tests {
             false,
         ))
         .unwrap();
-        assert_eq!(
-            armed["tools"].as_array().map(Vec::len),
-            Some(1),
-            "the offered tool rides along: {armed}"
-        );
+        assert_eq!(armed["tools"][0]["type"], "function");
+        assert_eq!(armed["tools"][0]["name"], "bash");
     }
 
+    /// The replay contract: a recorded item goes back as it arrived, minted ids
+    /// and encrypted reasoning included, on both backends.
     #[test]
-    fn the_request_replays_items_without_provider_minted_ids() {
-        let reasoning = InputItem::Item(Item::Reasoning(ReasoningItem {
-            id: Some("rs_0".to_string()),
-            encrypted_content: Some("ciphertext".to_string()),
-            content: Some(vec![ReasoningItemContent::ReasoningText(ReasoningTextContent {
-                text: "pondering".to_string(),
-            })]),
-            ..ReasoningItem::default()
-        }));
-        let call = InputItem::Item(Item::FunctionCall(FunctionToolCall {
-            id: Some("fc_0".to_string()),
-            call_id: "call_0".to_string(),
-            name: "bash".to_string(),
-            arguments: "{}".to_string(),
-            ..FunctionToolCall::default()
-        }));
-        let request = request_of("model", None, vec![reasoning, call], Vec::new(), false);
-
-        let body = serde_json::to_value(&request).unwrap();
-        let input = &body["input"];
-        // An id is either stripped or serialized as null, whichever the type
-        // does with a `None`; both leave nothing for a resource to look up.
-        assert!(input[0]["id"].is_null(), "reasoning id gone: {input}");
-        assert!(
-            input[0]["encrypted_content"].is_null(),
-            "ciphertext gone: {input}"
-        );
-        assert!(input[1]["id"].is_null(), "call id gone: {input}");
-        // What carries meaning for the next round stays.
-        assert_eq!(input[0]["content"][0]["text"], "pondering");
-        assert_eq!(input[1]["call_id"], "call_0");
-        assert_eq!(input[1]["name"], "bash");
+    fn the_request_replays_recorded_items_verbatim() {
+        let items = [
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_0",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "pondering"}],
+                "encrypted_content": "ciphertext",
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "id": "fc_0",
+                "call_id": "call_0",
+                "name": "bash",
+                "arguments": "{}",
+                "status": "completed",
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "msg_0",
+                "role": "assistant",
+                "status": "completed",
+                "phase": "final_answer",
+                "content": [
+                    {"type": "output_text", "text": "All done.", "annotations": [], "logprobs": []},
+                ],
+            }),
+        ];
+        for value in items {
+            let item: InputItem = serde_json::from_value(value.clone()).unwrap();
+            for chatgpt in [false, true] {
+                let request = request_of("model", None, vec![item.clone()], Vec::new(), chatgpt);
+                let back = &serde_json::to_value(&request).unwrap()["input"][0];
+                for (key, _) in value.as_object().unwrap() {
+                    assert_eq!(back[key], value[key], "{} keeps {key}: {back}", value["type"]);
+                }
+            }
+        }
     }
 }
