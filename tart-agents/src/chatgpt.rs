@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use openidconnect::core::{
@@ -124,11 +124,9 @@ fn callback(
     server: &tiny_http::Server,
     state: &CsrfToken,
 ) -> anyhow::Result<(AuthorizationCode, Option<String>)> {
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        ensure!(!wait.is_zero(), "ChatGPT sign-in timed out");
-        let request = server.recv_timeout(wait)?.context("ChatGPT sign-in timed out")?;
+    // Wait for the browser's redirect; Ctrl-C abandons the sign-in. Stray
+    // requests (favicons, probes) are answered and ignored.
+    for request in server.incoming_requests() {
         let Some(result) = parse_callback(request.method(), request.url(), state) else {
             let _ = request.respond(tiny_http::Response::empty(400));
             continue;
@@ -141,6 +139,7 @@ fn callback(
         let _ = request.respond(tiny_http::Response::from_string(message));
         return result;
     }
+    anyhow::bail!("ChatGPT sign-in stopped before the browser returned")
 }
 
 fn parse_callback(
