@@ -32,7 +32,16 @@ pub(crate) use async_openai::types::responses::{
 
 /// A Responses-API endpoint.
 #[derive(Clone, Debug)]
-pub struct Responses(Client<OpenAIConfig>);
+pub struct Responses {
+    client: Client<OpenAIConfig>,
+    chatgpt_http: Option<reqwest::Client>,
+}
+
+pub(crate) fn chatgpt_backend() -> Responses {
+    let mut backend = backend(crate::chatgpt::RESOURCE, "");
+    backend.chatgpt_http = Some(reqwest::Client::new());
+    backend
+}
 
 /// A backend handle for an OpenAI-compatible Responses endpoint.
 pub(crate) fn backend<U: Into<String>, K: Into<String>>(base_url: U, api_key: K) -> Responses {
@@ -41,7 +50,10 @@ pub(crate) fn backend<U: Into<String>, K: Into<String>>(base_url: U, api_key: K)
     let config = OpenAIConfig::new()
         .with_api_base(base_url.into())
         .with_api_key(api_key.into());
-    Responses(Client::with_config(config))
+    Responses {
+        client: Client::with_config(config),
+        chatgpt_http: None,
+    }
 }
 
 impl Backend for Responses {
@@ -54,9 +66,20 @@ impl Backend for Responses {
     ) -> impl Future<Output = anyhow::Result<RoundStream>> + Send {
         let model = model.to_string();
         async move {
-            let request = request_of(&model, effort, items, tools)?;
+            let mut request = request_of(&model, effort, items, tools)?;
+            let mut client = self.client.clone();
+            if let Some(http) = &self.chatgpt_http {
+                configure_chatgpt_request(&mut request);
+                let token = tokio::task::spawn_blocking(crate::chatgpt::access_token).await??;
+                client = Client::build(
+                    http.clone(),
+                    OpenAIConfig::new()
+                        .with_api_base(crate::chatgpt::RESOURCE)
+                        .with_api_key(token),
+                );
+            }
             debug::log_json("round request", || serde_json::to_string(&request));
-            let stream = self.0.responses().create_stream(request).await?;
+            let stream = client.responses().create_stream(request).await?;
             Ok(Box::pin(stream.filter_map(|item| async {
                 match item {
                     Ok(event) => translate(event).map(Ok),
@@ -91,6 +114,49 @@ fn request_of(
         args.tools(tools);
     }
     Ok(args.build()?)
+}
+
+fn configure_chatgpt_request(request: &mut CreateResponse) {
+    use async_openai::types::responses::{
+        FunctionToolParam, NamespaceToolParam, NamespaceToolParamTool,
+    };
+
+    request.store = Some(false);
+    if let InputParam::Items(items) = &mut request.input {
+        for item in items {
+            if let InputItem::EasyMessage(message) = item
+                && message.role == Role::System
+            {
+                message.role = Role::Developer;
+            }
+        }
+    }
+    if let Some(tools) = &mut request.tools {
+        let mut functions = Vec::new();
+        tools.retain(|tool| {
+            let Tool::Function(function) = tool else {
+                return true;
+            };
+            functions.push(NamespaceToolParamTool::Function(FunctionToolParam {
+                name: function.name.clone(),
+                description: function.description.clone(),
+                parameters: function.parameters.clone(),
+                strict: function.strict,
+                defer_loading: function.defer_loading,
+                r#async: function.r#async,
+                output_schema: function.output_schema.clone(),
+                allowed_callers: function.allowed_callers.clone(),
+            }));
+            false
+        });
+        if !functions.is_empty() {
+            tools.push(Tool::Namespace(NamespaceToolParam {
+                name: "tart".into(),
+                description: "Tools provided by Tart".into(),
+                tools: functions,
+            }));
+        }
+    }
 }
 
 /// One record item as a plain, self-contained item.
@@ -220,7 +286,7 @@ pub(crate) fn call_output(call: &FunctionToolCall, output: String) -> InputItem 
         id: None,
         status: None,
         name: None,
-        namespace: None,
+        namespace: call.namespace.clone(),
         caller: None,
     }))
 }
@@ -230,6 +296,25 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+
+    #[test]
+    fn chatgpt_uses_stateless_requests_and_namespaced_tools() {
+        let mut request = request_of(
+            "model",
+            None,
+            vec![message(Role::System, "Instructions".into()).unwrap()],
+            vec![tool("read", "Read a file", serde_json::json!({"type": "object"}))],
+        )
+        .unwrap();
+        configure_chatgpt_request(&mut request);
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["store"], false);
+        assert_eq!(wire["stream"], true);
+        assert_eq!(wire["input"][0]["role"], "developer");
+        assert_eq!(wire["tools"][0]["type"], "namespace");
+        assert_eq!(wire["tools"][0]["name"], "tart");
+        assert_eq!(wire["tools"][0]["tools"][0]["name"], "read");
+    }
 
     #[test]
     fn the_request_omits_an_empty_tools_list() {

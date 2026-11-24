@@ -142,9 +142,17 @@ impl Agent {
         model: M,
         policy: Policy,
     ) -> Self {
+        Self::with_backend(
+            crate::backends::openai_responses::backend(base_url, api_key),
+            model.into(),
+            policy,
+        )
+    }
+
+    fn with_backend(backend: Responses, model: String, policy: Policy) -> Self {
         Self {
-            backend: Arc::new(crate::backends::openai_responses::backend(base_url, api_key)),
-            model: model.into(),
+            backend: Arc::new(backend),
+            model,
             effort: None,
             max_rounds: max_tool_rounds(),
             mode: ChatMode::Default,
@@ -154,6 +162,22 @@ impl Agent {
             control: TurnHandle::default(),
             id: MAIN,
         }
+    }
+
+    /// Create an agent using the saved `ChatGPT` account.
+    pub fn new_chatgpt(model: String, policy: Policy) -> Self {
+        Self::with_backend(
+            crate::backends::openai_responses::chatgpt_backend(),
+            model,
+            policy,
+        )
+    }
+
+    /// Switch to a model using the saved `ChatGPT` account.
+    pub fn set_chatgpt_model(&mut self, model: String) {
+        self.backend = Arc::new(crate::backends::openai_responses::chatgpt_backend());
+        self.model = model;
+        self.effort = None;
     }
 
     /// Swap the model, keeping its runtime, policies, subagents, and turn lever.

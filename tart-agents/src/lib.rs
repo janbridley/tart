@@ -16,6 +16,9 @@ pub mod usage;
 mod backends;
 
 #[cfg(target_os = "macos")]
+pub mod chatgpt;
+
+#[cfg(target_os = "macos")]
 pub mod sandbox;
 
 pub use history::Transcript;

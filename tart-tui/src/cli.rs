@@ -21,8 +21,13 @@ pub(crate) struct Cli {
 
 impl Cli {
     /// Parse the process's argv.
-    pub(crate) fn parse() -> anyhow::Result<Self> {
-        Self::from(&command().get_matches(), std::env::var_os("HOME"))
+    pub(crate) fn parse() -> anyhow::Result<Option<Self>> {
+        let matches = command().get_matches();
+        if matches.subcommand_name() == Some("login") {
+            tart_agents::chatgpt::login()?;
+            return Ok(None);
+        }
+        Self::from(&matches, std::env::var_os("HOME")).map(Some)
     }
 
     /// The command line as `matches` name it, with the agents file resolved
@@ -60,6 +65,11 @@ fn resolve(matches: &ArgMatches, home: Option<OsString>) -> anyhow::Result<PathB
 fn command() -> Command {
     Command::new("tart")
         .about("A terminal chat front end for the tart agent harness.")
+        .subcommand(
+            Command::new("login")
+                .about("Sign in with ChatGPT")
+                .arg(Arg::new("provider").required(true).value_parser(["chatgpt"])),
+        )
         .arg(Arg::new("agents").long("agents").value_name("FILE").help(
             "TOML file describing the available agents [default: ~/.config/tart/providers.toml]",
         ))

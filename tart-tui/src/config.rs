@@ -33,6 +33,7 @@ pub(crate) struct ResolvedAgent {
     pub(crate) name: String,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
+    chatgpt: bool,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
     /// The model's context window, for the status line's token gauge.
@@ -49,7 +50,11 @@ impl fmt::Display for ResolvedAgent {
 impl ResolvedAgent {
     /// Consume the resolution and a Policy into the loop's agent.
     pub(crate) fn into_agent(self, policy: Policy) -> Agent {
-        let mut agent = Agent::new(self.base_url, self.api_key, self.model, policy);
+        let mut agent = if self.chatgpt {
+            Agent::new_chatgpt(self.model, policy)
+        } else {
+            Agent::new(self.base_url, self.api_key, self.model, policy)
+        };
         if let Some(effort) = self.effort {
             agent = agent.reasoning_effort(effort);
         }
@@ -79,10 +84,17 @@ impl fmt::Display for AgentChoice {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Provider {
-    base_url: String,
-    api_key: Auth,
+    base_url: Option<String>,
+    api_key: Option<Auth>,
+    auth: Option<ProviderAuth>,
     #[serde(default)]
     agents: Vec<AgentSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderAuth {
+    Chatgpt,
 }
 
 /// How a provider's API key is obtained.
@@ -146,6 +158,15 @@ impl Config {
         for (key, value) in table {
             let provider = Provider::deserialize(value)
                 .with_context(|| format!("invalid provider [{key}]"))?;
+            match (&provider.auth, &provider.base_url, &provider.api_key) {
+                (Some(ProviderAuth::Chatgpt), None, None) | (None, Some(_), Some(_)) => {}
+                (Some(ProviderAuth::Chatgpt), _, _) => {
+                    bail!(
+                        "provider [{key}]: auth = \"chatgpt\" supplies its own base_url and credential"
+                    );
+                }
+                _ => bail!("provider [{key}]: base_url and api_key are required"),
+            }
             if let Some(dup) = provider.agents.iter().map(|a| &a.name).duplicates().next() {
                 bail!("provider [{key}] defines two agents named '{dup}'");
             }
@@ -212,8 +233,14 @@ impl Config {
         Ok(ResolvedAgent {
             provider: key.to_owned(),
             name: agent.name.clone(),
-            base_url: provider.base_url.clone(),
-            api_key: resolve_api_key(key, &provider.api_key)?,
+            base_url: provider.base_url.clone().unwrap_or_default(),
+            api_key: provider
+                .api_key
+                .as_ref()
+                .map(|auth| resolve_api_key(key, auth))
+                .transpose()?
+                .unwrap_or_default(),
+            chatgpt: provider.auth.is_some(),
             model: agent.model.clone(),
             effort: agent.reasoning_effort,
             context_tokens: agent.context_tokens,
@@ -248,7 +275,11 @@ impl Config {
         match self.resolve(&choice.provider, &choice.name) {
             Ok(next) => {
                 pane.note(format!("model: {next}"));
-                agent.set_model(next.base_url, next.api_key, next.model);
+                if next.chatgpt {
+                    agent.set_chatgpt_model(next.model);
+                } else {
+                    agent.set_model(next.base_url, next.api_key, next.model);
+                }
                 if let Some(effort) = next.effort {
                     agent.set_reasoning_effort(effort);
                 }

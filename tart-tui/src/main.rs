@@ -58,7 +58,10 @@ use tmux_override::{override_shift_up, restore_tmux};
 pub const DRAW_INTERVAL_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
-    let mut tui = Tui::try_from(&cli::Cli::parse()?)?;
+    let Some(cli) = cli::Cli::parse()? else {
+        return Ok(());
+    };
+    let mut tui = Tui::try_from(&cli)?;
     install_panic_hook();
     let (mut terminal, _tmux) = enter_terminal()?;
     let mut pane = tui.open_pane();
