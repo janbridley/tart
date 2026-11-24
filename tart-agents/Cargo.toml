@@ -17,13 +17,14 @@ reqwest = { version = "0.13", default-features = false, features = [
     "deflate",
 ] }
 url = "2"
+iprfc = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures = "0.3.34"
 serde.workspace = true
 serde_json.workspace = true
 time = { version = "0.3", default-features = false, features = ["std"] }
 nix = { version = "0.31.4", default-features = false, features = ["fs", "signal"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
 rs-trafilatura = "0.2.2"
 dom_query = "0.24"
 flate2.workspace = true

@@ -1228,6 +1228,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
+name = "iprfc"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29ab9fb3724c3be005a8bf66c373ed1d6438f770e04008dccd136cbd446dbb8b"
+dependencies = [
+ "bitflags",
+ "ipnet",
+ "pastey",
+ "serde",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2448,6 +2460,7 @@ dependencies = [
  "fixed",
  "flate2",
  "futures",
+ "iprfc",
  "libc",
  "macro_rules_attribute",
  "nix",
