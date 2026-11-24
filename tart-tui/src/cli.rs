@@ -24,11 +24,7 @@ impl Cli {
     pub(crate) fn parse() -> anyhow::Result<Option<Self>> {
         let matches = command().get_matches();
         if let Some(login) = matches.subcommand_matches("login") {
-            if login.get_flag("reset") {
-                tart_agents::chatgpt::reset_login()?;
-            } else {
-                tart_agents::chatgpt::login()?;
-            }
+            tart_agents::chatgpt::login(login.get_flag("reset"))?;
             return Ok(None);
         }
         Self::from(&matches, std::env::var_os("HOME")).map(Some)

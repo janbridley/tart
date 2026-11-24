@@ -748,6 +748,7 @@ mod tests {
 
     use super::*;
     use crate::Agent;
+    use crate::backends::openai_responses::WireTool;
     use crate::sandbox::Policy;
     use crate::sandbox::live::{skip_unless_live, skip_unless_networked};
     use crate::tools::{Tooling, execute};
@@ -769,7 +770,7 @@ mod tests {
 
     #[test]
     fn fetch_definition_requires_url() {
-        let tool = serde_json::to_value(fetch_definition()).unwrap();
+        let tool = serde_json::to_value(WireTool::Function(fetch_definition())).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "fetch");

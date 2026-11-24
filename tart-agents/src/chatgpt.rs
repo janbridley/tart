@@ -242,19 +242,11 @@ fn authorize_in_browser(
     })
 }
 
-/// Sign in to `ChatGPT` in the browser and save the session in Keychain.
+/// Sign in to `ChatGPT` and save the session in Keychain.
+///
+/// Pass `reset` to clear the connection and register again with the same host ID.
 #[inline]
-pub fn login() -> anyhow::Result<()> {
-    sign_in(false)
-}
-
-/// Clear the local `ChatGPT` connection and register again with the same host ID.
-#[inline]
-pub fn reset_login() -> anyhow::Result<()> {
-    sign_in(true)
-}
-
-fn sign_in(reset: bool) -> anyhow::Result<()> {
+pub fn login(reset: bool) -> anyhow::Result<()> {
     // Serialize sign-ins without blocking inference during browser interaction.
     let _login_lock = lock("chatgpt-login.lock")?;
     let (mut registration, saved_id, needs_consent) = {

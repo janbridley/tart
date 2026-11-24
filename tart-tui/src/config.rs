@@ -11,7 +11,7 @@ use itertools::Itertools;
 use serde::Deserialize;
 use tart_agents::sandbox::Policy;
 use tart_agents::usage::Cost;
-use tart_agents::{Agent, ReasoningEffort};
+use tart_agents::{Agent, Provider, ReasoningEffort};
 
 /// A parsed agents file. `default_agent` picks the agent the TUI runs;
 /// `chat_agent` optionally picks a different one for `--chat` sessions.
@@ -21,19 +21,17 @@ pub(crate) struct Config {
     /// The `[chat_agent]` pick, when the section is present.
     chat_agent: Option<AgentRef>,
     /// Provider tables by their TOML key, sorted for deterministic errors.
-    providers: BTreeMap<String, Provider>,
+    providers: BTreeMap<String, ProviderTable>,
 }
 
-/// The agent the TUI wires into its loop, with its API key resolved.
+/// The agent the TUI wires into its loop, with its provider resolved.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedAgent {
     /// The provider's table key.
     pub(crate) provider: String,
     /// The agent's name.
     pub(crate) name: String,
-    pub(crate) base_url: String,
-    pub(crate) api_key: String,
-    chatgpt: bool,
+    connection: Provider,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
     /// The model's context window, for the status line's token gauge.
@@ -50,11 +48,7 @@ impl fmt::Display for ResolvedAgent {
 impl ResolvedAgent {
     /// Consume the resolution and a Policy into the loop's agent.
     pub(crate) fn into_agent(self, policy: Policy) -> Agent {
-        let mut agent = if self.chatgpt {
-            Agent::new_chatgpt(self.model, policy)
-        } else {
-            Agent::new(self.base_url, self.api_key, self.model, policy)
-        };
+        let mut agent = Agent::with_provider(self.connection, self.model, policy);
         if let Some(effort) = self.effort {
             agent = agent.reasoning_effort(effort);
         }
@@ -83,12 +77,25 @@ impl fmt::Display for AgentChoice {
 /// One provider table: a base URL, a credential, and the agents behind it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Provider {
+struct ProviderTable {
     base_url: Option<String>,
     api_key: Option<Auth>,
     auth: Option<ProviderAuth>,
     #[serde(default)]
     agents: Vec<AgentSpec>,
+}
+
+impl ProviderTable {
+    fn credentials(&self) -> anyhow::Result<Option<(&str, &Auth)>> {
+        match (&self.auth, &self.base_url, &self.api_key) {
+            (Some(ProviderAuth::Chatgpt), None, None) => Ok(None),
+            (None, Some(url), Some(key)) => Ok(Some((url, key))),
+            (Some(ProviderAuth::Chatgpt), _, _) => {
+                bail!("auth = \"chatgpt\" supplies its own base_url and credential")
+            }
+            _ => bail!("base_url and api_key are required"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,17 +163,11 @@ impl Config {
         };
         let mut providers = BTreeMap::new();
         for (key, value) in table {
-            let provider = Provider::deserialize(value)
+            let provider = ProviderTable::deserialize(value)
                 .with_context(|| format!("invalid provider [{key}]"))?;
-            match (&provider.auth, &provider.base_url, &provider.api_key) {
-                (Some(ProviderAuth::Chatgpt), None, None) | (None, Some(_), Some(_)) => {}
-                (Some(ProviderAuth::Chatgpt), _, _) => {
-                    bail!(
-                        "provider [{key}]: auth = \"chatgpt\" supplies its own base_url and credential"
-                    );
-                }
-                _ => bail!("provider [{key}]: base_url and api_key are required"),
-            }
+            provider
+                .credentials()
+                .with_context(|| format!("invalid provider [{key}]"))?;
             if let Some(dup) = provider.agents.iter().map(|a| &a.name).duplicates().next() {
                 bail!("provider [{key}] defines two agents named '{dup}'");
             }
@@ -233,14 +234,10 @@ impl Config {
         Ok(ResolvedAgent {
             provider: key.to_owned(),
             name: agent.name.clone(),
-            base_url: provider.base_url.clone().unwrap_or_default(),
-            api_key: provider
-                .api_key
-                .as_ref()
-                .map(|auth| resolve_api_key(key, auth))
-                .transpose()?
-                .unwrap_or_default(),
-            chatgpt: provider.auth.is_some(),
+            connection: match provider.credentials()? {
+                Some((url, auth)) => Provider::api_key(url, resolve_api_key(key, auth)?),
+                None => Provider::ChatGpt,
+            },
             model: agent.model.clone(),
             effort: agent.reasoning_effort,
             context_tokens: agent.context_tokens,
@@ -275,11 +272,7 @@ impl Config {
         match self.resolve(&choice.provider, &choice.name) {
             Ok(next) => {
                 pane.note(format!("model: {next}"));
-                if next.chatgpt {
-                    agent.set_chatgpt_model(next.model);
-                } else {
-                    agent.set_model(next.base_url, next.api_key, next.model);
-                }
+                agent.set_provider(next.connection, next.model);
                 if let Some(effort) = next.effort {
                     agent.set_reasoning_effort(effort);
                 }
@@ -351,8 +344,8 @@ reasoning_effort = "high"
         let agent = Config::parse(MINIMAL).unwrap().default_agent().unwrap();
 
         assert_eq!(agent.to_string(), "zai · tart");
-        assert_eq!(agent.base_url, "https://api.z.ai/api/v1");
-        assert_eq!(agent.api_key, "secret-key");
+        assert!(matches!(agent.connection, Provider::ApiKey { base_url, api_key }
+            if base_url == "https://api.z.ai/api/v1" && api_key == "secret-key"));
         assert_eq!(agent.model, "glm-5.3");
         assert_eq!(agent.effort, Some(ReasoningEffort::High));
     }
@@ -498,7 +491,6 @@ model = "glm-4-flash"
     #[test]
     fn missing_api_key_is_an_error() {
         let text = MINIMAL.replacen("\napi_key = [\"echo\", \"secret-key\"]\n", "\n", 1);
-        // The missing field surfaces as a serde cause; walk the chain.
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
 
         assert!(error.contains("api_key"), "{error}");
@@ -669,7 +661,8 @@ model = "glm-4-flash"
             MINIMAL.replacen("api_key = [\"echo\", \"secret-key\"]", "api_key = \"PATH\"", 1);
         let agent = Config::parse(&text).unwrap().default_agent().unwrap();
 
-        assert_eq!(agent.api_key, std::env::var("PATH").unwrap());
+        assert!(matches!(agent.connection, Provider::ApiKey { api_key, .. }
+            if api_key == std::env::var("PATH").unwrap()));
     }
 
     #[test]
