@@ -148,17 +148,14 @@ fn parse_callback(
     state: &CsrfToken,
 ) -> Option<anyhow::Result<(AuthorizationCode, Option<String>)>> {
     let (path, query) = target.split_once('?')?;
-    if method != &tiny_http::Method::Get || path != CALLBACK {
-        return None;
-    }
+    (method == &tiny_http::Method::Get && path == CALLBACK).then_some(())?;
     let params = url::form_urlencoded::parse(query.as_bytes());
-    let get = |name| {
-        let mut values = params.filter(|(key, _)| key == name);
-        let value = values.next().map(|(_, value)| value.into_owned());
-        if values.next().is_some() {
-            Err(anyhow::anyhow!("Duplicate ChatGPT callback parameter"))
-        } else {
-            Ok(value)
+    let get = |name: &str| -> anyhow::Result<Option<String>> {
+        let values: Vec<_> = params.filter(|(key, _)| key == name).collect();
+        match &values[..] {
+            [] => Ok(None),
+            [(_, value)] => Ok(Some(value.to_string())),
+            _ => bail!("Duplicate ChatGPT callback parameter"),
         }
     };
     if get("state").ok().flatten().as_ref() != Some(state.secret()) {
@@ -215,13 +212,11 @@ fn authorize_in_browser(
         authorize = authorize.add_extra_param("prompt", "consent");
     }
     let (url, state, nonce) = authorize.url();
-    ensure!(
-        Command::new("/usr/bin/open")
-            .arg(url.as_str())
-            .status()?
-            .success(),
-        "Could not open the browser"
-    );
+    let opened = Command::new("/usr/bin/open")
+        .arg(url.as_str())
+        .status()?
+        .success();
+    ensure!(opened, "Could not open the browser");
     let (code, returned_id) = callback(&server, &state)?;
     let client_id = match (saved_id, returned_id) {
         (Some(saved), Some(returned)) if saved != returned => {
