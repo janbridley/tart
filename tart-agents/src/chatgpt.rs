@@ -13,7 +13,7 @@ use openidconnect::{
     IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
     RefreshToken, RequestTokenError, Scope, SyncHttpClient, TokenResponse, TokenUrl,
 };
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, ClientBuilder};
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
@@ -106,15 +106,18 @@ impl SyncHttpClient for OAuthHttp {
     }
 }
 
-fn oauth_http_client() -> anyhow::Result<OAuthHttp> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    Ok(OAuthHttp(
-        Client::builder()
+impl TryFrom<ClientBuilder> for OAuthHttp {
+    type Error = reqwest::Error;
+
+    fn try_from(builder: ClientBuilder) -> Result<Self, Self::Error> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        builder
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(20))
-            .build()?,
-    ))
+            .build()
+            .map(Self)
+    }
 }
 
 fn callback(
@@ -277,7 +280,7 @@ fn sign_in(reset: bool) -> anyhow::Result<()> {
         save_keychain("registration", &registration)?;
         (registration, saved_id, needs_consent)
     };
-    let http = oauth_http_client()?;
+    let http = OAuthHttp::try_from(Client::builder())?;
     let metadata = CoreProviderMetadata::discover(&IssuerUrl::new(ISSUER.into())?, &http)?;
     let authorization =
         authorize_in_browser(&metadata, &registration.host, saved_id.as_deref(), needs_consent)?;
@@ -394,7 +397,7 @@ fn refresh(session: &mut Session) -> anyhow::Result<()> {
     let result = client
         .exchange_refresh_token(&refresh)
         .add_extra_param("resource", RESOURCE)
-        .request(&oauth_http_client()?);
+        .request(&OAuthHttp::try_from(Client::builder())?);
     let tokens = match result {
         Ok(tokens) => tokens,
         Err(error) => {
