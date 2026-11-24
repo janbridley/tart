@@ -217,11 +217,12 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+    use crate::backends::openai_responses::WireTool;
     use std::path::PathBuf;
 
     #[test]
     fn search_definition_requires_query() {
-        let tool = serde_json::to_value(search_definition()).unwrap();
+        let tool = serde_json::to_value(WireTool::Function(search_definition())).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "search");

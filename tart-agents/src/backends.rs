@@ -1,19 +1,12 @@
-//! The provider seam: the crate speaks only the vocabulary in this module,
-//! and a backend translates it to and from its wire protocol.
-//! `openai_responses` is the backend tart runs today; an Anthropic or Chat
-//! Completions backend would implement the same [`Backend`] contract beside it.
+//! Requests and events shared by the agent loop and the Responses adapter.
 
 pub mod openai_responses;
 
-use std::future::Future;
-use std::pin::Pin;
-
-use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::usage::TokenUsage;
 
-/// The record and tool types every backend exchanges with the loop.
+/// The record and tool types exchanged with the loop.
 pub(crate) use self::openai_responses::{
     EasyInputContent, FunctionToolCall, InputItem, Item, ReasoningItem, ReasoningItemContent, Role,
     Tool, call_output, message, tool,
@@ -59,19 +52,4 @@ pub(crate) enum Event {
     Failed(String),
     /// The round ended truncated; the reason text.
     Incomplete(String),
-}
-
-/// One round's event stream; `Err` items are transport failures.
-pub(crate) type RoundStream = Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>>;
-
-/// A provider that runs rounds of the tool loop.
-pub(crate) trait Backend: Clone + Send + Sync + 'static {
-    /// Connect one round: the model, the effort, the record, and the tools.
-    fn round(
-        &self,
-        model: &str,
-        effort: Option<ReasoningEffort>,
-        items: Vec<InputItem>,
-        tools: Vec<Tool>,
-    ) -> impl Future<Output = anyhow::Result<RoundStream>> + Send;
 }

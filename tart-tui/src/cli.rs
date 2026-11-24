@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use clap::{Arg, ArgMatches, Command};
 
-/// The command line, parsed once: the agents file to load, and whether this session is chat.
+/// The command line, parsed once before session startup.
 pub(crate) struct Cli {
     /// The TOML file describing the available agents.
     pub(crate) agents: PathBuf,
@@ -17,12 +17,19 @@ pub(crate) struct Cli {
     pub(crate) gpu: bool,
     /// Whether `--resume` was passed: reopen this project's newest session.
     pub(crate) resume: bool,
+    /// A prompt to run once without opening the terminal UI.
+    pub(crate) headless: Option<String>,
 }
 
 impl Cli {
     /// Parse the process's argv.
-    pub(crate) fn parse() -> anyhow::Result<Self> {
-        Self::from(&command().get_matches(), std::env::var_os("HOME"))
+    pub(crate) fn parse() -> anyhow::Result<Option<Self>> {
+        let matches = command().get_matches();
+        if let Some(login) = matches.subcommand_matches("login") {
+            tart_agents::chatgpt::login(login.get_flag("reset"))?;
+            return Ok(None);
+        }
+        Self::from(&matches, std::env::var_os("HOME")).map(Some)
     }
 
     /// The command line as `matches` name it, with the agents file resolved
@@ -33,6 +40,7 @@ impl Cli {
             chat: matches.get_flag("chat"),
             gpu: matches.get_flag("gpu"),
             resume: matches.get_flag("resume"),
+            headless: matches.get_one::<String>("headless").cloned(),
         })
     }
 }
@@ -60,6 +68,17 @@ fn resolve(matches: &ArgMatches, home: Option<OsString>) -> anyhow::Result<PathB
 fn command() -> Command {
     Command::new("tart")
         .about("A terminal chat front end for the tart agent harness.")
+        .subcommand(
+            Command::new("login")
+                .about("Sign in with ChatGPT")
+                .arg(Arg::new("provider").required(true).value_parser(["chatgpt"]))
+                .arg(
+                    Arg::new("reset")
+                        .long("reset")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Clear the local connection and register again"),
+                ),
+        )
         .arg(Arg::new("agents").long("agents").value_name("FILE").help(
             "TOML file describing the available agents [default: ~/.config/tart/providers.toml]",
         ))
@@ -78,11 +97,53 @@ fn command() -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Resume this project's most recent session instead of starting a new one"),
         )
+        .arg(
+            Arg::new("headless")
+                .long("headless")
+                .value_name("PROMPT")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help("Run one prompt without the terminal UI and print the final answer"),
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resetting_chatgpt_requires_the_explicit_flag() {
+        let args = ["tart", "login", "chatgpt"];
+        for reset in [false, true] {
+            let matches = command()
+                .try_get_matches_from(args.into_iter().chain(reset.then_some("--reset")))
+                .expect("login command parses");
+            let login = matches.subcommand_matches("login").expect("login subcommand");
+            assert_eq!(login.get_flag("reset"), reset);
+        }
+    }
+
+    #[test]
+    fn headless_takes_one_literal_prompt() {
+        let prompt = "Summarize '$HOME'\nKeep it short.";
+        let matches = command()
+            .try_get_matches_from(["tart", "--agents", "f.toml", "--headless", prompt, "--chat"])
+            .expect("the quoted prompt is one argument");
+        let cli = Cli::from(&matches, None).expect("the named file is used as-is");
+        assert_eq!(cli.headless.as_deref(), Some(prompt));
+        assert!(cli.chat);
+
+        assert!(command().try_get_matches_from(["tart", "--headless"]).is_err());
+        assert!(
+            command()
+                .try_get_matches_from(["tart", "--headless", ""])
+                .is_err()
+        );
+        assert!(
+            command()
+                .try_get_matches_from(["tart", "--headless", "two", "words"])
+                .is_err()
+        );
+    }
 
     /// `--agents` names the file to read, without checking it exists:
     /// `Config::load` reports a missing named file with the path as typed.

@@ -24,3 +24,12 @@ has expired
 # The azure resource backing inference has switched and we lack the information to
 # continue the request (e.g. our request ID is incorrect)
 different azure openai resource
+
+# ChatGPT subscription authentication and allowance failures
+run tart login chatgpt to connect
+run tart login chatgpt --reset
+chatgpt plan usage was not granted
+subscription_sharing_usage_limit_exceeded
+subscription_sharing_user_not_eligible
+subscription_sharing_invalid_user
+subscription_sharing_unsupported_capability

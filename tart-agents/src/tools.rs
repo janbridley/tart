@@ -14,8 +14,6 @@ use crate::backends::{FunctionToolCall, Tool, tool};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 
-use crate::backends::Backend;
-use crate::backends::openai_responses::Responses;
 use crate::{Agent, AgentId, Agents, ChatMode, Progress, sandbox::Policy};
 
 mod web;
@@ -349,9 +347,9 @@ fn parse_check(arguments: &str) -> anyhow::Result<Check> {
 ///
 /// Tool *failures* (a non-zero exit, an edit that did not apply, or a command the
 /// sandbox denies) are content that the model should see, and so is a *malformed call*.
-pub(crate) fn execute<B: Backend, F: Fn(Progress)>(
+pub(crate) fn execute<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_, B>,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
     // Force-disable tools, lest hallucinated calls attempt execution regardless.
@@ -383,9 +381,9 @@ pub(crate) fn execute<B: Backend, F: Fn(Progress)>(
 }
 
 /// Fork a subagent on the task and return at once.
-fn run_spawn_agent<B: Backend, F: Fn(Progress)>(
+fn run_spawn_agent<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_, B>,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
     let spawn = match parse_spawn(&call.arguments) {
@@ -416,9 +414,9 @@ fn run_spawn_agent<B: Backend, F: Fn(Progress)>(
 }
 
 /// Run one `check_agent` tool call: an instant check, never a block.
-fn run_check_agent<B: Backend, F: Fn(Progress)>(
+fn run_check_agent<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_, B>,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
     let check = match parse_check(&call.arguments) {
@@ -639,7 +637,7 @@ fn excerpt(text: &str) -> String {
 }
 
 /// Information required for a tool call, including sandbox and cancellation info.
-pub(crate) struct Tooling<'a, B: Backend = Responses> {
+pub(crate) struct Tooling<'a> {
     /// The policy the call's commands run sandboxed under.
     pub(crate) policy: &'a Policy,
     /// The turn's cancel lever: Esc kills a command in flight.
@@ -647,7 +645,7 @@ pub(crate) struct Tooling<'a, B: Backend = Responses> {
     /// The subagent registry, when this agent can spawn.
     pub(crate) agents: Option<&'a Agents>,
     /// The agent whose turn this is: the template a `spawn_agent` clones.
-    pub(crate) template: &'a Agent<B>,
+    pub(crate) template: &'a Agent,
 }
 
 /// One finished command run under a watchdog: a deadline or a cancel.
@@ -1013,9 +1011,9 @@ fn misuse<F: Fn(Progress)>(
 ///
 /// A command is killed with everything it started when it ends, times out,
 /// or is cancelled.
-fn run_bash<B: Backend, F: Fn(Progress)>(
+fn run_bash<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_, B>,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
     let bash = match parse_bash(&call.arguments) {
@@ -1095,9 +1093,9 @@ fn not_regular_file(path: impl AsRef<Path>) -> bool {
 }
 
 /// Run one read tool call under `tools`, reporting its steps to `on_progress`.
-fn run_read<B: Backend, F: Fn(Progress)>(
+fn run_read<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_, B>,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
     let read = match parse_read(&call.arguments) {
@@ -1141,9 +1139,9 @@ fn run_read<B: Backend, F: Fn(Progress)>(
 /// As with bash, edit *failures* (an unreadable file, no or ambiguous match, a
 /// sandbox denial) are not errors: their message is content the model can act
 /// on and retry.
-fn run_edit<B: Backend, F: Fn(Progress)>(
+fn run_edit<F: Fn(Progress)>(
     call: &FunctionToolCall,
-    tools: &Tooling<'_, B>,
+    tools: &Tooling<'_>,
     on_progress: &F,
 ) -> String {
     let edit = match parse_edit(&call.arguments) {
@@ -1283,6 +1281,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::backends::openai_responses::WireTool;
     use nix::sys::signal::kill;
     use std::fmt::Write as _;
     use std::os::unix::process::ExitStatusExt as _;
@@ -1362,7 +1361,7 @@ mod tests {
 
     #[test]
     fn the_bash_definition_matches_claude_code() {
-        let tool = serde_json::to_value(bash()).unwrap();
+        let tool = serde_json::to_value(WireTool::Function(bash())).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "bash");
@@ -2308,7 +2307,7 @@ mod tests {
 
     #[test]
     fn edit_definition_matches_claude_code() {
-        let tool = serde_json::to_value(edit()).unwrap();
+        let tool = serde_json::to_value(WireTool::Function(edit())).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "edit");
@@ -2375,7 +2374,7 @@ mod tests {
 
     #[test]
     fn read_definition_matches_claude_code() {
-        let tool = serde_json::to_value(read()).unwrap();
+        let tool = serde_json::to_value(WireTool::Function(read())).unwrap();
 
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "read");

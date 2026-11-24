@@ -40,3 +40,11 @@ base_url = "https://api.deepseek.com"
 api_key = "DEEPSEEK_API_KEY"
 
 # ... agent configuration here
+
+# Run `tart login chatgpt` once, then select a model available on your plan.
+[chatgpt]
+auth = "chatgpt"
+
+[[chatgpt.agents]]
+name = "ChatGPT Coding"
+model = "gpt-6.1-sol"

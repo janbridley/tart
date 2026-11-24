@@ -16,6 +16,9 @@ pub mod usage;
 mod backends;
 
 #[cfg(target_os = "macos")]
+pub mod chatgpt;
+
+#[cfg(target_os = "macos")]
 pub mod sandbox;
 
 pub use history::Transcript;
@@ -53,3 +56,4 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 4096;
 /// The reasoning efforts a backend accepts, so callers can pick one without
 /// depending on the backend's own vocabulary.
 pub use backends::ReasoningEffort;
+pub use backends::openai_responses::Provider;

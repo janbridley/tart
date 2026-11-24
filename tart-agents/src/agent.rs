@@ -7,11 +7,11 @@ use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
 use crate::backends::openai_responses::Responses;
-use crate::backends::{Backend, Event, FunctionToolCall, ReasoningEffort, ReasoningItem, Tool};
+use crate::backends::{Event, FunctionToolCall, ReasoningEffort, ReasoningItem, Tool};
 use crate::usage::MAIN_AGENT;
 use crate::{
-    AgentId, Agents, CancelToken, MAIN, Progress, Transcript, debug, errors, max_tool_rounds,
-    sandbox::Policy, tools,
+    AgentId, Agents, CancelToken, MAIN, Progress, Provider, Transcript, debug, errors,
+    max_tool_rounds, sandbox::Policy, tools,
 };
 
 /// The session's collaboration mode, mirroring Codex's `ModeKind`.
@@ -34,15 +34,9 @@ pub enum ChatMode {
 }
 
 /// A Responses-API model configured to run the tart tool loop.
-#[allow(
-    private_bounds,
-    private_interfaces,
-    reason = "the default backend and the trait bounds are crate-internal; the public name is `Agent`"
-)]
 #[derive(Clone)]
-pub struct Agent<B: Backend = Responses> {
-    /// The provider seam, statically dispatched.
-    backend: Arc<B>,
+pub struct Agent {
+    backend: Responses,
     /// Model name sent with every request.
     model: String,
     /// How hard the model reasons; `None` uses the provider default.
@@ -142,8 +136,25 @@ impl Agent {
         model: M,
         policy: Policy,
     ) -> Self {
+        Self::with_provider(Provider::api_key(base_url, api_key), model, policy)
+    }
+
+    /// Swap the model, keeping the runtime, policies, and turn control.
+    #[inline]
+    pub fn set_model<U: Into<String>, K: Into<String>, M: Into<String>>(
+        &mut self,
+        base_url: U,
+        api_key: K,
+        model: M,
+    ) {
+        self.set_provider(Provider::api_key(base_url, api_key), model);
+    }
+
+    /// Create an agent for a provider and model, running tools under `policy`.
+    #[inline]
+    pub fn with_provider<M: Into<String>>(provider: Provider, model: M, policy: Policy) -> Self {
         Self {
-            backend: Arc::new(crate::backends::openai_responses::backend(base_url, api_key)),
+            backend: Responses::new(provider),
             model: model.into(),
             effort: None,
             max_rounds: max_tool_rounds(),
@@ -156,26 +167,14 @@ impl Agent {
         }
     }
 
-    /// Swap the model, keeping its runtime, policies, subagents, and turn lever.
+    /// Switch providers or models, clearing the previous model's effort setting.
     #[inline]
-    pub fn set_model<U: Into<String>, K: Into<String>, M: Into<String>>(
-        &mut self,
-        base_url: U,
-        api_key: K,
-        model: M,
-    ) {
-        self.backend = Arc::new(crate::backends::openai_responses::backend(base_url, api_key));
+    pub fn set_provider<M: Into<String>>(&mut self, provider: Provider, model: M) {
+        self.backend = Responses::new(provider);
         self.model = model.into();
         self.effort = None;
     }
-}
 
-#[allow(
-    private_bounds,
-    private_interfaces,
-    reason = "`B` is crate plumbing; the public name is the defaulted `Agent`"
-)]
-impl<B: Backend> Agent<B> {
     /// The session's collaboration mode.
     #[inline]
     pub const fn mode(&self) -> ChatMode {
@@ -407,6 +406,8 @@ impl<B: Backend> Agent<B> {
             let mut call_in_flight = false;
             // Some output arrived, so the stream was delivering.
             let mut saw_output = false;
+            let mut completed = false;
+            let requires_completion = self.backend.requires_completion();
             // The last transport error, skipped so a trailing one cannot discard an
             // otherwise complete answer.
             let mut last_error: Option<String> = None;
@@ -456,6 +457,7 @@ impl<B: Backend> Agent<B> {
                         saw_output = true;
                     }
                     Ok(Event::Completed(usage)) => {
+                        completed = true;
                         // A completed response is output even when it holds no items.
                         saw_output = true;
                         if let Some(spend) = usage {
@@ -464,6 +466,9 @@ impl<B: Backend> Agent<B> {
                             spend.bill(&self.agent_tag(), &self.model);
                             let (input, cached, output) = spend.gauge();
                             on_progress(Progress::Usage { input, cached, output });
+                        }
+                        if requires_completion {
+                            break;
                         }
                     }
                     Ok(Event::Failed(reason)) => {
@@ -493,6 +498,10 @@ impl<B: Backend> Agent<B> {
             }
 
             // A stream that broke before completing its round dropped it -> retry.
+            if requires_completion && !completed && saw_output {
+                let reason = with_last_error("stream ended before response.completed", last_error);
+                return terminate_and_log(on_progress, Progress::Failed(reason));
+            }
             if call_in_flight || !saw_output {
                 let reason = with_last_error(
                     if call_in_flight {
@@ -757,13 +766,7 @@ mod tests {
 
     /// The names of the function tools among `definitions`.
     fn names(definitions: &[Tool]) -> Vec<&str> {
-        definitions
-            .iter()
-            .filter_map(|tool| match tool {
-                Tool::Function(function) => Some(function.name.as_str()),
-                _ => None,
-            })
-            .collect()
+        definitions.iter().map(|tool| tool.name.as_str()).collect()
     }
 
     fn drive(agent: &Agent, transcript: &Transcript) -> Vec<String> {
@@ -841,7 +844,7 @@ mod tests {
 
         // One round streams a partial answer, then parks: the stream never
         // ends on its own, so only a cancel can end the turn.
-        let server = serve(listener, vec![delta("Once upon"), delta(" a time")]);
+        let server = serve(listener, vec![delta("Once upon"), delta(" a time")], true);
 
         // Esc lands once both fragments have streamed, so the cancel wakes
         // the parked select with the partial already in hand.
@@ -931,6 +934,23 @@ mod tests {
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         assert_eq!(items.as_array().map(Vec::len), Some(3));
         assert_eq!(items[2]["content"], "Once upon a time");
+    }
+
+    #[test]
+    fn explicit_completion_is_required_before_dispatching_a_tool() {
+        let Some(listener) = loopback() else { return };
+        let address = listener.local_addr().unwrap();
+        let server = serve(listener, vec![call_done(0)], false);
+        let policy = Policy::new(std::env::temp_dir()).unwrap();
+        let mut agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        agent.backend.use_chatgpt_wire_format_for_test();
+        let transcript = Transcript::new().unwrap();
+        transcript.push_user("Read a file".into()).unwrap();
+        let before = transcript.request_items().len();
+        let log = drive(&agent, &transcript);
+        assert_eq!(log, [r#"Failed("stream ended before response.completed")"#]);
+        assert_eq!(transcript.request_items().len(), before);
+        server.join().unwrap();
     }
 
     /// One round whose `read` output passes the content cap: history records
@@ -1463,11 +1483,11 @@ mod tests {
     }
 
     /// Answer one `/responses` request with `events` as `text/event-stream`,
-    /// then park until the client drops the connection: the stream never ends
-    /// on its own, so a test decides when the turn ends.
+    /// optionally keeping it open until the client cancels.
     fn serve(
         listener: std::net::TcpListener,
         events: Vec<ResponseStreamEvent>,
+        hold_open: bool,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
@@ -1483,7 +1503,9 @@ mod tests {
                 let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
             }
             let _ = stream.flush();
-            // Park until the client drops the stream: a cancel does.
+            if !hold_open {
+                return;
+            }
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
             let mut drain = [0; 1024];
             while !matches!(stream.read(&mut drain), Ok(0) | Err(_)) {}

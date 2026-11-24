@@ -9,13 +9,7 @@ anyhow.workspace = true
 # rustls-no-provider keeps aws-lc-rs provider out of our dependency chain and speed up
 # compiles. We directly depend on rustls to get the required components.
 async-openai = { version = "0.42.3", default-features = false, features = ["responses", "rustls-no-provider"] }
-reqwest = { version = "0.13", default-features = false, features = [
-    "blocking",
-    "rustls-no-provider",
-    "gzip",
-    "brotli",
-    "deflate",
-] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "gzip", "brotli", "deflate"] }
 url = "2"
 iprfc = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -31,6 +25,12 @@ flate2.workspace = true
 libc = "0.2.191"
 tempfile.workspace = true
 fixed = { version = "1.31.0", features = ["serde", "serde-str"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+openidconnect = { version = "4.0.1", default-features = false }
+security-framework = "3.7"
+tiny_http = "0.12"
+uuid = { version = "1.29.3", features = ["v4"] }
 
 [dev-dependencies]
 macro_rules_attribute = "0.2.3"

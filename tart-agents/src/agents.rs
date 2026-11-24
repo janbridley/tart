@@ -8,7 +8,6 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::backends::Backend;
 use crate::{Agent, Progress, Transcript, TurnHandle};
 
 /// The subagent preamble, opening the child's first user message ahead of its task
@@ -138,12 +137,7 @@ impl Agents {
     /// Fork a subagent on `task`, cloned from `template`, and return its id
     /// at once: the child runs on its own thread and never blocks the caller.
     #[inline]
-    #[allow(
-        private_bounds,
-        private_interfaces,
-        reason = "`B` is crate plumbing; the public name is the defaulted `Agent`"
-    )]
-    pub fn spawn<B: Backend>(&self, template: &Agent<B>, task: &str) -> anyhow::Result<AgentId> {
+    pub fn spawn(&self, template: &Agent, task: &str) -> anyhow::Result<AgentId> {
         if self.inner.lock_children().len() >= MAX_SUBAGENTS {
             anyhow::bail!("at most {MAX_SUBAGENTS} subagents may run at once");
         }

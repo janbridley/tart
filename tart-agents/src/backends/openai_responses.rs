@@ -1,69 +1,163 @@
 //! The `OpenAI` Responses backend: the only module that touches `async-openai`.
 
-use std::future::Future;
-
 use async_openai::{
     Client,
     config::OpenAIConfig,
+    error::OpenAIError,
     types::responses::{
-        CreateResponse, CreateResponseArgs, EasyInputMessageArgs, FunctionCallOutput,
-        FunctionCallOutputItemParam, FunctionTool, InputParam, Reasoning,
-        ReasoningEffort as ResponsesEffort, ResponseErrorCode, ResponseUsage,
+        CreateResponse, EasyInputMessageArgs, FunctionCallOutput, FunctionCallOutputItemParam,
+        FunctionToolParam, InputParam, NamespaceToolParam, NamespaceToolParamTool, Reasoning,
+        ReasoningEffort as ResponsesEffort, ResponseErrorCode, ResponseStream, ResponseUsage,
     },
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 use crate::debug;
 use crate::usage::TokenUsage;
 
-use super::{Backend, Event, ReasoningEffort, RoundStream};
+use super::{Event, ReasoningEffort};
 
-/// The record and tool vocabulary the loop exchanges with any backend, plus
+/// The record vocabulary the loop exchanges with the backend, plus
 /// the raw wire events for tests that serve a stream by hand.
 pub(crate) use async_openai::types::responses::{
-    EasyInputContent, FunctionToolCall, InputItem, Item, OutputItem, ReasoningItem,
-    ReasoningItemContent, ResponseStreamEvent, Role, Tool,
+    EasyInputContent, FunctionTool as Tool, FunctionToolCall, InputItem, Item, OutputItem,
+    ReasoningItem, ReasoningItemContent, ResponseStreamEvent, Role, Tool as WireTool,
 };
-/// Wire and content types only test fixtures require. Can't be below for some reason?
+/// Wire and content types used by stream fixtures.
 #[cfg(test)]
 pub(crate) use async_openai::types::responses::{
     ReasoningTextContent, ResponseOutputItemDoneEvent, ResponseTextDeltaEvent,
 };
 
-/// A Responses-API endpoint.
-#[derive(Clone, Debug)]
-pub struct Responses(Client<OpenAIConfig>);
-
-/// A backend handle for an OpenAI-compatible Responses endpoint.
-pub(crate) fn backend<U: Into<String>, K: Into<String>>(base_url: U, api_key: K) -> Responses {
-    // Register a cryptography backend, otherwise reqwest rustls-no-provider panics.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = OpenAIConfig::new()
-        .with_api_base(base_url.into())
-        .with_api_key(api_key.into());
-    Responses(Client::with_config(config))
+/// Credentials and endpoint for the Responses API.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum Provider {
+    /// An API key for an OpenAI-compatible endpoint.
+    ApiKey {
+        /// The endpoint's base URL.
+        base_url: String,
+        /// The key sent to the endpoint.
+        api_key: String,
+    },
+    /// The saved `ChatGPT` account, scoped to the `OpenAI` endpoint.
+    ChatGpt,
 }
 
-impl Backend for Responses {
-    fn round(
+impl std::fmt::Debug for Provider {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ApiKey { .. } => "ApiKey",
+            Self::ChatGpt => "ChatGpt",
+        })
+    }
+}
+
+impl Provider {
+    /// An API key for an OpenAI-compatible endpoint.
+    #[inline]
+    pub fn api_key<U: Into<String>, K: Into<String>>(base_url: U, api_key: K) -> Self {
+        Self::ApiKey {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum Responses {
+    ApiKey(Client<OpenAIConfig>),
+    ChatGpt(reqwest::Client),
+    #[cfg(test)]
+    ChatGptFixture(Client<OpenAIConfig>),
+}
+
+impl Responses {
+    pub(crate) fn new(provider: Provider) -> Self {
+        // Reqwest uses rustls without a default cryptography provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        match provider {
+            Provider::ApiKey { base_url, api_key } => Self::ApiKey(Client::with_config(
+                OpenAIConfig::new().with_api_base(base_url).with_api_key(api_key),
+            )),
+            Provider::ChatGpt => Self::ChatGpt(
+                reqwest::Client::builder()
+                    .https_only(true)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .expect("ChatGPT HTTP client did not initialize"),
+            ),
+        }
+    }
+
+    pub(crate) const fn requires_completion(&self) -> bool {
+        !matches!(self, Self::ApiKey(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_chatgpt_wire_format_for_test(&mut self) {
+        if let Self::ApiKey(client) = self {
+            *self = Self::ChatGptFixture(client.clone());
+        }
+    }
+
+    pub(crate) async fn round(
         &self,
         model: &str,
         effort: Option<ReasoningEffort>,
         items: Vec<InputItem>,
         tools: Vec<Tool>,
-    ) -> impl Future<Output = anyhow::Result<RoundStream>> + Send {
-        let model = model.to_string();
-        async move {
-            let request = request_of(&model, effort, items, tools)?;
-            debug::log_json("round request", || serde_json::to_string(&request));
-            let stream = self.0.responses().create_stream(request).await?;
-            Ok(Box::pin(stream.filter_map(|item| async {
-                match item {
-                    Ok(event) => translate(event).map(Ok),
-                    Err(error) => Some(Err(anyhow::Error::new(error))),
-                }
-            })) as RoundStream)
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Event>> + Unpin + use<>> {
+        let request = request_of(model, effort, items, tools, self.requires_completion());
+        debug::log_json("round request", || serde_json::to_string(&request));
+        let stream = match self {
+            Self::ApiKey(client) => client.responses().create_stream(request).await?,
+            Self::ChatGpt(http) => chatgpt_stream(http, request).await?,
+            #[cfg(test)]
+            Self::ChatGptFixture(client) => client.responses().create_stream(request).await?,
+        };
+        Ok(stream.filter_map(|item| {
+            std::future::ready(match item {
+                Ok(event) => translate(event).map(Ok),
+                Err(error) => Some(Err(error.into())),
+            })
+        }))
+    }
+}
+
+async fn chatgpt_stream(
+    http: &reqwest::Client,
+    request: CreateResponse,
+) -> anyhow::Result<ResponseStream> {
+    use crate::chatgpt::{RECONNECT, RESOURCE, access_token, invalidate_access_token};
+
+    let token = tokio::task::spawn_blocking(access_token).await??;
+    let client = Client::build(
+        http.clone(),
+        OpenAIConfig::new()
+            .with_api_base(RESOURCE)
+            .with_api_key(token.clone())
+            .with_org_id("")
+            .with_project_id(""),
+    );
+    let error = match client.responses().create_stream(request).await {
+        Err(OpenAIError::ApiError(error))
+            if error.status_code == reqwest::StatusCode::UNAUTHORIZED =>
+        {
+            error
         }
+        other => return Ok(other?),
+    };
+    match error.api_error.code.as_deref() {
+        Some("token_revoked" | "refresh_token_invalidated") => {
+            tokio::task::spawn_blocking(move || invalidate_access_token(&token)).await??;
+            anyhow::bail!("ChatGPT session was revoked. {RECONNECT}.");
+        }
+        Some("subscription_sharing_invalid_user" | "invalid_token") => {
+            anyhow::bail!("{error}. {RECONNECT}.");
+        }
+        _ => Err(OpenAIError::ApiError(error).into()),
     }
 }
 
@@ -73,24 +167,44 @@ fn request_of(
     effort: Option<ReasoningEffort>,
     items: Vec<InputItem>,
     tools: Vec<Tool>,
-) -> anyhow::Result<CreateResponse> {
-    // The builder's setters borrow it, so chain off the binding.
-    let mut args = CreateResponseArgs::default();
-    args.model(model)
-        .stream(true)
-        .reasoning(Reasoning {
+    chatgpt: bool,
+) -> CreateResponse {
+    CreateResponse {
+        model: Some(model.into()),
+        stream: Some(true),
+        store: chatgpt.then_some(false),
+        reasoning: Some(Reasoning {
             effort: effort.map(effort_of),
-            summary: None,
-            context: None,
-            mode: None,
-        })
-        .input(InputParam::Items(
-            items.into_iter().map(strip_server_side_state).collect(),
-        ));
-    if !tools.is_empty() {
-        args.tools(tools);
+            ..Reasoning::default()
+        }),
+        input: InputParam::Items(items.into_iter().map(|item| wire_item(item, chatgpt)).collect()),
+        tools: (!tools.is_empty()).then(|| {
+            if chatgpt {
+                vec![WireTool::Namespace(NamespaceToolParam {
+                    name: "tart".into(),
+                    description: "Tools provided by Tart".into(),
+                    tools: tools
+                        .into_iter()
+                        .map(|tool| {
+                            NamespaceToolParamTool::Function(FunctionToolParam {
+                                name: tool.name,
+                                description: tool.description,
+                                parameters: tool.parameters,
+                                strict: tool.strict,
+                                defer_loading: tool.defer_loading,
+                                r#async: tool.r#async,
+                                output_schema: tool.output_schema,
+                                allowed_callers: tool.allowed_callers,
+                            })
+                        })
+                        .collect(),
+                })]
+            } else {
+                tools.into_iter().map(WireTool::Function).collect()
+            }
+        }),
+        ..CreateResponse::default()
     }
-    Ok(args.build()?)
 }
 
 /// One record item as a plain, self-contained item.
@@ -98,14 +212,17 @@ fn request_of(
 /// We must drop server-side data (`id`s for stored items, as well as their
 /// `encrypted_content`), or proxies like `Azure OpenAI` kill the stream when the
 /// backing resource changes. We keep track of dropped data on our end for posterity.
-fn strip_server_side_state(mut item: InputItem) -> InputItem {
+fn wire_item(mut item: InputItem, chatgpt: bool) -> InputItem {
     match &mut item {
         InputItem::Item(Item::Reasoning(reasoning)) => {
             reasoning.id = None;
             reasoning.encrypted_content = None;
         }
         InputItem::Item(Item::FunctionCall(call)) => call.id = None,
-        _ => {} // Nothing else the record holds names stored state.
+        InputItem::EasyMessage(message) if chatgpt && message.role == Role::System => {
+            message.role = Role::Developer;
+        }
+        _ => {}
     }
     item
 }
@@ -198,18 +315,13 @@ pub(crate) fn message(role: Role, text: String) -> anyhow::Result<InputItem> {
         .into())
 }
 
-/// A function tool with the given name, description, and JSON-schema parameters.
 pub(crate) fn tool(name: &str, description: &str, parameters: serde_json::Value) -> Tool {
-    Tool::Function(FunctionTool {
-        defer_loading: None,
-        name: name.to_string(),
-        description: Some(description.to_string()),
+    Tool {
+        name: name.into(),
+        description: Some(description.into()),
         parameters: Some(parameters),
-        strict: None,
-        r#async: None,
-        output_schema: None,
-        allowed_callers: None,
-    })
+        ..Tool::default()
+    }
 }
 
 /// A tool call's output, paired back to its call.
@@ -220,7 +332,7 @@ pub(crate) fn call_output(call: &FunctionToolCall, output: String) -> InputItem 
         id: None,
         status: None,
         name: None,
-        namespace: None,
+        namespace: call.namespace.clone(),
         caller: None,
     }))
 }
@@ -232,14 +344,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chatgpt_uses_stateless_requests_and_namespaced_tools() {
+        let request = request_of(
+            "model",
+            None,
+            vec![message(Role::System, "Instructions".into()).unwrap()],
+            vec![tool("read", "Read a file", serde_json::json!({"type": "object"}))],
+            true,
+        );
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["store"], false);
+        assert_eq!(wire["stream"], true);
+        assert_eq!(wire["input"][0]["role"], "developer");
+        assert_eq!(wire["tools"][0]["type"], "namespace");
+        assert_eq!(wire["tools"][0]["name"], "tart");
+        assert_eq!(wire["tools"][0]["tools"][0]["name"], "read");
+    }
+
+    #[test]
     fn the_request_omits_an_empty_tools_list() {
-        let bare = serde_json::to_value(request_of("model", None, Vec::new(), Vec::new()).unwrap())
-            .unwrap();
+        let bare =
+            serde_json::to_value(request_of("model", None, Vec::new(), Vec::new(), false)).unwrap();
         assert!(bare.get("tools").is_none(), "no tools, no field: {bare}");
 
-        let armed = serde_json::to_value(
-            request_of("model", None, Vec::new(), vec![crate::tools::bash()]).unwrap(),
-        )
+        let armed = serde_json::to_value(request_of(
+            "model",
+            None,
+            Vec::new(),
+            vec![crate::tools::bash()],
+            false,
+        ))
         .unwrap();
         assert_eq!(
             armed["tools"].as_array().map(Vec::len),
@@ -265,7 +399,7 @@ mod tests {
             arguments: "{}".to_string(),
             ..FunctionToolCall::default()
         }));
-        let request = request_of("model", None, vec![reasoning, call], Vec::new()).unwrap();
+        let request = request_of("model", None, vec![reasoning, call], Vec::new(), false);
 
         let body = serde_json::to_value(&request).unwrap();
         let input = &body["input"];
