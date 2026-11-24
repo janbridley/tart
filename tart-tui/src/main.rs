@@ -29,7 +29,7 @@ mod turn_picker;
 mod testutil;
 
 use std::collections::BTreeMap;
-use std::io::stdout;
+use std::io::{Write as _, stdout};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -42,7 +42,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::text::Span;
 
-use init::Tui;
+use init::Startup;
 use pane::{DIM_STYLE, Mode, Pane, PaneEvent, ULTRATHINK, Wake};
 use perf::Perf;
 use recorded::MANUAL_AT;
@@ -61,22 +61,53 @@ fn main() -> anyhow::Result<()> {
     let Some(cli) = cli::Cli::parse()? else {
         return Ok(());
     };
-    let mut tui = Tui::try_from(&cli)?;
+    let mut startup = Startup::try_from(&cli)?;
+    if let Some(prompt) = cli.headless {
+        return startup.run_headless(prompt);
+    }
+
     install_panic_hook();
     let (mut terminal, _tmux) = enter_terminal()?;
-    let mut pane = tui.open_pane();
+    let mut pane = startup.open_pane();
     let result = run(
         &mut terminal,
-        &mut tui.agent,
-        tui.transcript,
-        &mut tui.session,
+        &mut startup.agent,
+        startup.transcript,
+        &mut startup.session,
         &mut pane,
-        &tui.config,
+        &startup.config,
     );
     leave_terminal(&mut terminal)?;
     // Print an exit summary once we've closed the TUI
-    print_exit_summary(&tui.session, &tui.config.prices());
+    print_exit_summary(&startup.session, &startup.config.prices());
     result
+}
+
+impl Startup {
+    /// Run a single turn using the same worker and session record as the TUI.
+    pub(crate) fn run_headless(&mut self, prompt: String) -> anyhow::Result<()> {
+        let transcript = &self.transcript;
+        transcript.push_user(prompt)?;
+        self.session.record(transcript)?;
+
+        let (sender, progress) = mpsc::channel();
+        self.agent.spawn(transcript, move |event| {
+            let _ = sender.send(event);
+        });
+        let terminal = progress.into_iter().find(Progress::is_terminal);
+        self.session.record(transcript)?;
+        match terminal {
+            Some(Progress::Done { message }) => {
+                if let Some(answer) = message {
+                    writeln!(stdout().lock(), "{answer}")?;
+                }
+                Ok(())
+            }
+            Some(Progress::Failed(error)) => anyhow::bail!("{error}"),
+            Some(Progress::Cancelled) => anyhow::bail!("generation cancelled"),
+            _ => anyhow::bail!("generation ended without a terminal event"),
+        }
+    }
 }
 
 /// Print the session's spend and estimated cost as codex does on close.
@@ -171,9 +202,7 @@ fn run(
         }
     });
 
-    let mut quit = false;
-    let mut perf_on = false;
-    let mut perf = Perf::default();
+    let (mut quit, mut perf_on, mut perf) = (false, false, Perf::default());
     // The registry every conversation registers in: the main turn's lever at startup,
     // each subagent's as the model spawns it.
     let agents = Agents::new({

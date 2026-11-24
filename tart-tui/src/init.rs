@@ -1,4 +1,4 @@
-//! Startup: the session the command line describes, and the pane over it.
+//! Shared session startup and the interactive pane built from it.
 
 use std::path::{Path, PathBuf};
 
@@ -97,8 +97,8 @@ impl Kind {
     }
 }
 
-/// What `run` needs, assembled once at startup.
-pub(crate) struct Tui {
+/// Shared startup state for interactive and headless sessions.
+pub(crate) struct Startup {
     /// The providers file, for `/model` picks.
     pub(crate) config: config::Config,
     /// The agent the session talks to.
@@ -118,7 +118,7 @@ pub(crate) struct Tui {
 }
 
 /// The command line becomes the session it describes.
-impl TryFrom<&cli::Cli> for Tui {
+impl TryFrom<&cli::Cli> for Startup {
     type Error = anyhow::Error;
 
     #[allow(
@@ -174,7 +174,7 @@ impl TryFrom<&cli::Cli> for Tui {
     }
 }
 
-impl Tui {
+impl Startup {
     /// The pane over the setup: wired to its agent and conversation, its
     /// session directory for `/resume`, and a banner naming what it runs.
     pub(crate) fn open_pane(&self) -> Pane {
@@ -213,23 +213,23 @@ mod tests {
         file
     }
 
-    /// The chat command line builds a chat `Tui`: the agent in Chat mode, the
-    /// CHAT project, and the minimal prompt opening the record.
+    /// The chat command line builds a chat agent in the CHAT project with the minimal prompt.
     #[test]
-    fn a_chat_cli_builds_a_chat_tui() {
+    fn a_chat_cli_starts_a_chat_session() {
         let dir = tempfile::tempdir().unwrap();
         let cli = cli::Cli {
             agents: providers(dir.path()),
             chat: true,
             gpu: false,
             resume: false,
+            headless: None,
         };
 
-        let tui = Tui::try_from(&cli).unwrap();
+        let startup = Startup::try_from(&cli).unwrap();
 
-        assert_eq!(tui.agent.mode(), ChatMode::Chat);
-        assert_eq!(tui.project, PathBuf::from(CHAT_PROJECT));
-        let items = serde_json::to_value(tui.transcript.request_items()).unwrap();
+        assert_eq!(startup.agent.mode(), ChatMode::Chat);
+        assert_eq!(startup.project, PathBuf::from(CHAT_PROJECT));
+        let items = serde_json::to_value(startup.transcript.request_items()).unwrap();
         assert_eq!(items[0]["role"], "system");
         assert_eq!(items[0]["content"], prompts::CHAT);
     }
@@ -275,20 +275,21 @@ mod tests {
 
     /// The bare command line stays the coding kind.
     #[test]
-    fn a_bare_cli_builds_a_coding_tui() {
+    fn a_bare_cli_starts_a_coding_session() {
         let dir = tempfile::tempdir().unwrap();
         let cli = cli::Cli {
             agents: providers(dir.path()),
             chat: false,
             gpu: false,
             resume: false,
+            headless: None,
         };
 
-        let tui = Tui::try_from(&cli).unwrap();
+        let startup = Startup::try_from(&cli).unwrap();
 
-        assert_eq!(tui.agent.mode(), ChatMode::Default);
-        assert_eq!(tui.project, std::env::current_dir().unwrap());
-        let items = serde_json::to_value(tui.transcript.request_items()).unwrap();
+        assert_eq!(startup.agent.mode(), ChatMode::Default);
+        assert_eq!(startup.project, std::env::current_dir().unwrap());
+        let items = serde_json::to_value(startup.transcript.request_items()).unwrap();
         assert_ne!(items[0]["content"], prompts::CHAT);
     }
 }

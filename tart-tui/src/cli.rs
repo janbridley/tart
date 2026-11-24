@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use clap::{Arg, ArgMatches, Command};
 
-/// The command line, parsed once: the agents file to load, and whether this session is chat.
+/// The command line, parsed once before session startup.
 pub(crate) struct Cli {
     /// The TOML file describing the available agents.
     pub(crate) agents: PathBuf,
@@ -17,6 +17,8 @@ pub(crate) struct Cli {
     pub(crate) gpu: bool,
     /// Whether `--resume` was passed: reopen this project's newest session.
     pub(crate) resume: bool,
+    /// A prompt to run once without opening the terminal UI.
+    pub(crate) headless: Option<String>,
 }
 
 impl Cli {
@@ -38,6 +40,7 @@ impl Cli {
             chat: matches.get_flag("chat"),
             gpu: matches.get_flag("gpu"),
             resume: matches.get_flag("resume"),
+            headless: matches.get_one::<String>("headless").cloned(),
         })
     }
 }
@@ -94,6 +97,13 @@ fn command() -> Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Resume this project's most recent session instead of starting a new one"),
         )
+        .arg(
+            Arg::new("headless")
+                .long("headless")
+                .value_name("PROMPT")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help("Run one prompt without the terminal UI and print the final answer"),
+        )
 }
 
 #[cfg(test)]
@@ -110,6 +120,29 @@ mod tests {
             let login = matches.subcommand_matches("login").expect("login subcommand");
             assert_eq!(login.get_flag("reset"), reset);
         }
+    }
+
+    #[test]
+    fn headless_takes_one_literal_prompt() {
+        let prompt = "Summarize '$HOME'\nKeep it short.";
+        let matches = command()
+            .try_get_matches_from(["tart", "--agents", "f.toml", "--headless", prompt, "--chat"])
+            .expect("the quoted prompt is one argument");
+        let cli = Cli::from(&matches, None).expect("the named file is used as-is");
+        assert_eq!(cli.headless.as_deref(), Some(prompt));
+        assert!(cli.chat);
+
+        assert!(command().try_get_matches_from(["tart", "--headless"]).is_err());
+        assert!(
+            command()
+                .try_get_matches_from(["tart", "--headless", ""])
+                .is_err()
+        );
+        assert!(
+            command()
+                .try_get_matches_from(["tart", "--headless", "two", "words"])
+                .is_err()
+        );
     }
 
     /// `--agents` names the file to read, without checking it exists:
