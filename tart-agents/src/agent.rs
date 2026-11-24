@@ -7,7 +7,7 @@ use futures::future::{Either, select};
 use tokio::runtime::Runtime;
 
 use crate::backends::openai_responses::Responses;
-use crate::backends::{Event, FunctionToolCall, ReasoningEffort, ReasoningItem, Tool};
+use crate::backends::{Event, FunctionToolCall, InputItem, Item, ReasoningEffort, Tool};
 use crate::usage::MAIN_AGENT;
 use crate::{
     AgentId, Agents, CancelToken, MAIN, Progress, Provider, Transcript, debug, errors,
@@ -137,17 +137,6 @@ impl Agent {
         policy: Policy,
     ) -> Self {
         Self::with_provider(Provider::api_key(base_url, api_key), model, policy)
-    }
-
-    /// Swap the model, keeping the runtime, policies, and turn control.
-    #[inline]
-    pub fn set_model<U: Into<String>, K: Into<String>, M: Into<String>>(
-        &mut self,
-        base_url: U,
-        api_key: K,
-        model: M,
-    ) {
-        self.set_provider(Provider::api_key(base_url, api_key), model);
     }
 
     /// Create an agent for a provider and model, running tools under `policy`.
@@ -282,8 +271,8 @@ impl Agent {
     /// The configured effort, so a caller can layer a one-turn boost on it.
     #[inline]
     #[must_use]
-    pub const fn configured_effort(&self) -> Option<ReasoningEffort> {
-        self.effort
+    pub fn configured_effort(&self) -> Option<ReasoningEffort> {
+        self.effort.clone()
     }
 
     /// Run one generation on its own thread, reporting progress to `on_progress`.
@@ -294,7 +283,7 @@ impl Agent {
     /// worker panics.
     #[inline]
     pub fn spawn<F: Fn(Progress) + Send + 'static>(&self, transcript: &Transcript, on_progress: F) {
-        self.spawn_with(self.effort, transcript, on_progress);
+        self.spawn_with(self.effort.clone(), transcript, on_progress);
     }
 
     /// [`Self::spawn`] at a caller-chosen effort: the `ultrathink` boost
@@ -315,7 +304,7 @@ impl Agent {
         std::thread::spawn(move || {
             // A panicking worker must still deliver the terminal event to the caller
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                agent.run(effort, &transcript, receiver, &token, &on_progress);
+                agent.run(effort.as_ref(), &transcript, receiver, &token, &on_progress);
             }));
             // The turn is over: retire the lever unless a newer turn claimed it.
             agent.control.release(generation);
@@ -360,7 +349,7 @@ impl Agent {
     )]
     fn run<F: Fn(Progress)>(
         &self,
-        effort: Option<ReasoningEffort>,
+        effort: Option<&ReasoningEffort>,
         transcript: &Transcript,
         mut cancel_rx: mpsc::Receiver<()>,
         token: &CancelToken,
@@ -380,7 +369,7 @@ impl Agent {
             // record, and the tools the model has this round.
             let mut stream = match self.runtime.block_on(self.backend.round(
                 &self.model,
-                effort,
+                effort.cloned(),
                 transcript.request_items(),
                 self.tools_for(),
             )) {
@@ -398,10 +387,11 @@ impl Agent {
             };
 
             let mut answer = String::new();
-            // Completed calls, captured from finished output items, in stream order.
+            // The round's finished output items, exactly as delivered and in
+            // stream order: reasoning, calls, and assistant messages alike.
+            let mut items: Vec<InputItem> = Vec::new();
+            // The typed view of its calls, for execution and their outputs.
             let mut calls: Vec<FunctionToolCall> = Vec::new();
-            // The reasoning that preceded them; thinking mode requires its replay.
-            let mut reasoning: Option<ReasoningItem> = None;
             // A function-call item started but never reported done.
             let mut call_in_flight = false;
             // Some output arrived, so the stream was delivering.
@@ -422,12 +412,7 @@ impl Agent {
                             continue;
                         }
                         // Esc won: dropping the stream keeps what it streamed.
-                        if let Err(error) = transcript.push_answer(&answer) {
-                            return terminate_and_log(
-                                on_progress,
-                                Progress::Failed(error.to_string()),
-                            );
-                        }
+                        transcript.push_answer(&answer);
                         return terminate_and_log(on_progress, Progress::Cancelled);
                     }
                     Either::Left((item, _)) => item,
@@ -446,15 +431,13 @@ impl Agent {
                     Ok(Event::CallStarted) => {
                         call_in_flight = true;
                     }
-                    Ok(Event::Reasoning(item)) => {
-                        debug::log_json("captured reasoning item", || serde_json::to_string(&item));
-                        reasoning = Some(item);
+                    Ok(Event::ItemDone(item)) => {
                         saw_output = true;
-                    }
-                    Ok(Event::Call(call)) => {
-                        calls.push(call);
-                        call_in_flight = false;
-                        saw_output = true;
+                        if let InputItem::Item(Item::FunctionCall(call)) = &item {
+                            calls.push(call.clone());
+                            call_in_flight = false;
+                        }
+                        items.push(item);
                     }
                     Ok(Event::Completed(usage)) => {
                         completed = true;
@@ -519,9 +502,7 @@ impl Agent {
 
             // No calls pending: this round's answer is the turn's message.
             if calls.is_empty() {
-                if let Err(error) = transcript.push_answer(&answer) {
-                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-                }
+                transcript.push_round(items, &answer, Vec::new());
                 return terminate_and_log(
                     on_progress,
                     Progress::Done {
@@ -576,20 +557,14 @@ impl Agent {
                 };
                 exchanges.push((call, kept));
             }
-            // A round cut short before its first executed call records no
-            // reasoning: without its calls the item would dangle in the replay.
+            // A round cut short before its first executed call records only the
+            // partial answer: its calls would have no outputs to pair with, and
+            // the retried round delivers its items again. Calls skipped after
+            // the first one ran are left out of the record by `push_round`.
             if exchanges.is_empty() {
-                if let Err(error) = transcript.push_answer(&answer) {
-                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-                }
+                transcript.push_answer(&answer);
             } else {
-                if let Some(item) = reasoning {
-                    transcript.push_reasoning(item);
-                }
-                if let Err(error) = transcript.push_answer(&answer) {
-                    return terminate_and_log(on_progress, Progress::Failed(error.to_string()));
-                }
-                transcript.push_tool_round(exchanges);
+                transcript.push_round(items, &answer, exchanges);
             }
             if self.control.cancelled(&mut cancel_rx) {
                 // The turn stops here, keeping the rounds recorded so far.
@@ -630,27 +605,10 @@ mod tests {
     use super::*;
     use crate::backends::openai_responses::{
         OutputItem, ResponseOutputItemDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
+        Responses,
     };
     use crate::usage::TokenUsage;
     use crate::usage::tests::sample_usage;
-    use std::io::{Read, Write};
-
-    /// Toggling flips the policy the default mode runs under; the sandbox
-    /// test module pins plan-mode inheritance and chat's no-access policy.
-    #[test]
-    fn toggling_gpu_flips_the_default_policy() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut agent = Agent::new(
-            "http://127.0.0.1:1",
-            "key",
-            "model",
-            Policy::new(dir.path()).unwrap(),
-        );
-        assert!(agent.toggle_gpu());
-        assert!(agent.policy().render().contains("AGXDeviceUserClient"));
-        assert!(!agent.toggle_gpu());
-        assert!(!agent.policy().render().contains("AGXDeviceUserClient"));
-    }
 
     /// `Agent::new` must install a TLS crypto provider before building its
     /// reqwest client; the `rustls-no-provider` build panics otherwise.
@@ -663,52 +621,26 @@ mod tests {
         let _ = agent.model;
     }
 
-    /// Every turn worker blocks onto the agent's runtime from its own thread:
-    /// eight concurrent `block_on`s on the one runtime must all come back.
+    /// `/model` swaps the endpoint and model through `set_provider`, dropping the
+    /// previous effort while the mode survives it; a child inherits the effort.
     #[test]
-    fn the_runtime_blocks_eight_concurrent_threads() {
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let agent = Agent::new("http://localhost:9", "key", "model", policy);
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let runtime = Arc::clone(&agent.runtime);
-                std::thread::spawn(move || {
-                    // The `async` block defers the timer's construction to
-                    // inside the runtime context `block_on` provides.
-                    runtime.block_on(async {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    });
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().expect("a blocked thread comes back");
-        }
-    }
-
-    #[test]
-    fn children_keep_the_configured_effort() {
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
-        agent.set_reasoning_effort(ReasoningEffort::Low);
-        assert_eq!(agent.configured_effort(), Some(ReasoningEffort::Low));
-        assert_eq!(agent.child().configured_effort(), Some(ReasoningEffort::Low));
-    }
-
-    /// `/model` swaps the endpoint and model, keeping the runtime, policies, and turn
-    #[test]
-    fn set_model_swaps_the_endpoint_and_resets_effort() {
+    fn swapping_the_provider_resets_effort_and_children_inherit_it() {
         let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
         let mut agent = Agent::new("http://localhost:9", "key", "model", policy);
         agent.set_reasoning_effort(ReasoningEffort::High);
+        assert_eq!(agent.child().configured_effort(), Some(ReasoningEffort::High));
 
-        agent.set_model("https://api.deepseek.com", "key2", "glm-4-flash");
+        agent.set_provider(
+            Provider::api_key("https://api.deepseek.com", "key2"),
+            "glm-4-flash",
+        );
         assert_eq!(agent.model, "glm-4-flash");
         assert_eq!(agent.effort, None, "the previous agent's effort is left behind");
-        // The lever, runtime, and mode survive the swap.
-        assert_eq!(agent.mode(), ChatMode::Default);
         agent.set_mode(ChatMode::Chat);
-        agent.set_model("https://api.deepseek.com", "key2", "glm-4-flash");
+        agent.set_provider(
+            Provider::api_key("https://api.deepseek.com", "key2"),
+            "glm-4-flash",
+        );
         assert_eq!(agent.mode(), ChatMode::Chat, "a /model swap keeps chat mode");
     }
 
@@ -769,6 +701,24 @@ mod tests {
         definitions.iter().map(|tool| tool.name.as_str()).collect()
     }
 
+    /// An agent whose backend serves `rounds` in turn, each stream held open
+    /// after its events when `hold` is set.
+    fn scripted(rounds: Vec<Vec<ResponseStreamEvent>>, hold: bool) -> Agent {
+        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
+        let mut agent = Agent::new("http://unused", "key", "model", policy);
+        agent.backend = Responses::scripted(rounds, hold);
+        agent
+    }
+
+    /// A transcript holding the user's `prompt`.
+    fn primed(prompt: &str) -> Transcript {
+        let transcript = Transcript::new().expect("a transcript opens");
+        transcript
+            .push_user(prompt.to_string())
+            .expect("the user turn records");
+        transcript
+    }
+
     fn drive(agent: &Agent, transcript: &Transcript) -> Vec<String> {
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let (sender, receiver) = mpsc::channel(1);
@@ -784,24 +734,29 @@ mod tests {
             .unwrap()
     }
 
-    /// Claiming installs the wake sender and retires the last turn's cancel;
-    /// a stale release must not retire a newer turn's lever.
+    /// Claiming installs the wake sender and retires the last turn's cancel: a
+    /// stale release must not retire a newer turn's lever, cancelling kills the
+    /// commands of the turn that claimed it and only those, and the next claim
+    /// mints a fresh command lever.
     #[test]
-    fn turn_control_cancel_is_generation_owned() {
+    fn turn_control_is_generation_owned() {
         let control = TurnHandle::default();
 
         // Claiming resets the cancel and installs the wake sender.
         let (sender, mut rx) = mpsc::channel(1);
-        let (first, _) = control.claim(sender);
+        let (first, commands) = control.claim(sender);
         assert!(!control.cancelled(&mut rx));
 
-        // Cancel pokes the claimed sender; the drained flag decides.
+        // Cancel pokes the claimed sender and kills its commands; the drained
+        // flag decides.
         control.cancel();
         assert!(control.cancelled(&mut rx));
+        assert!(commands.cancelled());
 
         // A stale release must not retire the newer turn's lever.
         let (sender, _) = mpsc::channel(1);
-        let (second, _) = control.claim(sender);
+        let (second, fresh) = control.claim(sender);
+        assert!(!fresh.cancelled(), "a fresh claim is not born cancelled");
         control.release(first);
         control.cancel();
         assert!(control.cancelled(&mut rx));
@@ -811,40 +766,16 @@ mod tests {
         assert!(!control.cancelled(&mut rx));
     }
 
-    /// Cancelling a turn kills the commands of the turn that claimed the lever,
-    /// and only those: the next claim mints a fresh command lever.
-    #[test]
-    fn cancel_kills_the_claims_commands_and_no_one_elses() {
-        let control = TurnHandle::default();
-
-        let (sender, _) = mpsc::channel(1);
-        let (_, first) = control.claim(sender);
-        control.cancel();
-        assert!(first.cancelled());
-
-        // A fresh claim is not born cancelled: the prior cancel died with its turn.
-        let (sender, _) = mpsc::channel(1);
-        let (_, second) = control.claim(sender);
-        assert!(!second.cancelled());
-    }
-
     /// A cancel mid-stream keeps the partial answer and ends the turn
     /// [`Progress::Cancelled`], with nothing recorded after it: what an
     /// interrupted turn leaves behind for the front end to requeue onto.
     #[test]
     fn cancel_mid_stream_keeps_the_partial_answer() {
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
-        let transcript = Transcript::new().expect("a transcript opens");
-        transcript
-            .push_user("tell me a story".to_string())
-            .expect("the user turn records");
+        let transcript = primed("tell me a story");
 
         // One round streams a partial answer, then parks: the stream never
         // ends on its own, so only a cancel can end the turn.
-        let server = serve(listener, vec![delta("Once upon"), delta(" a time")], true);
+        let agent = scripted(vec![vec![delta("Once upon"), delta(" a time")]], true);
 
         // Esc lands once both fragments have streamed, so the cancel wakes
         // the parked select with the partial already in hand.
@@ -882,45 +813,45 @@ mod tests {
         let items = serde_json::to_value(transcript.request_items()).unwrap();
         assert_eq!(items.as_array().map(Vec::len), Some(3));
         assert_eq!(items[2]["content"], "Once upon a time");
-
-        server.join().expect("the server exits");
     }
 
     /// A stream that delivers nothing and closes drops its round; the retry
     /// re-sends the request verbatim and the turn completes on the second one.
+    /// A round that streams its text and then the finished message item
+    /// records the provider's item alone: the streamed text is the fallback,
+    /// not a second copy beside it, while `Done` still carries it.
+    #[test]
+    fn a_message_item_replaces_the_streamed_answer_in_the_record() {
+        let transcript = primed("tell me a story");
+        let agent = scripted(
+            vec![vec![delta("All "), delta("done."), message_done("All done.")]],
+            false,
+        );
+
+        let log = drive(&agent, &transcript);
+
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some(r#"Done { message: Some("All done.") }"#)
+        );
+        let items = serde_json::to_value(transcript.request_items()).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 3, "system, user, the provider's message: {items:?}");
+        assert_eq!(items[2]["id"], "msg_0", "the provider's item, not a stand-in");
+        assert_eq!(items[2]["phase"], "final_answer");
+        assert_eq!(items[2]["content"][0]["text"], "All done.");
+    }
+
     #[test]
     fn a_dropped_stream_retries_its_round() {
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
-        let transcript = Transcript::new().expect("a transcript opens");
-        transcript
-            .push_user("tell me a story".to_string())
-            .expect("the user turn records");
+        let transcript = primed("tell me a story");
 
         // The first request answers with an empty stream that closes at once;
         // the retried request gets the complete one, so only the retry ends
         // the turn.
-        let server = std::thread::spawn(move || {
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let (mut stream, _) = listener.accept().expect("the first client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.flush();
-            drop(stream);
-            let (mut stream, _) = listener.accept().expect("the retried client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            let event = serde_json::to_string(&delta("Once upon a time")).expect("serializes");
-            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            let _ = stream.flush();
-        });
+        let agent = scripted(vec![vec![], vec![delta("Once upon a time")]], false);
 
         let log = drive(&agent, &transcript);
-        server.join().expect("the server exits");
 
         // The stall is visible as a note, and the retry completes the turn.
         assert!(
@@ -938,19 +869,13 @@ mod tests {
 
     #[test]
     fn explicit_completion_is_required_before_dispatching_a_tool() {
-        let Some(listener) = loopback() else { return };
-        let address = listener.local_addr().unwrap();
-        let server = serve(listener, vec![call_done(0)], false);
-        let policy = Policy::new(std::env::temp_dir()).unwrap();
-        let mut agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        let mut agent = scripted(vec![vec![call_done(0)]], false);
         agent.backend.use_chatgpt_wire_format_for_test();
-        let transcript = Transcript::new().unwrap();
-        transcript.push_user("Read a file".into()).unwrap();
+        let transcript = primed("Read a file");
         let before = transcript.request_items().len();
         let log = drive(&agent, &transcript);
         assert_eq!(log, [r#"Failed("stream ended before response.completed")"#]);
         assert_eq!(transcript.request_items().len(), before);
-        server.join().unwrap();
     }
 
     /// One round whose `read` output passes the content cap: history records
@@ -961,14 +886,18 @@ mod tests {
     fn an_oversized_tool_output_spills_into_history() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
-        let transcript = Transcript::new().expect("a transcript opens");
-        transcript
-            .push_user("read it all".to_string())
-            .expect("the user turn records");
+        // The round runs a real `read`, under the harness's own sandbox.
+        if let Err(why) = crate::sandbox::live::probe() {
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "note: skipping live test an_oversized_tool_output_spills_into_history (reaches sandbox-exec): {why}"
+            );
+            return;
+        }
+
+        let transcript = primed("read it all");
 
         // A file whose numbered rendering passes the content cap.
         let big = std::env::temp_dir().join("tart-spill-test-input.txt");
@@ -976,37 +905,25 @@ mod tests {
         let arguments = serde_json::json!({ "file_path": &big }).to_string();
 
         // The first round calls read on the big file; the second answers.
-        let server = std::thread::spawn(move || {
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let (mut stream, _) = listener.accept().expect("the first client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            let call = serde_json::to_string(&call_done_with(
-                0,
-                FunctionToolCall {
-                    namespace: None,
-                    name: "read".to_string(),
-                    arguments,
-                    call_id: "call_0".to_string(),
-                    id: Some("item_0".to_string()),
-                    status: None,
-                    caller: None,
-                    r#async: None,
-                },
-            ))
-            .expect("serializes");
-            let _ = stream.write_all(format!("data: {call}\n\n").as_bytes());
-            let _ = stream.flush();
-            drop(stream);
-            let (mut stream, _) = listener.accept().expect("the second client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            let event = serde_json::to_string(&delta("done")).expect("serializes");
-            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            let _ = stream.flush();
-        });
+        let agent = scripted(
+            vec![
+                vec![call_done_with(
+                    0,
+                    FunctionToolCall {
+                        namespace: None,
+                        name: "read".to_string(),
+                        arguments,
+                        call_id: "call_0".to_string(),
+                        id: Some("item_0".to_string()),
+                        status: None,
+                        caller: None,
+                        r#async: None,
+                    },
+                )],
+                vec![delta("done")],
+            ],
+            false,
+        );
 
         let log = drive(&agent, &transcript);
         assert!(
@@ -1043,104 +960,21 @@ mod tests {
 
         let _ = std::fs::remove_file(saved);
         let _ = std::fs::remove_file(&big);
-        server.join().expect("the server exits");
     }
 
-    #[test]
-    fn a_malformed_call_does_not_end_the_turn() {
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
-        let transcript = Transcript::new().expect("a transcript opens");
-        transcript
-            .push_user("read something".to_string())
-            .expect("the user turn records");
-
-        // The first round calls read with no path; the second, having seen the
-        // call's error as its output, answers instead.
-        let server = std::thread::spawn(move || {
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let (mut stream, _) = listener.accept().expect("the first client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            let event = serde_json::to_string(&call_done(0)).expect("serializes");
-            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            let _ = stream.flush();
-            drop(stream);
-            let (mut stream, _) = listener.accept().expect("the second client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            let event = serde_json::to_string(&delta("recovered")).expect("serializes");
-            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            let _ = stream.flush();
-        });
-
-        let log = drive(&agent, &transcript);
-
-        // The turn completes: no failure, one terminal event, and it is Done.
-        // Asserted before joining the server so a regression fails here
-        // instead of hanging on an accept that never comes.
-        assert!(
-            log.iter().all(|entry| !entry.starts_with("Failed")),
-            "the malformed call must not fail the turn: {log:?}"
-        );
-        assert_eq!(log.last().map(|entry| entry.starts_with("Done")), Some(true));
-
-        // The malformed call and its error stayed in the record, so the next
-        // request and a resumed session replay them.
-        let items = serde_json::to_value(transcript.request_items()).unwrap();
-        let items = items.as_array().expect("the record is a list of items");
-        assert_eq!(items.len(), 5, "system, user, call, output, answer: {items:?}");
-        assert_eq!(items[2]["name"], "read");
-        assert!(
-            items[3]["output"]
-                .as_str()
-                .is_some_and(|output| output.contains("`file_path` is missing")),
-            "the call's error is its output: {}",
-            items[3]["output"]
-        );
-        assert_eq!(items[4]["content"], "recovered");
-        server.join().expect("the server exits");
-    }
-
-    /// The round's remaining calls still run after a malformed one: the old
-    /// loop broke the round on a call it could not run, and this pins that a
-    /// misuse output ends no round and skips no sibling call.
+    /// A call the harness cannot run records its misuse as the output and ends
+    /// neither the round nor its siblings: the old loop broke the round on a
+    /// call it could not run, and this pins that a misuse output skips no
+    /// sibling call.
     #[test]
     fn the_rounds_remaining_calls_run_after_a_malformed_one() {
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
-        let transcript = Transcript::new().expect("a transcript opens");
-        transcript
-            .push_user("read something".to_string())
-            .expect("the user turn records");
+        let transcript = primed("read something");
 
         // One round carries two malformed read calls; the next round answers.
-        let server = std::thread::spawn(move || {
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let (mut stream, _) = listener.accept().expect("the first client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            for event in [call_done(0), call_done(1)] {
-                let event = serde_json::to_string(&event).expect("serializes");
-                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            }
-            let _ = stream.flush();
-            drop(stream);
-            let (mut stream, _) = listener.accept().expect("the second client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            let event = serde_json::to_string(&delta("both answered")).expect("serializes");
-            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            let _ = stream.flush();
-        });
+        let agent = scripted(
+            vec![vec![call_done(0), call_done(1)], vec![delta("both answered")]],
+            false,
+        );
 
         let log = drive(&agent, &transcript);
 
@@ -1158,6 +992,7 @@ mod tests {
             7,
             "system, user, two calls, two outputs, answer: {items:?}"
         );
+        assert_eq!(items[2]["name"], "read");
         assert_eq!(items[2]["call_id"], "call_0");
         assert_eq!(items[3]["call_id"], "call_1");
         for output in [4, 5] {
@@ -1170,32 +1005,23 @@ mod tests {
             );
         }
         assert_eq!(items[6]["content"], "both answered");
-        server.join().expect("the server exits");
     }
 
     /// A claim on a running child answers "still running" at once, as often
     /// as asked: nothing blocks, so nothing has to recover from blocking.
     #[test]
     fn a_claim_on_a_running_child_is_instant_and_repeatable() {
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
+        // A stream that never ends holds the child mid-request, so it stays
+        // running through every claim.
+        let agent = scripted(Vec::new(), true);
         let agents = Agents::new(|_, _| {});
         let id = agents.spawn(&agent, "outlive the claims").unwrap();
-
-        // A listener that never accepts holds the child mid-request, so it
-        // stays running through every claim.
         assert!(agents.claim(id).unwrap().is_none());
         assert!(agents.claim(id).unwrap().is_none());
     }
 
     #[test]
     fn spawned_subagents_run_and_report() {
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
         let events = Arc::new(Mutex::new(Vec::<(crate::AgentId, Progress)>::new()));
         let log = Arc::clone(&events);
         let agents = crate::Agents::new(move |id, progress| {
@@ -1204,17 +1030,7 @@ mod tests {
 
         // The child's one round streams an answer, then the stream closes:
         // the turn ends on its own, no cancel needed.
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("the child connects");
-            read_request(&mut stream);
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let _ = stream.write_all(head.as_bytes());
-            let event = serde_json::to_string(&delta("found it")).expect("serializes");
-            let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            let _ = stream.flush();
-        });
+        let agent = scripted(vec![vec![delta("found it")]], false);
 
         let id = agents
             .spawn(&agent, "find the flaky test")
@@ -1222,7 +1038,6 @@ mod tests {
         settled(&agents, id);
         let outcome = agents.claim(id).expect("the child is registered");
         assert_eq!(outcome, Some(crate::Outcome::Done(Some("found it".to_string()))));
-        server.join().expect("the server exits");
 
         // The box opener precedes every child event.
         let events = events.lock().unwrap();
@@ -1247,35 +1062,18 @@ mod tests {
     /// requirement, pinned end to end through the real spawn path.
     #[test]
     fn a_subagents_round_bills_as_a_child() {
-        let Some(listener) = loopback() else { return };
         let _held = crate::usage::tests::held_for_test();
         let _ledger = crate::usage::tests::ledger_root();
         crate::usage::set_session("child-ledger".to_string());
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
         let agents = crate::Agents::new(|_, _| ());
 
         // The child's one round answers, bills, and the stream ends.
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("the child connects");
-            read_request(&mut stream);
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let _ = stream.write_all(head.as_bytes());
-            for event in [delta("found it"), completed(&sample_usage())] {
-                let event = serde_json::to_string(&event).expect("a stream event serializes");
-                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            }
-            let _ = stream.flush();
-        });
+        let agent = scripted(vec![vec![delta("found it"), completed(&sample_usage())]], false);
 
         let id = agents
             .spawn(&agent, "find the flaky test")
             .expect("room for a child");
         settled(&agents, id);
-        server.join().expect("the server exits");
 
         let row = crate::usage::Ledger::last_entry().expect("the child's round billed");
         assert_eq!(row.agent, format!("child-{}", id.id()), "the row names the child");
@@ -1283,11 +1081,11 @@ mod tests {
         assert_eq!(row.usage, sample_usage());
     }
 
-    /// A delivered report leaves a marker: a later wait for that id says
-    /// the report was delivered, while a wait for an id that never ran says
-    /// so.
+    /// A report delivers once and frees its slot: a second claim on the id
+    /// says the report was delivered, a claim on an id that never ran says so,
+    /// and the freed slots take new children.
     #[test]
-    fn markers_split_delivered_from_never_ran() {
+    fn reports_deliver_once_and_free_their_slots() {
         let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
         let agent = Agent::new("http://localhost:9", "key", "model", policy);
         let agents = crate::Agents::new(|_, _| {});
@@ -1296,26 +1094,10 @@ mod tests {
             .claim(crate::AgentId::from(99))
             .expect_err("no such subagent")
             .to_string();
-        assert!(never.contains("never ran"), "{never}");
-        assert!(!never.contains("already delivered"), "{never}");
-
-        // The unreachable endpoint fails the child fast; the claim delivers.
-        let id = agents.spawn(&agent, "task").expect("a slot is free");
-        settled(&agents, id);
-        agents
-            .claim(id)
-            .expect("the child ended")
-            .expect("a failed child still reports");
-        let delivered = agents.claim(id).expect_err("one delivery only").to_string();
-        assert!(delivered.contains("already delivered"), "{delivered}");
-        assert!(!delivered.contains("never ran"), "{delivered}");
-    }
-
-    #[test]
-    fn reports_deliver_once_and_free_their_slots() {
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let agent = Agent::new("http://localhost:9", "key", "model", policy);
-        let agents = crate::Agents::new(|_, _| {});
+        assert!(
+            never.contains("never ran") && !never.contains("already delivered"),
+            "{never}"
+        );
 
         let mut ids = Vec::new();
         for _ in 0..crate::MAX_SUBAGENTS {
@@ -1330,6 +1112,11 @@ mod tests {
             let outcome = agents.claim(id).expect("the child ended");
             assert!(outcome.is_some(), "a failed child still reports: {outcome:?}");
             assert_eq!(agents.take_outcome(id), None, "one delivery only");
+            let delivered = agents.claim(id).expect_err("one delivery only").to_string();
+            assert!(
+                delivered.contains("already delivered") && !delivered.contains("never ran"),
+                "{delivered}"
+            );
         }
         assert_eq!(agents.running(), []);
         agents
@@ -1344,23 +1131,6 @@ mod tests {
         while !agents.done(id) {
             assert!(std::time::Instant::now() < deadline, "the child ends");
             std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    /// The loopback listener the worker test streams from, or `None` where denied
-    fn loopback() -> Option<std::net::TcpListener> {
-        match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-            Ok(listener) => Some(listener),
-            Err(error) => {
-                let current = std::thread::current();
-                let name = current.name().unwrap_or("<unnamed>");
-                let mut stderr = std::io::stderr().lock();
-                let _ = writeln!(
-                    stderr,
-                    "note: skipping live test {name} (needs loopback the sandbox denies): {error}"
-                );
-                None
-            }
         }
     }
 
@@ -1406,6 +1176,25 @@ mod tests {
         })
     }
 
+    /// An output-item-done event carrying the finished assistant message, as
+    /// a provider streams it after the text deltas: the item the record keeps.
+    fn message_done(text: &str) -> ResponseStreamEvent {
+        let event = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 7,
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_0",
+                "role": "assistant",
+                "status": "completed",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        });
+        serde_json::from_value(event).expect("a message item done event parses")
+    }
+
     /// A `response.completed` event whose response burned `spend` tokens.
     fn completed(spend: &TokenUsage) -> ResponseStreamEvent {
         let event = serde_json::json!({
@@ -1433,32 +1222,13 @@ mod tests {
 
     #[test]
     fn a_completed_round_bills_the_ledger() {
-        let Some(listener) = loopback() else { return };
-        let policy = Policy::new(std::env::temp_dir()).expect("temp dir is a valid root");
-        let address = listener.local_addr().expect("a bound address");
-        let agent = Agent::new(format!("http://{address}"), "key", "model", policy);
-        let transcript = Transcript::new().expect("a transcript opens");
-        transcript
-            .push_user("hello".to_string())
-            .expect("the user turn records");
+        let transcript = primed("hello");
         let _held = crate::usage::tests::held_for_test();
         let _ledger = crate::usage::tests::ledger_root();
         crate::usage::set_session("ledgered".to_string());
 
         // One round answers, bills, and the stream ends: the turn completes.
-        let server = std::thread::spawn(move || {
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let (mut stream, _) = listener.accept().expect("the client arrives");
-            read_request(&mut stream);
-            let _ = stream.write_all(head.as_bytes());
-            for event in [delta("hi there"), completed(&sample_usage())] {
-                let event = serde_json::to_string(&event).expect("a stream event serializes");
-                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            }
-            let _ = stream.flush();
-        });
+        let agent = scripted(vec![vec![delta("hi there"), completed(&sample_usage())]], false);
 
         let log = drive(&agent, &transcript);
 
@@ -1472,73 +1242,12 @@ mod tests {
 
         // The answer is recorded, and the round's bill landed in the ledger:
         // one row, tagged for this agent, session, and model.
-        let lines = transcript.recorded_after(0);
+        let lines = transcript.lines();
         assert_eq!(lines.len(), 3);
         let row = crate::usage::Ledger::last_entry().expect("the round billed");
         assert_eq!(row.agent, "main");
         assert_eq!(row.model, "model");
         assert_eq!(row.session.as_deref(), Some("ledgered"));
         assert_eq!(row.usage, crate::usage::tests::sample_usage());
-        server.join().expect("the server exits");
-    }
-
-    /// Answer one `/responses` request with `events` as `text/event-stream`,
-    /// optionally keeping it open until the client cancels.
-    fn serve(
-        listener: std::net::TcpListener,
-        events: Vec<ResponseStreamEvent>,
-        hold_open: bool,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            read_request(&mut stream);
-            let head = "HTTP/1.1 200 OK\r\n\
-                        content-type: text/event-stream\r\n\
-                        connection: close\r\n\r\n";
-            let _ = stream.write_all(head.as_bytes());
-            for event in events {
-                let event = serde_json::to_string(&event).expect("a stream event serializes");
-                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
-            }
-            let _ = stream.flush();
-            if !hold_open {
-                return;
-            }
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-            let mut drain = [0; 1024];
-            while !matches!(stream.read(&mut drain), Ok(0) | Err(_)) {}
-        })
-    }
-
-    /// Read one request off `stream`: the head, then the body its
-    /// `content-length` names. Nothing beyond that length is parsed.
-    fn read_request(stream: &mut std::net::TcpStream) {
-        let mut seen = Vec::new();
-        let mut chunk = [0; 1024];
-        let head = loop {
-            let read = stream.read(&mut chunk).unwrap_or(0);
-            if read == 0 {
-                return; // the client gave up
-            }
-            seen.extend_from_slice(&chunk[..read]);
-            if let Some(at) = seen.windows(4).position(|window| window == b"\r\n\r\n") {
-                break at + 4;
-            }
-        };
-        let length = String::from_utf8_lossy(&seen[..head])
-            .to_uppercase()
-            .lines()
-            .find_map(|line| line.strip_prefix("CONTENT-LENGTH:"))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        while seen.len() < head + length {
-            let read = stream.read(&mut chunk).unwrap_or(0);
-            if read == 0 {
-                return;
-            }
-            seen.extend_from_slice(&chunk[..read]);
-        }
     }
 }

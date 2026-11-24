@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use openidconnect::core::{
@@ -61,11 +61,7 @@ fn load_keychain<T: serde::de::DeserializeOwned>(account: &str) -> anyhow::Resul
 }
 
 fn save_keychain(account: &str, value: &impl Serialize) -> anyhow::Result<()> {
-    Ok(set_generic_password(
-        SERVICE,
-        account,
-        &serde_json::to_vec(value)?,
-    )?)
+    set_generic_password(SERVICE, account, &serde_json::to_vec(value)?).map_err(Into::into)
 }
 
 fn lock(name: &str) -> anyhow::Result<File> {
@@ -124,11 +120,9 @@ fn callback(
     server: &tiny_http::Server,
     state: &CsrfToken,
 ) -> anyhow::Result<(AuthorizationCode, Option<String>)> {
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        ensure!(!wait.is_zero(), "ChatGPT sign-in timed out");
-        let request = server.recv_timeout(wait)?.context("ChatGPT sign-in timed out")?;
+    // Wait for the browser's redirect; Ctrl-C abandons the sign-in. Stray
+    // requests (favicons, probes) are answered and ignored.
+    for request in server.incoming_requests() {
         let Some(result) = parse_callback(request.method(), request.url(), state) else {
             let _ = request.respond(tiny_http::Response::empty(400));
             continue;
@@ -141,6 +135,7 @@ fn callback(
         let _ = request.respond(tiny_http::Response::from_string(message));
         return result;
     }
+    anyhow::bail!("ChatGPT sign-in stopped before the browser returned")
 }
 
 fn parse_callback(
@@ -149,17 +144,14 @@ fn parse_callback(
     state: &CsrfToken,
 ) -> Option<anyhow::Result<(AuthorizationCode, Option<String>)>> {
     let (path, query) = target.split_once('?')?;
-    if method != &tiny_http::Method::Get || path != CALLBACK {
-        return None;
-    }
+    (method == &tiny_http::Method::Get && path == CALLBACK).then_some(())?;
     let params = url::form_urlencoded::parse(query.as_bytes());
-    let get = |name| {
-        let mut values = params.filter(|(key, _)| key == name);
-        let value = values.next().map(|(_, value)| value.into_owned());
-        if values.next().is_some() {
-            Err(anyhow::anyhow!("Duplicate ChatGPT callback parameter"))
-        } else {
-            Ok(value)
+    let get = |name: &str| -> anyhow::Result<Option<String>> {
+        let values: Vec<_> = params.filter(|(key, _)| key == name).collect();
+        match &values[..] {
+            [] => Ok(None),
+            [(_, value)] => Ok(Some(value.to_string())),
+            _ => bail!("Duplicate ChatGPT callback parameter"),
         }
     };
     if get("state").ok().flatten().as_ref() != Some(state.secret()) {
@@ -216,13 +208,11 @@ fn authorize_in_browser(
         authorize = authorize.add_extra_param("prompt", "consent");
     }
     let (url, state, nonce) = authorize.url();
-    ensure!(
-        Command::new("/usr/bin/open")
-            .arg(url.as_str())
-            .status()?
-            .success(),
-        "Could not open the browser"
-    );
+    let opened = Command::new("/usr/bin/open")
+        .arg(url.as_str())
+        .status()?
+        .success();
+    ensure!(opened, "Could not open the browser");
     let (code, returned_id) = callback(&server, &state)?;
     let client_id = match (saved_id, returned_id) {
         (Some(saved), Some(returned)) if saved != returned => {

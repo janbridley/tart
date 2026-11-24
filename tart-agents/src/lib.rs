@@ -53,7 +53,8 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 /// The round cap when `TART_MAX_TOOL_ROUNDS` is unset or invalid.
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 4096;
 
-/// The reasoning efforts a backend accepts, so callers can pick one without
-/// depending on the backend's own vocabulary.
+/// How hard the model reasons, as the Responses provider spells it: the
+/// `async-openai` vocabulary, re-exported so callers need no direct dependency
+/// of their own.
 pub use backends::ReasoningEffort;
 pub use backends::openai_responses::Provider;

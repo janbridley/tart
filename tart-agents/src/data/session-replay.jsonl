@@ -1,0 +1,5 @@
+{"content":"# Tart\n\nYou are *tart*, a terminal coding agent working in the user's current directory. You\nhave seven tools: `bash` (r …cut for the fixture","role":"system","timestamp":"2026-11-24 15:19:34","type":"message"}
+{"content":"Please check out this repo.","role":"user","timestamp":"2026-11-24 15:19:34","type":"message"}
+{"arguments":"{\"command\":\"ls; git status --short; rg --files | head -100\",\"timeout\":1000}","call_id":"call_0f3a9c7e5b2d4e6f8a1b3c5d7e9f0a2b","id":"fc_1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f","name":"bash","namespace":"tart","status":"completed","timestamp":"2026-11-24 15:19:39","type":"function_call"}
+{"call_id":"call_0f3a9c7e5b2d4e6f8a1b3c5d7e9f0a2b","namespace":"tart","output":"Cargo.toml\nCargo.lock\n…cut for the fixture\n","timestamp":"2026-11-24 15:19:39","type":"function_call_output"}
+{"content":[],"encrypted_content":"gAAAAAAAAAB0ZXN0LWZpeHR1cmUtY2lwaGVydGV4dC1ub3QtcmVhbA","id":"rs_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a","summary":[],"timestamp":"2026-11-24 15:20:07","type":"reasoning"}

@@ -239,7 +239,7 @@ impl Config {
                 None => Provider::ChatGpt,
             },
             model: agent.model.clone(),
-            effort: agent.reasoning_effort,
+            effort: agent.reasoning_effort.clone(),
             context_tokens: agent.context_tokens,
         })
     }
