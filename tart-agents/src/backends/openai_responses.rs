@@ -19,8 +19,6 @@ use crate::usage::TokenUsage;
 #[cfg(test)]
 use std::collections::VecDeque;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::task::Poll;
@@ -84,10 +82,12 @@ impl Provider {
 pub(crate) enum Responses {
     ApiKey(Client<OpenAIConfig>),
     ChatGpt(reqwest::Client),
-    /// A scripted stand-in: each round streams the next queued events, then
-    /// holds the stream open when asked, as a server would.
+    /// A scripted stand-in
+    ///
+    /// Each round streams the next queued events, then holds the stream open if asked.
+    /// Flag ensures streams end only on `response.completed` like the `ChatGPT` backend
     #[cfg(test)]
-    Scripted(Arc<Script>),
+    Scripted(Arc<Script>, bool),
 }
 
 /// What a [`Responses::Scripted`] backend serves: the rounds in turn, and
@@ -97,8 +97,6 @@ pub(crate) struct Script {
     rounds: Mutex<VecDeque<Vec<ResponseStreamEvent>>>,
     /// Keep every stream open after its events, until the loop drops it.
     hold: bool,
-    /// Stream like the `ChatGPT` backend: only `response.completed` ends a round.
-    explicit_completion: AtomicBool,
 }
 
 impl Responses {
@@ -119,12 +117,12 @@ impl Responses {
         }
     }
 
-    pub(crate) fn requires_completion(&self) -> bool {
+    pub(crate) const fn requires_completion(&self) -> bool {
         match self {
             Self::ApiKey(_) => false,
             Self::ChatGpt(_) => true,
             #[cfg(test)]
-            Self::Scripted(script) => script.explicit_completion.load(Ordering::Relaxed),
+            Self::Scripted(_, completing) => *completing,
         }
     }
 
@@ -132,27 +130,26 @@ impl Responses {
     /// events when `hold` is set.
     #[cfg(test)]
     pub(crate) fn scripted(rounds: Vec<Vec<ResponseStreamEvent>>, hold: bool) -> Self {
-        Self::Scripted(Arc::new(Script {
-            rounds: Mutex::new(rounds.into()),
-            hold,
-            explicit_completion: AtomicBool::new(false),
-        }))
+        Self::Scripted(
+            Arc::new(Script {
+                rounds: Mutex::new(rounds.into()),
+                hold,
+            }),
+            false,
+        )
     }
 
     #[cfg(test)]
-    pub(crate) fn use_chatgpt_wire_format_for_test(&mut self) {
-        if let Self::Scripted(script) = self {
-            script.explicit_completion.store(true, Ordering::Relaxed);
+    pub(crate) const fn use_chatgpt_wire_format_for_test(&mut self) {
+        if let Self::Scripted(_, completing) = self {
+            *completing = true;
         }
     }
 
     /// The next round's stream: its events as the loop takes them, then an
     /// open end that never comes while the script holds.
     #[cfg(test)]
-    fn next_round(
-        &self,
-        script: &Script,
-    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>> {
+    fn next_round(script: &Script) -> Pin<Box<dyn Stream<Item = anyhow::Result<Event>> + Send>> {
         let events = crate::locked(&script.rounds).pop_front().unwrap_or_default();
         let items = events
             .into_iter()
@@ -190,7 +187,7 @@ impl Responses {
                     .filter_map(|item| std::future::ready(translated(item))),
             ),
             #[cfg(test)]
-            Self::Scripted(script) => self.next_round(script),
+            Self::Scripted(script, _) => Self::next_round(script),
         };
         Ok(stream)
     }
