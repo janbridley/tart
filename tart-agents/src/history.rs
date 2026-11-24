@@ -50,8 +50,7 @@ fn stamp<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Str
 }
 
 impl RecordLine {
-    /// One line as the record appends it, stamped with the moment it is
-    /// recorded.
+    /// One line as the record appends it, stamped with the moment it is recorded.
     #[inline]
     fn fresh(item: InputItem) -> Self {
         Self {
